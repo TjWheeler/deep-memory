@@ -33,7 +33,10 @@ From an **admin** PowerShell:
   /AllowNetworkAccess `
   /Key=C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw== `
   /EnableGremlinEndpoint
+  /DisableRateLimiting
 ```
+
+**Security Note** - this enables cosmosdb on your network.  Make sure you don't run this on an untrusted network.  You can remove '/AllowNetworkAccess' but you may have connectivity problems depending on how you run the local mcp server.
 
 This exposes:
 - REST API on `https://localhost:8081` (used by `ensureSchema()` to create the database/container)

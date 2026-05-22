@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "deep-memory": {
+      "command": "node",
+      "args": ["packages/mcp-server/dist/index.js"],
+      "env": {
+        "DEEP_MEMORY_ACTOR_ID": "mcp-agent",
+        "DEEP_MEMORY_ACTOR_TYPE": "agent"
+      }
+    },
+    "deep-memory-indexer": {
+      "command": "node",
+      "args": ["packages/indexer-mcp-server/dist/index.js"]
+    }
+  }
+}

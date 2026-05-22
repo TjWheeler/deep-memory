@@ -1,0 +1,49 @@
+{
+  "name": "@utaba/deep-memory-indexer-mcp-server",
+  "version": "0.16.0",
+  "private": true,
+  "description": "Indexer MCP server — phase-aware indexing pipeline tools for AI agents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "deep-memory-indexer-mcp": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@utaba/deep-memory": "workspace:*",
+    "@utaba/deep-memory-indexer": "workspace:*",
+    "@utaba/deep-memory-indexer-llm-anthropic": "workspace:*",
+    "@utaba/deep-memory-storage-sqlserver": "workspace:*",
+    "@utaba/deep-memory-storage-cosmosdb": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.28.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}

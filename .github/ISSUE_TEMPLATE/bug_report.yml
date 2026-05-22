@@ -1,0 +1,102 @@
+name: Bug report
+description: Report something not working as documented.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. The more detail you provide, the faster we can fix it.
+
+        Before filing, please check whether an existing issue covers the same problem.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear summary of the bug.
+      placeholder: When I do X, Y happens, but I expected Z.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps. A small code sample is ideal.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include any error messages, stack traces, or relevant log output.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package
+      description: Which package does this bug relate to? Pick the closest match.
+      options:
+        - "@utaba/deep-memory (core)"
+        - "@utaba/deep-memory-embeddings-openai"
+        - "@utaba/deep-memory-storage-cosmosdb"
+        - "@utaba/deep-memory-storage-sqlserver"
+        - "@utaba/deep-memory-local-mcp-server"
+        - "@utaba/deep-memory-indexer"
+        - "@utaba/deep-memory-indexer-llm-anthropic"
+        - "@utaba/deep-memory-indexer-mcp-server"
+        - "Multiple / not sure"
+        - "Other (repo-level, build, docs, etc.)"
+    validations:
+      required: true
+
+  - type: input
+    id: package_version
+    attributes:
+      label: Package version
+      placeholder: e.g. 0.16.0
+    validations:
+      required: true
+
+  - type: input
+    id: node_version
+    attributes:
+      label: Node.js version
+      placeholder: e.g. v22.11.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else — screenshots, config snippets, related issues.
+    validations:
+      required: false

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and discussion
+    url: https://github.com/TjWheeler/deep-memory/discussions
+    about: For usage questions, design discussion, or "how do I...", please use Discussions instead of opening an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/TjWheeler/deep-memory/security/advisories/new
+    about: Report security issues privately via GitHub Security Advisory. See SECURITY.md. Do not file a public issue for security.

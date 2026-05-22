@@ -1,27 +1,92 @@
 # @utaba/deep-memory-local-mcp-server
 
-Local MCP server that exposes [@utaba/deep-memory](https://www.npmjs.com/package/@utaba/deep-memory) as Model Context Protocol tools. Designed for AI agents (Claude Code, Claude Desktop, etc.) to interact with knowledge graphs over stdio.
+Local MCP server that exposes [@utaba/deep-memory](https://www.npmjs.com/package/@utaba/deep-memory) as Model Context Protocol tools. Gives AI agents (Claude Desktop, Claude Code, and any other MCP-capable client) persistent, structured memory backed by a knowledge graph — accessed over stdio.
 
-> **Note:** Indexing pipeline tools live in a separate server — [`@utaba/deep-memory-indexer-mcp-server`](https://www.npmjs.com/package/@utaba/deep-memory-indexer-mcp-server). This server focuses on memory repository operations only.
+## Quick start — Claude Desktop / Claude Code
 
-## Installation
+Memory is only useful if it survives restarts. The recommended setup runs a local SQL Server in Docker — everything stays on your machine, the database survives reboots, and you don't have to manage anything once it's installed.
 
-```bash
-pnpm add @utaba/deep-memory @utaba/deep-memory-local-mcp-server
-```
+**Full step-by-step (Windows / Mac / Linux):** [quickstart-claude-desktop.md](https://github.com/TjWheeler/deep-memory/blob/main/quickstart-claude-desktop.md) — three installers + one config file, around 15 minutes.
 
-## Claude Code / Desktop Integration
+The summary version: install Docker Desktop and Node.js, download the project ZIP, run `docker compose up sqlserver -d`, create the `deep-memory` database, then paste this into your MCP client's config:
 
-Add to `.mcp.json` at your project root:
+**Mac / Linux:**
 
 ```json
 {
   "mcpServers": {
     "deep-memory": {
-      "command": "node",
-      "args": ["node_modules/@utaba/deep-memory-local-mcp-server/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "@utaba/deep-memory-local-mcp-server"],
       "env": {
-        "DEEP_MEMORY_ACTOR_ID": "mcp-agent",
+        "DEEP_MEMORY_ACTOR_ID": "claude-desktop",
+        "DEEP_MEMORY_ACTOR_TYPE": "agent",
+        "DEEP_MEMORY_STORAGE": "sqlserver",
+        "DEEP_MEMORY_SQL_HOST": "localhost",
+        "DEEP_MEMORY_SQL_PORT": "1435",
+        "DEEP_MEMORY_SQL_DATABASE": "deep-memory",
+        "DEEP_MEMORY_SQL_USER": "sa",
+        "DEEP_MEMORY_SQL_PASSWORD": "DeepMem@Dev1234",
+        "DEEP_MEMORY_SQL_TRUST_CERT": "true"
+      }
+    }
+  }
+}
+```
+
+**Windows** (the `cmd /c` wrapper is needed so the launcher can resolve `npx`):
+
+```json
+{
+  "mcpServers": {
+    "deep-memory": {
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@utaba/deep-memory-local-mcp-server"],
+      "env": {
+        "DEEP_MEMORY_ACTOR_ID": "claude-desktop",
+        "DEEP_MEMORY_ACTOR_TYPE": "agent",
+        "DEEP_MEMORY_STORAGE": "sqlserver",
+        "DEEP_MEMORY_SQL_HOST": "localhost",
+        "DEEP_MEMORY_SQL_PORT": "1435",
+        "DEEP_MEMORY_SQL_DATABASE": "deep-memory",
+        "DEEP_MEMORY_SQL_USER": "sa",
+        "DEEP_MEMORY_SQL_PASSWORD": "DeepMem@Dev1234",
+        "DEEP_MEMORY_SQL_TRUST_CERT": "true"
+      }
+    }
+  }
+}
+```
+
+**Config file locations:**
+
+| Client | Path |
+|--------|------|
+| Claude Desktop (Mac) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Desktop (Windows) | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Claude Desktop (Linux) | `~/.config/Claude/claude_desktop_config.json` |
+| Claude Code | `.mcp.json` at your project root, or `~/.mcp.json` for global |
+
+The password and port above match the bundled `docker-compose.yml` in the project repo — change them in both places if you customise the database setup. CosmosDB Gremlin is also supported; see the [project repository](https://github.com/TjWheeler/deep-memory) for that path.
+
+> **Security — change the default password.** `DeepMem@Dev1234` is a publicly known development default. Anyone who can reach your machine on port 1435 can read your entire memory with it. Before you put anything personal or sensitive into the database, change the `SA_PASSWORD` / `MSSQL_SA_PASSWORD` in `docker-compose.yml` (and the matching `DEEP_MEMORY_SQL_PASSWORD` in the MCP config above) to a strong, unique password. The default is only safe when the database is bound to `localhost` on a trusted machine.
+
+Quit and reopen the MCP client. The server should show as connected with around 28 memory tools.
+
+## Test-only configuration (in-memory)
+
+> **Use this only to verify the install works. Do not use it as your real memory — it is wiped every time the server restarts.**
+
+If you just want to confirm the MCP server connects before going through the database setup, you can run with no storage at all:
+
+```json
+{
+  "mcpServers": {
+    "deep-memory": {
+      "command": "npx",
+      "args": ["-y", "@utaba/deep-memory-local-mcp-server"],
+      "env": {
+        "DEEP_MEMORY_ACTOR_ID": "test",
         "DEEP_MEMORY_ACTOR_TYPE": "agent"
       }
     }
@@ -29,18 +94,37 @@ Add to `.mcp.json` at your project root:
 }
 ```
 
-Restart Claude Code after editing `.mcp.json`.
+(On Windows, use the `cmd /c npx ...` form from above.) Once you've confirmed the tools are wired up, switch to the SQL Server configuration above before storing anything you want to keep.
 
-## Configuration
+## Configuration reference
 
-Environment variables:
+Environment variables passed via the MCP client's `env` block:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEEP_MEMORY_ACTOR_ID` | `mcp-agent` | Actor ID stamped on provenance |
 | `DEEP_MEMORY_ACTOR_TYPE` | `agent` | Actor type: `agent`, `human`, or `system` |
+| `DEEP_MEMORY_STORAGE` | `memory` | `memory` (test only — wiped on restart) or `sqlserver` (recommended) |
+| `DEEP_MEMORY_SQL_HOST` | — | SQL Server hostname (when `DEEP_MEMORY_STORAGE=sqlserver`) |
+| `DEEP_MEMORY_SQL_PORT` | `1433` | SQL Server port |
+| `DEEP_MEMORY_SQL_DATABASE` | — | Database name |
+| `DEEP_MEMORY_SQL_USER` | — | SQL Server username |
+| `DEEP_MEMORY_SQL_PASSWORD` | — | SQL Server password |
+| `DEEP_MEMORY_SQL_SCHEMA` | `dbo` | SQL Server schema |
+| `DEEP_MEMORY_SQL_TRUST_CERT` | `false` | Trust self-signed certificates (set `true` for local Docker) |
+| `DEEP_MEMORY_EMBEDDINGS_BASE_URL` | — | Embeddings API URL (enables semantic search) |
+| `DEEP_MEMORY_EMBEDDINGS_MODEL` | — | Embeddings model identifier |
+| `DEEP_MEMORY_EMBEDDINGS_API_KEY` | — | API key for authenticated embeddings endpoints |
 
-The server uses `InMemoryStorageProvider` and `InMemorySearchProvider` by default — all data is lost on restart. For persistent storage, wire up your own server using the core library directly with a storage provider like `@utaba/deep-memory-storage-sqlserver` or `@utaba/deep-memory-storage-cosmosdb`.
+## Programmatic use
+
+If you're embedding the server into your own code rather than launching it from an MCP client, install it as a dependency:
+
+```bash
+pnpm add @utaba/deep-memory @utaba/deep-memory-local-mcp-server
+```
+
+The package exports the same entry point its `bin` invokes — see the [project repository](https://github.com/TjWheeler/deep-memory) for examples.
 
 ## Tools (28)
 
@@ -140,4 +224,4 @@ The streaming variants avoid buffering the entire repository in memory. The buff
 ## See also
 
 - [`@utaba/deep-memory`](https://www.npmjs.com/package/@utaba/deep-memory) — the underlying graph memory library
-- [`@utaba/deep-memory-indexer-mcp-server`](https://www.npmjs.com/package/@utaba/deep-memory-indexer-mcp-server) — sibling MCP server for driving the indexing pipeline
+- [Project repository](https://github.com/TjWheeler/deep-memory) — source, quickstarts, starter kits, and the document-indexing pipeline (run from a clone of the repo)

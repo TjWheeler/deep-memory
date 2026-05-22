@@ -262,6 +262,17 @@ pnpm --filter @utaba/deep-memory-local-mcp-server build
 - [Source Content Conversion](docs/source-content-conversion.md) — PDF to Markdown conversion
 - [Publishing Guide](docs/publishing-guide.md) — Publishing packages to npm
 
+## About Us
+
+Deep Memory is built and maintained by [Utaba](https://utaba.ai).
+
+A full production implementation of Deep Memory is integrated into the [Universal Context Manager (UCM)](https://ucm.utaba.com.au) — our AI productivity platform for enterprise customers.
+
+If you are interested in working with us, please reach out:
+
+- [Contact Us](https://utaba.ai/contact)
+- [Email Us](mailto:hello@utaba.ai)
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).

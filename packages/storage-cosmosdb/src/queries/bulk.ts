@@ -9,6 +9,12 @@
 // Export optimizations:
 //   1. Cursor-based pagination using ID ordering instead of offset-based range()
 //      (avoids O(n²) scan on large repositories)
+//
+// Phase 2 perf-fixes exception: this file is the one read path that
+// intentionally keeps `valueMap(true)`. Export must include every stored
+// property including the embedding so a re-import is field-for-field
+// faithful. Do not migrate to the project chain helpers — they strip
+// fields the import path expects.
 
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { ExportChunk, ImportChunk, BulkImportOptions } from '@utaba/deep-memory/types';
@@ -233,7 +239,7 @@ async function insertRelationship(
     propParts.push(`.property('${key}', ${paramName})`);
   }
 
-  const query = `g.V().has('repositoryId', rid).has('id', srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).has('id', tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
+  const query = `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
   await conn.submit(query, bindings);
 }
 
@@ -264,7 +270,7 @@ async function upsertEntity(
   }
 
   // coalesce: find existing → update it, or create new
-  const query = `g.V().has('repositoryId', rid).has('id', vid).has('entityType').fold().coalesce(unfold()${propParts.join('')}, addV(vertexLabel).property('id', vid)${propParts.join('')})`;
+  const query = `g.V().has('repositoryId', rid).hasId(vid).has('entityType').fold().coalesce(unfold()${propParts.join('')}, addV(vertexLabel).property('id', vid)${propParts.join('')})`;
   await conn.submit(query, bindings);
 }
 
@@ -297,7 +303,7 @@ async function upsertRelationship(
   // coalesce: find existing → update it, or create new edge.
   // The E() lookup is scoped by repositoryId so an edge with the same id in a
   // different repo cannot be matched and silently overwritten.
-  const createEdge = `g.V().has('repositoryId', rid).has('id', srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).has('id', tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
-  const query = `g.E().has('repositoryId', rid).has('id', relId).fold().coalesce(unfold()${propParts.join('')}, ${createEdge})`;
+  const createEdge = `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
+  const query = `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(unfold()${propParts.join('')}, ${createEdge})`;
   await conn.submit(query, bindings);
 }

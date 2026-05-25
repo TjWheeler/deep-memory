@@ -27,11 +27,19 @@ describe('GremlinCompiler', () => {
     const result = compiler.compile(spec, emptyVocab);
 
     expect(result.query).toContain('g.V()');
-    expect(result.query).toContain(".has('id',");
+    // Phase 3: entityId-anchored starts emit hasId(p) (direct doc fetch by
+    // system id), not has('id', p) (property-equality lookup).
+    expect(result.query).toMatch(/\.hasId\(p\d+\)/);
+    expect(result.query).not.toContain(".has('id',");
     expect(result.query).toContain('.out(');
     expect(result.query).toContain('.dedup()');
     expect(result.query).toContain('.range(');
-    expect(result.query).toContain('.valueMap(true)');
+    // Phase 1: vertex project chain replaces valueMap(true) on the terminal mode.
+    expect(result.query).toContain(".project('__kind','id','entityType'");
+    expect(result.query).toContain(".by(constant('v'))");
+    expect(result.query).toContain('.by(id)');
+    expect(result.query).not.toContain('valueMap(true)');
+    expect(result.query).not.toContain("'embedding'");
     expect(Object.values(result.params)).toContain('entity-1');
     expect(Object.values(result.params)).toContain('HAS_COMPONENT');
   });
@@ -163,6 +171,20 @@ describe('GremlinCompiler', () => {
     expect(result.params['_offset']).toBe(10);
   });
 
+  it('emits hasId() for entityId-anchored starts (Phase 3)', () => {
+    // Direct doc fetch by system id, not property-equality lookup. See
+    // docs/cosmosdb-gremlin-compatibility.md §Performance.
+    const spec: TraversalSpec = {
+      start: { entityId: 'alice-johnson' },
+      steps: [{ direction: 'out', relationshipTypes: ['WORKS_AT'] }],
+      returnMode: 'terminal',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    expect(result.query).toMatch(/g\.V\(\)\.hasId\(p\d+\)/);
+    expect(result.query).not.toContain(".has('id',");
+    expect(Object.values(result.params)).toContain('alice-johnson');
+  });
+
   it('compiles start by entityType', () => {
     const spec: TraversalSpec = {
       start: { entityType: 'Equipment' },
@@ -206,17 +228,21 @@ describe('GremlinCompiler', () => {
     // Each branch is an anonymous traversal rooted with __.
     expect(result.query).toContain('.union(');
     expect(result.query).toContain('__.identity()');
-    expect(result.query).toMatch(/__\.outE\(p\d+\)/);
-    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)/);
-    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)/);
-    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)\.inV\(\)/);
+    // Phase 1: branches end in their own per-type project chain.
+    expect(result.query).toMatch(/__\.outE\(p\d+\)\.project\('__kind','id','relationshipType'/);
+    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.project\('__kind','id','entityType'/);
+    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)\.project\('__kind','id','relationshipType'/);
+    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)\.inV\(\)\.project\('__kind','id','entityType'/);
 
-    // 'all' is inherently deduped server-side, spec.dedup is ignored.
-    expect(result.query).toContain('.dedup()');
+    // 'all' is inherently deduped server-side, spec.dedup is ignored. On
+    // projected Maps, dedup must select the id key (string property-name
+    // doesn't resolve on a Map in CosmosDB Gremlin's subset).
+    expect(result.query).toContain(`.dedup().by(select('id'))`);
 
-    // Flat valueMap projection — not path().by(...).
-    expect(result.query).toContain('.valueMap(true)');
+    // No post-union projection step — projection happened per-branch.
+    expect(result.query).not.toContain('valueMap(true)');
     expect(result.query).not.toContain('.path()');
+    expect(result.query).not.toContain("'embedding'");
   });
 
   it("compiles 'all' mode with .dedup() even when spec.dedup is false", () => {
@@ -227,7 +253,7 @@ describe('GremlinCompiler', () => {
       dedup: false,
     };
     const result = compiler.compile(spec, emptyVocab);
-    expect(result.query).toContain('.dedup()');
+    expect(result.query).toContain(`.dedup().by(select('id'))`);
   });
 
   it("throws on 'all' mode with repeat steps (documented limitation)", () => {
@@ -241,7 +267,7 @@ describe('GremlinCompiler', () => {
 
   // ─── 'path' mode — edge-explicit + path().by(valueMap(true)), no dedup ──
 
-  it("compiles 'path' mode with edge-explicit emission and .path().by(valueMap(true))", () => {
+  it("compiles 'path' mode with edge-explicit emission and two-by round-robin path projection", () => {
     const spec: TraversalSpec = {
       start: { entityId: 'e1' },
       steps: [
@@ -253,7 +279,13 @@ describe('GremlinCompiler', () => {
     const result = compiler.compile(spec, emptyVocab);
     expect(result.query).toContain('.outE(');
     expect(result.query).toContain('.inV()');
-    expect(result.query).toContain('.path().by(valueMap(true))');
+    // Phase 1: two-by round-robin — vertex project then edge project. A single
+    // by() across mixed path objects crashes when an edge lacks a vertex-only key.
+    expect(result.query).toMatch(
+      /\.path\(\)\.by\(project\('__kind','id','entityType'.+\)\.by\(project\('__kind','id','relationshipType'/,
+    );
+    expect(result.query).not.toContain('valueMap(true)');
+    expect(result.query).not.toContain("'embedding'");
   });
 
   it("never emits .dedup() in 'path' mode, even when spec.dedup is true", () => {

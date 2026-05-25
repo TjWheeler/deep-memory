@@ -49,6 +49,8 @@ Verified either by live probe (cited below) or by being in production code that 
 |---|---|
 | `g.V().has('repositoryId', x)` | Partition-scoped vertex start. `repositoryId` is the partition key; this predicate routes the query to a single physical partition. |
 | `g.V().hasId(x)` | Direct doc fetch by system id. Cheaper than `has('id', x)` (property-equality lookup). Always pair with the partition predicate. |
+| `g.V().hasId(within(x, y, z))` | Batch doc fetch by system id. Live-validated 2026-05-25 (Phase 3 probe) against vertices and edges. Same semantics as `has('id', within(...))` but routes via the doc-id index rather than the property index. |
+| `g.E().hasId(x)` | Edge variant of the above. Works in the emulator (Phase 3 probe). Without a partition predicate, the engine still fans out — pair with `has('repositoryId', rid)` for partition-scoped routing where the source vertex id is not known. |
 | `g.V().has('id', x)` | Property-equality lookup on `id`. Works but slower than `hasId`. See [§Performance](#performance-critical-operator-differences). |
 | `out(t)`, `in(t)`, `both(t)` | Simple vertex-to-vertex steps. Type args are optional. |
 | `outE(t)`, `inE(t)`, `bothE(t)` | Edge-explicit steps. |
@@ -358,6 +360,7 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 |---|---|
 | Operators in production use | [packages/storage-cosmosdb/src/queries/](../packages/storage-cosmosdb/src/queries/) — every Gremlin string in these files has been exercised against the emulator at least once via the test suite. |
 | Live shape probes — Phase 1 (2026-05-25) | `path()` two-by round-robin; `'all'` union per-branch project + `dedup().by(select('id'))`; `coalesce(values, constant)` for optional fields; failure modes of single-by mixed projection, `dedup().by('id')`, and bare `.by('optionalField')`. |
+| Live shape probes — Phase 3 (2026-05-25) | `hasId(x)` single-id and `hasId(within(x, y, z))` batch forms work on both `g.V()` and `g.E()` — drop-in replacements for the equivalent `has('id', ...)` shapes. |
 | Performance catalogue | [plans/performance-issues.md](../plans/performance-issues.md) — 20 ranked RU/round-trip issues, drawn from code review and Cosmos documentation. |
 | Performance fixes plan | [plans/performance-fixes-2026-05-25.md](../plans/performance-fixes-2026-05-25.md) — phased plan that consumes this doc and adds findings back to it as each phase probes new shapes. |
 

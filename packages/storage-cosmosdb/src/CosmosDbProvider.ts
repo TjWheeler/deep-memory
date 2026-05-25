@@ -1,6 +1,6 @@
 // CosmosDbProvider — CosmosDB Gremlin implementation of StorageProvider + GraphTraversalProvider
 
-import type { StorageProvider, EnsureSchemaResult } from '@utaba/deep-memory/providers';
+import type { StorageProvider, EnsureSchemaResult, EntityReadOptions } from '@utaba/deep-memory/providers';
 import type { GraphTraversalProvider, GraphTraversalCapabilities } from '@utaba/deep-memory/providers';
 import type {
   StoredEntity,
@@ -78,6 +78,13 @@ const SCHEMA_VERSION = 1;
 const META_VERTEX_ID = '_meta:schema';
 
 /**
+ * Vocabulary TTL for the per-process cache. Vocabulary changes are rare
+ * (governance-gated writes); a 60 s window bounds cross-process staleness
+ * acceptably while eliminating the one extra round-trip on every traversal.
+ */
+const VOCABULARY_CACHE_TTL_MS = 60_000;
+
+/**
  * CosmosDB Gremlin storage provider for deep-memory.
  * Implements both StorageProvider (full CRUD) and GraphTraversalProvider (native Gremlin traversals).
  */
@@ -86,6 +93,13 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   private readonly config: CosmosDbProviderConfig;
   private readonly compiler = new GremlinCompiler();
   private readonly reportUsage: UsageSink | undefined;
+  /**
+   * Per-process vocabulary cache, keyed by repositoryId. Read lazily by
+   * `traverseImpl` via `getVocabularyCached`; invalidated on `saveVocabulary`.
+   * Each provider instance owns its own cache so isolated test providers do
+   * not share state.
+   */
+  private readonly vocabularyCache = new Map<string, { vocab: MemoryVocabulary; expiresAt: number }>();
 
   constructor(config: CosmosDbProviderConfig) {
     this.config = config;
@@ -213,7 +227,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
       // 4. Write schema version meta vertex
       const existing = await this.conn.submit(
-        "g.V().has('id', metaId).hasLabel('_meta').valueMap(true)",
+        "g.V().hasId(metaId).hasLabel('_meta').valueMap(true)",
         { metaId: META_VERTEX_ID },
       );
 
@@ -229,7 +243,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
           };
         }
         await this.conn.submit(
-          "g.V().has('id', metaId).hasLabel('_meta').property('schemaVersion', ver)",
+          "g.V().hasId(metaId).hasLabel('_meta').property('schemaVersion', ver)",
           { metaId: META_VERTEX_ID, ver: SCHEMA_VERSION },
         );
       } else {
@@ -321,11 +335,40 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
+  /**
+   * Cached vocabulary read used by traversal compilation. The vocabulary is
+   * compile-time context for the GremlinCompiler — it changes on the order of
+   * once per session, but the traversal hot path pays one round-trip per call
+   * to fetch it. The cache flips that to one round-trip per TTL window.
+   *
+   * Reads inside an active usage scope are still recorded if a fetch happens
+   * (cache miss); cache hits emit no round-trip and therefore no usage entry.
+   */
+  private async getVocabularyCached(repositoryId: string): Promise<MemoryVocabulary> {
+    const now = Date.now();
+    const cached = this.vocabularyCache.get(repositoryId);
+    if (cached && cached.expiresAt > now) {
+      return cached.vocab;
+    }
+    const vocab = await vocabQueries.getVocabulary(this.conn, repositoryId);
+    this.vocabularyCache.set(repositoryId, {
+      vocab,
+      expiresAt: now + VOCABULARY_CACHE_TTL_MS,
+    });
+    return vocab;
+  }
+
+  /** Drop the cache entry for a repository — call after any vocabulary write. */
+  private invalidateVocabularyCache(repositoryId: string): void {
+    this.vocabularyCache.delete(repositoryId);
+  }
+
   async saveVocabulary(repositoryId: string, vocabulary: MemoryVocabulary): Promise<void> {
     this.assertValidRepositoryId(repositoryId);
-    return this.track('saveVocabulary', repositoryId, () =>
-      vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary),
-    );
+    return this.track('saveVocabulary', repositoryId, async () => {
+      await vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary);
+      this.invalidateVocabularyCache(repositoryId);
+    });
   }
 
   async getVocabularyChangeLog(repositoryId: string, options?: PaginationOptions): Promise<PaginatedResult<VocabularyChangeRecord>> {
@@ -344,24 +387,24 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async getEntity(repositoryId: string, entityId: string): Promise<StoredEntity | null> {
+  async getEntity(repositoryId: string, entityId: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntity', repositoryId, () =>
-      entityQueries.getEntity(this.conn, repositoryId, entityId),
+      entityQueries.getEntity(this.conn, repositoryId, entityId, options),
     );
   }
 
-  async getEntityBySlug(repositoryId: string, slug: string): Promise<StoredEntity | null> {
+  async getEntityBySlug(repositoryId: string, slug: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntityBySlug', repositoryId, () =>
-      entityQueries.getEntityBySlug(this.conn, repositoryId, slug),
+      entityQueries.getEntityBySlug(this.conn, repositoryId, slug, options),
     );
   }
 
-  async getEntities(repositoryId: string, entityIds: string[]): Promise<Map<string, StoredEntity>> {
+  async getEntities(repositoryId: string, entityIds: string[], options?: EntityReadOptions): Promise<Map<string, StoredEntity>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntities', repositoryId, () =>
-      entityQueries.getEntities(this.conn, repositoryId, entityIds),
+      entityQueries.getEntities(this.conn, repositoryId, entityIds, options),
     );
   }
 
@@ -402,7 +445,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       }
       const withinExpr = `P.within(${idParams.join(', ')})`;
       const existResult = await this.conn.submit(
-        `g.V().has('repositoryId', rid).has('id', ${withinExpr}).has('entityType').values('id')`,
+        `g.V().has('repositoryId', rid).hasId(${withinExpr}).has('entityType').values('id')`,
         bindings,
       );
       const found = existResult.items as string[];
@@ -418,7 +461,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         }
         const dropWithinExpr = `P.within(${dropIdParams.join(', ')})`;
         await this.conn.submit(
-          `g.V().has('repositoryId', rid).has('id', ${dropWithinExpr}).has('entityType').drop()`,
+          `g.V().has('repositoryId', rid).hasId(${dropWithinExpr}).has('entityType').drop()`,
           dropBindings,
         );
         deleted.push(...found);
@@ -436,10 +479,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async findEntities(repositoryId: string, query: StorageFindQuery): Promise<PaginatedResult<StoredEntity>> {
+  async findEntities(repositoryId: string, query: StorageFindQuery, options?: EntityReadOptions): Promise<PaginatedResult<StoredEntity>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('findEntities', repositoryId, () =>
-      entityQueries.findEntities(this.conn, repositoryId, query),
+      entityQueries.findEntities(this.conn, repositoryId, query, options),
     );
   }
 
@@ -496,7 +539,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       }
       const withinExpr = `P.within(${idParams.join(', ')})`;
       const existResult = await this.conn.submit(
-        `g.E().has('repositoryId', rid).has('id', ${withinExpr}).values('id')`,
+        `g.E().has('repositoryId', rid).hasId(${withinExpr}).values('id')`,
         bindings,
       );
       const found = existResult.items as string[];
@@ -650,8 +693,9 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   ): Promise<TraversalResult> {
     const startTime = Date.now();
 
-    // Get vocabulary for compilation
-    const vocabulary = await this.getVocabulary(repositoryId);
+    // Vocabulary is compile-time context — fetch from the per-process cache so
+    // back-to-back traversals do not each pay the `_vocabulary` round-trip.
+    const vocabulary = await this.getVocabularyCached(repositoryId);
 
     // Compile the spec to Gremlin — the provider owns compilation.
     const compiled = this.compiler.compile(spec, vocabulary);
@@ -717,26 +761,30 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         }
         relationships = undefined;
       } else if (spec.returnMode === 'all') {
-        // Flat stream of unique vertex AND edge valueMaps — the union+dedup
-        // query already deduped server-side, so no id-keyed Map needed here.
-        // Vertices carry `entityType`; edges carry `relationshipType`.
+        // Flat stream of unique vertex AND edge projected Maps — the
+        // union+dedup query already deduped server-side, so no id-keyed Map
+        // needed here. Rows carry an explicit `__kind` discriminator
+        // (`'v'` for vertex, `'e'` for edge), set by the compiler's per-branch
+        // project chain.
+        //
         // direction defaults to 'outbound' (stored topology) per the Phase 7
         // contract — the deduped union carries no walk context.
         relationships = [];
         for (const item of result.items) {
           const props = item as Record<string, unknown>;
-          if (props['entityType'] != null) {
+          const kind = props['__kind'];
+          if (kind === 'v') {
             entities.push(projectStoredEntity(entityFromGremlin(props)));
-          } else if (props['relationshipType'] != null) {
+          } else if (kind === 'e') {
             relationships.push(projectStoredRelationship(relationshipFromGremlin(props)));
           }
-          // Objects with neither marker are skipped defensively.
+          // Rows without a recognised marker are skipped defensively.
         }
       } else {
         // 'path' — Gremlin Path objects: { objects: [vertex|edge, ...] }
-        // where each object is a flat valueMap distinguishable by entityType
-        // (vertex) vs relationshipType (edge). One TraversalPath per path,
-        // no dedup across paths (distinct walks are the answer).
+        // where each object is a projected Map carrying an explicit `__kind`
+        // discriminator ('v' or 'e'). One TraversalPath per path, no dedup
+        // across paths (distinct walks are the answer).
         //
         // Direction per edge is computed during the walk using a lastVertexId
         // cursor: 'outbound' when the walk crossed source → target, 'inbound'
@@ -759,12 +807,13 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
           for (const obj of pathData.objects) {
             const props = obj as Record<string, unknown>;
-            if (props['entityType'] != null) {
+            const kind = props['__kind'];
+            if (kind === 'v') {
               const stored = entityFromGremlin(props);
               entityMap.set(stored.id, stored);
               pathEntityIds.push(stored.id);
               lastVertexId = stored.id;
-            } else if (props['relationshipType'] != null) {
+            } else if (kind === 'e') {
               const stored = relationshipFromGremlin(props);
               relMap.set(stored.id, stored);
               pathRelIds.push(stored.id);
@@ -775,7 +824,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
                 relFirstDirection.set(stored.id, direction);
               }
             }
-            // Objects with neither marker are skipped defensively.
+            // Objects without a recognised marker are skipped defensively.
           }
 
           pathRows.push({ entityIds: pathEntityIds, relIds: pathRelIds, relDirections: pathRelDirections });

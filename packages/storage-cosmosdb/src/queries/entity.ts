@@ -3,8 +3,9 @@
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { StoredEntity, StoredEntityUpdate } from '@utaba/deep-memory/types';
 import type { StorageFindQuery, PaginatedResult } from '@utaba/deep-memory/types';
+import type { EntityReadOptions } from '@utaba/deep-memory/providers';
 import { entityFromGremlin, entityToGremlinProps } from '../mapping.js';
-import { DuplicateEntityError } from '@utaba/deep-memory';
+import { DuplicateEntityError, buildVertexProjectChain } from '@utaba/deep-memory';
 
 export async function createEntity(
   conn: CosmosDbConnection,
@@ -13,7 +14,7 @@ export async function createEntity(
 ): Promise<StoredEntity> {
   // Check for duplicate
   const existing = await conn.submit(
-    "g.V().has('repositoryId', rid).has('id', eid).count()",
+    "g.V().has('repositoryId', rid).hasId(eid).count()",
     { rid: repositoryId, eid: entity.id },
   );
   if (Number(existing.items[0] ?? 0) > 0) {
@@ -43,9 +44,11 @@ export async function getEntity(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityId: string,
+  options?: EntityReadOptions,
 ): Promise<StoredEntity | null> {
+  const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
   const result = await conn.submit(
-    "g.V().has('repositoryId', rid).has('id', eid).has('entityType').valueMap(true)",
+    `g.V().has('repositoryId', rid).hasId(eid).has('entityType').${projection}`,
     { rid: repositoryId, eid: entityId },
   );
   if (result.items.length === 0) return null;
@@ -56,9 +59,11 @@ export async function getEntityBySlug(
   conn: CosmosDbConnection,
   repositoryId: string,
   slug: string,
+  options?: EntityReadOptions,
 ): Promise<StoredEntity | null> {
+  const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
   const result = await conn.submit(
-    "g.V().has('repositoryId', rid).has('slug', slugVal).has('entityType').valueMap(true)",
+    `g.V().has('repositoryId', rid).has('slug', slugVal).has('entityType').${projection}`,
     { rid: repositoryId, slugVal: slug },
   );
   if (result.items.length === 0) return null;
@@ -69,6 +74,7 @@ export async function getEntities(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityIds: string[],
+  options?: EntityReadOptions,
 ): Promise<Map<string, StoredEntity>> {
   if (entityIds.length === 0) return new Map();
 
@@ -82,8 +88,9 @@ export async function getEntities(
   });
 
   const withinClause = `within(${idParams.join(', ')})`;
+  const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
   const result = await conn.submit(
-    `g.V().has('repositoryId', rid).has('id', ${withinClause}).has('entityType').valueMap(true)`,
+    `g.V().has('repositoryId', rid).hasId(${withinClause}).has('entityType').${projection}`,
     bindings,
   );
 
@@ -142,9 +149,12 @@ export async function updateEntity(
   if (updates.provenance.modifiedInConversation != null) addProp('modifiedInConversation', updates.provenance.modifiedInConversation);
   if (updates.provenance.modifiedFromMessage != null) addProp('modifiedFromMessage', updates.provenance.modifiedFromMessage);
 
-  const query = `g.V().has('repositoryId', rid).has('id', eid).has('entityType')${propParts.join('')}`;
+  const query = `g.V().has('repositoryId', rid).hasId(eid).has('entityType')${propParts.join('')}`;
   await conn.submit(query, bindings);
 
+  // The re-read serves the updated entity back to the caller. Embeddings
+  // remain off the wire — callers that need the embedding pass the option
+  // through the public StorageProvider.getEntity call themselves.
   return (await getEntity(conn, repositoryId, entityId))!;
 }
 
@@ -155,7 +165,7 @@ export async function deleteEntity(
 ): Promise<void> {
   // Gremlin drop() on a vertex also drops connected edges
   await conn.submit(
-    "g.V().has('repositoryId', rid).has('id', eid).has('entityType').drop()",
+    "g.V().has('repositoryId', rid).hasId(eid).has('entityType').drop()",
     { rid: repositoryId, eid: entityId },
   );
 }
@@ -194,6 +204,7 @@ export async function findEntities(
   conn: CosmosDbConnection,
   repositoryId: string,
   query: StorageFindQuery,
+  options?: EntityReadOptions,
 ): Promise<PaginatedResult<StoredEntity>> {
   const bindings: Record<string, unknown> = { rid: repositoryId };
   let filterClause = ".has('repositoryId', rid).has('entityType')";
@@ -209,6 +220,8 @@ export async function findEntities(
     filterClause += `.has('entityType', within(${typeParams.join(', ')}))`;
   }
 
+  const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
+
   // searchTerm and properties can't be filtered server-side: CosmosDB Gremlin
   // silently drops TextP.containing(), and properties are stored as a JSON blob.
   // When either is present, load all type-matched vertices and filter in memory
@@ -219,7 +232,7 @@ export async function findEntities(
 
   if (needsClientFilter) {
     const dataResult = await conn.submit(
-      `g.V()${filterClause}.valueMap(true)`,
+      `g.V()${filterClause}.${projection}`,
       bindings,
     );
     let items = (dataResult.items as Record<string, unknown>[]).map(entityFromGremlin);
@@ -265,7 +278,7 @@ export async function findEntities(
   bindings['rangeStart'] = query.offset;
   bindings['rangeEnd'] = query.offset + query.limit;
   const dataResult = await conn.submit(
-    `g.V()${filterClause}.range(rangeStart, rangeEnd).valueMap(true)`,
+    `g.V()${filterClause}.range(rangeStart, rangeEnd).${projection}`,
     bindings,
   );
 

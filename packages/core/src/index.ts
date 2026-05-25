@@ -44,7 +44,13 @@ export { projectEntity } from './entities/entityProjection.js';
 export { createSafeSink } from './usage/safeSink.js';
 
 // Compilers (for provider authors who want to reuse them)
-export { GremlinCompiler } from './relationships/compilers/GremlinCompiler.js';
+export {
+  GremlinCompiler,
+  GREMLIN_VERTEX_PROJECTION_FIELDS,
+  GREMLIN_EDGE_PROJECTION_FIELDS,
+  buildVertexProjectChain,
+  buildEdgeProjectChain,
+} from './relationships/compilers/GremlinCompiler.js';
 export { CypherCompiler } from './relationships/compilers/CypherCompiler.js';
 export type { TraversalCompiler, CompiledQuery } from './relationships/compilers/TraversalCompiler.js';
 

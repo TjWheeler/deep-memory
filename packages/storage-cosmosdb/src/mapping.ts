@@ -5,7 +5,106 @@ import type { StoredRelationship } from '@utaba/deep-memory/types';
 import type { Provenance } from '@utaba/deep-memory/types';
 import type { StoredRepository, StoredRepositorySummary } from '@utaba/deep-memory/types';
 import type { GovernanceConfig } from '@utaba/deep-memory/types';
-import type { VocabularyChangeRecord, MemoryVocabulary } from '@utaba/deep-memory/types';
+import type { VocabularyChangeRecord } from '@utaba/deep-memory/types';
+
+// ─── Projection field lists ───────────────────────────────────────
+//
+// The GremlinCompiler emits read-path projections listing these exact field
+// names. The mapper functions below (entityFromGremlin, relationshipFromGremlin)
+// consume the same key set. Keeping the two in lockstep is enforced by the
+// cross-package test in mapping.test.ts, which imports the compiler's own
+// list and asserts equality.
+//
+// `embedding` is intentionally excluded — read paths never ship the embedding
+// over the wire. The vector-search path will pass an explicit `loadEmbeddings`
+// option (Phase 2) to opt back in.
+//
+// Synthetic projection-only fields (`__kind`) are NOT stored properties and
+// are not in this list — the compiler adds them as discriminator markers but
+// the mapper does not read them.
+
+export const STORED_ENTITY_FIELDS = [
+  'id',
+  'entityType',
+  'entityLabel',
+  'slug',
+  'summary',
+  'properties',
+  'data',
+  'dataFormat',
+  'createdBy',
+  'createdByType',
+  'createdAt',
+  'createdInConversation',
+  'createdFromMessage',
+  'modifiedBy',
+  'modifiedByType',
+  'modifiedAt',
+  'modifiedInConversation',
+  'modifiedFromMessage',
+] as const;
+
+export const STORED_RELATIONSHIP_FIELDS = [
+  'id',
+  'relationshipType',
+  'sourceEntityId',
+  'targetEntityId',
+  'properties',
+  'bidirectional',
+  'createdBy',
+  'createdByType',
+  'createdAt',
+  'createdInConversation',
+  'createdFromMessage',
+  'modifiedBy',
+  'modifiedByType',
+  'modifiedAt',
+  'modifiedInConversation',
+  'modifiedFromMessage',
+] as const;
+
+// Repository projection — used by getRepository / listRepositories. The
+// compiler does not deal with `_repository` vertices, so the projection chain
+// lives here (no cross-package sync needed). Mirror what `repositoryFromGremlin`
+// and `repositorySummaryFromGremlin` consume.
+export const STORED_REPOSITORY_FIELDS = [
+  'id',
+  'repositoryId',
+  'repoLabel',
+  'description',
+  'type',
+  'legal',
+  'owner',
+  'governanceConfig',
+  'metadata',
+  'createdAt',
+  'createdBy',
+] as const;
+
+/**
+ * Build a Gremlin `.project(...).by(...)...` chain expression for a
+ * `_repository` vertex, with no leading dot. Append after a vertex predicate.
+ * `repoLabel`, `governanceConfig`, `createdAt`, `createdBy`, and `repositoryId`
+ * are always written on create; the optional fields use coalesce-default-empty
+ * to avoid the "by('optionalField') crashes when absent" failure mode (see
+ * docs/cosmosdb-gremlin-compatibility.md §Constraints).
+ */
+export function buildRepositoryProjectChain(): string {
+  return [
+    `project('id','repositoryId','repoLabel','description','type','legal','owner','governanceConfig','metadata','createdAt','createdBy')`,
+    `.by(id)`,
+    `.by('repositoryId')`,
+    `.by('repoLabel')`,
+    `.by(coalesce(values('description'), constant('')))`,
+    `.by(coalesce(values('type'), constant('')))`,
+    `.by(coalesce(values('legal'), constant('')))`,
+    `.by(coalesce(values('owner'), constant('')))`,
+    `.by('governanceConfig')`,
+    `.by(coalesce(values('metadata'), constant('')))`,
+    `.by('createdAt')`,
+    `.by('createdBy')`,
+  ].join('');
+}
 
 // ─── Gremlin property extraction ──────────────────────────────────
 
@@ -120,17 +219,7 @@ export function repositorySummaryFromGremlin(props: Record<string, unknown>): St
   };
 }
 
-// ─── Vocabulary mapping ───────────────────────────────────────────
-
-export function vocabularyFromGremlin(props: Record<string, unknown>): MemoryVocabulary {
-  return safeParseJson<MemoryVocabulary>(unwrap(props['vocabulary']), {
-    version: '0.0.0',
-    lastModified: new Date().toISOString(),
-    modifiedBy: 'system',
-    entityTypes: [],
-    relationshipTypes: [],
-  });
-}
+// ─── Vocabulary change-log mapping ────────────────────────────────
 
 export function changeRecordFromGremlin(props: Record<string, unknown>): VocabularyChangeRecord {
   return {

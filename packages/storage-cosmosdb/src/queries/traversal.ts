@@ -14,7 +14,7 @@ import type {
   StoredRelationship,
 } from '@utaba/deep-memory/types';
 import { entityFromGremlin, relationshipFromGremlin } from '../mapping.js';
-import { matchesPropertyFilters } from '@utaba/deep-memory';
+import { matchesPropertyFilters, buildVertexProjectChain } from '@utaba/deep-memory';
 
 /**
  * Explore neighborhood using BFS layer-by-layer.
@@ -117,14 +117,14 @@ async function getRelationshipsForEntity(
   let edgeTraversal: string;
   switch (options.direction) {
     case 'outbound':
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').union(outE(), inE().has('bidirectional', true))";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(outE(), inE().has('bidirectional', true))";
       break;
     case 'inbound':
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').union(inE(), outE().has('bidirectional', true))";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(inE(), outE().has('bidirectional', true))";
       break;
     case 'both':
     default:
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').bothE()";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').bothE()";
       break;
   }
 
@@ -154,14 +154,19 @@ async function getRelationshipsForEntity(
   return rels;
 }
 
-/** Get a single entity without embedding (light). */
+/**
+ * Get a single entity for the BFS frontier walk. Never loads embeddings — the
+ * frontier loader is on the AI-agent hot path and stripping the ~30 KB
+ * embedding per vertex is the whole point of the Phase 2 projection switch.
+ */
 async function getEntityLight(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityId: string,
 ): Promise<StoredEntity | null> {
+  const projection = buildVertexProjectChain();
   const result = await conn.submit(
-    "g.V().has('repositoryId', rid).has('id', eid).has('entityType').valueMap(true)",
+    `g.V().has('repositoryId', rid).hasId(eid).has('entityType').${projection}`,
     { rid: repositoryId, eid: entityId },
   );
   if (result.items.length === 0) return null;
@@ -202,7 +207,7 @@ export async function findPaths(
 
       // Get all relationships for current entity (both directions)
       const bindings: Record<string, unknown> = { rid: repositoryId, eid: state.entityId };
-      let edgeQuery = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').bothE()";
+      let edgeQuery = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').bothE()";
 
       if (options.relationshipTypes && options.relationshipTypes.length > 0) {
         const typeParams: string[] = [];

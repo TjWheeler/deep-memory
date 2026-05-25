@@ -4,7 +4,7 @@ import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { StoredRelationship, RelationshipQueryOptions } from '@utaba/deep-memory/types';
 import type { PaginatedResult } from '@utaba/deep-memory/types';
 import { relationshipFromGremlin, relationshipToGremlinProps } from '../mapping.js';
-import { DuplicateRelationshipError, matchesPropertyFilters } from '@utaba/deep-memory';
+import { DuplicateRelationshipError, matchesPropertyFilters, buildEdgeProjectChain } from '@utaba/deep-memory';
 
 export async function createRelationship(
   conn: CosmosDbConnection,
@@ -14,7 +14,7 @@ export async function createRelationship(
   // Check for duplicate — scoped by repositoryId so the same relationship id
   // in a different repo does not cause a false-positive collision.
   const existing = await conn.submit(
-    "g.E().has('repositoryId', rid).has('id', relId).count()",
+    "g.E().has('repositoryId', rid).hasId(relId).count()",
     { rid: repositoryId, relId: relationship.id },
   );
   if (Number(existing.items[0] ?? 0) > 0) {
@@ -39,7 +39,7 @@ export async function createRelationship(
   }
 
   // addE requires source and target vertex references
-  const query = `g.V().has('repositoryId', rid).has('id', srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).has('id', tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
+  const query = `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
   await conn.submit(query, bindings);
 
   return relationship;
@@ -50,8 +50,13 @@ export async function getRelationship(
   repositoryId: string,
   relationshipId: string,
 ): Promise<StoredRelationship | null> {
+  const projection = buildEdgeProjectChain();
+  // Edge-id lookup: g.E().hasId(relId) is engine-routed by doc id; the
+  // `has('repositoryId', rid)` predicate after it still doesn't push partition
+  // routing down (issue #2, Phase 7 partition-routes via the source vertex
+  // when its id is known).
   const result = await conn.submit(
-    "g.E().has('id', relId).has('repositoryId', rid).valueMap(true)",
+    `g.E().hasId(relId).has('repositoryId', rid).${projection}`,
     { relId: relationshipId, rid: repositoryId },
   );
   if (result.items.length === 0) return null;
@@ -77,14 +82,14 @@ export async function getEntityRelationships(
   let edgeTraversal: string;
   switch (direction) {
     case 'outbound':
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').outE()";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').outE()";
       break;
     case 'inbound':
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').inE()";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').inE()";
       break;
     case 'both':
     default:
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').bothE()";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').bothE()";
       break;
   }
 
@@ -107,9 +112,9 @@ export async function getEntityRelationships(
   let unionQuery: string | null = null;
   if (direction === 'outbound') {
     // outE + inE where bidirectional=true
-    unionQuery = `g.V().has('repositoryId', rid).has('id', eid).has('entityType').union(outE()${typeFilter}, inE()${typeFilter}.has('bidirectional', true))`;
+    unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(outE()${typeFilter}, inE()${typeFilter}.has('bidirectional', true))`;
   } else if (direction === 'inbound') {
-    unionQuery = `g.V().has('repositoryId', rid).has('id', eid).has('entityType').union(inE()${typeFilter}, outE()${typeFilter}.has('bidirectional', true))`;
+    unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(inE()${typeFilter}, outE()${typeFilter}.has('bidirectional', true))`;
   }
 
   const baseQuery = unionQuery ?? `${edgeTraversal}${typeFilter}`;
@@ -119,10 +124,11 @@ export async function getEntityRelationships(
   const total = Number(countResult.items[0] ?? 0);
 
   // Data
+  const projection = buildEdgeProjectChain();
   bindings['rangeStart'] = offset;
   bindings['rangeEnd'] = offset + limit;
   const dataResult = await conn.submit(
-    `${baseQuery}.dedup().range(rangeStart, rangeEnd).valueMap(true)`,
+    `${baseQuery}.dedup().range(rangeStart, rangeEnd).${projection}`,
     bindings,
   );
 
@@ -148,7 +154,7 @@ export async function deleteRelationship(
   relationshipId: string,
 ): Promise<void> {
   await conn.submit(
-    "g.E().has('id', relId).has('repositoryId', rid).drop()",
+    "g.E().hasId(relId).has('repositoryId', rid).drop()",
     { relId: relationshipId, rid: repositoryId },
   );
 }

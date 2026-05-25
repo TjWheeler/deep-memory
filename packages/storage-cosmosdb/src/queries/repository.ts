@@ -10,7 +10,7 @@ import type {
   RepositoryUpdate,
 } from '@utaba/deep-memory/types';
 import type { PaginatedResult, DeleteProgressCallback } from '@utaba/deep-memory/types';
-import { repositoryFromGremlin, repositorySummaryFromGremlin } from '../mapping.js';
+import { repositoryFromGremlin, repositorySummaryFromGremlin, buildRepositoryProjectChain } from '../mapping.js';
 import { DuplicateRepositoryError, RepositoryNotFoundError } from '@utaba/deep-memory';
 
 const REPO_LABEL = '_repository';
@@ -40,7 +40,7 @@ export async function createRepository(
 
   // Check for existing
   const existing = await conn.submit(
-    "g.V().has('id', vid).has('label', lbl).count()",
+    "g.V().hasId(vid).has('label', lbl).count()",
     { vid: vertexId, lbl: REPO_LABEL },
   );
   if (existing.items.length > 0 && Number(existing.items[0]) > 0) {
@@ -87,8 +87,9 @@ export async function getRepository(
   conn: CosmosDbConnection,
   repositoryId: string,
 ): Promise<StoredRepository | null> {
+  const projection = buildRepositoryProjectChain();
   const result = await conn.submit(
-    "g.V().has('id', vid).hasLabel('_repository').valueMap(true)",
+    `g.V().hasId(vid).hasLabel('_repository').${projection}`,
     { vid: repoVertexId(repositoryId) },
   );
   if (result.items.length === 0) return null;
@@ -115,10 +116,11 @@ export async function listRepositories(
   const countResult = await conn.submit(`${countQuery}.count()`, bindings);
   const total = Number(countResult.items[0] ?? 0);
 
+  const projection = buildRepositoryProjectChain();
   bindings['rangeStart'] = offset;
   bindings['rangeEnd'] = offset + limit;
   const dataResult = await conn.submit(
-    `${dataQuery}.range(rangeStart, rangeEnd).valueMap(true)`,
+    `${dataQuery}.range(rangeStart, rangeEnd).${projection}`,
     bindings,
   );
 
@@ -162,7 +164,7 @@ export async function updateRepository(
   if (Object.keys(props).length === 0) return existing;
 
   const { chain } = propertyChain(bindings, props, 0);
-  const query = `g.V().has('id', vid).hasLabel('_repository')${chain}`;
+  const query = `g.V().hasId(vid).hasLabel('_repository')${chain}`;
   await conn.submit(query, bindings);
 
   return (await getRepository(conn, repositoryId))!;

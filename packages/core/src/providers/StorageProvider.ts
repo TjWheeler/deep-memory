@@ -46,6 +46,23 @@ export interface EnsureSchemaResult {
 }
 
 /**
+ * Internal entity-read options shared by `getEntity`, `getEntityBySlug`,
+ * `getEntities`, and `findEntities`.
+ *
+ * `loadEmbeddings` defaults to `false`. When `false`, providers must not ship
+ * the stored embedding over the wire — this is the AI-agent hot-path
+ * contract. When `true`, providers populate `StoredEntity.embedding` from the
+ * underlying store. The only legitimate caller is the vector-search path in
+ * `SearchOrchestrator.searchByConcept`.
+ *
+ * Providers that do not separate light/full reads (e.g. the in-memory
+ * provider, which always carries the full entity) may ignore this option.
+ */
+export interface EntityReadOptions {
+  loadEmbeddings?: boolean;
+}
+
+/**
  * StorageProvider — the primary persistence interface.
  *
  * Must be supplied when creating a DeepMemory instance. Handles all
@@ -101,14 +118,17 @@ export interface StorageProvider {
   getEntity(
     repositoryId: string,
     entityId: string,
+    options?: EntityReadOptions,
   ): Promise<StoredEntity | null>;
   getEntityBySlug(
     repositoryId: string,
     slug: string,
+    options?: EntityReadOptions,
   ): Promise<StoredEntity | null>;
   getEntities(
     repositoryId: string,
     entityIds: string[],
+    options?: EntityReadOptions,
   ): Promise<Map<string, StoredEntity>>;
   updateEntity(
     repositoryId: string,
@@ -129,6 +149,7 @@ export interface StorageProvider {
   findEntities(
     repositoryId: string,
     query: StorageFindQuery,
+    options?: EntityReadOptions,
   ): Promise<PaginatedResult<StoredEntity>>;
 
   // ─── Relationships ─────────────────────────────────────────────────

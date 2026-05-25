@@ -3,31 +3,41 @@
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { MemoryVocabulary, VocabularyChangeRecord } from '@utaba/deep-memory/types';
 import type { PaginationOptions, PaginatedResult } from '@utaba/deep-memory/types';
-import { vocabularyFromGremlin, changeRecordFromGremlin } from '../mapping.js';
+import { changeRecordFromGremlin } from '../mapping.js';
 
 function vocabVertexId(repositoryId: string): string {
   return `vocab:${repositoryId}`;
 }
 
+const EMPTY_VOCABULARY = (): MemoryVocabulary => ({
+  version: '0.0.0',
+  lastModified: new Date().toISOString(),
+  modifiedBy: 'system',
+  entityTypes: [],
+  relationshipTypes: [],
+});
+
 export async function getVocabulary(
   conn: CosmosDbConnection,
   repositoryId: string,
 ): Promise<MemoryVocabulary> {
+  // We only ever read the JSON-stringified `vocabulary` property; the full
+  // valueMap(true) shipped every property on the vocab vertex (label,
+  // repositoryId, etc.) for no reason. `.values('vocabulary').limit(1)`
+  // returns just the JSON string — smaller wire payload, single column read.
   const result = await conn.submit(
-    "g.V().has('id', vid).hasLabel('_vocabulary').valueMap(true)",
+    "g.V().hasId(vid).hasLabel('_vocabulary').values('vocabulary').limit(1)",
     { vid: vocabVertexId(repositoryId) },
   );
-  if (result.items.length === 0) {
-    // Return default empty vocabulary
-    return {
-      version: '0.0.0',
-      lastModified: new Date().toISOString(),
-      modifiedBy: 'system',
-      entityTypes: [],
-      relationshipTypes: [],
-    };
+  if (result.items.length === 0) return EMPTY_VOCABULARY();
+  const raw = result.items[0];
+  const json = typeof raw === 'string' ? raw : String(raw ?? '');
+  if (!json) return EMPTY_VOCABULARY();
+  try {
+    return JSON.parse(json) as MemoryVocabulary;
+  } catch {
+    return EMPTY_VOCABULARY();
   }
-  return vocabularyFromGremlin(result.items[0] as Record<string, unknown>);
 }
 
 export async function saveVocabulary(
@@ -40,13 +50,13 @@ export async function saveVocabulary(
 
   // Upsert: try to update existing, create if not found
   const existing = await conn.submit(
-    "g.V().has('id', vid).hasLabel('_vocabulary').count()",
+    "g.V().hasId(vid).hasLabel('_vocabulary').count()",
     { vid },
   );
 
   if (Number(existing.items[0] ?? 0) > 0) {
     await conn.submit(
-      "g.V().has('id', vid).hasLabel('_vocabulary').property('vocabulary', vocabJson)",
+      "g.V().hasId(vid).hasLabel('_vocabulary').property('vocabulary', vocabJson)",
       { vid, vocabJson },
     );
   } else {

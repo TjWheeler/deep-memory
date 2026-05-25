@@ -131,8 +131,10 @@ Verified either by live probe (cited below) or by being in production code that 
 
 | Operator | Notes |
 |---|---|
-| `aggregate('bucket')` / `store('bucket')` | Collect into a side-effect bucket. **Not yet probed for mixed vertex+edge use.** Phase 5 of the perf-fixes plan needs this. |
-| `cap('bucket')` | Retrieve a collected bucket. |
+| `aggregate('bucket')` | Collect the current traverser into a named side-effect bucket; passes the traverser through unchanged. **Verified working with mixed vertex+edge accumulation in one bucket** — see [§Aggregating raw vertices and edges together](#aggregating-raw-vertices-and-edges-together) below. |
+| `aggregate('bucket').by(<projection>)` | Collect the by-modulator's *output* into the bucket instead of the raw traverser. The projection runs on a LIVE element (vertex or edge), so the by-modulator idioms that work for terminal-mode projection (`.by(id)` token, `.by('propertyName')`, `coalesce(values, constant)` for optionals) also work here. **This is the load-bearing pattern** if you ever need ready-to-emit projected Maps in the bucket — the alternative of projecting after `cap+unfold` is not viable in the CosmosDB subset (see [§`cap+unfold` strips property accessors](#capbucketunfold-strips-property-accessors)). |
+| `store('bucket')` | Eager variant of `aggregate`. Available but `aggregate` is the idiom used in the codebase. |
+| `cap('bucket')` | Retrieve a collected bucket. Emits one traverser whose value is the list. `.cap('bucket').unfold()` re-emits each element as a separate traverser. |
 | `group().by('field').by(count())` | Group-by aggregation. Used by `getRepositoryStats`. RU scales with the input set, not the output set — full-partition group-by is expensive on large repos. |
 
 ---
@@ -254,33 +256,77 @@ In `'path'` mode the same vertex is shipped once per containing path — so a ve
 
 **Preferred:** use explicit `.project(...).by(...)` chains listing only the fields the mapper consumes. Phase 1 of the perf-fixes plan replaces `valueMap(true)` with project chains on every read path except the export path (where the embedding is intentionally included).
 
-### Union branches with shared prefix re-walk the prefix
+### Union branches with shared prefix are NOT a quadratic-compute problem (surprising — verified)
 
 A union shape like
 
 ```gremlin
 .union(
-  outE(r1),
-  outE(r1).inV(),
-  outE(r1).inV().outE(r2),
-  outE(r1).inV().outE(r2).inV()
+  __.identity(),
+  __.outE(r1),
+  __.outE(r1).inV(),
+  __.outE(r1).inV().outE(r2),
+  __.outE(r1).inV().outE(r2).inV()
 )
 ```
 
-Each branch re-walks the prefix from scratch. Emitted bytes are deduped after the union, but **server-side compute is O(N²) in hops**. Fine at 2 hops; compounds badly past 3.
+LOOKS like each branch re-walks the shared prefix from scratch — O(N²) hops at depth N. The emitted query string is also quadratic in the number of vertex-step references. This is the conventional Gremlin-correctness reading.
 
-**Preferred:** incremental walk that accumulates each visited vertex/edge into a side-effect bucket once and emits at the end:
+**But empirically the CosmosDB engine already recognises the shared prefix and walks it once.** With unbounded pagination, this union shape and an equivalent linear walk (`aggregate('els').by(<project>)...cap('els').unfold().dedup().range(...)` — see [§Aggregating raw vertices and edges together](#aggregating-raw-vertices-and-edges-together)) produce **identical RU at every depth** on the Mining Fleet repo (4504 entities, 6642 relationships):
 
-```gremlin
-.aggregate('els')
-  .outE(r1).aggregate('els')
-  .inV().aggregate('els')
-  .outE(r2).aggregate('els')
-  .inV().aggregate('els')
-  .cap('els').unfold().dedup().by(...).range(...)
-```
+| Anchor | Depth | Union RU | Aggregate-walk RU |
+|---|---|---|---|
+| Caterpillar (1213 edges) | 1 | 534.82 | 534.82 |
+| Cat 309 CR (194 edges) | 2 | 830.80 | 830.80 |
+| Cat 309 CR (194 edges) | 3 | 2014.90 | 2014.90 |
 
-**Not yet probed.** Phase 5 of the perf-fixes plan validates this against the emulator before committing.
+So the engine compiles the union shape to a linear execution plan. The quadratic concern only applies to emitted-string length, not to runtime cost.
+
+### `range()` pushdown through `union(...).dedup()` is the real perf lever
+
+The union shape's *real* runtime advantage is that **`.union(...).dedup().by(select('id')).range(0, N)` short-circuits the union once N deduped items have been produced.** Deeper-depth branches never fire if shallower branches saturate the cap. On Caterpillar at depth-3 with `range(0, 200)`, the union shape walks just enough to produce 200 unique items (94.36 RU). The equivalent `aggregate('els')` shape, capped at the same 200, pays **2014.90 RU (21×)** because side-effect aggregation has no early-termination — the walk completes in full and `range` only trims the deduped output.
+
+| Anchor | Depth | range(0, 200) | range(0, 99999) |
+|---|---|---|---|
+| Cat 309 — union | 3 | 94.36 RU | 2014.90 RU |
+| Cat 309 — aggregate-walk | 3 | 2014.90 RU | 2014.90 RU |
+
+Workarounds attempted for early termination on the aggregation shape that did **not** work in the CosmosDB subset:
+
+- `where(cap('els').count(local).is(P.gte(N)))` mid-walk — unsupported.
+- `until(cap('els').count(local).is(P.gte(N)))` as a `repeat()` modulator — only fires inside `repeat`, doesn't apply to per-step walks of differing directions.
+- `.limit(N)` before `aggregate` — only caps the entry-point stream, not the side-effect bucket.
+
+**Prefer the union-with-shared-prefix shape over incremental aggregation for `'all'`-mode reads with a user-supplied limit.** The current `GremlinCompiler` `'all'` mode does this (`union(__.identity().<v>, __.<edges-and-vertices-per-depth>).dedup().by(select('id')).range(...)`); do not replace it.
+
+### `cap('bucket').unfold()` strips property accessors
+
+After `.cap('bucket').unfold()`, the elements ARE returned as Vertex / Edge objects — `.label()`, `.id()`, and `.valueMap(true)` all work on them. But **by-modulator property access fails silently**:
+
+| After `cap+unfold`, on a stream that includes vertices and edges | Behaviour |
+|---|---|
+| `.values('entityType')` | Returns empty even on vertices that have `entityType` set. |
+| `.has('entityType')` as a filter | Filters out every element, vertices included. |
+| `.by('propertyName')` inside `project(...).by('foo')` | Resolves to `""` rather than the actual property value. |
+| `.by(coalesce(values('foo'), constant('')))` | Returns the constant default for every element. |
+| `.by(id)` (bare Gremlin token) inside `project(...).by(id)` | Throws `Project By: Next: The provided traverser of key "id" maps to nothing`. |
+| `.by(__.id())` (anonymous traversal step) inside `project(...).by(__.id())` | Works — returns the system id. |
+| `.id()` as a step | Works — returns the system id. |
+| `.label()` as a step | Works — returns the label. |
+| `.valueMap(true)` as a step | Works — returns the full property map. |
+
+So you can do `.cap('bucket').unfold().dedup().range(0, N).id()` (cheap id list) or `.cap('bucket').unfold().dedup().range(0, N).valueMap(true)` (full map, ships embeddings). But you cannot project a custom shape via `project(...).by(...)` *after* `cap+unfold` — the by-modulators that you need for selectively reading properties don't work on the re-emitted stream.
+
+**Workaround when you DO need a custom projection from a side-effect bucket:** project at aggregate-time (`aggregate('bucket').by(<projectionWithSelectiveBys>)`) — the projection runs on a LIVE element before it enters the bucket. The bucket then contains Maps, and `.cap('bucket').unfold().dedup().by(select('id'))` is the right downstream form (`dedup().by('id')` on Maps doesn't work either — see [§dedup().by('id') on projected maps](#dedupbyid-on-projected-maps)).
+
+### Aggregating raw vertices and edges together
+
+`aggregate('bucket')` accepts both Vertex and Edge traversers into the same bucket and preserves type. After `.cap('bucket').unfold()`, you get back a mixed-type stream. To distinguish:
+
+- A discriminator key projected at aggregate time: `aggregate('b').by(project('__kind','id').by(constant('v')).by(__.id()))` for vertices and `…by(constant('e')).by(__.id())` for edges. The downstream consumer then reads `__kind`.
+- `.label()` on the cap-unfold stream — returns the vertex's entity label (`Person`, `Equipment`, …) or the edge's relationship label (`WORKS_AT`, `IS_IDENTITY_FOR`, …). Useful for filtering when the label set is known statically.
+
+Mixed-type bucket dedup by id requires the aggregate-at-project-time form because `dedup().by(__.id())` after cap+unfold *does* work on raw elements but loses access to the discriminator the downstream parser needs. If your bucket holds Maps, use `dedup().by(select('id'))`.
 
 ### Sorting without a Range index does a full scan
 
@@ -363,6 +409,7 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 | Live shape probes — Phase 1 (2026-05-25) | `path()` two-by round-robin; `'all'` union per-branch project + `dedup().by(select('id'))`; `coalesce(values, constant)` for optional fields; failure modes of single-by mixed projection, `dedup().by('id')`, and bare `.by('optionalField')`. |
 | Live shape probes — Phase 3 (2026-05-25) | `hasId(x)` single-id and `hasId(within(x, y, z))` batch forms work on both `g.V()` and `g.E()` — drop-in replacements for the equivalent `has('id', ...)` shapes. |
 | Live shape probes — Phase 4 (2026-05-25) | `simplePath()` placed before `.path()` filters cycle-revisiting traversers in the CosmosDB Gremlin subset. Composes correctly with the Phase 1 two-by projection `.path().by(<vertexProject>).by(<edgeProject>)`. |
+| Live shape probes — Phase 5 (2026-05-25) | (1) `aggregate('bucket')` accepts mixed vertex+edge accumulation; `aggregate('bucket').by(<projection>)` projects at aggregate time on a live element. (2) `cap('bucket').unfold()` strips by-modulator property accessors — only `.id()`/`.label()`/`.valueMap(true)` survive. (3) The union-with-shared-prefix shape is NOT quadratic on the engine — CosmosDB recognises the shared prefix and walks it once; both shapes have identical RU at every depth in unbounded mode. (4) `range()` pushdown through `union(...).dedup()` short-circuits the walk once the cap is hit; side-effect aggregation has no equivalent — the bounded union shape is up to 21× cheaper than the equivalent aggregation shape at depth 3 with cap=200 on Mining-Fleet–size data. |
 | Performance catalogue | [plans/performance-issues.md](../plans/performance-issues.md) — 20 ranked RU/round-trip issues, drawn from code review and Cosmos documentation. |
 | Performance fixes plan | [plans/performance-fixes-2026-05-25.md](../plans/performance-fixes-2026-05-25.md) — phased plan that consumes this doc and adds findings back to it as each phase probes new shapes. |
 
@@ -370,7 +417,6 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 
 ## To-probe before next changes
 
-- `aggregate('bucket')` / `store('bucket')` with mixed vertex+edge objects in one bucket — Phase 5 (`'all'`-mode incremental walk).
 - `choose(neq(sentinel), property(k, v), identity())` for the optional-property-skip pattern — Phase 10 (fixed-shape property ladders).
 - `T.id` vs bare `id` token as a by-modulator argument — empirically `id` works; `T.id` not yet tested.
 - `select('id')` behaviour on edges where the projected map has a discriminator-prefixed key (e.g. if we project `__id` instead of `id` to avoid colliding with Gremlin's `id` token).

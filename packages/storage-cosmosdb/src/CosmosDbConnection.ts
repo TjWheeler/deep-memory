@@ -163,12 +163,36 @@ function getRetryAfterMs(err: unknown, attempt: number): number {
   return Math.min(500 * Math.pow(2, attempt), 10000);
 }
 
-/** Extract request charge (RU) from a ResultSet's attributes. */
+/**
+ * Extract request charge (RU) from a ResultSet's attributes.
+ *
+ * CosmosDB Gremlin exposes two related attributes on the response message:
+ *   - `x-ms-request-charge`        — RU for this specific response message
+ *   - `x-ms-total-request-charge`  — cumulative RU across the entire query
+ *
+ * For single-message responses (single-vertex reads, count(), small projections)
+ * the two are equal. For streamed multi-message responses (traversals, path
+ * queries, large result sets), the gremlin-javascript driver surfaces only
+ * the FINAL message's attributes — and the final message's
+ * `x-ms-request-charge` is typically 0 (its own delta) while
+ * `x-ms-total-request-charge` carries the real cumulative charge.
+ *
+ * Therefore: always prefer the total. Falling back to the per-message value
+ * with `??` (the previous behaviour) silently zeroed out every traversal
+ * because 0 is not nullish.
+ *
+ * Verified against the Cosmos emulator with rate limiting enabled
+ * (`local-tests/ru-raw-probe.mjs` 2026-05-25): a depth-2 path traversal
+ * returns `{ x-ms-request-charge: 0, x-ms-total-request-charge: 29.72 }`.
+ */
 function extractRequestCharge(resultSet: gremlin.driver.ResultSet): number | undefined {
   const attrs = resultSet.attributes as Record<string, unknown> | undefined;
   if (!attrs) return undefined;
-  const charge = attrs['x-ms-request-charge'] ?? attrs['x-ms-total-request-charge'];
-  return typeof charge === 'number' ? charge : undefined;
+  const total = attrs['x-ms-total-request-charge'];
+  if (typeof total === 'number') return total;
+  const single = attrs['x-ms-request-charge'];
+  if (typeof single === 'number') return single;
+  return undefined;
 }
 
 function sleep(ms: number): Promise<void> {

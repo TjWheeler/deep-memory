@@ -2,7 +2,7 @@
 
 This is the canonical reference for releasing `@utaba/deep-memory` packages to npm.
 
-Versioning is driven by [Changesets](https://github.com/changesets/changesets). Publishing happens **locally** from a maintainer's machine — there is no CI-driven publish step (and therefore no `NPM_TOKEN` in repo secrets).
+Versioning is driven by [Changesets](https://github.com/changesets/changesets). 
 
 ## Packages
 

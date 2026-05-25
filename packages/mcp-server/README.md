@@ -106,7 +106,7 @@ Environment variables passed via the MCP client's `env` block:
 | `DEEP_MEMORY_ACTOR_TYPE` | `agent` | Actor type: `agent`, `human`, or `system` |
 | `DEEP_MEMORY_STORAGE` | `memory` | `memory` (test only — wiped on restart) or `sqlserver` (recommended) |
 | `DEEP_MEMORY_SQL_HOST` | — | SQL Server hostname (when `DEEP_MEMORY_STORAGE=sqlserver`) |
-| `DEEP_MEMORY_SQL_PORT` | `1433` | SQL Server port |
+| `DEEP_MEMORY_SQL_PORT` | `1433` | SQL Server port. The bundled `docker-compose.yml` publishes the container on host port **1435** (to avoid clashing with any local SQL install on the default 1433); use `1435` for that path. For a different SQL Server instance, check the port that instance is listening on. |
 | `DEEP_MEMORY_SQL_DATABASE` | — | Database name |
 | `DEEP_MEMORY_SQL_USER` | — | SQL Server username |
 | `DEEP_MEMORY_SQL_PASSWORD` | — | SQL Server password |

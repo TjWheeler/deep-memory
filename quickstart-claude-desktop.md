@@ -90,6 +90,8 @@ You should see output ending with something like `Changed database context to 'm
 
 The database will now restart automatically every time Docker Desktop starts. You only need to do Step 3 once.
 
+> **About the port:** the config below uses port **1435**, not SQL Server's default of 1433. 
+
 ---
 
 ## Step 4 — Tell Claude Desktop about the memory server

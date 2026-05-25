@@ -23,6 +23,8 @@ docker compose up sqlserver -d
 
 This builds the bundled image (Microsoft's SQL Server 2025 with full-text search) and exposes port **1435** on the host, mapped to 1433 in the container. The `sa` password is `DeepMem@Dev1234`.
 
+> SQL Server's default port is **1433**. The bundled compose uses **1435** on the host to avoid clashing with any pre-existing SQL Server install on this machine. If you're pointing Deep Memory at a different SQL Server instance instead of the bundled one, check what port that server is actually listening on (1433 for a default install) and set `DEEP_MEMORY_SQL_PORT` to match.
+
 Wait for the health check to go green (about a minute on first run):
 
 ```bash

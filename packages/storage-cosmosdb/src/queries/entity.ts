@@ -5,24 +5,25 @@ import type { StoredEntity, StoredEntityUpdate } from '@utaba/deep-memory/types'
 import type { StorageFindQuery, PaginatedResult } from '@utaba/deep-memory/types';
 import type { EntityReadOptions } from '@utaba/deep-memory/providers';
 import { entityFromGremlin, entityToGremlinProps } from '../mapping.js';
-import { DuplicateEntityError, buildVertexProjectChain } from '@utaba/deep-memory';
+import { DuplicateEntityError, EntityNotFoundError, buildVertexProjectChain } from '@utaba/deep-memory';
+
+// Sentinel returned by the duplicate-detection branch of the
+// fold().coalesce(unfold().constant('__duplicate'), addV/addE) pattern.
+// Phase 6: single round-trip create — the create succeeds inline or the
+// duplicate path returns this string, which we translate into the typed error.
+const DUPLICATE_SENTINEL = '__duplicate';
 
 export async function createEntity(
   conn: CosmosDbConnection,
   repositoryId: string,
   entity: StoredEntity,
 ): Promise<StoredEntity> {
-  // Check for duplicate
-  const existing = await conn.submit(
-    "g.V().has('repositoryId', rid).hasId(eid).count()",
-    { rid: repositoryId, eid: entity.id },
-  );
-  if (Number(existing.items[0] ?? 0) > 0) {
-    throw new DuplicateEntityError(entity.id);
-  }
-
   const props = entityToGremlinProps(repositoryId, entity);
-  const bindings: Record<string, unknown> = { vid: entity.id };
+  const bindings: Record<string, unknown> = {
+    rid: repositoryId,
+    vid: entity.id,
+    vertexLabel: entity.entityType,
+  };
   const propParts: string[] = [];
   let idx = 0;
 
@@ -32,10 +33,19 @@ export async function createEntity(
     propParts.push(`.property('${key}', ${paramName})`);
   }
 
-  // Use entityType as the vertex label for Gremlin graph semantics
-  bindings['vertexLabel'] = entity.entityType;
-  const query = `g.addV(vertexLabel).property('id', vid)${propParts.join('')}`;
-  await conn.submit(query, bindings);
+  // Single round-trip: if a vertex with this id already exists in the
+  // partition, the unfold().constant(...) branch fires and returns the sentinel
+  // string. Otherwise the addV branch creates the new vertex.
+  const query =
+    `g.V().has('repositoryId', rid).hasId(vid).fold().coalesce(` +
+    `unfold().constant('${DUPLICATE_SENTINEL}'),` +
+    `addV(vertexLabel).property('id', vid)${propParts.join('')}` +
+    `)`;
+  const result = await conn.submit(query, bindings);
+
+  if (result.items[0] === DUPLICATE_SENTINEL) {
+    throw new DuplicateEntityError(entity.id);
+  }
 
   return entity;
 }
@@ -149,13 +159,19 @@ export async function updateEntity(
   if (updates.provenance.modifiedInConversation != null) addProp('modifiedInConversation', updates.provenance.modifiedInConversation);
   if (updates.provenance.modifiedFromMessage != null) addProp('modifiedFromMessage', updates.provenance.modifiedFromMessage);
 
-  const query = `g.V().has('repositoryId', rid).hasId(eid).has('entityType')${propParts.join('')}`;
-  await conn.submit(query, bindings);
+  // Phase 6: append the read-projection onto the update so the updated state
+  // comes back in a single round-trip (was: update, then a separate getEntity).
+  // Embeddings stay off the wire — callers that need the embedding pass the
+  // option through the public StorageProvider.getEntity call themselves.
+  const projection = buildVertexProjectChain();
+  const query = `g.V().has('repositoryId', rid).hasId(eid).has('entityType')${propParts.join('')}.${projection}`;
+  const result = await conn.submit(query, bindings);
 
-  // The re-read serves the updated entity back to the caller. Embeddings
-  // remain off the wire — callers that need the embedding pass the option
-  // through the public StorageProvider.getEntity call themselves.
-  return (await getEntity(conn, repositoryId, entityId))!;
+  if (result.items.length === 0) {
+    throw new EntityNotFoundError(entityId);
+  }
+
+  return entityFromGremlin(result.items[0] as Record<string, unknown>);
 }
 
 export async function deleteEntity(

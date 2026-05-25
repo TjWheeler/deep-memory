@@ -6,27 +6,21 @@ import type { PaginatedResult } from '@utaba/deep-memory/types';
 import { relationshipFromGremlin, relationshipToGremlinProps } from '../mapping.js';
 import { DuplicateRelationshipError, matchesPropertyFilters, buildEdgeProjectChain } from '@utaba/deep-memory';
 
+// Sentinel returned by the duplicate-detection branch of the coalesce upsert
+// pattern. Mirrors entity.ts — Phase 6 single-round-trip create.
+const DUPLICATE_SENTINEL = '__duplicate';
+
 export async function createRelationship(
   conn: CosmosDbConnection,
   repositoryId: string,
   relationship: StoredRelationship,
 ): Promise<StoredRelationship> {
-  // Check for duplicate — scoped by repositoryId so the same relationship id
-  // in a different repo does not cause a false-positive collision.
-  const existing = await conn.submit(
-    "g.E().has('repositoryId', rid).hasId(relId).count()",
-    { rid: repositoryId, relId: relationship.id },
-  );
-  if (Number(existing.items[0] ?? 0) > 0) {
-    throw new DuplicateRelationshipError(relationship.id);
-  }
-
   const props = relationshipToGremlinProps(repositoryId, relationship);
   const bindings: Record<string, unknown> = {
+    rid: repositoryId,
     relId: relationship.id,
     srcId: relationship.sourceEntityId,
     tgtId: relationship.targetEntityId,
-    rid: repositoryId,
     edgeLabel: relationship.relationshipType,
   };
   const propParts: string[] = [];
@@ -38,9 +32,26 @@ export async function createRelationship(
     propParts.push(`.property('${key}', ${paramName})`);
   }
 
-  // addE requires source and target vertex references
-  const query = `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
-  await conn.submit(query, bindings);
+  // Single round-trip: if an edge with this id already exists in the
+  // partition, the unfold branch fires and returns the sentinel string.
+  // Otherwise the addE branch creates the new edge. Same shape as
+  // bulk.ts:upsertRelationship — a `g.V()...addE()...` traversal inside the
+  // second coalesce branch is verified to work in CosmosDB.
+  const createEdge =
+    `g.V().has('repositoryId', rid).hasId(srcId).has('entityType')` +
+    `.addE(edgeLabel)` +
+    `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+    `.property('id', relId)${propParts.join('')}`;
+  const query =
+    `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
+    `unfold().constant('${DUPLICATE_SENTINEL}'),` +
+    `${createEdge}` +
+    `)`;
+  const result = await conn.submit(query, bindings);
+
+  if (result.items[0] === DUPLICATE_SENTINEL) {
+    throw new DuplicateRelationshipError(relationship.id);
+  }
 
   return relationship;
 }

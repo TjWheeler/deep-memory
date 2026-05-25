@@ -10,7 +10,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { CosmosDbProvider } from './CosmosDbProvider.js';
 import type { GremlinResult } from './CosmosDbConnection.js';
-import type { TraversalSpec } from '@utaba/deep-memory/types';
+import type {
+  StoredEntity,
+  StoredEntityUpdate,
+  StoredRelationship,
+  TraversalSpec,
+} from '@utaba/deep-memory/types';
+import { DuplicateEntityError, DuplicateRelationshipError, EntityNotFoundError } from '@utaba/deep-memory';
 
 const TEST_REPO = '40000000-0000-4000-a000-000000000099';
 
@@ -195,5 +201,221 @@ describe('Phase 2 non-traversal read paths emit projection chains, not valueMap(
     expect(lastQuery).not.toContain('valueMap(true)');
     expect(lastQuery).toContain("'repositoryId'");
     expect(lastQuery).toContain("'repoLabel'");
+  });
+});
+
+// ─── Phase 6 — single round-trip create / update ─────────────────────
+//
+// The fold().coalesce(unfold().constant('__duplicate'), addV/addE) pattern
+// removes the existence-check round-trip. updateEntity appends the read
+// projection so it no longer does update + getEntity. These tests assert
+// exactly one storage call on the happy path and the duplicate path, and
+// surface the right typed errors.
+
+function makeEntity(id: string): StoredEntity {
+  return {
+    id,
+    slug: `slug-${id}`,
+    entityType: 'Person',
+    label: 'Phase 6 Probe',
+    properties: { age: 30 },
+    provenance: {
+      createdBy: 'test',
+      createdByType: 'agent',
+      createdAt: '2026-05-25T00:00:00.000Z',
+      modifiedBy: 'test',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-25T00:00:00.000Z',
+    },
+  };
+}
+
+function makeRelationship(id: string, src: string, tgt: string): StoredRelationship {
+  return {
+    id,
+    relationshipType: 'KNOWS',
+    sourceEntityId: src,
+    targetEntityId: tgt,
+    properties: {},
+    bidirectional: false,
+    provenance: {
+      createdBy: 'test',
+      createdByType: 'agent',
+      createdAt: '2026-05-25T00:00:00.000Z',
+      modifiedBy: 'test',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-25T00:00:00.000Z',
+    },
+  };
+}
+
+describe('Phase 6 single-round-trip create / update', () => {
+  it('createEntity issues exactly one storage call on success', async () => {
+    const { provider, stub } = makeProvider();
+    // Default stub returns { items: [] } — simulate the addV branch firing by
+    // returning a vertex-shaped result for the create query.
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+        return { items: [{ id: 'created-vertex' }] };
+      }
+      return { items: [] };
+    };
+
+    const entity = makeEntity('40000000-0000-4000-a000-000000006001');
+    const before = stub.calls.length;
+    await provider.createEntity(TEST_REPO, entity);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    const created = stub.calls[stub.calls.length - 1]!;
+    expect(created.query).toContain('fold().coalesce(');
+    expect(created.query).toContain("unfold().constant('__duplicate')");
+    expect(created.query).toContain('addV(vertexLabel)');
+    expect(created.query).not.toContain('.count()');
+  });
+
+  it('createEntity issues exactly one storage call on duplicate and throws DuplicateEntityError', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+        return { items: ['__duplicate'] };
+      }
+      return { items: [] };
+    };
+
+    const entity = makeEntity('40000000-0000-4000-a000-000000006002');
+    const before = stub.calls.length;
+    await expect(provider.createEntity(TEST_REPO, entity)).rejects.toBeInstanceOf(DuplicateEntityError);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+  });
+
+  it('createRelationship issues exactly one storage call on success', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+        return { items: [{ id: 'created-edge' }] };
+      }
+      return { items: [] };
+    };
+
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006003',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0002',
+    );
+    const before = stub.calls.length;
+    await provider.createRelationship(TEST_REPO, rel);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    const created = stub.calls[stub.calls.length - 1]!;
+    expect(created.query).toContain('fold().coalesce(');
+    expect(created.query).toContain('addE(edgeLabel)');
+    expect(created.query).not.toContain('.count()');
+  });
+
+  it('createRelationship issues exactly one storage call on duplicate and throws DuplicateRelationshipError', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+        return { items: ['__duplicate'] };
+      }
+      return { items: [] };
+    };
+
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006004',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0002',
+    );
+    const before = stub.calls.length;
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(DuplicateRelationshipError);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+  });
+
+  it('updateEntity issues exactly one storage call and parses the projected result', async () => {
+    const { provider, stub } = makeProvider();
+    // The update query embeds the projection chain. We simulate the projected
+    // shape that entityFromGremlin expects.
+    const projectedVertex = {
+      id: '40000000-0000-4000-a000-000000006005',
+      entityType: 'Person',
+      entityLabel: 'Updated Label',
+      slug: 'updated-slug',
+      summary: '',
+      properties: '{}',
+      data: '',
+      dataFormat: '',
+      createdBy: 'test',
+      createdByType: 'agent',
+      createdAt: '2026-05-25T00:00:00.000Z',
+      createdInConversation: '',
+      createdFromMessage: '',
+      modifiedBy: 'test',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-25T00:00:01.000Z',
+      modifiedInConversation: '',
+      modifiedFromMessage: '',
+    };
+
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(eid).has(\'entityType\')') && query.includes('.project(')) {
+        return { items: [projectedVertex] };
+      }
+      return { items: [] };
+    };
+
+    const updates: StoredEntityUpdate = {
+      label: 'Updated Label',
+      provenance: {
+        createdBy: 'test',
+        createdByType: 'agent',
+        createdAt: '2026-05-25T00:00:00.000Z',
+        modifiedBy: 'test',
+        modifiedByType: 'agent',
+        modifiedAt: '2026-05-25T00:00:01.000Z',
+      },
+    };
+
+    const before = stub.calls.length;
+    const result = await provider.updateEntity(TEST_REPO, projectedVertex.id, updates);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    expect(result.label).toBe('Updated Label');
+    expect(stub.calls[stub.calls.length - 1]!.query).toContain('.project(');
+  });
+
+  it('updateEntity throws EntityNotFoundError when no vertex matches', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      return { items: [] };
+    };
+
+    const updates: StoredEntityUpdate = {
+      label: 'never-applies',
+      provenance: {
+        createdBy: 'test',
+        createdByType: 'agent',
+        createdAt: '2026-05-25T00:00:00.000Z',
+        modifiedBy: 'test',
+        modifiedByType: 'agent',
+        modifiedAt: '2026-05-25T00:00:01.000Z',
+      },
+    };
+
+    await expect(
+      provider.updateEntity(TEST_REPO, '40000000-0000-4000-a000-000000006006', updates),
+    ).rejects.toBeInstanceOf(EntityNotFoundError);
   });
 });

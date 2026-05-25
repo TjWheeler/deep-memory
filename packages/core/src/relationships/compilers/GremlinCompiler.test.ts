@@ -121,6 +121,41 @@ describe('GremlinCompiler', () => {
     expect(result.query).toContain('.emit()');
   });
 
+  it('emits .times() with a literal integer (CosmosDB rejects parameter bindings on times())', () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out', repeat: { maxDepth: 3 } }],
+      returnMode: 'terminal',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    expect(result.query).toContain('.times(3)');
+    // maxDepth must NOT appear as a binding value
+    expect(Object.values(result.params)).not.toContain(3);
+  });
+
+  it('rejects non-positive-integer repeat.maxDepth', () => {
+    expect(() =>
+      compiler.compile(
+        {
+          start: { entityId: 'e1' },
+          steps: [{ direction: 'out', repeat: { maxDepth: 0 } }],
+          returnMode: 'terminal',
+        },
+        emptyVocab,
+      ),
+    ).toThrow(/positive integer/);
+    expect(() =>
+      compiler.compile(
+        {
+          start: { entityId: 'e1' },
+          steps: [{ direction: 'out', repeat: { maxDepth: 2.5 } }],
+          returnMode: 'terminal',
+        },
+        emptyVocab,
+      ),
+    ).toThrow(/positive integer/);
+  });
+
   it('compiles path return mode', () => {
     const spec: TraversalSpec = {
       start: { entityId: 'e1' },
@@ -297,5 +332,42 @@ describe('GremlinCompiler', () => {
     };
     const result = compiler.compile(spec, emptyVocab);
     expect(result.query).not.toContain('.dedup()');
+  });
+
+  // ─── Phase 4: simplePath() for cycle prevention in 'path' mode ──
+
+  it("always emits .simplePath() before .range() and .path() in 'path' mode, and never in 'terminal' or 'all'", () => {
+    const pathSpec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [
+        { direction: 'both' },
+        { direction: 'both' },
+      ],
+      returnMode: 'path',
+    };
+    const pathResult = compiler.compile(pathSpec, emptyVocab);
+    expect(pathResult.query).toContain('.simplePath()');
+    // simplePath must come before .range() (which comes before .path()) so it
+    // filters traversers, not collected Path objects.
+    const sp = pathResult.query.indexOf('.simplePath()');
+    const range = pathResult.query.indexOf('.range(');
+    const path = pathResult.query.indexOf('.path(');
+    expect(sp).toBeGreaterThan(-1);
+    expect(sp).toBeLessThan(range);
+    expect(range).toBeLessThan(path);
+
+    const terminalSpec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out' }],
+      returnMode: 'terminal',
+    };
+    expect(compiler.compile(terminalSpec, emptyVocab).query).not.toContain('.simplePath()');
+
+    const allSpec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'both', relationshipTypes: ['WORKS_AT'] }],
+      returnMode: 'all',
+    };
+    expect(compiler.compile(allSpec, emptyVocab).query).not.toContain('.simplePath()');
   });
 });

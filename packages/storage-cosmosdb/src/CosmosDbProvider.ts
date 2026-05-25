@@ -22,17 +22,28 @@ import type {
   PaginationOptions,
   PaginatedResult,
   StorageNeighborhood,
+  StorageNeighborhoodLayer,
+  StoragePath,
   StoragePathResult,
   StorageTimelineResult,
   BulkImportResult,
   TraversalSpec,
+  TraversalStep,
   TraversalResult,
   QueryMetadata,
   UsageSink,
 } from '@utaba/deep-memory/types';
 import type { ExportChunk, ImportChunk, BulkImportOptions, DeleteProgressCallback } from '@utaba/deep-memory/types';
 import crypto from 'node:crypto';
-import { GremlinCompiler, ProviderError, InvalidInputError, isValidUuid, projectEntity, createSafeSink } from '@utaba/deep-memory';
+import {
+  GremlinCompiler,
+  ProviderError,
+  InvalidInputError,
+  isValidUuid,
+  projectEntity,
+  createSafeSink,
+  matchesPropertyFilters,
+} from '@utaba/deep-memory';
 import { CosmosDbConnection, usageScope } from './CosmosDbConnection.js';
 import type { UsageAccumulator } from './CosmosDbConnection.js';
 import { entityFromGremlin, relationshipFromGremlin } from './mapping.js';
@@ -40,7 +51,6 @@ import * as repoQueries from './queries/repository.js';
 import * as vocabQueries from './queries/vocabulary.js';
 import * as entityQueries from './queries/entity.js';
 import * as relQueries from './queries/relationship.js';
-import * as traversalQueries from './queries/traversal.js';
 import * as timelineQueries from './queries/timeline.js';
 import * as bulkQueries from './queries/bulk.js';
 
@@ -76,6 +86,47 @@ export interface CosmosDbProviderConfig {
 const PROVIDER_NAME = 'cosmosdb';
 const SCHEMA_VERSION = 1;
 const META_VERTEX_ID = '_meta:schema';
+
+/**
+ * Raw, un-projected output from {@link CosmosDbProvider.executeTraversal}.
+ * Only the fields relevant to the spec's `returnMode` are populated; the rest
+ * remain empty. Used to share the compile + submit + parse pipeline between
+ * `traverseInternal` (which projects into the public TraversalResult shape)
+ * and the storage-layer rewrites of `exploreNeighborhood` / `findPaths`
+ * (which need raw stored entities to rebuild storage-level outputs).
+ */
+interface RawTraversalResult {
+  /** Populated when `spec.returnMode === 'terminal'`. */
+  terminalEntities: StoredEntity[];
+  /** Populated when `spec.returnMode === 'all'`. */
+  allEntities: StoredEntity[];
+  /** Populated when `spec.returnMode === 'all'`. */
+  allRelationships: StoredRelationship[];
+  /** Populated when `spec.returnMode === 'path'`. */
+  pathRows: Array<{
+    entityIds: string[];
+    relationshipIds: string[];
+    relationshipDirections: Array<'outbound' | 'inbound'>;
+  }>;
+  /**
+   * Lookup table — populated for `'all'` and `'path'` modes. Includes every
+   * entity that appears in any returned row.
+   */
+  entityMap: Map<string, StoredEntity>;
+  /**
+   * Lookup table — populated for `'all'` and `'path'` modes. Includes every
+   * relationship that appears in any returned row.
+   */
+  relationshipMap: Map<string, StoredRelationship>;
+  /**
+   * First-seen walk direction per deduped edge id. Populated only for
+   * `'path'` mode (the `'all'` union has no walk context, see Phase 7).
+   */
+  pathRelFirstDirection: Map<string, 'outbound' | 'inbound'>;
+  executionTimeMs: number;
+  requestCharge: number | undefined;
+  compiledQuery: string;
+}
 
 /**
  * Vocabulary TTL for the per-process cache. Vocabulary changes are rare
@@ -574,15 +625,268 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   async exploreNeighborhood(repositoryId: string, entityId: string, options: StorageExploreOptions): Promise<StorageNeighborhood> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('exploreNeighborhood', repositoryId, () =>
-      traversalQueries.exploreNeighborhood(this.conn, repositoryId, entityId, options),
+      this.exploreNeighborhoodImpl(repositoryId, entityId, options),
     );
+  }
+
+  /**
+   * Phase 4 compiler-model rewrite of exploreNeighborhood.
+   *
+   * Strategy (plan §3 + Option A): for each depth `d` from 1 to
+   * `options.depth`, build a cumulative `TraversalSpec` with `d` steps and
+   * `returnMode: 'all'`, run it through {@link executeTraversal}, then walk
+   * one BFS layer client-side from the previous frontier using the returned
+   * edges.
+   *
+   * The server-side step direction is fixed to `'both'` (catches every edge
+   * in either direction). The directional + bidirectional filter is applied
+   * client-side per hop — i.e. `direction: 'outbound'` includes inbound edges
+   * where `bidirectional` is true. This is the contract the pre-Phase-4
+   * Cosmos BFS in (now-deleted) `packages/storage-cosmosdb/src/queries/
+   * traversal.ts` already implemented (it emitted
+   * `union(outE(), inE().has('bidirectional', true))` directly server-side
+   * for `direction: 'outbound'`, and the symmetric shape for `'inbound'`).
+   * The CosmosDB Gremlin compiler does not natively express that
+   * `union(outE, inE.has(bidirectional))` shape, so the filter moves
+   * client-side; the plan's §6 observable-outputs rule requires preserving
+   * the behaviour.
+   *
+   * Round-trips per call: `options.depth` (one per layer). The previous BFS
+   * was `1 + fanout + fanout² + …` round-trips for the same depth.
+   */
+  private async exploreNeighborhoodImpl(
+    repositoryId: string,
+    entityId: string,
+    options: StorageExploreOptions,
+  ): Promise<StorageNeighborhood> {
+    const layers: StorageNeighborhoodLayer[] = [];
+    const visited = new Set<string>([entityId]);
+    let frontier = new Set<string>([entityId]);
+
+    for (let d = 1; d <= options.depth; d++) {
+      if (frontier.size === 0) break;
+
+      const spec: TraversalSpec = {
+        start: { entityId },
+        steps: buildExploreSteps(d, options),
+        returnMode: 'all',
+        // Phase 4 fetches the cumulative subgraph at depth `d` and reconstructs
+        // layers client-side. The result can include every edge and vertex
+        // reachable in ≤d hops in either direction; size the limit generously.
+        limit: 10_000,
+        // Use 'full' + includeProvenance so executeTraversal returns full
+        // StoredEntity rows (StorageNeighborhood embeds StoredEntity).
+        detailLevel: 'full',
+        includeProvenance: true,
+      };
+      const raw = await this.executeTraversal(repositoryId, spec);
+
+      // Index edges by either endpoint so we can find edges incident to each
+      // frontier vertex in O(1).
+      const edgesByVertex = new Map<string, StoredRelationship[]>();
+      for (const rel of raw.allRelationships) {
+        const a = edgesByVertex.get(rel.sourceEntityId);
+        if (a) a.push(rel); else edgesByVertex.set(rel.sourceEntityId, [rel]);
+        const b = edgesByVertex.get(rel.targetEntityId);
+        if (b) b.push(rel); else edgesByVertex.set(rel.targetEntityId, [rel]);
+      }
+
+      const layer: StorageNeighborhoodLayer = {};
+      const nextFrontier = new Set<string>();
+      // Dedup edges within a layer: the cumulative-d response can include the
+      // same edge multiple times across the deduped union (server-side dedup
+      // is by row, not by edge-in-context). The visit set prevents the same
+      // (vertex, edge) pairing from contributing twice.
+      const layerEdgeSeen = new Set<string>();
+
+      for (const fv of frontier) {
+        const incident = edgesByVertex.get(fv) ?? [];
+        for (const rel of incident) {
+          const isSource = rel.sourceEntityId === fv;
+          const isTarget = rel.targetEntityId === fv;
+          let matchesDirection = false;
+          let connectedId: string | undefined;
+
+          if (isSource && (options.direction === 'outbound' || options.direction === 'both')) {
+            matchesDirection = true;
+            connectedId = rel.targetEntityId;
+          } else if (isTarget && (options.direction === 'inbound' || options.direction === 'both')) {
+            matchesDirection = true;
+            connectedId = rel.sourceEntityId;
+          } else if (rel.bidirectional) {
+            if (isSource && options.direction === 'inbound') {
+              matchesDirection = true;
+              connectedId = rel.targetEntityId;
+            } else if (isTarget && options.direction === 'outbound') {
+              matchesDirection = true;
+              connectedId = rel.sourceEntityId;
+            }
+          }
+          if (!matchesDirection || !connectedId) continue;
+          if (visited.has(connectedId)) continue;
+
+          // Relationship property filter — applied client-side per hop, matching
+          // the existing BFS. Edges that fail the filter neither populate the
+          // layer nor expand the frontier.
+          if (options.relationshipPropertyFilters && options.relationshipPropertyFilters.length > 0) {
+            if (!matchesPropertyFilters(rel.properties, options.relationshipPropertyFilters)) continue;
+          }
+
+          const connectedEntity = raw.entityMap.get(connectedId);
+          if (!connectedEntity) continue;
+
+          // Entity type filter — applied client-side; the server spec walks
+          // direction 'both' without entity-type narrowing so deeper layers
+          // are still reachable through any intermediate.
+          if (options.entityTypes && options.entityTypes.length > 0 &&
+              !options.entityTypes.includes(connectedEntity.entityType)) {
+            continue;
+          }
+
+          // Dedup the (vertex-pair, edge) within this layer.
+          const edgeKey = `${rel.id}|${fv}->${connectedId}`;
+          if (layerEdgeSeen.has(edgeKey)) continue;
+          layerEdgeSeen.add(edgeKey);
+
+          const relType = rel.relationshipType;
+          if (!layer[relType]) {
+            layer[relType] = { total: 0, entities: [], relationships: [] };
+          }
+          layer[relType]!.entities.push(connectedEntity);
+          layer[relType]!.relationships.push(rel);
+          layer[relType]!.total = layer[relType]!.entities.length;
+          nextFrontier.add(connectedId);
+        }
+      }
+
+      // Per-type pagination (matches the existing CosmosDB BFS — total
+      // reflects the full pre-slice count).
+      for (const relType of Object.keys(layer)) {
+        const group = layer[relType]!;
+        const start = options.offsetPerType;
+        const end = start + options.limitPerType;
+        group.entities = group.entities.slice(start, end);
+        group.relationships = group.relationships.slice(start, end);
+      }
+
+      if (Object.keys(layer).length > 0) {
+        layers.push(layer);
+      }
+
+      // Promote nextFrontier to visited AFTER the full layer is processed so
+      // the same entity can appear under multiple relationship types within
+      // a single layer (matches the existing semantic).
+      for (const id of nextFrontier) {
+        visited.add(id);
+      }
+      frontier = nextFrontier;
+    }
+
+    return { centerId: entityId, layers };
   }
 
   async findPaths(repositoryId: string, sourceId: string, targetId: string, options: StoragePathOptions): Promise<StoragePathResult> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('findPaths', repositoryId, () =>
-      traversalQueries.findPaths(this.conn, repositoryId, sourceId, targetId, options),
+      this.findPathsImpl(repositoryId, sourceId, targetId, options),
     );
+  }
+
+  /**
+   * Phase 4 compiler-model rewrite of findPaths.
+   *
+   * Strategy (plan §3): build a `TraversalSpec` with a single `'both'`
+   * direction step in `repeat()` mode with `emitIntermediates: true` and
+   * `returnMode: 'path'`, run it once. The compiler always emits
+   * `.simplePath()` in path mode for cycle prevention, producing
+   * `.emit().repeat(bothE().otherV()).times(maxDepth).simplePath()
+   * .range(...).path().by(<v>).by(<e>)`, which yields paths of every length
+   * from 0 (the start vertex alone) to `maxDepth`. Live-probed against the
+   * Cosmos emulator 2026-05-25 — see local-tests/phase4-repeat-emit-probe.mjs.
+   *
+   * The pre-Phase-4 Cosmos BFS in (now-deleted) `packages/storage-cosmosdb/
+   * src/queries/traversal.ts` traversed edges with unconditional `bothE()`
+   * regardless of the `bidirectional` flag (path discovery is reachability,
+   * not semantic direction). Mirror that here by using step direction
+   * `'both'` and not applying any direction filter. The plan's §6
+   * observable-outputs rule requires preserving this.
+   *
+   * One round-trip total. The previous BFS was up to `1 + fanout + fanout² + …`.
+   */
+  private async findPathsImpl(
+    repositoryId: string,
+    sourceId: string,
+    targetId: string,
+    options: StoragePathOptions,
+  ): Promise<StoragePathResult> {
+    if (sourceId === targetId) {
+      return { paths: [{ entityIds: [sourceId], relationshipIds: [] }], totalPaths: 1 };
+    }
+
+    const step: TraversalStep = {
+      direction: 'both',
+      repeat: { maxDepth: options.maxDepth, emitIntermediates: true },
+    };
+    if (options.relationshipTypes && options.relationshipTypes.length > 0) {
+      step.relationshipTypes = options.relationshipTypes;
+    }
+    if (options.relationshipPropertyFilters && options.relationshipPropertyFilters.length > 0) {
+      step.relationshipFilter = options.relationshipPropertyFilters;
+    }
+
+    const spec: TraversalSpec = {
+      start: { entityId: sourceId },
+      steps: [step],
+      returnMode: 'path',
+      // Cycle prevention comes from the compiler unconditionally emitting
+      // .simplePath() in path mode — replaces the explicit
+      // `state.path.includes(nextId)` guard from the old BFS.
+      // Pull the full pool of paths so we can post-filter to those ending at
+      // targetId, then paginate. The emulator returns paths of every length
+      // 0..maxDepth in one round-trip with the repeat+emit shape; cap
+      // generously to ensure all candidates are inspected.
+      limit: Math.max(options.limit + options.offset, options.limit) * 10,
+      detailLevel: 'full',
+      includeProvenance: true,
+    };
+
+    const raw = await this.executeTraversal(repositoryId, spec);
+
+    const matchingPaths: StoragePath[] = [];
+    for (const row of raw.pathRows) {
+      // The repeat+emit shape includes the 0-hop "path" (just the start
+      // vertex). source !== target at this point (handled above), so the
+      // last-entity check naturally rejects it.
+      const last = row.entityIds[row.entityIds.length - 1];
+      if (last !== targetId) continue;
+      // Apply entity-type filter on intermediate entities (matches the
+      // existing CosmosDB BFS — source and target are always allowed).
+      if (options.entityTypes && options.entityTypes.length > 0) {
+        let rejected = false;
+        for (let i = 1; i < row.entityIds.length - 1; i++) {
+          const intermediate = raw.entityMap.get(row.entityIds[i]!);
+          if (!intermediate) { rejected = true; break; }
+          if (!options.entityTypes.includes(intermediate.entityType)) {
+            rejected = true;
+            break;
+          }
+        }
+        if (rejected) continue;
+      }
+      matchingPaths.push({
+        entityIds: [...row.entityIds],
+        relationshipIds: [...row.relationshipIds],
+      });
+    }
+
+    // Pagination — slice the matching set. `totalPaths` reflects the full
+    // pre-slice count, matching the existing storage contract.
+    const paginated = matchingPaths.slice(options.offset, options.offset + options.limit);
+
+    return {
+      paths: paginated,
+      totalPaths: matchingPaths.length,
+    };
   }
 
   // ─── Timeline ──────────────────────────────────────────────────────
@@ -684,13 +988,162 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     spec: TraversalSpec,
   ): Promise<TraversalResult> {
     this.assertValidRepositoryId(repositoryId);
-    return this.track('traverse', repositoryId, () => this.traverseImpl(repositoryId, spec));
+    return this.track('traverse', repositoryId, () => this.traverseInternal(repositoryId, spec));
   }
 
-  private async traverseImpl(
+  /**
+   * Compile + execute a TraversalSpec against this repository's partition.
+   *
+   * Internal entrypoint shared by `traverse` (the public surface) and the
+   * compiler-model rewrites of `exploreNeighborhood` / `findPaths`. Does NOT
+   * wrap in `track()` — the outer public method owns its own usage scope, and
+   * inner submits accumulate into that scope (the nested-scope guard in
+   * `track()` keeps nested public calls from emitting duplicate records).
+   */
+  private async traverseInternal(
     repositoryId: string,
     spec: TraversalSpec,
   ): Promise<TraversalResult> {
+    const raw = await this.executeTraversal(repositoryId, spec);
+
+    // Project stored entities to the requested detail level. This strips
+    // embeddings and any other internal fields at every level — the
+    // projection contract never surfaces embeddings via traversal results.
+    const detailLevel = spec.detailLevel ?? 'summary';
+
+    type ProjectedEntity = TraversalResult['entities'][number];
+    type ProjectedRelationship = NonNullable<TraversalResult['relationships']>[number];
+
+    const projectStoredEntity = (stored: StoredEntity): ProjectedEntity => {
+      const projected = projectEntity(stored, detailLevel) as ProjectedEntity;
+      if (!spec.includeProvenance) {
+        delete (projected as unknown as Record<string, unknown>)['provenance'];
+      }
+      return projected;
+    };
+
+    // direction is mode-specific (Phase 7):
+    //   'all'  — always 'outbound' (stored topology; the deduped union has
+    //            no walk context). Callers derive walk direction relative
+    //            to any anchor via sourceEntityId / targetEntityId.
+    //   'path' — relative to the last hop within each walk; callers stamp
+    //            via the `direction` argument.
+    const projectStoredRelationship = (
+      rel: StoredRelationship,
+      direction: 'outbound' | 'inbound' = 'outbound',
+    ): ProjectedRelationship => ({
+      id: rel.id,
+      type: rel.relationshipType,
+      sourceEntityId: rel.sourceEntityId,
+      targetEntityId: rel.targetEntityId,
+      direction,
+      properties: rel.properties,
+    });
+
+    let entities: ProjectedEntity[] = [];
+    let relationships: ProjectedRelationship[] | undefined;
+    let paths: NonNullable<TraversalResult['paths']> | undefined;
+
+    if (spec.returnMode === 'terminal') {
+      entities = raw.terminalEntities.map(projectStoredEntity);
+      relationships = undefined;
+    } else if (spec.returnMode === 'all') {
+      entities = raw.allEntities.map(projectStoredEntity);
+      relationships = raw.allRelationships.map((r) => projectStoredRelationship(r));
+    } else {
+      // 'path' — emit one TraversalPath per Gremlin path row, with per-edge
+      // walk direction. The outer `relationships` array dedups by rel id and
+      // stamps the first-seen direction — the previous Cosmos traverseImpl
+      // carried this same first-writer-wins `relMap` semantic (see
+      // bugfix-23-05 §Phase 7); the plan's §6 observable-outputs rule
+      // requires preserving it.
+      paths = raw.pathRows.map((row) => ({
+        length: Math.max(row.entityIds.length - 1, 0),
+        entities: row.entityIds.map((id) => {
+          const stored = raw.entityMap.get(id);
+          if (!stored) {
+            throw new ProviderError(
+              'Unpacking Gremlin path: entity referenced by path is missing from the result',
+              'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+            );
+          }
+          return projectStoredEntity(stored);
+        }),
+        relationships: row.relationshipIds.map((id, i) => {
+          const stored = raw.relationshipMap.get(id);
+          if (!stored) {
+            throw new ProviderError(
+              'Unpacking Gremlin path: relationship referenced by path is missing from the result',
+              'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+            );
+          }
+          return projectStoredRelationship(stored, row.relationshipDirections[i]!);
+        }),
+      }));
+      relationships = Array.from(raw.relationshipMap.values()).map((rel) =>
+        projectStoredRelationship(rel, raw.pathRelFirstDirection.get(rel.id) ?? 'outbound'),
+      );
+    }
+
+    const limit = spec.limit ?? 50;
+    // 'all' mode returns an interleaved entity+edge union — total must count
+    // both so callers see the true page size.
+    let total: number;
+    if (spec.returnMode === 'path') {
+      total = paths?.length ?? 0;
+    } else if (spec.returnMode === 'all') {
+      total = entities.length + (relationships?.length ?? 0);
+    } else {
+      total = entities.length;
+    }
+
+    const queryMetadata: QueryMetadata = {
+      executionTimeMs: raw.executionTimeMs,
+      resourceCost: raw.requestCharge != null
+        ? { units: 'RU', value: raw.requestCharge }
+        : undefined,
+      compiledQuery: raw.compiledQuery,
+      compiledQueryLanguage: 'gremlin',
+      appliedLimits: {
+        maxResults: limit,
+        maxDepth: spec.steps?.length,
+      },
+      truncated: total >= limit,
+      truncationReason: total >= limit ? 'result_limit' : undefined,
+    };
+
+    return {
+      entities,
+      relationships,
+      paths,
+      total,
+      returned: total,
+      hasMore: total >= limit,
+      queryMetadata,
+    };
+  }
+
+  /**
+   * Lower-level traversal helper: compiles a spec, submits to Gremlin, and
+   * parses the rows into raw {@link StoredEntity} / {@link StoredRelationship}
+   * objects (no detail-level projection, no provenance stripping). Used by
+   * `traverseInternal` and by the storage-layer rewrites of
+   * `exploreNeighborhood` / `findPaths` that need the full stored shape to
+   * rebuild `StorageNeighborhood` / `StoragePathResult`.
+   *
+   * Returns a discriminated bag — only the fields relevant to `spec.returnMode`
+   * are populated:
+   * - `'terminal'`: `terminalEntities` (in row order, no dedup beyond what the
+   *    server emitted).
+   * - `'all'`: `allEntities` and `allRelationships`, already server-deduped.
+   * - `'path'`: `pathRows` plus the `entityMap` / `relationshipMap` lookup
+   *    tables and `pathRelFirstDirection` for the first-seen direction per
+   *    deduped edge id.
+   */
+  private async executeTraversal(
+    repositoryId: string,
+    spec: TraversalSpec,
+  ): Promise<RawTraversalResult> {
     const startTime = Date.now();
 
     // Vocabulary is compile-time context — fetch from the per-process cache so
@@ -711,198 +1164,101 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
     const scopedParams = { ...compiled.params, pRid: repositoryId };
 
+    let result;
     try {
-      const result = await this.conn.submit(scopedQuery, scopedParams);
-      const executionTimeMs = Date.now() - startTime;
-
-      // Project stored entities to the requested detail level. This strips
-      // embeddings and any other internal fields at every level — the
-      // projection contract never surfaces embeddings via traversal results.
-      const detailLevel = spec.detailLevel ?? 'summary';
-
-      type ProjectedEntity = TraversalResult['entities'][number];
-      type ProjectedRelationship = NonNullable<TraversalResult['relationships']>[number];
-
-      const projectStoredEntity = (stored: StoredEntity): ProjectedEntity => {
-        const projected = projectEntity(stored, detailLevel) as ProjectedEntity;
-        if (!spec.includeProvenance) {
-          delete (projected as unknown as Record<string, unknown>)['provenance'];
-        }
-        return projected;
-      };
-
-      // direction is mode-specific (Phase 7):
-      //   'all'  — always 'outbound' (stored topology; the deduped union has
-      //            no walk context). Callers derive walk direction relative
-      //            to any anchor via sourceEntityId / targetEntityId.
-      //   'path' — relative to the last hop within each walk; callers stamp
-      //            via the `direction` argument.
-      const projectStoredRelationship = (
-        rel: StoredRelationship,
-        direction: 'outbound' | 'inbound' = 'outbound',
-      ): ProjectedRelationship => ({
-        id: rel.id,
-        type: rel.relationshipType,
-        sourceEntityId: rel.sourceEntityId,
-        targetEntityId: rel.targetEntityId,
-        direction,
-        properties: rel.properties,
-      });
-
-      let entities: ProjectedEntity[] = [];
-      let relationships: ProjectedRelationship[] | undefined;
-      let paths: NonNullable<TraversalResult['paths']> | undefined;
-
-      if (spec.returnMode === 'terminal') {
-        // Flat valueMap(true) rows — one vertex per row.
-        for (const item of result.items) {
-          const stored = entityFromGremlin(item as Record<string, unknown>);
-          entities.push(projectStoredEntity(stored));
-        }
-        relationships = undefined;
-      } else if (spec.returnMode === 'all') {
-        // Flat stream of unique vertex AND edge projected Maps — the
-        // union+dedup query already deduped server-side, so no id-keyed Map
-        // needed here. Rows carry an explicit `__kind` discriminator
-        // (`'v'` for vertex, `'e'` for edge), set by the compiler's per-branch
-        // project chain.
-        //
-        // direction defaults to 'outbound' (stored topology) per the Phase 7
-        // contract — the deduped union carries no walk context.
-        relationships = [];
-        for (const item of result.items) {
-          const props = item as Record<string, unknown>;
-          const kind = props['__kind'];
-          if (kind === 'v') {
-            entities.push(projectStoredEntity(entityFromGremlin(props)));
-          } else if (kind === 'e') {
-            relationships.push(projectStoredRelationship(relationshipFromGremlin(props)));
-          }
-          // Rows without a recognised marker are skipped defensively.
-        }
-      } else {
-        // 'path' — Gremlin Path objects: { objects: [vertex|edge, ...] }
-        // where each object is a projected Map carrying an explicit `__kind`
-        // discriminator ('v' or 'e'). One TraversalPath per path, no dedup
-        // across paths (distinct walks are the answer).
-        //
-        // Direction per edge is computed during the walk using a lastVertexId
-        // cursor: 'outbound' when the walk crossed source → target, 'inbound'
-        // when it crossed target → source. The outer `relationships` array
-        // dedups by rel id and stamps the first-seen direction (matches the
-        // in-memory provider's first-writer-wins semantic).
-        const entityMap = new Map<string, StoredEntity>();
-        const relMap = new Map<string, StoredRelationship>();
-        const relFirstDirection = new Map<string, 'outbound' | 'inbound'>();
-        const pathRows: Array<{ entityIds: string[]; relIds: string[]; relDirections: Array<'outbound' | 'inbound'> }> = [];
-
-        for (const item of result.items) {
-          const pathData = item as { objects?: unknown[] };
-          if (!pathData.objects) continue;
-
-          const pathEntityIds: string[] = [];
-          const pathRelIds: string[] = [];
-          const pathRelDirections: Array<'outbound' | 'inbound'> = [];
-          let lastVertexId: string | null = null;
-
-          for (const obj of pathData.objects) {
-            const props = obj as Record<string, unknown>;
-            const kind = props['__kind'];
-            if (kind === 'v') {
-              const stored = entityFromGremlin(props);
-              entityMap.set(stored.id, stored);
-              pathEntityIds.push(stored.id);
-              lastVertexId = stored.id;
-            } else if (kind === 'e') {
-              const stored = relationshipFromGremlin(props);
-              relMap.set(stored.id, stored);
-              pathRelIds.push(stored.id);
-              const direction: 'outbound' | 'inbound' =
-                lastVertexId === stored.sourceEntityId ? 'outbound' : 'inbound';
-              pathRelDirections.push(direction);
-              if (!relFirstDirection.has(stored.id)) {
-                relFirstDirection.set(stored.id, direction);
-              }
-            }
-            // Objects without a recognised marker are skipped defensively.
-          }
-
-          pathRows.push({ entityIds: pathEntityIds, relIds: pathRelIds, relDirections: pathRelDirections });
-        }
-
-        paths = pathRows.map((row) => ({
-          length: Math.max(row.entityIds.length - 1, 0),
-          entities: row.entityIds.map((id) => {
-            const stored = entityMap.get(id);
-            if (!stored) {
-              throw new ProviderError(
-                'Unpacking Gremlin path: entity referenced by path is missing from the result',
-                'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
-              );
-            }
-            return projectStoredEntity(stored);
-          }),
-          relationships: row.relIds.map((id, i) => {
-            const stored = relMap.get(id);
-            if (!stored) {
-              throw new ProviderError(
-                'Unpacking Gremlin path: relationship referenced by path is missing from the result',
-                'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
-              );
-            }
-            return projectStoredRelationship(stored, row.relDirections[i]!);
-          }),
-        }));
-        // Mirror in-memory: outer `relationships` for 'path' is the flat union
-        // of per-path edges, each carrying the direction from the first walk
-        // that produced it.
-        relationships = Array.from(relMap.values()).map((rel) =>
-          projectStoredRelationship(rel, relFirstDirection.get(rel.id) ?? 'outbound'),
-        );
-      }
-
-      const limit = spec.limit ?? 50;
-      // 'all' mode returns an interleaved entity+edge union — total must count
-      // both so callers see the true page size (Phase 6 fix for issue I).
-      let total: number;
-      if (spec.returnMode === 'path') {
-        total = paths?.length ?? 0;
-      } else if (spec.returnMode === 'all') {
-        total = entities.length + (relationships?.length ?? 0);
-      } else {
-        total = entities.length;
-      }
-
-      const queryMetadata: QueryMetadata = {
-        executionTimeMs,
-        resourceCost: result.requestCharge != null
-          ? { units: 'RU', value: result.requestCharge }
-          : undefined,
-        compiledQuery: scopedQuery,
-        compiledQueryLanguage: 'gremlin',
-        appliedLimits: {
-          maxResults: limit,
-          maxDepth: spec.steps?.length,
-        },
-        truncated: total >= limit,
-        truncationReason: total >= limit ? 'result_limit' : undefined,
-      };
-
-      return {
-        entities,
-        relationships,
-        paths,
-        total,
-        returned: total,
-        hasMore: total >= limit,
-        queryMetadata,
-      };
+      result = await this.conn.submit(scopedQuery, scopedParams);
     } catch (err: unknown) {
       throw new ProviderError(
         `Gremlin traversal failed: ${err instanceof Error ? err.message : String(err)}`,
         'Check the traversal spec and ensure the CosmosDB connection is healthy.',
       );
     }
+    const executionTimeMs = Date.now() - startTime;
+
+    const raw: RawTraversalResult = {
+      terminalEntities: [],
+      allEntities: [],
+      allRelationships: [],
+      pathRows: [],
+      entityMap: new Map(),
+      relationshipMap: new Map(),
+      pathRelFirstDirection: new Map(),
+      executionTimeMs,
+      requestCharge: result.requestCharge,
+      compiledQuery: scopedQuery,
+    };
+
+    if (spec.returnMode === 'terminal') {
+      // Flat projected vertex rows — one per row.
+      for (const item of result.items) {
+        const stored = entityFromGremlin(item as Record<string, unknown>);
+        raw.terminalEntities.push(stored);
+      }
+    } else if (spec.returnMode === 'all') {
+      // Flat stream of vertex AND edge projected Maps, already server-deduped
+      // by id. Each row carries the synthetic `__kind` discriminator from the
+      // compiler's per-branch project chain ('v' = vertex, 'e' = edge).
+      for (const item of result.items) {
+        const props = item as Record<string, unknown>;
+        const kind = props['__kind'];
+        if (kind === 'v') {
+          const stored = entityFromGremlin(props);
+          raw.allEntities.push(stored);
+          raw.entityMap.set(stored.id, stored);
+        } else if (kind === 'e') {
+          const stored = relationshipFromGremlin(props);
+          raw.allRelationships.push(stored);
+          raw.relationshipMap.set(stored.id, stored);
+        }
+        // Rows without a recognised marker are skipped defensively.
+      }
+    } else {
+      // 'path' — Gremlin Path objects: { objects: [vertex|edge, ...] }
+      // where each object is a projected Map with a `__kind` discriminator.
+      //
+      // Direction per edge is computed during the walk using a lastVertexId
+      // cursor: 'outbound' when the walk crossed source → target, 'inbound'
+      // when it crossed target → source.
+      for (const item of result.items) {
+        const pathData = item as { objects?: unknown[] };
+        if (!pathData.objects) continue;
+
+        const pathEntityIds: string[] = [];
+        const pathRelIds: string[] = [];
+        const pathRelDirections: Array<'outbound' | 'inbound'> = [];
+        let lastVertexId: string | null = null;
+
+        for (const obj of pathData.objects) {
+          const props = obj as Record<string, unknown>;
+          const kind = props['__kind'];
+          if (kind === 'v') {
+            const stored = entityFromGremlin(props);
+            raw.entityMap.set(stored.id, stored);
+            pathEntityIds.push(stored.id);
+            lastVertexId = stored.id;
+          } else if (kind === 'e') {
+            const stored = relationshipFromGremlin(props);
+            raw.relationshipMap.set(stored.id, stored);
+            pathRelIds.push(stored.id);
+            const direction: 'outbound' | 'inbound' =
+              lastVertexId === stored.sourceEntityId ? 'outbound' : 'inbound';
+            pathRelDirections.push(direction);
+            if (!raw.pathRelFirstDirection.has(stored.id)) {
+              raw.pathRelFirstDirection.set(stored.id, direction);
+            }
+          }
+          // Objects without a recognised marker are skipped defensively.
+        }
+
+        raw.pathRows.push({
+          entityIds: pathEntityIds,
+          relationshipIds: pathRelIds,
+          relationshipDirections: pathRelDirections,
+        });
+      }
+    }
+
+    return raw;
   }
 
   /**
@@ -948,6 +1304,32 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 function unwrapGremlinValue(val: unknown): unknown {
   if (Array.isArray(val) && val.length > 0) return val[0];
   return val;
+}
+
+/**
+ * Build the per-step TraversalSpec steps for the Phase 4
+ * exploreNeighborhood rewrite at a given cumulative depth.
+ *
+ * Server-side step direction is fixed to `'both'` (catches every edge in
+ * either direction). The directional + bidirectional filter and entity-type
+ * filter run client-side during layer reconstruction — both because the
+ * compiler does not express the `union(outE, inE.has(bidirectional))` shape
+ * and because entity-type filtering at intermediate hops is non-propagating
+ * in the compiler's `'all'` emission (the prefix walks unfiltered vertices).
+ *
+ * relationshipTypes IS pushed to the server because the compiler emits it as
+ * `bothE(t1, t2, ...)`, which IS part of the prefix walk at every depth.
+ */
+function buildExploreSteps(depth: number, options: StorageExploreOptions): TraversalStep[] {
+  const base: TraversalStep = { direction: 'both' };
+  if (options.relationshipTypes && options.relationshipTypes.length > 0) {
+    base.relationshipTypes = options.relationshipTypes;
+  }
+  const steps: TraversalStep[] = [];
+  for (let i = 0; i < depth; i++) {
+    steps.push({ ...base });
+  }
+  return steps;
 }
 
 // ─── CosmosDB REST API helpers for database/container provisioning ──

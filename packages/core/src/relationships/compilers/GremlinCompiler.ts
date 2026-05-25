@@ -288,6 +288,19 @@ export class GremlinCompiler implements TraversalCompiler {
         parts.push('.dedup()');
       }
 
+      // Cycle prevention: 'path' mode always emits .simplePath(). A "path" in
+      // graph terms has no repeated vertices; without this, a repeat() walk
+      // emits walks-with-cycles (A→B→A→B…) that inflate the result set
+      // O(fanout^maxDepth) and are not paths in any sensible sense. simplePath()
+      // must be placed BEFORE .path() so it filters traversers; placed after,
+      // it would (incorrectly) operate on the collected Path objects. Live-
+      // probed against the Cosmos emulator 2026-05-25 — see
+      // docs/cosmosdb-gremlin-compatibility.md §Repeat/variable-depth.
+      // Not emitted for 'terminal' (no walk context) or 'all' (no path).
+      if (returnMode === 'path') {
+        parts.push('.simplePath()');
+      }
+
       // ─── Pagination ───────────────────────────────────────────
       const limit = spec.limit ?? 50;
       const offset = spec.offset ?? 0;
@@ -430,11 +443,20 @@ function compileRepeatStep(
     parts.push(`.until(${untilParts.join('')})`);
   }
 
-  // Max depth via times()
-  if (step.repeat?.maxDepth) {
-    const p = nextParam(step.repeat.maxDepth);
-    parts.push(`.times(${p})`);
+  // Max depth via times() — CosmosDB Gremlin does not accept a binding for
+  // times(); it must be a literal int. Validate the input is a positive
+  // integer before interpolating so the literal can't carry injected
+  // Gremlin syntax. `nextParam` is intentionally not used here. This
+  // function only runs when `step.repeat` is set (caller-checked), and
+  // `maxDepth` is required on the repeat object — so an unset value here
+  // would already be a type error upstream.
+  const n = step.repeat!.maxDepth;
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(
+      `GremlinCompiler: repeat.maxDepth must be a positive integer; got ${n}`,
+    );
   }
+  parts.push(`.times(${n})`);
 
   if (step.repeat?.emitIntermediates === false) {
     parts.push('.emit()');

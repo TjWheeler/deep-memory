@@ -113,7 +113,8 @@ Verified either by live probe (cited below) or by being in production code that 
 | `repeat(<traversal>).times(n)` | Bounded repeat. |
 | `repeat(<traversal>).until(<pred>)` | Conditional termination. |
 | `repeat(...).emit()` | Emit intermediate frontiers (`emit()` before `repeat` for intermediates, after for terminal-only). |
-| `simplePath()` | Cycle prevention via no-repeat-vertex. **Not yet probed** — used by Phase 4 (`findPaths` rewrite); validate before commit. |
+| `simplePath()` | Cycle prevention via no-repeat-vertex. **Verified working** — Phase 4 probe 2026-05-25. Placed **before** `.path()` so it filters traversers (not the collected Path objects). Composes cleanly with `.path().by(...).by(...)` two-by projection — the projection runs after the filter. Confirmed at depth 1 and depth 2; cycle-rejecting walks reduce the path count vs the same walk without it. Also composes with `.emit().repeat(...).times(N).simplePath().path()` for multi-length emission (see entry below). |
+| `.emit().repeat(<step>).times(N).path()` | Emit a path at every iteration boundary (length 0, 1, …, N). **Verified working** — Phase 4 probe 2026-05-25. Used by `findPaths` to surface paths of any length up to `maxDepth` in one round-trip — replaces the previous N-deep BFS that issued K-per-frontier-vertex queries per layer. Composes with `.simplePath()` placed after `.times(N)`; cycles are filtered globally rather than per-iteration. The first emission (length 0, just the start vertex alone) is included; callers filter it out by checking the terminal vertex against the target. |
 
 ### Mutation
 
@@ -361,6 +362,7 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 | Operators in production use | [packages/storage-cosmosdb/src/queries/](../packages/storage-cosmosdb/src/queries/) — every Gremlin string in these files has been exercised against the emulator at least once via the test suite. |
 | Live shape probes — Phase 1 (2026-05-25) | `path()` two-by round-robin; `'all'` union per-branch project + `dedup().by(select('id'))`; `coalesce(values, constant)` for optional fields; failure modes of single-by mixed projection, `dedup().by('id')`, and bare `.by('optionalField')`. |
 | Live shape probes — Phase 3 (2026-05-25) | `hasId(x)` single-id and `hasId(within(x, y, z))` batch forms work on both `g.V()` and `g.E()` — drop-in replacements for the equivalent `has('id', ...)` shapes. |
+| Live shape probes — Phase 4 (2026-05-25) | `simplePath()` placed before `.path()` filters cycle-revisiting traversers in the CosmosDB Gremlin subset. Composes correctly with the Phase 1 two-by projection `.path().by(<vertexProject>).by(<edgeProject>)`. |
 | Performance catalogue | [plans/performance-issues.md](../plans/performance-issues.md) — 20 ranked RU/round-trip issues, drawn from code review and Cosmos documentation. |
 | Performance fixes plan | [plans/performance-fixes-2026-05-25.md](../plans/performance-fixes-2026-05-25.md) — phased plan that consumes this doc and adds findings back to it as each phase probes new shapes. |
 
@@ -369,7 +371,6 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 ## To-probe before next changes
 
 - `aggregate('bucket')` / `store('bucket')` with mixed vertex+edge objects in one bucket — Phase 5 (`'all'`-mode incremental walk).
-- `simplePath()` cycle prevention in the path query shape — Phase 4 (`findPaths` rewrite).
 - `choose(neq(sentinel), property(k, v), identity())` for the optional-property-skip pattern — Phase 10 (fixed-shape property ladders).
 - `T.id` vs bare `id` token as a by-modulator argument — empirically `id` works; `T.id` not yet tested.
 - `select('id')` behaviour on edges where the projected map has a discriminator-prefixed key (e.g. if we project `__id` instead of `id` to avoid colliding with Gremlin's `id` token).

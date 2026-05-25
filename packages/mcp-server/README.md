@@ -112,8 +112,9 @@ Environment variables passed via the MCP client's `env` block:
 | `DEEP_MEMORY_SQL_PASSWORD` | — | SQL Server password |
 | `DEEP_MEMORY_SQL_SCHEMA` | `dbo` | SQL Server schema |
 | `DEEP_MEMORY_SQL_TRUST_CERT` | `false` | Trust self-signed certificates (set `true` for local Docker) |
-| `DEEP_MEMORY_EMBEDDINGS_BASE_URL` | — | Embeddings API URL (enables semantic search) |
+| `DEEP_MEMORY_EMBEDDINGS_BASE_URL` | — | Embeddings API URL (enables semantic search). See [quickstart-embeddings.md](https://github.com/TjWheeler/deep-memory/blob/main/quickstart-embeddings.md) for provider-specific recipes. |
 | `DEEP_MEMORY_EMBEDDINGS_MODEL` | — | Embeddings model identifier |
+| `DEEP_MEMORY_EMBEDDINGS_DIMENSIONS` | auto-detected | Embedding vector dimensionality. Set only when the model supports configurable dimensions (e.g. OpenAI `text-embedding-3-*`). |
 | `DEEP_MEMORY_EMBEDDINGS_API_KEY` | — | API key for authenticated embeddings endpoints |
 
 ## Programmatic use

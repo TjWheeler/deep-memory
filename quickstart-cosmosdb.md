@@ -182,6 +182,7 @@ For Claude Desktop, you'll need the absolute path to `packages/mcp-server/dist/i
 ## What's next
 
 - **SQL Server instead.** [quickstart-sqlserver.md](quickstart-sqlserver.md) uses SQL Server with the bundled Docker compose — works on macOS/Linux/Windows.
+- **Enable semantic search.** [quickstart-embeddings.md](quickstart-embeddings.md) wires up an embeddings provider (bundled vLLM, OpenAI, Ollama, or Azure) so `memory_search_by_concept` works.
 - **Build your own graph.** [quickstart-indexer.md](quickstart-indexer.md) runs the indexing pipeline over your source documents.
 - **Provider reference.** [packages/storage-cosmosdb/README.md](packages/storage-cosmosdb/README.md) covers the data model, Gremlin capabilities, RU cost considerations, and the adaptive bulk-import controller.
 - **MCP tools.** [packages/mcp-server/README.md](packages/mcp-server/README.md) lists all 28 tools.

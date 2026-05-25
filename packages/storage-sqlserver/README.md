@@ -19,7 +19,7 @@ import { SqlServerStorageProvider } from '@utaba/deep-memory-storage-sqlserver';
 const provider = new SqlServerStorageProvider({
   connection: {
     server: 'localhost',
-    port: 1434,
+    port: 1435,
     database: 'deep-memory',
     user: 'sa',
     password: 'YourPassword',
@@ -50,7 +50,7 @@ await dm.ensureSchema();
 const provider = new SqlServerStorageProvider({
   connection: {
     server: 'localhost',
-    port: 1434,
+    port: 1435,
     database: 'deep-memory',
     user: 'sa',
     password: 'YourPassword',
@@ -65,7 +65,7 @@ const provider = new SqlServerStorageProvider({
 const provider = new SqlServerStorageProvider({
   connection: {
     connectionString:
-      'Server=localhost,1434;Database=deep-memory;User Id=sa;Password=YourPassword;TrustServerCertificate=true',
+      'Server=localhost,1435;Database=deep-memory;User Id=sa;Password=YourPassword;TrustServerCertificate=true',
   },
 });
 ```
@@ -280,7 +280,7 @@ All errors are typed using the `@utaba/deep-memory` error hierarchy:
 The conformance test suite requires a running SQL Server instance. Set the connection string via environment variable:
 
 ```bash
-MSSQL_CONNECTION_STRING="Server=localhost,1434;Database=deep-memory;User Id=sa;Password=YourPassword;TrustServerCertificate=true" \
+MSSQL_CONNECTION_STRING="Server=localhost,1435;Database=deep-memory;User Id=sa;Password=YourPassword;TrustServerCertificate=true" \
   pnpm --filter @utaba/deep-memory-storage-sqlserver test
 ```
 

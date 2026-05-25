@@ -105,7 +105,7 @@ The repository includes a `docker-compose.yml` that provisions the required serv
 docker compose up sqlserver -d
 ```
 
-This starts a SQL Server 2022 Developer Edition container on port **1434**. The database schema is created automatically when the MCP server connects for the first time.
+This starts a SQL Server 2022 Developer Edition container on port **1435**. The database schema is created automatically when the MCP server connects for the first time.
 
 If you have an NVIDIA GPU and want semantic search (concept search, vocabulary deduplication via embeddings), also start the embeddings service:
 
@@ -144,7 +144,7 @@ Add the following to your `.mcp.json` (project root or `~/.mcp.json` for global)
         "DEEP_MEMORY_ACTOR_TYPE": "agent",
         "DEEP_MEMORY_STORAGE": "sqlserver",
         "DEEP_MEMORY_SQL_HOST": "localhost",
-        "DEEP_MEMORY_SQL_PORT": "1434",
+        "DEEP_MEMORY_SQL_PORT": "1435",
         "DEEP_MEMORY_SQL_DATABASE": "deep-memory",
         "DEEP_MEMORY_SQL_USER": "sa",
         "DEEP_MEMORY_SQL_PASSWORD": "DeepMem@Dev1234",
@@ -174,8 +174,9 @@ Security Note: Consider changing the SQL Password in the config and the docker s
 | `DEEP_MEMORY_SQL_PASSWORD` | — | SQL Server password |
 | `DEEP_MEMORY_SQL_SCHEMA` | `dbo` | SQL Server schema |
 | `DEEP_MEMORY_SQL_TRUST_CERT` | `false` | Trust self-signed certificates (set `true` for local dev) |
-| `DEEP_MEMORY_EMBEDDINGS_BASE_URL` | — | Embeddings API URL (enables semantic search) |
+| `DEEP_MEMORY_EMBEDDINGS_BASE_URL` | — | Embeddings API URL (enables semantic search). See [quickstart-embeddings.md](quickstart-embeddings.md) for provider-specific recipes (vLLM, OpenAI, Ollama, Azure). |
 | `DEEP_MEMORY_EMBEDDINGS_MODEL` | — | Embeddings model identifier |
+| `DEEP_MEMORY_EMBEDDINGS_DIMENSIONS` | auto-detected | Embedding vector dimensionality. Set only when the model supports configurable dimensions (e.g. OpenAI `text-embedding-3-*`). |
 | `DEEP_MEMORY_EMBEDDINGS_API_KEY` | — | API key for authenticated embeddings endpoints |
 | `DEEP_MEMORY_EXPORT_DIR` | `./exports` | Directory for exported repository archives |
 

@@ -225,7 +225,14 @@ export interface TraversalResult {
    */
   aggregations?: TraversalAggregation[];
 
-  /** Total number of results matching the traversal (before limit/offset). */
+  /**
+   * Total number of results matching the traversal (before limit/offset).
+   *
+   * For `'all'` mode, the response is an interleaved union of entities AND
+   * relationships, and `total` counts both arrays' page-size combined
+   * (`entities.length + relationships.length`). Use `hasMore` to determine
+   * whether further pages exist.
+   */
   total: number;
 
   /** Number of results returned in this response. */
@@ -251,6 +258,20 @@ export interface TraversalRelationship {
   type: string;
   sourceEntityId: string;
   targetEntityId: string;
+  /**
+   * Walk direction at the last hop, with mode-specific semantics:
+   *
+   * - **`'path'` mode** — `'outbound'` when the walk crossed the edge from
+   *   `sourceEntityId` to `targetEntityId`, `'inbound'` when it crossed in
+   *   the opposite direction. Computed relative to the entity at the
+   *   start of the hop within each `TraversalPath`.
+   * - **`'all'` mode** — always `'outbound'`. Reflects the stored edge
+   *   topology (`sourceEntityId` → `targetEntityId`), not any particular
+   *   walk; the deduped union has no walk context. Callers can derive
+   *   walk-direction relative to any anchor using `sourceEntityId` /
+   *   `targetEntityId`.
+   * - **`'terminal'` mode** — relationships are not returned.
+   */
   direction: 'outbound' | 'inbound';
   properties: Record<string, unknown>;
 }

@@ -42,67 +42,121 @@ export class GremlinCompiler implements TraversalCompiler {
       }
     }
 
-    // ─── Steps ──────────────────────────────────────────────────
+    // ─── Mode-specific emission ─────────────────────────────────
 
     const steps = spec.steps ?? [];
-    for (const step of steps) {
-      if (step.repeat) {
-        parts.push(compileRepeatStep(step, nextParam));
-        estimatedFanOut *= step.repeat.maxDepth * DEFAULT_ESTIMATED_FANOUT_PER_HOP;
-      } else if (step.relationshipFilter && step.relationshipFilter.length > 0) {
-        // Edge-explicit traversal for relationship property filters
-        parts.push(compileEdgeStep(step, nextParam));
-        estimatedFanOut *= DEFAULT_ESTIMATED_FANOUT_PER_HOP;
-      } else {
-        parts.push(compileSimpleStep(step, nextParam));
+    const returnMode = spec.returnMode ?? 'terminal';
+
+    if (returnMode === 'all') {
+      // Server-side union of every depth's edges and vertices, then dedup.
+      // Each unique element is serialised once regardless of how many walks
+      // visit it — large RU saving vs path()+client-dedup at depth ≥ 2.
+      // See plan §3 (revised) for the construction.
+      if (steps.some((s) => s.repeat)) {
+        throw new Error(
+          "GremlinCompiler: 'all' returnMode does not support repeat steps. Use 'terminal' or 'path' mode, or unroll the repeat into explicit steps.",
+        );
+      }
+
+      // Pre-compile each step's edge and vertex strings ONCE so params are
+      // allocated once and shared across the branches that reference them.
+      const compiledSteps = steps.map((step) => ({
+        edge: compileEdgeOnly(step, nextParam),
+        vertex: compileVertexHop(step),
+        // Per plan §3: entity-type/property filters apply only on branches
+        // ending at that depth's vertex. They are NOT included in the prefix
+        // that deeper branches traverse through.
+        entityFilters: compileEntityFilters(step, nextParam),
+      }));
+
+      // Branches inside .union(...) are anonymous traversals — each must be
+      // rooted with `__` (TinkerPop's anonymous-traversal helper), not a
+      // leading-dot chain off the receiver. Same convention used by
+      // compileRepeatStep for .repeat() arguments.
+      const branches: string[] = ['__.identity()'];
+      let prefix = '';
+      for (const { edge, vertex, entityFilters } of compiledSteps) {
+        // Edge at depth i
+        branches.push(`__${prefix}${edge}`);
+        // Vertex at depth i, with this depth's entity filters applied
+        branches.push(`__${prefix}${edge}${vertex}${entityFilters}`);
+        // Deeper branches walk through the unfiltered vertex hop
+        prefix = `${prefix}${edge}${vertex}`;
         estimatedFanOut *= DEFAULT_ESTIMATED_FANOUT_PER_HOP;
       }
 
-      // Entity type filter on target vertices
-      if (step.entityTypes && step.entityTypes.length > 0) {
-        const typeParams = step.entityTypes.map((t) => nextParam(t));
-        parts.push(`.has('entityType', within(${typeParams.join(', ')}))`);
-      }
+      parts.push(`.union(${branches.join(', ')})`);
 
-      // Entity property filters on target vertices
-      if (step.entityFilter) {
-        for (const f of step.entityFilter) {
-          parts.push(compilePropertyFilter(f, nextParam));
+      // 'all' is inherently deduped by id — spec.dedup is ignored.
+      parts.push('.dedup()');
+
+      // ─── Pagination ───────────────────────────────────────────
+      const limit = spec.limit ?? 50;
+      const offset = spec.offset ?? 0;
+      const pOffset = nextParam(offset);
+      const pEnd = nextParam(offset + limit);
+      parts.push(`.range(${pOffset}, ${pEnd})`);
+      params['_limit'] = limit;
+      params['_offset'] = offset;
+
+      // Flat stream of vertex/edge property maps; provider splits by marker.
+      parts.push('.valueMap(true)');
+    } else {
+      // 'terminal' and 'path' share the step-loop emission, but differ in
+      // whether they use edge-explicit emission and in their projection.
+      const useEdgeEmission = returnMode === 'path';
+
+      for (const step of steps) {
+        if (step.repeat) {
+          parts.push(compileRepeatStep(step, nextParam, useEdgeEmission));
+          estimatedFanOut *= step.repeat.maxDepth * DEFAULT_ESTIMATED_FANOUT_PER_HOP;
+        } else if (useEdgeEmission || (step.relationshipFilter && step.relationshipFilter.length > 0)) {
+          // Edge-explicit traversal — required for path-walking, or for relationship property filters
+          parts.push(compileEdgeStep(step, nextParam));
+          estimatedFanOut *= DEFAULT_ESTIMATED_FANOUT_PER_HOP;
+        } else {
+          parts.push(compileSimpleStep(step, nextParam));
+          estimatedFanOut *= DEFAULT_ESTIMATED_FANOUT_PER_HOP;
+        }
+
+        // Entity type filter on target vertices
+        if (step.entityTypes && step.entityTypes.length > 0) {
+          const typeParams = step.entityTypes.map((t) => nextParam(t));
+          parts.push(`.has('entityType', within(${typeParams.join(', ')}))`);
+        }
+
+        // Entity property filters on target vertices
+        if (step.entityFilter) {
+          for (const f of step.entityFilter) {
+            parts.push(compilePropertyFilter(f, nextParam));
+          }
         }
       }
-    }
 
-    // ─── Return mode modifiers ──────────────────────────────────
+      // Dedup: 'terminal' honours spec.dedup. 'path' never dedups — paths are
+      // distinct walks by definition; collapsing them by terminal id throws
+      // away the answer.
+      if (returnMode === 'terminal' && spec.dedup !== false) {
+        parts.push('.dedup()');
+      }
 
-    if (spec.returnMode === 'all') {
-      // emit() at each step is handled within repeat; for non-repeat this is implicit
-    }
+      // ─── Pagination ───────────────────────────────────────────
+      const limit = spec.limit ?? 50;
+      const offset = spec.offset ?? 0;
+      const pOffset = nextParam(offset);
+      const pEnd = nextParam(offset + limit);
+      parts.push(`.range(${pOffset}, ${pEnd})`);
+      params['_limit'] = limit;
+      params['_offset'] = offset;
 
-    if (spec.dedup !== false) {
-      parts.push('.dedup()');
-    }
-
-    // ─── Pagination ─────────────────────────────────────────────
-
-    const limit = spec.limit ?? 50;
-    const offset = spec.offset ?? 0;
-    const pOffset = nextParam(offset);
-    const pEnd = nextParam(offset + limit);
-    parts.push(`.range(${pOffset}, ${pEnd})`);
-
-    params['_limit'] = limit;
-    params['_offset'] = offset;
-
-    // ─── Path mode ──────────────────────────────────────────────
-
-    if (spec.returnMode === 'path') {
-      parts.push('.path()');
-    }
-
-    // ─── Value projection ───────────────────────────────────────
-
-    if (spec.returnMode !== 'path') {
-      parts.push('.valueMap(true)');
+      // 'terminal': flat valueMap rows.
+      // 'path': path objects with every vertex AND edge projected as a
+      // valueMap so the provider can split objects[] into entities/relationships.
+      if (returnMode === 'terminal') {
+        parts.push('.valueMap(true)');
+      } else {
+        parts.push('.path().by(valueMap(true))');
+      }
     }
 
     return {
@@ -131,8 +185,8 @@ function compileSimpleStep(
   }
 }
 
-/** Compile an edge-explicit step for relationship property filtering. */
-function compileEdgeStep(
+/** Compile the edge portion of an edge-explicit step (no vertex hop). */
+function compileEdgeOnly(
   step: TraversalStep,
   nextParam: (value: unknown) => string,
 ): string {
@@ -140,7 +194,6 @@ function compileEdgeStep(
   const types = step.relationshipTypes;
   const typeArgs = types ? types.map((t) => nextParam(t)).join(', ') : '';
 
-  // Edge traversal
   switch (step.direction) {
     case 'out':
       parts.push(types ? `.outE(${typeArgs})` : '.outE()');
@@ -153,36 +206,64 @@ function compileEdgeStep(
       break;
   }
 
-  // Relationship property filters on the edge
   if (step.relationshipFilter) {
     for (const f of step.relationshipFilter) {
       parts.push(compilePropertyFilter(f, nextParam));
     }
   }
 
-  // Traverse to the target vertex
+  return parts.join('');
+}
+
+/** Compile the vertex-hop portion of an edge-explicit step. */
+function compileVertexHop(step: TraversalStep): string {
   switch (step.direction) {
     case 'out':
-      parts.push('.inV()');
-      break;
+      return '.inV()';
     case 'in':
-      parts.push('.outV()');
-      break;
+      return '.outV()';
     case 'both':
-      parts.push('.otherV()');
-      break;
+      return '.otherV()';
+  }
+}
+
+/** Compile entity-type and entity-property filters that apply to a target vertex. */
+function compileEntityFilters(
+  step: TraversalStep,
+  nextParam: (value: unknown) => string,
+): string {
+  const parts: string[] = [];
+
+  if (step.entityTypes && step.entityTypes.length > 0) {
+    const typeParams = step.entityTypes.map((t) => nextParam(t));
+    parts.push(`.has('entityType', within(${typeParams.join(', ')}))`);
+  }
+
+  if (step.entityFilter) {
+    for (const f of step.entityFilter) {
+      parts.push(compilePropertyFilter(f, nextParam));
+    }
   }
 
   return parts.join('');
+}
+
+/** Compile an edge-explicit step for relationship property filtering. */
+function compileEdgeStep(
+  step: TraversalStep,
+  nextParam: (value: unknown) => string,
+): string {
+  return compileEdgeOnly(step, nextParam) + compileVertexHop(step);
 }
 
 /** Compile a repeat/loop step. */
 function compileRepeatStep(
   step: TraversalStep,
   nextParam: (value: unknown) => string,
+  useEdgeEmission: boolean,
 ): string {
   const parts: string[] = [];
-  const innerStep = step.relationshipFilter?.length
+  const innerStep = (useEdgeEmission || step.relationshipFilter?.length)
     ? compileEdgeStep({ ...step, repeat: undefined }, nextParam)
     : compileSimpleStep(step, nextParam);
 

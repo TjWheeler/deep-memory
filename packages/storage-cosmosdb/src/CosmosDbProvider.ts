@@ -35,7 +35,7 @@ import crypto from 'node:crypto';
 import { GremlinCompiler, ProviderError, InvalidInputError, isValidUuid, projectEntity, createSafeSink } from '@utaba/deep-memory';
 import { CosmosDbConnection, usageScope } from './CosmosDbConnection.js';
 import type { UsageAccumulator } from './CosmosDbConnection.js';
-import { entityFromGremlin } from './mapping.js';
+import { entityFromGremlin, relationshipFromGremlin } from './mapping.js';
 import * as repoQueries from './queries/repository.js';
 import * as vocabQueries from './queries/vocabulary.js';
 import * as entityQueries from './queries/entity.js';
@@ -675,39 +675,155 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       // embeddings and any other internal fields at every level — the
       // projection contract never surfaces embeddings via traversal results.
       const detailLevel = spec.detailLevel ?? 'summary';
-      const entities: TraversalResult['entities'] = [];
-      const relationships: NonNullable<TraversalResult['relationships']> = [];
-      const paths: NonNullable<TraversalResult['paths']> = [];
 
-      if (spec.returnMode === 'path') {
-        for (const item of result.items) {
-          const pathData = item as { objects?: unknown[] };
-          if (pathData.objects) {
-            const pathEntities: TraversalResult['entities'] = [];
-            for (const obj of pathData.objects) {
-              const props = obj as Record<string, unknown>;
-              if (props['entityType']) {
-                const stored = entityFromGremlin(props);
-                pathEntities.push(projectEntity(stored, detailLevel) as TraversalResult['entities'][number]);
-              }
-            }
-            if (pathEntities.length > 0) {
-              paths.push({
-                length: pathEntities.length - 1,
-                entities: pathEntities,
-                relationships: [],
-              });
-            }
-          }
+      type ProjectedEntity = TraversalResult['entities'][number];
+      type ProjectedRelationship = NonNullable<TraversalResult['relationships']>[number];
+
+      const projectStoredEntity = (stored: StoredEntity): ProjectedEntity => {
+        const projected = projectEntity(stored, detailLevel) as ProjectedEntity;
+        if (!spec.includeProvenance) {
+          delete (projected as unknown as Record<string, unknown>)['provenance'];
         }
-      } else {
+        return projected;
+      };
+
+      // direction is mode-specific (Phase 7):
+      //   'all'  — always 'outbound' (stored topology; the deduped union has
+      //            no walk context). Callers derive walk direction relative
+      //            to any anchor via sourceEntityId / targetEntityId.
+      //   'path' — relative to the last hop within each walk; callers stamp
+      //            via the `direction` argument.
+      const projectStoredRelationship = (
+        rel: StoredRelationship,
+        direction: 'outbound' | 'inbound' = 'outbound',
+      ): ProjectedRelationship => ({
+        id: rel.id,
+        type: rel.relationshipType,
+        sourceEntityId: rel.sourceEntityId,
+        targetEntityId: rel.targetEntityId,
+        direction,
+        properties: rel.properties,
+      });
+
+      let entities: ProjectedEntity[] = [];
+      let relationships: ProjectedRelationship[] | undefined;
+      let paths: NonNullable<TraversalResult['paths']> | undefined;
+
+      if (spec.returnMode === 'terminal') {
+        // Flat valueMap(true) rows — one vertex per row.
         for (const item of result.items) {
           const stored = entityFromGremlin(item as Record<string, unknown>);
-          entities.push(projectEntity(stored, detailLevel) as TraversalResult['entities'][number]);
+          entities.push(projectStoredEntity(stored));
         }
+        relationships = undefined;
+      } else if (spec.returnMode === 'all') {
+        // Flat stream of unique vertex AND edge valueMaps — the union+dedup
+        // query already deduped server-side, so no id-keyed Map needed here.
+        // Vertices carry `entityType`; edges carry `relationshipType`.
+        // direction defaults to 'outbound' (stored topology) per the Phase 7
+        // contract — the deduped union carries no walk context.
+        relationships = [];
+        for (const item of result.items) {
+          const props = item as Record<string, unknown>;
+          if (props['entityType'] != null) {
+            entities.push(projectStoredEntity(entityFromGremlin(props)));
+          } else if (props['relationshipType'] != null) {
+            relationships.push(projectStoredRelationship(relationshipFromGremlin(props)));
+          }
+          // Objects with neither marker are skipped defensively.
+        }
+      } else {
+        // 'path' — Gremlin Path objects: { objects: [vertex|edge, ...] }
+        // where each object is a flat valueMap distinguishable by entityType
+        // (vertex) vs relationshipType (edge). One TraversalPath per path,
+        // no dedup across paths (distinct walks are the answer).
+        //
+        // Direction per edge is computed during the walk using a lastVertexId
+        // cursor: 'outbound' when the walk crossed source → target, 'inbound'
+        // when it crossed target → source. The outer `relationships` array
+        // dedups by rel id and stamps the first-seen direction (matches the
+        // in-memory provider's first-writer-wins semantic).
+        const entityMap = new Map<string, StoredEntity>();
+        const relMap = new Map<string, StoredRelationship>();
+        const relFirstDirection = new Map<string, 'outbound' | 'inbound'>();
+        const pathRows: Array<{ entityIds: string[]; relIds: string[]; relDirections: Array<'outbound' | 'inbound'> }> = [];
+
+        for (const item of result.items) {
+          const pathData = item as { objects?: unknown[] };
+          if (!pathData.objects) continue;
+
+          const pathEntityIds: string[] = [];
+          const pathRelIds: string[] = [];
+          const pathRelDirections: Array<'outbound' | 'inbound'> = [];
+          let lastVertexId: string | null = null;
+
+          for (const obj of pathData.objects) {
+            const props = obj as Record<string, unknown>;
+            if (props['entityType'] != null) {
+              const stored = entityFromGremlin(props);
+              entityMap.set(stored.id, stored);
+              pathEntityIds.push(stored.id);
+              lastVertexId = stored.id;
+            } else if (props['relationshipType'] != null) {
+              const stored = relationshipFromGremlin(props);
+              relMap.set(stored.id, stored);
+              pathRelIds.push(stored.id);
+              const direction: 'outbound' | 'inbound' =
+                lastVertexId === stored.sourceEntityId ? 'outbound' : 'inbound';
+              pathRelDirections.push(direction);
+              if (!relFirstDirection.has(stored.id)) {
+                relFirstDirection.set(stored.id, direction);
+              }
+            }
+            // Objects with neither marker are skipped defensively.
+          }
+
+          pathRows.push({ entityIds: pathEntityIds, relIds: pathRelIds, relDirections: pathRelDirections });
+        }
+
+        paths = pathRows.map((row) => ({
+          length: Math.max(row.entityIds.length - 1, 0),
+          entities: row.entityIds.map((id) => {
+            const stored = entityMap.get(id);
+            if (!stored) {
+              throw new ProviderError(
+                'Unpacking Gremlin path: entity referenced by path is missing from the result',
+                'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+              );
+            }
+            return projectStoredEntity(stored);
+          }),
+          relationships: row.relIds.map((id, i) => {
+            const stored = relMap.get(id);
+            if (!stored) {
+              throw new ProviderError(
+                'Unpacking Gremlin path: relationship referenced by path is missing from the result',
+                'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+              );
+            }
+            return projectStoredRelationship(stored, row.relDirections[i]!);
+          }),
+        }));
+        // Mirror in-memory: outer `relationships` for 'path' is the flat union
+        // of per-path edges, each carrying the direction from the first walk
+        // that produced it.
+        relationships = Array.from(relMap.values()).map((rel) =>
+          projectStoredRelationship(rel, relFirstDirection.get(rel.id) ?? 'outbound'),
+        );
       }
 
       const limit = spec.limit ?? 50;
+      // 'all' mode returns an interleaved entity+edge union — total must count
+      // both so callers see the true page size (Phase 6 fix for issue I).
+      let total: number;
+      if (spec.returnMode === 'path') {
+        total = paths?.length ?? 0;
+      } else if (spec.returnMode === 'all') {
+        total = entities.length + (relationships?.length ?? 0);
+      } else {
+        total = entities.length;
+      }
+
       const queryMetadata: QueryMetadata = {
         executionTimeMs,
         resourceCost: result.requestCharge != null
@@ -719,17 +835,17 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
           maxResults: limit,
           maxDepth: spec.steps?.length,
         },
-        truncated: entities.length >= limit,
-        truncationReason: entities.length >= limit ? 'result_limit' : undefined,
+        truncated: total >= limit,
+        truncationReason: total >= limit ? 'result_limit' : undefined,
       };
 
       return {
-        entities: spec.returnMode === 'path' ? [] : entities,
-        relationships: spec.returnMode === 'path' || spec.returnMode === 'all' ? relationships : undefined,
-        paths: spec.returnMode === 'path' ? paths : undefined,
-        total: entities.length + paths.length,
-        returned: entities.length + paths.length,
-        hasMore: entities.length >= limit || paths.length >= limit,
+        entities,
+        relationships,
+        paths,
+        total,
+        returned: total,
+        hasMore: total >= limit,
         queryMetadata,
       };
     } catch (err: unknown) {

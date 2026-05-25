@@ -188,4 +188,82 @@ describe('GremlinCompiler', () => {
     const result = compiler.compile(spec, emptyVocab);
     expect(result.estimatedFanOut).toBeLessThanOrEqual(10000);
   });
+
+  // ─── 'all' mode — union + server-side dedup (Phase 2/3 revised) ──
+
+  it("compiles 'all' mode as a union of every depth's edges and vertices", () => {
+    const spec: TraversalSpec = {
+      start: { entityType: 'Identity' },
+      steps: [
+        { direction: 'out', relationshipTypes: ['IS_IDENTITY_FOR'] },
+        { direction: 'out', relationshipTypes: ['WORKS_AT'] },
+      ],
+      returnMode: 'all',
+      dedup: false,
+    };
+    const result = compiler.compile(spec, emptyVocab);
+
+    // Each branch is an anonymous traversal rooted with __.
+    expect(result.query).toContain('.union(');
+    expect(result.query).toContain('__.identity()');
+    expect(result.query).toMatch(/__\.outE\(p\d+\)/);
+    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)/);
+    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)/);
+    expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)\.inV\(\)/);
+
+    // 'all' is inherently deduped server-side, spec.dedup is ignored.
+    expect(result.query).toContain('.dedup()');
+
+    // Flat valueMap projection — not path().by(...).
+    expect(result.query).toContain('.valueMap(true)');
+    expect(result.query).not.toContain('.path()');
+  });
+
+  it("compiles 'all' mode with .dedup() even when spec.dedup is false", () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out', relationshipTypes: ['HAS_COMPONENT'] }],
+      returnMode: 'all',
+      dedup: false,
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    expect(result.query).toContain('.dedup()');
+  });
+
+  it("throws on 'all' mode with repeat steps (documented limitation)", () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out', relationshipTypes: ['CONTAINS'], repeat: { maxDepth: 3 } }],
+      returnMode: 'all',
+    };
+    expect(() => compiler.compile(spec, emptyVocab)).toThrow(/repeat/);
+  });
+
+  // ─── 'path' mode — edge-explicit + path().by(valueMap(true)), no dedup ──
+
+  it("compiles 'path' mode with edge-explicit emission and .path().by(valueMap(true))", () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [
+        { direction: 'out', relationshipTypes: ['IS_IDENTITY_FOR'] },
+        { direction: 'out', relationshipTypes: ['WORKS_AT'] },
+      ],
+      returnMode: 'path',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    expect(result.query).toContain('.outE(');
+    expect(result.query).toContain('.inV()');
+    expect(result.query).toContain('.path().by(valueMap(true))');
+  });
+
+  it("never emits .dedup() in 'path' mode, even when spec.dedup is true", () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out', relationshipTypes: ['WORKS_AT'] }],
+      returnMode: 'path',
+      dedup: true,
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    expect(result.query).not.toContain('.dedup()');
+  });
 });

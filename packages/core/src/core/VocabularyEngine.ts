@@ -206,10 +206,17 @@ export class VocabularyEngine {
     return this.proposeChange(proposal, proposedBy);
   }
 
-  /** Cascade-delete all data for a deleted vocabulary type */
+  /**
+   * Cascade-delete all data for a deleted vocabulary type.
+   *
+   * `deletedRelationships` may be `undefined` when the underlying provider
+   * does not count cascaded edges (see StorageProvider.deleteEntitiesByType).
+   * The return value is currently discarded by the only caller; the type is
+   * preserved for symmetry with the storage contract.
+   */
   private async cascadeDeleteData(
     proposal: VocabularyProposal,
-  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+  ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
     if (proposal.proposalType === 'delete_entity_type' && proposal.deleteEntityType) {
       return this.storage.deleteEntitiesByType(
         this.repositoryId,

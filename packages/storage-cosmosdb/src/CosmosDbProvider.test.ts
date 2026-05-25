@@ -419,3 +419,143 @@ describe('Phase 6 single-round-trip create / update', () => {
     ).rejects.toBeInstanceOf(EntityNotFoundError);
   });
 });
+
+// ─── Phase 7 — single round-trip delete paths ────────────────────────
+//
+// The aggregate('found').by('id').drop().cap('found') pattern collapses the
+// previous existence-check + drop into one Gremlin round-trip per chunk. The
+// bucket emits a list of ids the drop actually touched; the caller derives
+// notFound = requestedIds - foundIds client-side.
+//
+// Shape verified live against the Cosmos emulator 2026-05-25 — see
+// local-tests/phase7-shape-probe.mjs.
+
+describe('Phase 7 single-round-trip delete paths', () => {
+  const ENTITY_A = '40000000-0000-4000-a000-000000007001';
+  const ENTITY_B = '40000000-0000-4000-a000-000000007002';
+  const ENTITY_MISSING = '40000000-0000-4000-a000-000000007999';
+
+  it('deleteEntities issues exactly one storage call per chunk on success', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes("aggregate('found')") && query.startsWith('g.V().')) {
+        // Bucket emits the matched ids; ENTITY_MISSING is filtered out by the
+        // partition+id predicate on the server.
+        return { items: [[ENTITY_A, ENTITY_B]] };
+      }
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    const result = await provider.deleteEntities(TEST_REPO, [ENTITY_A, ENTITY_B, ENTITY_MISSING]);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    expect(result.deleted).toEqual([ENTITY_A, ENTITY_B]);
+    expect(result.notFound).toEqual([ENTITY_MISSING]);
+
+    const issued = stub.calls[stub.calls.length - 1]!;
+    expect(issued.query).toContain("aggregate('found').by('id')");
+    expect(issued.query).toContain('.drop()');
+    expect(issued.query).toContain(".cap('found')");
+    expect(issued.query).not.toContain('.values(');
+  });
+
+  it('deleteEntities returns all ids as notFound when the bucket is empty', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes("aggregate('found')") && query.startsWith('g.V().')) {
+        return { items: [[]] };
+      }
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    const result = await provider.deleteEntities(TEST_REPO, [ENTITY_MISSING]);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    expect(result.deleted).toEqual([]);
+    expect(result.notFound).toEqual([ENTITY_MISSING]);
+  });
+
+  it('deleteRelationships issues exactly one storage call per chunk and splits deleted/notFound', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_A = '40000000-0000-4000-a000-000000007010';
+    const REL_B = '40000000-0000-4000-a000-000000007011';
+    const REL_MISSING = '40000000-0000-4000-a000-000000007099';
+
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes("aggregate('found')") && query.startsWith('g.E().')) {
+        return { items: [[REL_A, REL_B]] };
+      }
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    const result = await provider.deleteRelationships(TEST_REPO, [REL_A, REL_B, REL_MISSING]);
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    expect(result.deleted).toEqual([REL_A, REL_B]);
+    expect(result.notFound).toEqual([REL_MISSING]);
+
+    const issued = stub.calls[stub.calls.length - 1]!;
+    expect(issued.query).toContain("aggregate('found').by('id')");
+    expect(issued.query).toContain('.drop()');
+    expect(issued.query).toContain(".cap('found')");
+  });
+
+  it('deleteEntitiesByType issues one storage call and reports deletedRelationships as undefined', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes("aggregate('found')") && query.includes("has('entityType', etype)")) {
+        return { items: [[ENTITY_A, ENTITY_B]] };
+      }
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    const result = await provider.deleteEntitiesByType(TEST_REPO, 'Person');
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    expect(result.deletedEntities).toBe(2);
+    expect(result.deletedRelationships).toBeUndefined();
+
+    const issued = stub.calls[stub.calls.length - 1]!;
+    expect(issued.query).not.toContain('.count()');
+    expect(issued.query).not.toContain('bothE()');
+    expect(issued.query).toContain("aggregate('found').by('id')");
+  });
+
+  it('deleteRelationshipsByType issues one storage call and returns the bucket count', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_X = '40000000-0000-4000-a000-000000007020';
+    const REL_Y = '40000000-0000-4000-a000-000000007021';
+    const REL_Z = '40000000-0000-4000-a000-000000007022';
+
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes("aggregate('found')") && query.startsWith('g.E().')) {
+        return { items: [[REL_X, REL_Y, REL_Z]] };
+      }
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    const result = await provider.deleteRelationshipsByType(TEST_REPO, 'KNOWS');
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    expect(result.deletedRelationships).toBe(3);
+
+    const issued = stub.calls[stub.calls.length - 1]!;
+    expect(issued.query).not.toContain('.count()');
+    expect(issued.query).toContain("aggregate('found').by('id')");
+  });
+});

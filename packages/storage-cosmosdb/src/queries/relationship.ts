@@ -171,23 +171,23 @@ export async function deleteRelationship(
 }
 
 
+/**
+ * Phase 7: collapse the count + drop into a single round-trip via the
+ * aggregate-side-effect pattern. The bucket records the edge ids that were
+ * actually dropped, giving an exact `deletedRelationships` count without the
+ * separate count query.
+ */
 export async function deleteRelationshipsByType(
   conn: CosmosDbConnection,
   repositoryId: string,
   relationshipType: string,
 ): Promise<{ deletedRelationships: number }> {
-  const countResult = await conn.submit(
-    "g.E().has('repositoryId', rid).hasLabel(rtype).count()",
+  const result = await conn.submit(
+    "g.E().has('repositoryId', rid).hasLabel(rtype)" +
+      ".aggregate('found').by('id').drop().cap('found')",
     { rid: repositoryId, rtype: relationshipType },
   );
-  const deletedRelationships = Number(countResult.items[0] ?? 0);
-
-  if (deletedRelationships > 0) {
-    await conn.submit(
-      "g.E().has('repositoryId', rid).hasLabel(rtype).drop()",
-      { rid: repositoryId, rtype: relationshipType },
-    );
-  }
-
+  const bucket = result.items[0];
+  const deletedRelationships = Array.isArray(bucket) ? bucket.length : 0;
   return { deletedRelationships };
 }

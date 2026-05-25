@@ -141,11 +141,19 @@ export interface StorageProvider {
     repositoryId: string,
     ids: string[],
   ): Promise<{ deleted: string[]; notFound: string[] }>;
-  /** Delete all entities of a given type and their associated relationships */
+  /**
+   * Delete all entities of a given type and their associated relationships.
+   *
+   * `deletedRelationships` may be `undefined` when the provider does not count
+   * cascaded edges. The CosmosDB provider skips the edge-count fan-out
+   * (a `bothE()` walk across every partition the type touches) because the
+   * count itself is rarely consumed — vocabulary cascade-delete discards it.
+   * SQL Server and in-memory providers continue to return the exact number.
+   */
   deleteEntitiesByType(
     repositoryId: string,
     entityType: string,
-  ): Promise<{ deletedEntities: number; deletedRelationships: number }>;
+  ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }>;
   findEntities(
     repositoryId: string,
     query: StorageFindQuery,

@@ -479,6 +479,19 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return this.track('deleteEntities', repositoryId, () => this.deleteEntitiesImpl(repositoryId, ids));
   }
 
+  /**
+   * Phase 7: collapse the per-chunk existence-check + drop into a single
+   * round-trip via the aggregate-side-effect pattern.
+   *
+   *   g.V()...hasId(within(...)).has('entityType')
+   *     .aggregate('found').by('id')   // collects the ids that match
+   *     .drop()                         // drops the vertices (and cascaded edges)
+   *     .cap('found')                   // emits the bucket as the single result
+   *
+   * The bucket is always emitted as a single list item — empty when nothing
+   * matched (probe-verified 2026-05-25, local-tests/phase7-shape-probe.mjs).
+   * `notFound` is derived client-side as the set difference.
+   */
   private async deleteEntitiesImpl(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
     const deleted: string[] = [];
     const CHUNK = 100;
@@ -486,7 +499,6 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     for (let i = 0; i < ids.length; i += CHUNK) {
       const chunk = ids.slice(i, i + CHUNK);
 
-      // Find which vertex IDs actually exist using P.within
       const bindings: Record<string, unknown> = { rid: repositoryId };
       const idParams: string[] = [];
       for (let j = 0; j < chunk.length; j++) {
@@ -494,28 +506,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         bindings[p] = chunk[j];
         idParams.push(p);
       }
-      const withinExpr = `P.within(${idParams.join(', ')})`;
-      const existResult = await this.conn.submit(
-        `g.V().has('repositoryId', rid).hasId(${withinExpr}).has('entityType').values('id')`,
+      const withinExpr = `within(${idParams.join(', ')})`;
+      const result = await this.conn.submit(
+        `g.V().has('repositoryId', rid).hasId(${withinExpr}).has('entityType')` +
+          `.aggregate('found').by('id').drop().cap('found')`,
         bindings,
       );
-      const found = existResult.items as string[];
-
-      if (found.length > 0) {
-        // Drop vertices — Gremlin drop() automatically cascades to connected edges
-        const dropBindings: Record<string, unknown> = { rid: repositoryId };
-        const dropIdParams: string[] = [];
-        for (let j = 0; j < found.length; j++) {
-          const p = `did${j}`;
-          dropBindings[p] = found[j];
-          dropIdParams.push(p);
-        }
-        const dropWithinExpr = `P.within(${dropIdParams.join(', ')})`;
-        await this.conn.submit(
-          `g.V().has('repositoryId', rid).hasId(${dropWithinExpr}).has('entityType').drop()`,
-          dropBindings,
-        );
-        deleted.push(...found);
+      const bucket = result.items[0];
+      if (Array.isArray(bucket)) {
+        deleted.push(...(bucket as string[]));
       }
     }
 
@@ -523,7 +522,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
   }
 
-  async deleteEntitiesByType(repositoryId: string, entityType: string): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+  async deleteEntitiesByType(repositoryId: string, entityType: string): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteEntitiesByType', repositoryId, () =>
       entityQueries.deleteEntitiesByType(this.conn, repositoryId, entityType),
@@ -573,6 +572,20 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return this.track('deleteRelationships', repositoryId, () => this.deleteRelationshipsImpl(repositoryId, ids));
   }
 
+  /**
+   * Phase 7: collapse the per-chunk existence-check + REST batch delete into a
+   * single Gremlin round-trip via the aggregate-side-effect pattern. Replaces
+   * the previous REST-API atomic batch delete path — Gremlin drop on edges is
+   * routed by the engine and the bucket gives back the exact ids that were
+   * actually dropped, so `notFound` can be derived client-side.
+   *
+   * Source-id partition routing is not exposed on this method (the public
+   * surface accepts only edge ids), so the lookup may fan out across
+   * partitions — see [docs/cosmosdb-gremlin-compatibility.md §`g.E().has`
+   * doesn't always push partition down]. Callers that already hold a
+   * StoredRelationship and want partition-scoped routing should add a
+   * dedicated method when the need is concrete.
+   */
   private async deleteRelationshipsImpl(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
     const deleted: string[] = [];
     const CHUNK = 100;
@@ -580,7 +593,6 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     for (let i = 0; i < ids.length; i += CHUNK) {
       const chunk = ids.slice(i, i + CHUNK);
 
-      // Build Gremlin P.within(...) query to find which IDs actually exist
       const bindings: Record<string, unknown> = { rid: repositoryId };
       const idParams: string[] = [];
       for (let j = 0; j < chunk.length; j++) {
@@ -588,24 +600,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         bindings[p] = chunk[j];
         idParams.push(p);
       }
-      const withinExpr = `P.within(${idParams.join(', ')})`;
-      const existResult = await this.conn.submit(
-        `g.E().has('repositoryId', rid).hasId(${withinExpr}).values('id')`,
+      const withinExpr = `within(${idParams.join(', ')})`;
+      const result = await this.conn.submit(
+        `g.E().has('repositoryId', rid).hasId(${withinExpr})` +
+          `.aggregate('found').by('id').drop().cap('found')`,
         bindings,
       );
-      const found = existResult.items as string[];
-
-      if (found.length > 0) {
-        await cosmosRestBatchDelete(
-          this.getRestEndpoint(),
-          this.config.key,
-          this.config.database,
-          this.config.container,
-          repositoryId,
-          found,
-          this.config.rejectUnauthorized ?? true,
-        );
-        deleted.push(...found);
+      const bucket = result.items[0];
+      if (Array.isArray(bucket)) {
+        deleted.push(...(bucket as string[]));
       }
     }
 
@@ -1395,49 +1398,4 @@ async function cosmosRestPut(
 
   const text = await response.text();
   throw new Error(`CosmosDB REST ${response.status}: ${text}`);
-}
-
-/**
- * Delete multiple CosmosDB documents in a single Transactional Batch request.
- * All documents must share the same partition key value (repositoryId).
- * Max 100 operations per batch — caller is responsible for chunking.
- */
-async function cosmosRestBatchDelete(
-  restBase: string,
-  key: string,
-  database: string,
-  container: string,
-  partitionKeyValue: string,
-  ids: string[],
-  rejectUnauthorized: boolean,
-): Promise<void> {
-  const resourceLink = `dbs/${database}/colls/${container}`;
-  const date = new Date().toUTCString();
-  const token = cosmosAuthToken('post', 'docs', resourceLink, date, key);
-
-  if (!rejectUnauthorized) {
-    process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
-  }
-
-  const ops = ids.map((id) => ({ operationType: 'Delete', id }));
-
-  const response = await fetch(`${restBase}/${resourceLink}/docs`, {
-    method: 'POST',
-    headers: {
-      'Authorization': token,
-      'x-ms-version': '2020-07-15',
-      'x-ms-date': date,
-      'Content-Type': 'application/json',
-      'x-ms-documentdb-partitionkey': JSON.stringify([partitionKeyValue]),
-      'x-ms-cosmos-is-batch-request': 'true',
-      'x-ms-cosmos-batch-atomic': 'true',
-    },
-    body: JSON.stringify(ops),
-  });
-
-  // 200 (non-atomic) or 207 (atomic) indicate the batch was processed
-  if (response.status !== 200 && response.status !== 207) {
-    const text = await response.text();
-    throw new ProviderError(`CosmosDB batch delete failed (${response.status}): ${text}`);
-  }
 }

@@ -186,34 +186,32 @@ export async function deleteEntity(
   );
 }
 
+/**
+ * Phase 7: collapse the 3-step (count entities + count edges via `bothE()`
+ * fan-out + drop) into a single round-trip via the aggregate-side-effect
+ * pattern. The bucket records the vertex ids that the drop touched, giving an
+ * exact entity count; the cascaded edge count is skipped because the
+ * `bothE().dedup().count()` it required walked every incident edge across
+ * every partition the type touches — and the value is currently discarded by
+ * the only caller (VocabularyEngine.cascadeDeleteData).
+ *
+ * Returns `deletedRelationships: undefined` to signal the field is genuinely
+ * unknown for this provider. SQL Server and in-memory providers continue to
+ * return the exact number (rowsAffected / iteration).
+ */
 export async function deleteEntitiesByType(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityType: string,
-): Promise<{ deletedEntities: number; deletedRelationships: number }> {
-  // Count entities of this type
-  const entityCountResult = await conn.submit(
-    "g.V().has('repositoryId', rid).has('entityType', etype).count()",
+): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
+  const result = await conn.submit(
+    "g.V().has('repositoryId', rid).has('entityType', etype)" +
+      ".aggregate('found').by('id').drop().cap('found')",
     { rid: repositoryId, etype: entityType },
   );
-  const deletedEntities = Number(entityCountResult.items[0] ?? 0);
-
-  // Count relationships connected to these entities
-  const relCountResult = await conn.submit(
-    "g.V().has('repositoryId', rid).has('entityType', etype).bothE().dedup().count()",
-    { rid: repositoryId, etype: entityType },
-  );
-  const deletedRelationships = Number(relCountResult.items[0] ?? 0);
-
-  // Drop the vertices (and their edges)
-  if (deletedEntities > 0) {
-    await conn.submit(
-      "g.V().has('repositoryId', rid).has('entityType', etype).drop()",
-      { rid: repositoryId, etype: entityType },
-    );
-  }
-
-  return { deletedEntities, deletedRelationships };
+  const bucket = result.items[0];
+  const deletedEntities = Array.isArray(bucket) ? bucket.length : 0;
+  return { deletedEntities, deletedRelationships: undefined };
 }
 
 export async function findEntities(

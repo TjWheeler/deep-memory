@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-storage-cosmosdb",
-  "version": "1.0.0",
+  "version": "0.17.0",
   "description": "CosmosDB Gremlin storage provider for @utaba/deep-memory",
   "type": "module",
   "main": "./dist/index.cjs",

@@ -1,3 +1,3 @@
 # @utaba/deep-memory
 
-## 1.0.0
+## 0.17.0

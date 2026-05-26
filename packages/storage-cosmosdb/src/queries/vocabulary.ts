@@ -75,23 +75,26 @@ export async function getVocabularyChangeLog(
   const limit = options?.limit ?? 10;
   const offset = options?.offset ?? 0;
 
-  const countResult = await conn.submit(
-    "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').count()",
-    { rid: repositoryId },
-  );
+  // Phase 9: parallel count + data. No property filters here, so the count
+  // is exact and `total` is always a number.
+  const [countResult, dataResult] = await Promise.all([
+    conn.submit(
+      "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').count()",
+      { rid: repositoryId },
+    ),
+    conn.submit(
+      "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').order().by('proposedAt', decr).range(rangeStart, rangeEnd).valueMap(true)",
+      { rid: repositoryId, rangeStart: offset, rangeEnd: offset + limit },
+    ),
+  ]);
+
   const total = Number(countResult.items[0] ?? 0);
-
-  const dataResult = await conn.submit(
-    "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').order().by('proposedAt', decr).range(rangeStart, rangeEnd).valueMap(true)",
-    { rid: repositoryId, rangeStart: offset, rangeEnd: offset + limit },
-  );
-
   const items = (dataResult.items as Record<string, unknown>[]).map(changeRecordFromGremlin);
 
   return {
     items,
     total,
-    hasMore: offset + limit < total,
+    hasMore: offset + items.length < total,
     limit,
     offset,
   };

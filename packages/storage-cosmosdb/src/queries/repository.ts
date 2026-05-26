@@ -103,33 +103,32 @@ export async function listRepositories(
   const limit = filter?.limit ?? 20;
   const offset = filter?.offset ?? 0;
 
-  let countQuery = "g.V().hasLabel('_repository')";
-  let dataQuery = "g.V().hasLabel('_repository')";
-  const bindings: Record<string, unknown> = {};
+  let baseQuery = "g.V().hasLabel('_repository')";
+  const baseBindings: Record<string, unknown> = {};
 
   if (filter?.type) {
-    countQuery += ".has('type', filterType)";
-    dataQuery += ".has('type', filterType)";
-    bindings['filterType'] = filter.type;
+    baseQuery += ".has('type', filterType)";
+    baseBindings['filterType'] = filter.type;
   }
 
-  const countResult = await conn.submit(`${countQuery}.count()`, bindings);
-  const total = Number(countResult.items[0] ?? 0);
-
+  // Phase 9: parallel count + data. Phase 11 will replace this whole
+  // function with a `_repository_index` sentinel-vertex read; in the meantime,
+  // running the two existing round-trips in parallel cuts wall-clock latency
+  // in half on a slow account.
   const projection = buildRepositoryProjectChain();
-  bindings['rangeStart'] = offset;
-  bindings['rangeEnd'] = offset + limit;
-  const dataResult = await conn.submit(
-    `${dataQuery}.range(rangeStart, rangeEnd).${projection}`,
-    bindings,
-  );
+  const dataBindings = { ...baseBindings, rangeStart: offset, rangeEnd: offset + limit };
+  const [countResult, dataResult] = await Promise.all([
+    conn.submit(`${baseQuery}.count()`, baseBindings),
+    conn.submit(`${baseQuery}.range(rangeStart, rangeEnd).${projection}`, dataBindings),
+  ]);
 
+  const total = Number(countResult.items[0] ?? 0);
   const items = (dataResult.items as Record<string, unknown>[]).map(repositorySummaryFromGremlin);
 
   return {
     items,
     total,
-    hasMore: offset + limit < total,
+    hasMore: offset + items.length < total,
     limit,
     offset,
   };

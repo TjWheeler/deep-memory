@@ -83,8 +83,10 @@ export async function getEntityRelationships(
   const limit = options?.limit ?? 50;
   const offset = options?.offset ?? 0;
   const direction = options?.direction ?? 'both';
+  const hasPropertyFilters =
+    options?.propertyFilters != null && options.propertyFilters.length > 0;
 
-  const bindings: Record<string, unknown> = {
+  const baseBindings: Record<string, unknown> = {
     rid: repositoryId,
     eid: entityId,
   };
@@ -110,7 +112,7 @@ export async function getEntityRelationships(
     const typeParams: string[] = [];
     options.relationshipTypes.forEach((t, i) => {
       const paramName = `rtype${i}`;
-      bindings[paramName] = t;
+      baseBindings[paramName] = t;
       typeParams.push(paramName);
     });
     typeFilter = `.hasLabel(${typeParams.join(', ')})`;
@@ -129,31 +131,37 @@ export async function getEntityRelationships(
   }
 
   const baseQuery = unionQuery ?? `${edgeTraversal}${typeFilter}`;
-
-  // Count
-  const countResult = await conn.submit(`${baseQuery}.dedup().count()`, bindings);
-  const total = Number(countResult.items[0] ?? 0);
-
-  // Data
   const projection = buildEdgeProjectChain();
-  bindings['rangeStart'] = offset;
-  bindings['rangeEnd'] = offset + limit;
-  const dataResult = await conn.submit(
-    `${baseQuery}.dedup().range(rangeStart, rangeEnd).${projection}`,
-    bindings,
-  );
 
-  let items = (dataResult.items as Record<string, unknown>[]).map(relationshipFromGremlin);
+  // Phase 9: parallel count + data. When `propertyFilters` is set the filter
+  // runs client-side after the fetch, so a server-side count would overstate
+  // the matched total — match the findEntities pattern and surface
+  // `total: undefined` in that case.
+  const dataBindings = { ...baseBindings, rangeStart: offset, rangeEnd: offset + limit };
+  const [countResult, dataResult] = await Promise.all([
+    hasPropertyFilters
+      ? Promise.resolve(null)
+      : conn.submit(`${baseQuery}.dedup().count()`, baseBindings),
+    conn.submit(
+      `${baseQuery}.dedup().range(rangeStart, rangeEnd).${projection}`,
+      dataBindings,
+    ),
+  ]);
 
-  // Post-filter by property filters
-  if (options?.propertyFilters && options.propertyFilters.length > 0) {
-    items = items.filter(rel => matchesPropertyFilters(rel.properties, options.propertyFilters!));
+  const rawItems = dataResult.items as Record<string, unknown>[];
+  let items = rawItems.map(relationshipFromGremlin);
+
+  if (hasPropertyFilters) {
+    items = items.filter(rel => matchesPropertyFilters(rel.properties, options!.propertyFilters!));
   }
+
+  const total = countResult ? Number(countResult.items[0] ?? 0) : undefined;
+  const hasMore = total != null ? offset + rawItems.length < total : rawItems.length === limit;
 
   return {
     items,
     total,
-    hasMore: offset + limit < total,
+    hasMore,
     limit,
     offset,
   };

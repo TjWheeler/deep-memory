@@ -135,12 +135,20 @@ export class SearchOrchestrator {
     // Embed the query
     const queryEmbedding = await this.embedding.embed(query);
 
-    // Get all entities (paginated scan — for production, a vector index would be used)
-    const allEntities = await this.storage.findEntities(this.repositoryId, {
-      entityTypes: options?.entityTypes,
-      limit: this.conceptSearchScanLimit,
-      offset: 0,
-    });
+    // Get all entities (paginated scan — for production, a vector index would be used).
+    // Vector-search is the one legitimate consumer of stored embeddings on read,
+    // so opt in via the storage `loadEmbeddings` option. Without it, providers
+    // that strip embeddings on the wire (e.g. CosmosDB) return no embeddings
+    // and the cosine path falls back to embedding entities on the fly.
+    const allEntities = await this.storage.findEntities(
+      this.repositoryId,
+      {
+        entityTypes: options?.entityTypes,
+        limit: this.conceptSearchScanLimit,
+        offset: 0,
+      },
+      { loadEmbeddings: true },
+    );
 
     // Score each entity against the query embedding
     const scored: ScoredEntity[] = [];

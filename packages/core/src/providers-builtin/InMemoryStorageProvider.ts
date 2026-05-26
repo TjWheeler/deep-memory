@@ -1,6 +1,6 @@
 // InMemoryStorageProvider — reference implementation of StorageProvider using Maps
 
-import type { StorageProvider } from '../providers/StorageProvider.js';
+import type { StorageProvider, EntityReadOptions } from '../providers/StorageProvider.js';
 import type {
   StoredEntity,
   StoredEntityUpdate,
@@ -241,12 +241,15 @@ export class InMemoryStorageProvider implements StorageProvider {
     return entity;
   }
 
-  async getEntity(repositoryId: string, entityId: string): Promise<StoredEntity | null> {
+  // The in-memory provider always carries the full entity (embedding and all).
+  // The `loadEmbeddings` option is accepted for interface symmetry but ignored —
+  // there is no light/full split to switch between when entities live in a Map.
+  async getEntity(repositoryId: string, entityId: string, _options?: EntityReadOptions): Promise<StoredEntity | null> {
     const store = this.getStore(repositoryId);
     return store.entities.get(entityId) ?? null;
   }
 
-  async getEntityBySlug(repositoryId: string, slug: string): Promise<StoredEntity | null> {
+  async getEntityBySlug(repositoryId: string, slug: string, _options?: EntityReadOptions): Promise<StoredEntity | null> {
     const store = this.getStore(repositoryId);
     const id = store.slugIndex.get(slug);
     if (!id) return null;
@@ -256,6 +259,7 @@ export class InMemoryStorageProvider implements StorageProvider {
   async getEntities(
     repositoryId: string,
     entityIds: string[],
+    _options?: EntityReadOptions,
   ): Promise<Map<string, StoredEntity>> {
     const store = this.getStore(repositoryId);
     const result = new Map<string, StoredEntity>();
@@ -355,6 +359,7 @@ export class InMemoryStorageProvider implements StorageProvider {
   async findEntities(
     repositoryId: string,
     query: StorageFindQuery,
+    _options?: EntityReadOptions,
   ): Promise<PaginatedResult<StoredEntity>> {
     const store = this.getStore(repositoryId);
     let matches = Array.from(store.entities.values());

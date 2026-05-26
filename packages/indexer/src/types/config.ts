@@ -65,18 +65,18 @@ export interface OrchestratorConfig {
   consolidation: ConsolidationConfig;
   /** Deep-memory configuration for the import phase */
   import: ImportConfig;
-  /** Validation configuration (Phase B.5 + Phase D checkpoints) */
+  /** Validation configuration (per-output Tier 1/2 validation + import-phase checkpoints) */
   validation?: ValidationConfig;
-  /** Full extraction validation configuration (Phase B.7 — LLM-powered per-entity/relationship validation) */
+  /** Full extraction validation configuration (LLM-powered per-entity/relationship validation) */
   fullValidation?: FullValidationConfig;
-  /** Embeddings configuration (Phase E — embed all entities after import) */
+  /** Embeddings configuration (embed all entities after import) */
   embeddings?: EmbeddingsConfig;
   /** Quality thresholds for review diagnostics — domain-specific acceptable error rates */
   qualityThresholds: QualityThresholds;
 }
 
 /**
- * Configuration for extraction workers (Phase B).
+ * Configuration for extraction workers.
  *
  * Backward-compatible: when `workers` is omitted, the top-level fields
  * (endpoint, model, concurrency, etc.) define a single default worker.
@@ -197,7 +197,7 @@ export interface WorkerConfig {
   llmProvider?: string;
 }
 
-/** Configuration for the consolidation Reasoning Agent (Phase C) */
+/** Configuration for the consolidation Reasoning Agent */
 export interface ConsolidationConfig {
   /** OpenAI-compatible endpoint URL (could be cloud or local) */
   endpoint: string;
@@ -209,7 +209,7 @@ export interface ConsolidationConfig {
   maxTokens?: number;
 }
 
-/** Configuration for the import phase (Phase D) */
+/** Configuration for the import phase */
 export interface ImportConfig {
   /** Deep-memory storage provider configuration */
   storage: StorageProviderConfig;
@@ -253,7 +253,7 @@ export interface EmbeddingsWorkerConfig {
   weight?: number;
 }
 
-/** Configuration for the embeddings phase (Phase E) */
+/** Configuration for the embeddings phase */
 export interface EmbeddingsConfig {
   /** OpenAI-compatible endpoint URL for the embeddings model */
   endpoint: string;

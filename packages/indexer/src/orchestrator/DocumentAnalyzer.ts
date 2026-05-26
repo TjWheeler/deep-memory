@@ -73,7 +73,7 @@ export interface AnalysisReport {
   };
   byWorker: Record<string, WorkerAnalysisSummary>;
   documents: DocumentAnalysis[];
-  /** Phase B.7 full validation cost estimate (present when fullValidation config is set and extraction data is available) */
+  /** Full extraction validation cost estimate (present when fullValidation config is set and extraction data is available) */
   validationEstimate?: ValidationCostEstimate;
 }
 
@@ -402,7 +402,7 @@ export function reassignFailedSource(
 }
 
 /**
- * Estimate the cost of Phase B.7 full validation.
+ * Estimate the cost of full extraction validation.
  *
  * Token estimates per item:
  * - Input: ~1,500 tokens (item data + source refs + ~2 tool calls at ~500 tokens each)

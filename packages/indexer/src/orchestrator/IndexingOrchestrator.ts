@@ -73,7 +73,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase A: Scan source documents, initialize state directory.
+   * Prepare: scan source documents, initialize state directory.
    * Idempotent — safe to call multiple times. Skips sources already in the list.
    */
   async prepare(sourceDir: string): Promise<IndexSourceList> {
@@ -143,7 +143,7 @@ export class IndexingOrchestrator {
     }
     await this.state.saveSourceList(sourceList);
 
-    // Add Phase B.7 validation cost estimate if fullValidation is configured
+    // Add full extraction validation cost estimate if fullValidation is configured
     if (this.config.fullValidation) {
       const extractions = await this.state.getExtractionOutputs();
       if (extractions.length > 0) {
@@ -163,7 +163,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase B: Run extraction workers in parallel.
+   * Extract: Run extraction workers in parallel.
    * Resumes from where it left off — skips sources with status >= 'extracted'.
    * Checks for stop signals between documents and cancels in-flight HTTP
    * requests via AbortController when any worker fails.
@@ -553,7 +553,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase B.6: Run review diagnostics on extraction outputs.
+   * Extraction review: Run review diagnostics on extraction outputs.
    * Pure computation — no LLM calls. Checks entity type distribution,
    * property coverage, orphan relationships, duplicates, and label quality.
    * Persists the report to state/review-diagnostics.json.
@@ -564,7 +564,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase C.5: Run consolidation review diagnostics.
+   * Consolidation review: Run consolidation review diagnostics.
    * Analyzes merge decisions for false merges, alias specificity issues,
    * cross-source anomalies, and type consistency problems.
    */
@@ -574,7 +574,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase B.7: Full extraction validation.
+   * Full extraction validation.
    *
    * LLM-powered validation of every entity and relationship against source documents.
    * Workers use tool access to navigate source documents (read lines, search, cross-reference).
@@ -641,7 +641,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase B.5: Validate all extraction outputs.
+   * Validate all extraction outputs.
    * Runs Tier 1 (schema + range + structural) and optionally Tier 2 (source-grounded LLM verification).
    * Returns validation results per extraction. Extractions that fail are not consolidated.
    */
@@ -738,7 +738,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase C: Consolidate all extractions into a deduplicated export archive.
+   * Consolidate all extractions into a deduplicated export archive.
    * Reads all extraction outputs, deduplicates, assigns GUIDs, produces ExportArchive.
    */
   async consolidate(): Promise<{ registry: EntityRegistry; archive: ExportArchive; report: ConsolidationReport }> {
@@ -778,7 +778,7 @@ export class IndexingOrchestrator {
   }
 
   /**
-   * Phase D: Import an ExportArchive into the repository via DeepMemory.
+   * Import an ExportArchive into the repository via DeepMemory.
    */
   async importArchive(archive: ExportArchive, deepMemory: DeepMemory): Promise<ImportResult> {
     const importer = new BatchImporter(deepMemory);
@@ -850,7 +850,7 @@ export class IndexingOrchestrator {
       };
     }
 
-    // Phase A + B
+    // Prepare + Extract
     if (currentPhase === Phase.PREPARE || currentPhase === Phase.EXTRACT) {
       if (currentPhase === Phase.PREPARE) {
         await this.prepare(sourceDir);
@@ -865,7 +865,7 @@ export class IndexingOrchestrator {
       currentPhase = await this.state.getCurrentPhase();
     }
 
-    // Phase B.5: Validate
+    // Validate extraction outputs
     if (currentPhase === Phase.CONSOLIDATE && this.config.validation) {
       validationResults = await this.validate();
       const failedCount = validationResults.filter(r => r.overallVerdict === 'fail').length;
@@ -881,20 +881,20 @@ export class IndexingOrchestrator {
       }
     }
 
-    // Phase C
+    // Consolidate
     if (currentPhase === Phase.CONSOLIDATE) {
       const result = await this.consolidate();
       consolidationReport = result.report;
       entitiesFound = result.archive.entities.length;
       relationshipsFound = result.archive.relationships.length;
 
-      // Phase D
+      // Import
       if (deepMemory) {
         importResult = await this.importArchive(result.archive, deepMemory);
       }
     }
 
-    // Phase D (resume — archive already exists)
+    // Import (resume — archive already exists)
     if (currentPhase === Phase.IMPORT && deepMemory) {
       // Re-consolidate to get the archive (it's not persisted to disk as a zip)
       const result = await this.consolidate();

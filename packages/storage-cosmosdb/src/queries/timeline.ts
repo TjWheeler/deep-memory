@@ -14,7 +14,7 @@ export async function getTimeline(
 
   // Entity creation event
   const entityResult = await conn.submit(
-    "g.V().has('repositoryId', rid).has('id', eid).has('entityType').valueMap('createdAt', 'modifiedAt')",
+    "g.V().has('repositoryId', rid).hasId(eid).has('entityType').valueMap('createdAt', 'modifiedAt')",
     { rid: repositoryId, eid: entityId },
   );
 
@@ -41,7 +41,7 @@ export async function getTimeline(
 
   // Relationship events connected to this entity
   const relResult = await conn.submit(
-    "g.V().has('repositoryId', rid).has('id', eid).has('entityType').bothE().valueMap('id', 'createdAt')",
+    "g.V().has('repositoryId', rid).hasId(eid).has('entityType').bothE().valueMap('id', 'createdAt')",
     { rid: repositoryId, eid: entityId },
   );
 

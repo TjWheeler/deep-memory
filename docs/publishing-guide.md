@@ -2,7 +2,7 @@
 
 This is the canonical reference for releasing `@utaba/deep-memory` packages to npm.
 
-Versioning is driven by [Changesets](https://github.com/changesets/changesets). Publishing happens **locally** from a maintainer's machine — there is no CI-driven publish step (and therefore no `NPM_TOKEN` in repo secrets).
+Versioning is driven by [Changesets](https://github.com/changesets/changesets). 
 
 ## Packages
 
@@ -70,7 +70,29 @@ This writes a markdown file under `.changeset/`. Commit it as part of your PR.
 
 **You don't have to pick every package in the fixed group manually** — selecting any one of the five forces the entire group to bump together. Pick the package whose change is most prominent for the description.
 
+**Picking the bump level:**
+
+- `patch` — internal fixes, perf wins, bug fixes, anything with no public-surface impact.
+- `minor` — additive public surface (new methods, options, exports). While versions are pre-1.0, breaking changes also go in `minor`.
+- `major` — reserved for the 1.0 cut.
+
 If your PR is docs / tests / CI only and doesn't affect published behaviour, **skip the changeset** — it's fine to merge without one.
+
+### Authoring a changeset by hand (or from an agent)
+
+Instead of running the CLI, create `.changeset/<descriptive-slug>.md` directly with this frontmatter format:
+
+```markdown
+---
+'@utaba/deep-memory-storage-cosmosdb': minor
+---
+
+Short one-line description of the change for the changelog.
+
+Optional further paragraphs for detail.
+```
+
+List any one of the five fixed-group packages in the frontmatter — the others bump together. The slug can be anything kebab-case; Changesets uses random names by default, but a descriptive slug is fine.
 
 ### 2. Merge to `main`
 

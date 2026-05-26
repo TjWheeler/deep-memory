@@ -614,11 +614,16 @@ export class DeepMemory {
     try {
       const result = await repo.reembedAll({
         ...options,
+        // The repo signature widens `totalEntities` to `number | undefined`
+        // because PaginatedResult.total may be undefined under some provider/
+        // query combinations. The `reembed:progress` event contract is
+        // `totalEntities: number`, so fall back to the cached stats count
+        // when the inner layer doesn't supply one.
         onProgress: (progress) =>
           this.globalEventBus.emit('reembed:progress', {
             repositoryId,
             processed: progress.processed,
-            totalEntities: progress.totalEntities,
+            totalEntities: progress.totalEntities ?? stats.entityCount,
             failed: progress.failed,
           }),
         onItemFailed: (failure) =>

@@ -6,10 +6,22 @@ import type { ResolvedVocabulary } from './vocabulary.js';
 import type { RepositoryStats } from './repositories.js';
 import type { ValidationError } from '../vocabulary/VocabularyValidator.js';
 
-/** Paginated result wrapper */
+/**
+ * Paginated result wrapper.
+ *
+ * `total` is the exact count of items matching the query when the storage
+ * provider can compute it cheaply (typically via a parallel `COUNT(1)` or
+ * equivalent on an indexed predicate). It is `undefined` when computing an
+ * exact total would be more expensive than the query itself — e.g. the Cosmos
+ * `findEntities` path with `properties` filters, where the server-side
+ * approximate prefilter would inflate a count by false positives that are
+ * only resolved client-side. Callers that need a "more pages?" signal should
+ * use `hasMore`, which providers derive from `total` when present and from
+ * `items.length === limit` otherwise.
+ */
 export interface PaginatedResult<T> {
   items: T[];
-  total: number;
+  total: number | undefined;
   hasMore: boolean;
   limit: number;
   offset: number;

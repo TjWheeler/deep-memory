@@ -1,7 +1,7 @@
 // SqlServerStorageProvider — SQL Server implementation of StorageProvider
 
 import sql from 'mssql';
-import type { StorageProvider, EnsureSchemaResult } from '@utaba/deep-memory/providers';
+import type { StorageProvider, EnsureSchemaResult, EntityReadOptions } from '@utaba/deep-memory/providers';
 import type {
   StoredEntity,
   StoredEntityUpdate,
@@ -835,13 +835,14 @@ export class SqlServerStorageProvider implements StorageProvider {
     return entity;
   }
 
-  async getEntity(repositoryId: string, entityId: string): Promise<StoredEntity | null> {
+  async getEntity(repositoryId: string, entityId: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     const pool = this.getPool();
+    const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
     const result = await pool.request()
       .input('repoId', sql.UniqueIdentifier, repositoryId)
       .input('entityId', sql.NVarChar, entityId)
       .query<Record<string, unknown>>(
-        `SELECT ${ENTITY_COLS_LIGHT} FROM ${this.t('dm_entities')}
+        `SELECT ${cols} FROM ${this.t('dm_entities')}
          WHERE [repository_id] = @repoId AND [entity_id] = @entityId`,
       );
 
@@ -850,13 +851,14 @@ export class SqlServerStorageProvider implements StorageProvider {
     return entityFromRow(row);
   }
 
-  async getEntityBySlug(repositoryId: string, slug: string): Promise<StoredEntity | null> {
+  async getEntityBySlug(repositoryId: string, slug: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     const pool = this.getPool();
+    const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
     const result = await pool.request()
       .input('repoId', sql.UniqueIdentifier, repositoryId)
       .input('slug', sql.NVarChar, slug)
       .query<Record<string, unknown>>(
-        `SELECT ${ENTITY_COLS_LIGHT} FROM ${this.t('dm_entities')}
+        `SELECT ${cols} FROM ${this.t('dm_entities')}
          WHERE [repository_id] = @repoId AND [slug] = @slug`,
       );
 
@@ -868,17 +870,19 @@ export class SqlServerStorageProvider implements StorageProvider {
   async getEntities(
     repositoryId: string,
     entityIds: string[],
+    options?: EntityReadOptions,
   ): Promise<Map<string, StoredEntity>> {
     const pool = this.getPool();
     const result = new Map<string, StoredEntity>();
     if (entityIds.length === 0) return result;
 
+    const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
     const tvp = this.createIdListTvp(entityIds);
     const rows = await pool.request()
       .input('repoId', sql.UniqueIdentifier, repositoryId)
       .input('entityIds', tvp)
       .query<Record<string, unknown>>(
-        `SELECT ${ENTITY_COLS_LIGHT} FROM ${this.t('dm_entities')}
+        `SELECT ${cols} FROM ${this.t('dm_entities')}
          WHERE [repository_id] = @repoId
          AND [entity_id] IN (SELECT [id] FROM @entityIds)`,
       );
@@ -1070,6 +1074,7 @@ export class SqlServerStorageProvider implements StorageProvider {
   async findEntities(
     repositoryId: string,
     query: StorageFindQuery,
+    options?: EntityReadOptions,
   ): Promise<PaginatedResult<StoredEntity>> {
     const pool = this.getPool();
     const req = pool.request().input('repoId', sql.UniqueIdentifier, repositoryId);
@@ -1150,8 +1155,9 @@ export class SqlServerStorageProvider implements StorageProvider {
     req.input('limit', sql.Int, query.limit);
     req.input('offset', sql.Int, query.offset);
 
+    const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
     const result = await req.query<Record<string, unknown>>(
-      `SELECT ${ENTITY_COLS_LIGHT} FROM ${this.t('dm_entities')}
+      `SELECT ${cols} FROM ${this.t('dm_entities')}
        WHERE ${where}
        ORDER BY [entity_id]
        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`,

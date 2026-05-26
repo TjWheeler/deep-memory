@@ -1,9 +1,9 @@
 /**
- * Types for extraction worker output (Phase B).
+ * Types for extraction worker output.
  *
- * Each worker produces a self-contained ExtractionOutput for a single source document.
- * Entities and relationships are referenced by label (not GUID) — GUID assignment
- * happens during consolidation (Phase C).
+ * Each worker produces a self-contained ExtractionOutput for a single source
+ * document. Entities and relationships are referenced by label (not GUID) —
+ * GUID assignment happens during consolidation.
  */
 
 /** Metadata about LLM output truncation events during extraction */

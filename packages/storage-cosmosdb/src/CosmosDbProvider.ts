@@ -1,6 +1,6 @@
 // CosmosDbProvider — CosmosDB Gremlin implementation of StorageProvider + GraphTraversalProvider
 
-import type { StorageProvider, EnsureSchemaResult } from '@utaba/deep-memory/providers';
+import type { StorageProvider, EnsureSchemaResult, EntityReadOptions } from '@utaba/deep-memory/providers';
 import type { GraphTraversalProvider, GraphTraversalCapabilities } from '@utaba/deep-memory/providers';
 import type {
   StoredEntity,
@@ -22,25 +22,37 @@ import type {
   PaginationOptions,
   PaginatedResult,
   StorageNeighborhood,
+  StorageNeighborhoodLayer,
+  StoragePath,
   StoragePathResult,
   StorageTimelineResult,
   BulkImportResult,
   TraversalSpec,
+  TraversalStep,
   TraversalResult,
   QueryMetadata,
   UsageSink,
 } from '@utaba/deep-memory/types';
 import type { ExportChunk, ImportChunk, BulkImportOptions, DeleteProgressCallback } from '@utaba/deep-memory/types';
-import crypto from 'node:crypto';
-import { GremlinCompiler, ProviderError, InvalidInputError, isValidUuid, projectEntity, createSafeSink } from '@utaba/deep-memory';
-import { CosmosDbConnection, usageScope } from './CosmosDbConnection.js';
-import type { UsageAccumulator } from './CosmosDbConnection.js';
-import { entityFromGremlin } from './mapping.js';
+import {
+  GremlinCompiler,
+  ProviderError,
+  InvalidInputError,
+  isValidUuid,
+  projectEntity,
+  createSafeSink,
+  matchesPropertyFilters,
+} from '@utaba/deep-memory';
+import { CosmosDbConnection } from './CosmosDbConnection.js';
+import { CosmosDocumentClient } from './CosmosDocumentClient.js';
+import { usageScope } from './usage.js';
+import type { UsageAccumulator } from './usage.js';
+import { cosmosRestPut } from './cosmos-rest-auth.js';
+import { entityFromGremlin, relationshipFromGremlin } from './mapping.js';
 import * as repoQueries from './queries/repository.js';
 import * as vocabQueries from './queries/vocabulary.js';
 import * as entityQueries from './queries/entity.js';
 import * as relQueries from './queries/relationship.js';
-import * as traversalQueries from './queries/traversal.js';
 import * as timelineQueries from './queries/timeline.js';
 import * as bulkQueries from './queries/bulk.js';
 
@@ -78,14 +90,84 @@ const SCHEMA_VERSION = 1;
 const META_VERTEX_ID = '_meta:schema';
 
 /**
+ * Indexing-policy paths that `findEntities` SQL relies on. If a container's
+ * `excludedPaths` covers any of these (directly or via wildcard), the rewrite
+ * falls back to scan — see {@link CosmosDbProvider.runIndexingPolicyDiagnostic}.
+ */
+const GUARDED_INDEX_PATHS = [
+  '/entityLabel',
+  '/slug',
+  '/summary',
+  '/entityType',
+  '/properties',
+  '/repositoryId',
+] as const;
+
+/**
+ * Raw, un-projected output from {@link CosmosDbProvider.executeTraversal}.
+ * Only the fields relevant to the spec's `returnMode` are populated; the rest
+ * remain empty. Used to share the compile + submit + parse pipeline between
+ * `traverseInternal` (which projects into the public TraversalResult shape)
+ * and the storage-layer rewrites of `exploreNeighborhood` / `findPaths`
+ * (which need raw stored entities to rebuild storage-level outputs).
+ */
+interface RawTraversalResult {
+  /** Populated when `spec.returnMode === 'terminal'`. */
+  terminalEntities: StoredEntity[];
+  /** Populated when `spec.returnMode === 'all'`. */
+  allEntities: StoredEntity[];
+  /** Populated when `spec.returnMode === 'all'`. */
+  allRelationships: StoredRelationship[];
+  /** Populated when `spec.returnMode === 'path'`. */
+  pathRows: Array<{
+    entityIds: string[];
+    relationshipIds: string[];
+    relationshipDirections: Array<'outbound' | 'inbound'>;
+  }>;
+  /**
+   * Lookup table — populated for `'all'` and `'path'` modes. Includes every
+   * entity that appears in any returned row.
+   */
+  entityMap: Map<string, StoredEntity>;
+  /**
+   * Lookup table — populated for `'all'` and `'path'` modes. Includes every
+   * relationship that appears in any returned row.
+   */
+  relationshipMap: Map<string, StoredRelationship>;
+  /**
+   * First-seen walk direction per deduped edge id. Populated only for
+   * `'path'` mode — the `'all'` mode's deduped union carries no walk context.
+   */
+  pathRelFirstDirection: Map<string, 'outbound' | 'inbound'>;
+  executionTimeMs: number;
+  requestCharge: number | undefined;
+  compiledQuery: string;
+}
+
+/**
+ * Vocabulary TTL for the per-process cache. Vocabulary changes are rare
+ * (governance-gated writes); a 60 s window bounds cross-process staleness
+ * acceptably while eliminating the one extra round-trip on every traversal.
+ */
+const VOCABULARY_CACHE_TTL_MS = 60_000;
+
+/**
  * CosmosDB Gremlin storage provider for deep-memory.
  * Implements both StorageProvider (full CRUD) and GraphTraversalProvider (native Gremlin traversals).
  */
 export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider {
   private readonly conn: CosmosDbConnection;
+  private readonly docClient: CosmosDocumentClient;
   private readonly config: CosmosDbProviderConfig;
   private readonly compiler = new GremlinCompiler();
   private readonly reportUsage: UsageSink | undefined;
+  /**
+   * Per-process vocabulary cache, keyed by repositoryId. Read lazily by
+   * `traverseImpl` via `getVocabularyCached`; invalidated on `saveVocabulary`.
+   * Each provider instance owns its own cache so isolated test providers do
+   * not share state.
+   */
+  private readonly vocabularyCache = new Map<string, { vocab: MemoryVocabulary; expiresAt: number }>();
 
   constructor(config: CosmosDbProviderConfig) {
     this.config = config;
@@ -98,6 +180,20 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       maxRetries: config.maxRetries,
       defaultTimeoutMs: config.defaultTimeoutMs,
       rejectUnauthorized: config.rejectUnauthorized,
+    });
+    // Document (NoSQL SQL) endpoint client — used by query paths the Gremlin
+    // subset can't express server-side (substring + case-insensitive search,
+    // structured property predicates). RU accumulates into the same
+    // usageScope as `conn`, so one public-method call emits one usage record
+    // even when both endpoints are touched.
+    this.docClient = new CosmosDocumentClient({
+      restEndpoint: this.getRestEndpoint(),
+      key: config.key,
+      database: config.database,
+      container: config.container,
+      rejectUnauthorized: config.rejectUnauthorized ?? true,
+      maxRetries: config.maxRetries,
+      defaultTimeoutMs: config.defaultTimeoutMs,
     });
   }
 
@@ -213,25 +309,19 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
       // 4. Write schema version meta vertex
       const existing = await this.conn.submit(
-        "g.V().has('id', metaId).hasLabel('_meta').valueMap(true)",
+        "g.V().hasId(metaId).hasLabel('_meta').valueMap(true)",
         { metaId: META_VERTEX_ID },
       );
 
       if (existing.items.length > 0) {
         const props = existing.items[0] as Record<string, unknown>;
         const version = Number(unwrapGremlinValue(props['schemaVersion']) ?? 0);
-        if (version >= SCHEMA_VERSION && !databaseCreated && !schemaCreated) {
-          return {
-            databaseCreated: false,
-            schemaCreated: false,
-            alreadyUpToDate: true,
-            schemaVersion: SCHEMA_VERSION,
-          };
+        if (version < SCHEMA_VERSION || databaseCreated || schemaCreated) {
+          await this.conn.submit(
+            "g.V().hasId(metaId).hasLabel('_meta').property('schemaVersion', ver)",
+            { metaId: META_VERTEX_ID, ver: SCHEMA_VERSION },
+          );
         }
-        await this.conn.submit(
-          "g.V().has('id', metaId).hasLabel('_meta').property('schemaVersion', ver)",
-          { metaId: META_VERTEX_ID, ver: SCHEMA_VERSION },
-        );
       } else {
         await this.conn.submit(
           "g.addV('_meta').property('id', metaId).property('repositoryId', pk).property('schemaVersion', ver)",
@@ -239,6 +329,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         );
         schemaCreated = true;
       }
+
+      // 5. Bootstrap the `_repository_index` sentinel. Idempotent — first run
+      // does a one-time cross-partition scan to backfill existing repos, every
+      // subsequent run is a single cheap doc-fetch that returns null.
+      await repoQueries.ensureRepositoryIndex(this.conn);
+
+      // 6. Step E — indexing-policy diagnostic. Always runs (operators may
+      // drift policy between calls). Never fails ensureSchema — see helper.
+      await this.runIndexingPolicyDiagnostic();
 
       return {
         databaseCreated,
@@ -250,6 +349,59 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       throw new ProviderError(
         `Failed to ensure CosmosDB schema: ${err instanceof Error ? err.message : String(err)}`,
         'Verify the CosmosDB REST endpoint is accessible and the Gremlin endpoint is reachable.',
+      );
+    }
+  }
+
+  /**
+   * Step E — verify the container's indexing policy covers every path that
+   * the SQL `findEntities` rewrite hits. The probe (2026-05-26) confirmed
+   * code-managed containers get the Cosmos default policy (everything
+   * indexed). This guard is for operator-facing protection: externally
+   * provisioned containers (ARM/Bicep) can have `excludedPaths` set, which
+   * would force `findEntities` to scan rather than index-lookup.
+   *
+   * Single GET against the colls resource, minimal RU. Never fails
+   * `ensureSchema` — a diagnostic must not break provisioning.
+   */
+  private async runIndexingPolicyDiagnostic(): Promise<void> {
+    let policy: { excludedPaths: Array<{ path: string }> };
+    try {
+      const props = await this.docClient.getContainerProperties();
+      policy = props.indexingPolicy;
+    } catch (err: unknown) {
+      console.warn(
+        `[CosmosDbProvider] could not verify indexing policy on container ` +
+          `${this.config.container}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    const offending: string[] = [];
+    for (const entry of policy.excludedPaths) {
+      // Cosmos exclusion paths end in `/?` (exact) or `/*` (subtree). Strip
+      // the wildcard to get the prefix the exclusion governs.
+      const prefix = entry.path.replace(/\/[?*]$/, '');
+      if (prefix === '' || prefix === '/') {
+        // Root wildcard — every guarded path is excluded.
+        for (const guard of GUARDED_INDEX_PATHS) {
+          offending.push(`${guard} (covered by ${entry.path})`);
+        }
+        break;
+      }
+      for (const guard of GUARDED_INDEX_PATHS) {
+        if (prefix === guard || guard.startsWith(prefix + '/')) {
+          offending.push(`${guard} (excluded by ${entry.path})`);
+        }
+      }
+    }
+
+    if (offending.length > 0) {
+      console.warn(
+        `[CosmosDbProvider] Container ${this.config.container} has indexing-policy ` +
+          `excludedPaths that cover paths used by findEntities. The query will ` +
+          `fall back to scan and may exceed RU budgets:\n  ${offending.join('\n  ')}\n` +
+          `Verify the ARM/Bicep template that provisioned the container.`,
       );
     }
   }
@@ -321,11 +473,40 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
+  /**
+   * Cached vocabulary read used by traversal compilation. The vocabulary is
+   * compile-time context for the GremlinCompiler — it changes on the order of
+   * once per session, but the traversal hot path pays one round-trip per call
+   * to fetch it. The cache flips that to one round-trip per TTL window.
+   *
+   * Reads inside an active usage scope are still recorded if a fetch happens
+   * (cache miss); cache hits emit no round-trip and therefore no usage entry.
+   */
+  private async getVocabularyCached(repositoryId: string): Promise<MemoryVocabulary> {
+    const now = Date.now();
+    const cached = this.vocabularyCache.get(repositoryId);
+    if (cached && cached.expiresAt > now) {
+      return cached.vocab;
+    }
+    const vocab = await vocabQueries.getVocabulary(this.conn, repositoryId);
+    this.vocabularyCache.set(repositoryId, {
+      vocab,
+      expiresAt: now + VOCABULARY_CACHE_TTL_MS,
+    });
+    return vocab;
+  }
+
+  /** Drop the cache entry for a repository — call after any vocabulary write. */
+  private invalidateVocabularyCache(repositoryId: string): void {
+    this.vocabularyCache.delete(repositoryId);
+  }
+
   async saveVocabulary(repositoryId: string, vocabulary: MemoryVocabulary): Promise<void> {
     this.assertValidRepositoryId(repositoryId);
-    return this.track('saveVocabulary', repositoryId, () =>
-      vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary),
-    );
+    return this.track('saveVocabulary', repositoryId, async () => {
+      await vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary);
+      this.invalidateVocabularyCache(repositoryId);
+    });
   }
 
   async getVocabularyChangeLog(repositoryId: string, options?: PaginationOptions): Promise<PaginatedResult<VocabularyChangeRecord>> {
@@ -344,24 +525,24 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async getEntity(repositoryId: string, entityId: string): Promise<StoredEntity | null> {
+  async getEntity(repositoryId: string, entityId: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntity', repositoryId, () =>
-      entityQueries.getEntity(this.conn, repositoryId, entityId),
+      entityQueries.getEntity(this.conn, repositoryId, entityId, options),
     );
   }
 
-  async getEntityBySlug(repositoryId: string, slug: string): Promise<StoredEntity | null> {
+  async getEntityBySlug(repositoryId: string, slug: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntityBySlug', repositoryId, () =>
-      entityQueries.getEntityBySlug(this.conn, repositoryId, slug),
+      entityQueries.getEntityBySlug(this.conn, repositoryId, slug, options),
     );
   }
 
-  async getEntities(repositoryId: string, entityIds: string[]): Promise<Map<string, StoredEntity>> {
+  async getEntities(repositoryId: string, entityIds: string[], options?: EntityReadOptions): Promise<Map<string, StoredEntity>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntities', repositoryId, () =>
-      entityQueries.getEntities(this.conn, repositoryId, entityIds),
+      entityQueries.getEntities(this.conn, repositoryId, entityIds, options),
     );
   }
 
@@ -385,6 +566,19 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return this.track('deleteEntities', repositoryId, () => this.deleteEntitiesImpl(repositoryId, ids));
   }
 
+  /**
+   * Single round-trip bulk-delete via the aggregate-side-effect pattern:
+   * collapses the per-chunk existence-check + drop into one Gremlin call.
+   *
+   *   g.V()...hasId(within(...)).has('entityType')
+   *     .aggregate('found').by('id')   // collects the ids that match
+   *     .drop()                         // drops the vertices (and cascaded edges)
+   *     .cap('found')                   // emits the bucket as the single result
+   *
+   * The bucket is always emitted as a single list item — empty when nothing
+   * matched (probe-verified 2026-05-25, local-tests/phase7-shape-probe.mjs).
+   * `notFound` is derived client-side as the set difference.
+   */
   private async deleteEntitiesImpl(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
     const deleted: string[] = [];
     const CHUNK = 100;
@@ -392,7 +586,6 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     for (let i = 0; i < ids.length; i += CHUNK) {
       const chunk = ids.slice(i, i + CHUNK);
 
-      // Find which vertex IDs actually exist using P.within
       const bindings: Record<string, unknown> = { rid: repositoryId };
       const idParams: string[] = [];
       for (let j = 0; j < chunk.length; j++) {
@@ -400,28 +593,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         bindings[p] = chunk[j];
         idParams.push(p);
       }
-      const withinExpr = `P.within(${idParams.join(', ')})`;
-      const existResult = await this.conn.submit(
-        `g.V().has('repositoryId', rid).has('id', ${withinExpr}).has('entityType').values('id')`,
+      const withinExpr = `within(${idParams.join(', ')})`;
+      const result = await this.conn.submit(
+        `g.V().has('repositoryId', rid).hasId(${withinExpr}).has('entityType')` +
+          `.aggregate('found').by('id').drop().cap('found')`,
         bindings,
       );
-      const found = existResult.items as string[];
-
-      if (found.length > 0) {
-        // Drop vertices — Gremlin drop() automatically cascades to connected edges
-        const dropBindings: Record<string, unknown> = { rid: repositoryId };
-        const dropIdParams: string[] = [];
-        for (let j = 0; j < found.length; j++) {
-          const p = `did${j}`;
-          dropBindings[p] = found[j];
-          dropIdParams.push(p);
-        }
-        const dropWithinExpr = `P.within(${dropIdParams.join(', ')})`;
-        await this.conn.submit(
-          `g.V().has('repositoryId', rid).has('id', ${dropWithinExpr}).has('entityType').drop()`,
-          dropBindings,
-        );
-        deleted.push(...found);
+      const bucket = result.items[0];
+      if (Array.isArray(bucket)) {
+        deleted.push(...(bucket as string[]));
       }
     }
 
@@ -429,17 +609,17 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
   }
 
-  async deleteEntitiesByType(repositoryId: string, entityType: string): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+  async deleteEntitiesByType(repositoryId: string, entityType: string): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteEntitiesByType', repositoryId, () =>
       entityQueries.deleteEntitiesByType(this.conn, repositoryId, entityType),
     );
   }
 
-  async findEntities(repositoryId: string, query: StorageFindQuery): Promise<PaginatedResult<StoredEntity>> {
+  async findEntities(repositoryId: string, query: StorageFindQuery, options?: EntityReadOptions): Promise<PaginatedResult<StoredEntity>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('findEntities', repositoryId, () =>
-      entityQueries.findEntities(this.conn, repositoryId, query),
+      entityQueries.findEntities(this.docClient, repositoryId, query, options),
     );
   }
 
@@ -479,6 +659,20 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return this.track('deleteRelationships', repositoryId, () => this.deleteRelationshipsImpl(repositoryId, ids));
   }
 
+  /**
+   * Single round-trip bulk relationship delete via the aggregate-side-effect
+   * pattern: collapses the per-chunk existence-check + drop into one Gremlin
+   * call. Gremlin drop on edges is routed by the engine and the bucket gives
+   * back the exact ids that were actually dropped, so `notFound` can be
+   * derived client-side.
+   *
+   * Source-id partition routing is not exposed on this method (the public
+   * surface accepts only edge ids), so the lookup may fan out across
+   * partitions — see [docs/cosmosdb-gremlin-compatibility.md §`g.E().has`
+   * doesn't always push partition down]. Callers that already hold a
+   * StoredRelationship and want partition-scoped routing should add a
+   * dedicated method when the need is concrete.
+   */
   private async deleteRelationshipsImpl(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
     const deleted: string[] = [];
     const CHUNK = 100;
@@ -486,7 +680,6 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     for (let i = 0; i < ids.length; i += CHUNK) {
       const chunk = ids.slice(i, i + CHUNK);
 
-      // Build Gremlin P.within(...) query to find which IDs actually exist
       const bindings: Record<string, unknown> = { rid: repositoryId };
       const idParams: string[] = [];
       for (let j = 0; j < chunk.length; j++) {
@@ -494,24 +687,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         bindings[p] = chunk[j];
         idParams.push(p);
       }
-      const withinExpr = `P.within(${idParams.join(', ')})`;
-      const existResult = await this.conn.submit(
-        `g.E().has('repositoryId', rid).has('id', ${withinExpr}).values('id')`,
+      const withinExpr = `within(${idParams.join(', ')})`;
+      const result = await this.conn.submit(
+        `g.E().has('repositoryId', rid).hasId(${withinExpr})` +
+          `.aggregate('found').by('id').drop().cap('found')`,
         bindings,
       );
-      const found = existResult.items as string[];
-
-      if (found.length > 0) {
-        await cosmosRestBatchDelete(
-          this.getRestEndpoint(),
-          this.config.key,
-          this.config.database,
-          this.config.container,
-          repositoryId,
-          found,
-          this.config.rejectUnauthorized ?? true,
-        );
-        deleted.push(...found);
+      const bucket = result.items[0];
+      if (Array.isArray(bucket)) {
+        deleted.push(...(bucket as string[]));
       }
     }
 
@@ -531,15 +715,264 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   async exploreNeighborhood(repositoryId: string, entityId: string, options: StorageExploreOptions): Promise<StorageNeighborhood> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('exploreNeighborhood', repositoryId, () =>
-      traversalQueries.exploreNeighborhood(this.conn, repositoryId, entityId, options),
+      this.exploreNeighborhoodImpl(repositoryId, entityId, options),
     );
+  }
+
+  /**
+   * Compiler-model implementation of exploreNeighborhood.
+   *
+   * Strategy: for each depth `d` from 1 to `options.depth`, build a
+   * cumulative `TraversalSpec` with `d` steps and `returnMode: 'all'`, run
+   * it through {@link executeTraversal}, then walk one BFS layer client-side
+   * from the previous frontier using the returned edges.
+   *
+   * The server-side step direction is fixed to `'both'` (catches every edge
+   * in either direction). The directional + bidirectional filter is applied
+   * client-side per hop — i.e. `direction: 'outbound'` includes inbound edges
+   * where `bidirectional` is true. The CosmosDB Gremlin compiler does not
+   * natively express the `union(outE, inE.has(bidirectional))` shape that
+   * would push this filter server-side, so it stays client-side; the
+   * observable contract (which edges count toward "outbound" given
+   * bidirectionality) is preserved.
+   *
+   * Round-trips per call: `options.depth` (one per layer). The previous BFS
+   * was `1 + fanout + fanout² + …` round-trips for the same depth.
+   */
+  private async exploreNeighborhoodImpl(
+    repositoryId: string,
+    entityId: string,
+    options: StorageExploreOptions,
+  ): Promise<StorageNeighborhood> {
+    const layers: StorageNeighborhoodLayer[] = [];
+    const visited = new Set<string>([entityId]);
+    let frontier = new Set<string>([entityId]);
+
+    for (let d = 1; d <= options.depth; d++) {
+      if (frontier.size === 0) break;
+
+      const spec: TraversalSpec = {
+        start: { entityId },
+        steps: buildExploreSteps(d, options),
+        returnMode: 'all',
+        // Each round-trip fetches the cumulative subgraph at depth `d` and
+        // we reconstruct layers client-side. The result can include every
+        // edge and vertex reachable in ≤d hops in either direction; size
+        // the limit generously.
+        limit: 10_000,
+        // Use 'full' + includeProvenance so executeTraversal returns full
+        // StoredEntity rows (StorageNeighborhood embeds StoredEntity).
+        detailLevel: 'full',
+        includeProvenance: true,
+      };
+      const raw = await this.executeTraversal(repositoryId, spec);
+
+      // Index edges by either endpoint so we can find edges incident to each
+      // frontier vertex in O(1).
+      const edgesByVertex = new Map<string, StoredRelationship[]>();
+      for (const rel of raw.allRelationships) {
+        const a = edgesByVertex.get(rel.sourceEntityId);
+        if (a) a.push(rel); else edgesByVertex.set(rel.sourceEntityId, [rel]);
+        const b = edgesByVertex.get(rel.targetEntityId);
+        if (b) b.push(rel); else edgesByVertex.set(rel.targetEntityId, [rel]);
+      }
+
+      const layer: StorageNeighborhoodLayer = {};
+      const nextFrontier = new Set<string>();
+      // Dedup edges within a layer: the cumulative-d response can include the
+      // same edge multiple times across the deduped union (server-side dedup
+      // is by row, not by edge-in-context). The visit set prevents the same
+      // (vertex, edge) pairing from contributing twice.
+      const layerEdgeSeen = new Set<string>();
+
+      for (const fv of frontier) {
+        const incident = edgesByVertex.get(fv) ?? [];
+        for (const rel of incident) {
+          const isSource = rel.sourceEntityId === fv;
+          const isTarget = rel.targetEntityId === fv;
+          let matchesDirection = false;
+          let connectedId: string | undefined;
+
+          if (isSource && (options.direction === 'outbound' || options.direction === 'both')) {
+            matchesDirection = true;
+            connectedId = rel.targetEntityId;
+          } else if (isTarget && (options.direction === 'inbound' || options.direction === 'both')) {
+            matchesDirection = true;
+            connectedId = rel.sourceEntityId;
+          } else if (rel.bidirectional) {
+            if (isSource && options.direction === 'inbound') {
+              matchesDirection = true;
+              connectedId = rel.targetEntityId;
+            } else if (isTarget && options.direction === 'outbound') {
+              matchesDirection = true;
+              connectedId = rel.sourceEntityId;
+            }
+          }
+          if (!matchesDirection || !connectedId) continue;
+          if (visited.has(connectedId)) continue;
+
+          // Relationship property filter — applied client-side per hop, matching
+          // the existing BFS. Edges that fail the filter neither populate the
+          // layer nor expand the frontier.
+          if (options.relationshipPropertyFilters && options.relationshipPropertyFilters.length > 0) {
+            if (!matchesPropertyFilters(rel.properties, options.relationshipPropertyFilters)) continue;
+          }
+
+          const connectedEntity = raw.entityMap.get(connectedId);
+          if (!connectedEntity) continue;
+
+          // Entity type filter — applied client-side; the server spec walks
+          // direction 'both' without entity-type narrowing so deeper layers
+          // are still reachable through any intermediate.
+          if (options.entityTypes && options.entityTypes.length > 0 &&
+              !options.entityTypes.includes(connectedEntity.entityType)) {
+            continue;
+          }
+
+          // Dedup the (vertex-pair, edge) within this layer.
+          const edgeKey = `${rel.id}|${fv}->${connectedId}`;
+          if (layerEdgeSeen.has(edgeKey)) continue;
+          layerEdgeSeen.add(edgeKey);
+
+          const relType = rel.relationshipType;
+          if (!layer[relType]) {
+            layer[relType] = { total: 0, entities: [], relationships: [] };
+          }
+          layer[relType]!.entities.push(connectedEntity);
+          layer[relType]!.relationships.push(rel);
+          layer[relType]!.total = layer[relType]!.entities.length;
+          nextFrontier.add(connectedId);
+        }
+      }
+
+      // Per-type pagination (matches the existing CosmosDB BFS — total
+      // reflects the full pre-slice count).
+      for (const relType of Object.keys(layer)) {
+        const group = layer[relType]!;
+        const start = options.offsetPerType;
+        const end = start + options.limitPerType;
+        group.entities = group.entities.slice(start, end);
+        group.relationships = group.relationships.slice(start, end);
+      }
+
+      if (Object.keys(layer).length > 0) {
+        layers.push(layer);
+      }
+
+      // Promote nextFrontier to visited AFTER the full layer is processed so
+      // the same entity can appear under multiple relationship types within
+      // a single layer (matches the existing semantic).
+      for (const id of nextFrontier) {
+        visited.add(id);
+      }
+      frontier = nextFrontier;
+    }
+
+    return { centerId: entityId, layers };
   }
 
   async findPaths(repositoryId: string, sourceId: string, targetId: string, options: StoragePathOptions): Promise<StoragePathResult> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('findPaths', repositoryId, () =>
-      traversalQueries.findPaths(this.conn, repositoryId, sourceId, targetId, options),
+      this.findPathsImpl(repositoryId, sourceId, targetId, options),
     );
+  }
+
+  /**
+   * Compiler-model implementation of findPaths.
+   *
+   * Strategy: build a `TraversalSpec` with a single `'both'` direction step
+   * in `repeat()` mode with `emitIntermediates: true` and `returnMode:
+   * 'path'`, run it once. The compiler always emits `.simplePath()` in path
+   * mode for cycle prevention, producing
+   * `.emit().repeat(bothE().otherV()).times(maxDepth).simplePath()
+   * .range(...).path().by(<v>).by(<e>)`, which yields paths of every length
+   * from 0 (the start vertex alone) to `maxDepth`. Live-probed against the
+   * Cosmos emulator 2026-05-25 — see local-tests/phase4-repeat-emit-probe.mjs.
+   *
+   * The pre-Phase-4 Cosmos BFS in (now-deleted) `packages/storage-cosmosdb/
+   * src/queries/traversal.ts` traversed edges with unconditional `bothE()`
+   * regardless of the `bidirectional` flag (path discovery is reachability,
+   * not semantic direction). Mirror that here by using step direction
+   * `'both'` and not applying any direction filter. The plan's §6
+   * observable-outputs rule requires preserving this.
+   *
+   * One round-trip total. The previous BFS was up to `1 + fanout + fanout² + …`.
+   */
+  private async findPathsImpl(
+    repositoryId: string,
+    sourceId: string,
+    targetId: string,
+    options: StoragePathOptions,
+  ): Promise<StoragePathResult> {
+    if (sourceId === targetId) {
+      return { paths: [{ entityIds: [sourceId], relationshipIds: [] }], totalPaths: 1 };
+    }
+
+    const step: TraversalStep = {
+      direction: 'both',
+      repeat: { maxDepth: options.maxDepth, emitIntermediates: true },
+    };
+    if (options.relationshipTypes && options.relationshipTypes.length > 0) {
+      step.relationshipTypes = options.relationshipTypes;
+    }
+    if (options.relationshipPropertyFilters && options.relationshipPropertyFilters.length > 0) {
+      step.relationshipFilter = options.relationshipPropertyFilters;
+    }
+
+    const spec: TraversalSpec = {
+      start: { entityId: sourceId },
+      steps: [step],
+      returnMode: 'path',
+      // Cycle prevention comes from the compiler unconditionally emitting
+      // .simplePath() in path mode — replaces the explicit
+      // `state.path.includes(nextId)` guard from the old BFS.
+      // Pull the full pool of paths so we can post-filter to those ending at
+      // targetId, then paginate. The emulator returns paths of every length
+      // 0..maxDepth in one round-trip with the repeat+emit shape; cap
+      // generously to ensure all candidates are inspected.
+      limit: Math.max(options.limit + options.offset, options.limit) * 10,
+      detailLevel: 'full',
+      includeProvenance: true,
+    };
+
+    const raw = await this.executeTraversal(repositoryId, spec);
+
+    const matchingPaths: StoragePath[] = [];
+    for (const row of raw.pathRows) {
+      // The repeat+emit shape includes the 0-hop "path" (just the start
+      // vertex). source !== target at this point (handled above), so the
+      // last-entity check naturally rejects it.
+      const last = row.entityIds[row.entityIds.length - 1];
+      if (last !== targetId) continue;
+      // Apply entity-type filter on intermediate entities (matches the
+      // existing CosmosDB BFS — source and target are always allowed).
+      if (options.entityTypes && options.entityTypes.length > 0) {
+        let rejected = false;
+        for (let i = 1; i < row.entityIds.length - 1; i++) {
+          const intermediate = raw.entityMap.get(row.entityIds[i]!);
+          if (!intermediate) { rejected = true; break; }
+          if (!options.entityTypes.includes(intermediate.entityType)) {
+            rejected = true;
+            break;
+          }
+        }
+        if (rejected) continue;
+      }
+      matchingPaths.push({
+        entityIds: [...row.entityIds],
+        relationshipIds: [...row.relationshipIds],
+      });
+    }
+
+    // Pagination — slice the matching set. `totalPaths` reflects the full
+    // pre-slice count, matching the existing storage contract.
+    const paginated = matchingPaths.slice(options.offset, options.offset + options.limit);
+
+    return {
+      paths: paginated,
+      totalPaths: matchingPaths.length,
+    };
   }
 
   // ─── Timeline ──────────────────────────────────────────────────────
@@ -641,17 +1074,165 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     spec: TraversalSpec,
   ): Promise<TraversalResult> {
     this.assertValidRepositoryId(repositoryId);
-    return this.track('traverse', repositoryId, () => this.traverseImpl(repositoryId, spec));
+    return this.track('traverse', repositoryId, () => this.traverseInternal(repositoryId, spec));
   }
 
-  private async traverseImpl(
+  /**
+   * Compile + execute a TraversalSpec against this repository's partition.
+   *
+   * Internal entrypoint shared by `traverse` (the public surface) and the
+   * compiler-model rewrites of `exploreNeighborhood` / `findPaths`. Does NOT
+   * wrap in `track()` — the outer public method owns its own usage scope, and
+   * inner submits accumulate into that scope (the nested-scope guard in
+   * `track()` keeps nested public calls from emitting duplicate records).
+   */
+  private async traverseInternal(
     repositoryId: string,
     spec: TraversalSpec,
   ): Promise<TraversalResult> {
+    const raw = await this.executeTraversal(repositoryId, spec);
+
+    // Project stored entities to the requested detail level. This strips
+    // embeddings and any other internal fields at every level — the
+    // projection contract never surfaces embeddings via traversal results.
+    const detailLevel = spec.detailLevel ?? 'summary';
+
+    type ProjectedEntity = TraversalResult['entities'][number];
+    type ProjectedRelationship = NonNullable<TraversalResult['relationships']>[number];
+
+    const projectStoredEntity = (stored: StoredEntity): ProjectedEntity => {
+      const projected = projectEntity(stored, detailLevel) as ProjectedEntity;
+      if (!spec.includeProvenance) {
+        delete (projected as unknown as Record<string, unknown>)['provenance'];
+      }
+      return projected;
+    };
+
+    // direction is mode-specific:
+    //   'all'  — always 'outbound' (stored topology; the deduped union has
+    //            no walk context). Callers derive walk direction relative
+    //            to any anchor via sourceEntityId / targetEntityId.
+    //   'path' — relative to the last hop within each walk; callers stamp
+    //            via the `direction` argument.
+    const projectStoredRelationship = (
+      rel: StoredRelationship,
+      direction: 'outbound' | 'inbound' = 'outbound',
+    ): ProjectedRelationship => ({
+      id: rel.id,
+      type: rel.relationshipType,
+      sourceEntityId: rel.sourceEntityId,
+      targetEntityId: rel.targetEntityId,
+      direction,
+      properties: rel.properties,
+    });
+
+    let entities: ProjectedEntity[] = [];
+    let relationships: ProjectedRelationship[] | undefined;
+    let paths: NonNullable<TraversalResult['paths']> | undefined;
+
+    if (spec.returnMode === 'terminal') {
+      entities = raw.terminalEntities.map(projectStoredEntity);
+      relationships = undefined;
+    } else if (spec.returnMode === 'all') {
+      entities = raw.allEntities.map(projectStoredEntity);
+      relationships = raw.allRelationships.map((r) => projectStoredRelationship(r));
+    } else {
+      // 'path' — emit one TraversalPath per Gremlin path row, with per-edge
+      // walk direction. The outer `relationships` array dedups by rel id and
+      // stamps the first-seen direction (first-writer-wins) — this matches
+      // the observable contract that callers depend on for path rendering.
+      paths = raw.pathRows.map((row) => ({
+        length: Math.max(row.entityIds.length - 1, 0),
+        entities: row.entityIds.map((id) => {
+          const stored = raw.entityMap.get(id);
+          if (!stored) {
+            throw new ProviderError(
+              'Unpacking Gremlin path: entity referenced by path is missing from the result',
+              'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+            );
+          }
+          return projectStoredEntity(stored);
+        }),
+        relationships: row.relationshipIds.map((id, i) => {
+          const stored = raw.relationshipMap.get(id);
+          if (!stored) {
+            throw new ProviderError(
+              'Unpacking Gremlin path: relationship referenced by path is missing from the result',
+              'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+            );
+          }
+          return projectStoredRelationship(stored, row.relationshipDirections[i]!);
+        }),
+      }));
+      relationships = Array.from(raw.relationshipMap.values()).map((rel) =>
+        projectStoredRelationship(rel, raw.pathRelFirstDirection.get(rel.id) ?? 'outbound'),
+      );
+    }
+
+    const limit = spec.limit ?? 50;
+    // 'all' mode returns an interleaved entity+edge union — total must count
+    // both so callers see the true page size.
+    let total: number;
+    if (spec.returnMode === 'path') {
+      total = paths?.length ?? 0;
+    } else if (spec.returnMode === 'all') {
+      total = entities.length + (relationships?.length ?? 0);
+    } else {
+      total = entities.length;
+    }
+
+    const queryMetadata: QueryMetadata = {
+      executionTimeMs: raw.executionTimeMs,
+      resourceCost: raw.requestCharge != null
+        ? { units: 'RU', value: raw.requestCharge }
+        : undefined,
+      compiledQuery: raw.compiledQuery,
+      compiledQueryLanguage: 'gremlin',
+      appliedLimits: {
+        maxResults: limit,
+        maxDepth: spec.steps?.length,
+      },
+      truncated: total >= limit,
+      truncationReason: total >= limit ? 'result_limit' : undefined,
+    };
+
+    return {
+      entities,
+      relationships,
+      paths,
+      total,
+      returned: total,
+      hasMore: total >= limit,
+      queryMetadata,
+    };
+  }
+
+  /**
+   * Lower-level traversal helper: compiles a spec, submits to Gremlin, and
+   * parses the rows into raw {@link StoredEntity} / {@link StoredRelationship}
+   * objects (no detail-level projection, no provenance stripping). Used by
+   * `traverseInternal` and by the storage-layer rewrites of
+   * `exploreNeighborhood` / `findPaths` that need the full stored shape to
+   * rebuild `StorageNeighborhood` / `StoragePathResult`.
+   *
+   * Returns a discriminated bag — only the fields relevant to `spec.returnMode`
+   * are populated:
+   * - `'terminal'`: `terminalEntities` (in row order, no dedup beyond what the
+   *    server emitted).
+   * - `'all'`: `allEntities` and `allRelationships`, already server-deduped.
+   * - `'path'`: `pathRows` plus the `entityMap` / `relationshipMap` lookup
+   *    tables and `pathRelFirstDirection` for the first-seen direction per
+   *    deduped edge id.
+   */
+  private async executeTraversal(
+    repositoryId: string,
+    spec: TraversalSpec,
+  ): Promise<RawTraversalResult> {
     const startTime = Date.now();
 
-    // Get vocabulary for compilation
-    const vocabulary = await this.getVocabulary(repositoryId);
+    // Vocabulary is compile-time context — fetch from the per-process cache so
+    // back-to-back traversals do not each pay the `_vocabulary` round-trip.
+    const vocabulary = await this.getVocabularyCached(repositoryId);
 
     // Compile the spec to Gremlin — the provider owns compilation.
     const compiled = this.compiler.compile(spec, vocabulary);
@@ -667,77 +1248,101 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
     const scopedParams = { ...compiled.params, pRid: repositoryId };
 
+    let result;
     try {
-      const result = await this.conn.submit(scopedQuery, scopedParams);
-      const executionTimeMs = Date.now() - startTime;
-
-      // Project stored entities to the requested detail level. This strips
-      // embeddings and any other internal fields at every level — the
-      // projection contract never surfaces embeddings via traversal results.
-      const detailLevel = spec.detailLevel ?? 'summary';
-      const entities: TraversalResult['entities'] = [];
-      const relationships: NonNullable<TraversalResult['relationships']> = [];
-      const paths: NonNullable<TraversalResult['paths']> = [];
-
-      if (spec.returnMode === 'path') {
-        for (const item of result.items) {
-          const pathData = item as { objects?: unknown[] };
-          if (pathData.objects) {
-            const pathEntities: TraversalResult['entities'] = [];
-            for (const obj of pathData.objects) {
-              const props = obj as Record<string, unknown>;
-              if (props['entityType']) {
-                const stored = entityFromGremlin(props);
-                pathEntities.push(projectEntity(stored, detailLevel) as TraversalResult['entities'][number]);
-              }
-            }
-            if (pathEntities.length > 0) {
-              paths.push({
-                length: pathEntities.length - 1,
-                entities: pathEntities,
-                relationships: [],
-              });
-            }
-          }
-        }
-      } else {
-        for (const item of result.items) {
-          const stored = entityFromGremlin(item as Record<string, unknown>);
-          entities.push(projectEntity(stored, detailLevel) as TraversalResult['entities'][number]);
-        }
-      }
-
-      const limit = spec.limit ?? 50;
-      const queryMetadata: QueryMetadata = {
-        executionTimeMs,
-        resourceCost: result.requestCharge != null
-          ? { units: 'RU', value: result.requestCharge }
-          : undefined,
-        compiledQuery: scopedQuery,
-        compiledQueryLanguage: 'gremlin',
-        appliedLimits: {
-          maxResults: limit,
-          maxDepth: spec.steps?.length,
-        },
-        truncated: entities.length >= limit,
-        truncationReason: entities.length >= limit ? 'result_limit' : undefined,
-      };
-
-      return {
-        entities: spec.returnMode === 'path' ? [] : entities,
-        relationships: spec.returnMode === 'path' || spec.returnMode === 'all' ? relationships : undefined,
-        paths: spec.returnMode === 'path' ? paths : undefined,
-        total: entities.length + paths.length,
-        returned: entities.length + paths.length,
-        hasMore: entities.length >= limit || paths.length >= limit,
-        queryMetadata,
-      };
+      result = await this.conn.submit(scopedQuery, scopedParams);
     } catch (err: unknown) {
       throw new ProviderError(
         `Gremlin traversal failed: ${err instanceof Error ? err.message : String(err)}`,
         'Check the traversal spec and ensure the CosmosDB connection is healthy.',
       );
     }
+    const executionTimeMs = Date.now() - startTime;
+
+    const raw: RawTraversalResult = {
+      terminalEntities: [],
+      allEntities: [],
+      allRelationships: [],
+      pathRows: [],
+      entityMap: new Map(),
+      relationshipMap: new Map(),
+      pathRelFirstDirection: new Map(),
+      executionTimeMs,
+      requestCharge: result.requestCharge,
+      compiledQuery: scopedQuery,
+    };
+
+    if (spec.returnMode === 'terminal') {
+      // Flat projected vertex rows — one per row.
+      for (const item of result.items) {
+        const stored = entityFromGremlin(item as Record<string, unknown>);
+        raw.terminalEntities.push(stored);
+      }
+    } else if (spec.returnMode === 'all') {
+      // Flat stream of vertex AND edge projected Maps, already server-deduped
+      // by id. Each row carries the synthetic `__kind` discriminator from the
+      // compiler's per-branch project chain ('v' = vertex, 'e' = edge).
+      for (const item of result.items) {
+        const props = item as Record<string, unknown>;
+        const kind = props['__kind'];
+        if (kind === 'v') {
+          const stored = entityFromGremlin(props);
+          raw.allEntities.push(stored);
+          raw.entityMap.set(stored.id, stored);
+        } else if (kind === 'e') {
+          const stored = relationshipFromGremlin(props);
+          raw.allRelationships.push(stored);
+          raw.relationshipMap.set(stored.id, stored);
+        }
+        // Rows without a recognised marker are skipped defensively.
+      }
+    } else {
+      // 'path' — Gremlin Path objects: { objects: [vertex|edge, ...] }
+      // where each object is a projected Map with a `__kind` discriminator.
+      //
+      // Direction per edge is computed during the walk using a lastVertexId
+      // cursor: 'outbound' when the walk crossed source → target, 'inbound'
+      // when it crossed target → source.
+      for (const item of result.items) {
+        const pathData = item as { objects?: unknown[] };
+        if (!pathData.objects) continue;
+
+        const pathEntityIds: string[] = [];
+        const pathRelIds: string[] = [];
+        const pathRelDirections: Array<'outbound' | 'inbound'> = [];
+        let lastVertexId: string | null = null;
+
+        for (const obj of pathData.objects) {
+          const props = obj as Record<string, unknown>;
+          const kind = props['__kind'];
+          if (kind === 'v') {
+            const stored = entityFromGremlin(props);
+            raw.entityMap.set(stored.id, stored);
+            pathEntityIds.push(stored.id);
+            lastVertexId = stored.id;
+          } else if (kind === 'e') {
+            const stored = relationshipFromGremlin(props);
+            raw.relationshipMap.set(stored.id, stored);
+            pathRelIds.push(stored.id);
+            const direction: 'outbound' | 'inbound' =
+              lastVertexId === stored.sourceEntityId ? 'outbound' : 'inbound';
+            pathRelDirections.push(direction);
+            if (!raw.pathRelFirstDirection.has(stored.id)) {
+              raw.pathRelFirstDirection.set(stored.id, direction);
+            }
+          }
+          // Objects without a recognised marker are skipped defensively.
+        }
+
+        raw.pathRows.push({
+          entityIds: pathEntityIds,
+          relationshipIds: pathRelIds,
+          relationshipDirections: pathRelDirections,
+        });
+      }
+    }
+
+    return raw;
   }
 
   /**
@@ -785,112 +1390,29 @@ function unwrapGremlinValue(val: unknown): unknown {
   return val;
 }
 
-// ─── CosmosDB REST API helpers for database/container provisioning ──
-
 /**
- * Generate a CosmosDB REST API authorization token.
- * See: https://learn.microsoft.com/en-us/rest/api/cosmos-db/access-control-on-cosmosdb-resources
+ * Build the per-step TraversalSpec steps for exploreNeighborhood at a given
+ * cumulative depth.
+ *
+ * Server-side step direction is fixed to `'both'` (catches every edge in
+ * either direction). The directional + bidirectional filter and entity-type
+ * filter run client-side during layer reconstruction — both because the
+ * compiler does not express the `union(outE, inE.has(bidirectional))` shape
+ * and because entity-type filtering at intermediate hops is non-propagating
+ * in the compiler's `'all'` emission (the prefix walks unfiltered vertices).
+ *
+ * relationshipTypes IS pushed to the server because the compiler emits it as
+ * `bothE(t1, t2, ...)`, which IS part of the prefix walk at every depth.
  */
-function cosmosAuthToken(
-  verb: string,
-  resourceType: string,
-  resourceLink: string,
-  date: string,
-  key: string,
-): string {
-  const payload = `${verb.toLowerCase()}\n${resourceType.toLowerCase()}\n${resourceLink}\n${date.toLowerCase()}\n\n`;
-  const keyBuffer = Buffer.from(key, 'base64');
-  const hmac = crypto.createHmac('sha256', keyBuffer);
-  hmac.update(payload);
-  const signature = hmac.digest('base64');
-  return encodeURIComponent(`type=master&ver=1.0&sig=${signature}`);
+function buildExploreSteps(depth: number, options: StorageExploreOptions): TraversalStep[] {
+  const base: TraversalStep = { direction: 'both' };
+  if (options.relationshipTypes && options.relationshipTypes.length > 0) {
+    base.relationshipTypes = options.relationshipTypes;
+  }
+  const steps: TraversalStep[] = [];
+  for (let i = 0; i < depth; i++) {
+    steps.push({ ...base });
+  }
+  return steps;
 }
 
-/**
- * Create a CosmosDB resource (database or container) via REST API.
- * Returns true if the resource was created, false if it already existed.
- */
-async function cosmosRestPut(
-  restBase: string,
-  key: string,
-  urlPath: string,
-  resourceLink: string,
-  resourceType: string,
-  body: Record<string, unknown>,
-  rejectUnauthorized: boolean,
-): Promise<boolean> {
-  const date = new Date().toUTCString();
-  const token = cosmosAuthToken('post', resourceType, resourceLink, date, key);
-
-  const url = `${restBase}/${urlPath}`;
-
-  const options: RequestInit = {
-    method: 'POST',
-    headers: {
-      'Authorization': token,
-      'x-ms-version': '2018-12-31',
-      'x-ms-date': date,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  };
-
-  // For self-signed certs (emulator), disable TLS verification process-wide.
-  // Caller explicitly opted in via rejectUnauthorized: false.
-  if (!rejectUnauthorized) {
-    process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
-  }
-
-  const response = await fetch(url, options);
-
-  if (response.status === 201) return true; // Created
-  if (response.status === 409) return false; // Already exists
-
-  const text = await response.text();
-  throw new Error(`CosmosDB REST ${response.status}: ${text}`);
-}
-
-/**
- * Delete multiple CosmosDB documents in a single Transactional Batch request.
- * All documents must share the same partition key value (repositoryId).
- * Max 100 operations per batch — caller is responsible for chunking.
- */
-async function cosmosRestBatchDelete(
-  restBase: string,
-  key: string,
-  database: string,
-  container: string,
-  partitionKeyValue: string,
-  ids: string[],
-  rejectUnauthorized: boolean,
-): Promise<void> {
-  const resourceLink = `dbs/${database}/colls/${container}`;
-  const date = new Date().toUTCString();
-  const token = cosmosAuthToken('post', 'docs', resourceLink, date, key);
-
-  if (!rejectUnauthorized) {
-    process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
-  }
-
-  const ops = ids.map((id) => ({ operationType: 'Delete', id }));
-
-  const response = await fetch(`${restBase}/${resourceLink}/docs`, {
-    method: 'POST',
-    headers: {
-      'Authorization': token,
-      'x-ms-version': '2020-07-15',
-      'x-ms-date': date,
-      'Content-Type': 'application/json',
-      'x-ms-documentdb-partitionkey': JSON.stringify([partitionKeyValue]),
-      'x-ms-cosmos-is-batch-request': 'true',
-      'x-ms-cosmos-batch-atomic': 'true',
-    },
-    body: JSON.stringify(ops),
-  });
-
-  // 200 (non-atomic) or 207 (atomic) indicate the batch was processed
-  if (response.status !== 200 && response.status !== 207) {
-    const text = await response.text();
-    throw new ProviderError(`CosmosDB batch delete failed (${response.status}): ${text}`);
-  }
-}

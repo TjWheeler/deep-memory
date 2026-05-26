@@ -23,6 +23,8 @@ docker compose up sqlserver -d
 
 This builds the bundled image (Microsoft's SQL Server 2025 with full-text search) and exposes port **1435** on the host, mapped to 1433 in the container. The `sa` password is `DeepMem@Dev1234`.
 
+> SQL Server's default port is **1433**. The bundled compose uses **1435** on the host to avoid clashing with any pre-existing SQL Server install on this machine. If you're pointing Deep Memory at a different SQL Server instance instead of the bundled one, check what port that server is actually listening on (1433 for a default install) and set `DEEP_MEMORY_SQL_PORT` to match.
+
 Wait for the health check to go green (about a minute on first run):
 
 ```bash
@@ -143,6 +145,7 @@ For Claude Desktop, you'll need the absolute path to `packages/mcp-server/dist/i
 ## What's next
 
 - **CosmosDB instead.** [quickstart-cosmosdb.md](quickstart-cosmosdb.md) uses the CosmosDB Gremlin API — native graph storage with the local emulator or Azure.
+- **Enable semantic search.** [quickstart-embeddings.md](quickstart-embeddings.md) wires up an embeddings provider (bundled vLLM, OpenAI, Ollama, or Azure) so `memory_search_by_concept` works.
 - **Build your own graph.** [quickstart-indexer.md](quickstart-indexer.md) runs the indexing pipeline over your source documents.
 - **Provider reference.** [packages/storage-sqlserver/README.md](packages/storage-sqlserver/README.md) covers the full schema, multi-tenancy, ER diagram, and query capabilities.
 - **MCP tools.** [packages/mcp-server/README.md](packages/mcp-server/README.md) lists all 28 tools.

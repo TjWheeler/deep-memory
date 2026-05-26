@@ -1,5 +1,5 @@
 /**
- * Extraction review diagnostics engine (Phase B.6).
+ * Extraction review diagnostics engine.
  *
  * Runs 5 automated checks against extraction outputs:
  *   1. Entity type distribution per document

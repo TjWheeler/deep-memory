@@ -141,25 +141,44 @@ export async function executeFallbackTraversal(
   const limit = spec.limit ?? 50;
   const offset = spec.offset ?? 0;
 
-  let resultEntries: FrontierEntry[];
+  // Result selection & pagination.
+  //
+  // - 'all' mode paginates against an interleaved entity+edge union ordered
+  //   by BFS layer (start vertices → step-1 edges → step-1 vertices → …),
+  //   with id-dedup applied within entities and within relationships. This
+  //   mirrors the post-dedup stream Cosmos's `.union(...).dedup().range()`
+  //   produces, so a paginated 'all' response holds a self-consistent slice
+  //   of the reached sub-graph instead of "this page's entities + every
+  //   edge in the subgraph".
+  // - 'terminal' and 'path' continue to paginate the entity list directly
+  //   (existing behaviour). 'terminal' honours spec.dedup; 'path' never
+  //   dedups (distinct walks are the answer).
+  let paged: FrontierEntry[];
+  let pagedAllRels: StoredRelationship[] = [];
+  let total: number;
+  let unionFullLength = 0;
+
   if (spec.returnMode === 'all') {
-    resultEntries = allCollected;
+    const unionElements = buildAllModeUnion(allCollected);
+    unionFullLength = unionElements.length;
+    const pageSlice = unionElements.slice(offset, offset + limit);
+    const pageEntries: FrontierEntry[] = [];
+    for (const element of pageSlice) {
+      if (element.kind === 'entity') {
+        pageEntries.push(element.entry);
+      } else {
+        pagedAllRels.push(element.rel);
+      }
+    }
+    paged = pageEntries;
+    total = pageEntries.length + pagedAllRels.length;
   } else {
-    resultEntries = frontier;
+    const resultEntries = dedup && spec.returnMode !== 'path'
+      ? dedupEntriesById(frontier)
+      : frontier;
+    total = resultEntries.length;
+    paged = resultEntries.slice(offset, offset + limit);
   }
-
-  // Dedup by entity ID
-  if (dedup) {
-    const seen = new Set<string>();
-    resultEntries = resultEntries.filter((entry) => {
-      if (seen.has(entry.entity.id)) return false;
-      seen.add(entry.entity.id);
-      return true;
-    });
-  }
-
-  const total = resultEntries.length;
-  const paged = resultEntries.slice(offset, offset + limit);
 
   // Build result
   // When projection is present, entities are suppressed by default (projection replaces full output).
@@ -214,8 +233,11 @@ export async function executeFallbackTraversal(
     const mode = spec.projection.mode ?? 'values';
     const distinct = spec.projection.distinct ?? false;
 
-    // Operate on ALL matching entities (pre-pagination) for aggregation
-    const sourceEntries = dedup
+    // Operate on ALL matching entities (pre-pagination) for aggregation.
+    // Dedup decision matches the entities path: 'all' always dedups, 'terminal'
+    // honours spec.dedup, 'path' never dedups.
+    const aggregateDedup = spec.returnMode === 'all' || (dedup && spec.returnMode !== 'path');
+    const sourceEntries = aggregateDedup
       ? (() => {
           const seen = new Set<string>();
           return (spec.returnMode === 'all' ? allCollected : frontier).filter((e) => {
@@ -267,17 +289,36 @@ export async function executeFallbackTraversal(
   let relationships: TraversalRelationship[] | undefined;
   let paths: TraversalPath[] | undefined;
 
-  if (!suppressEntities && (spec.returnMode === 'path' || spec.returnMode === 'all')) {
+  if (!suppressEntities && spec.returnMode === 'all') {
+    // 'all' mode: relationships come from the union page slice computed above,
+    // so the response stays a self-consistent window into the union ordering.
+    // direction is always 'outbound' (= stored topology) — the deduped union
+    // carries no walk context, so walk direction cannot be derived here.
+    relationships = pagedAllRels.map((rel) => ({
+      id: rel.id,
+      type: rel.relationshipType,
+      sourceEntityId: rel.sourceEntityId,
+      targetEntityId: rel.targetEntityId,
+      direction: 'outbound',
+      properties: rel.properties,
+    }));
+  } else if (!suppressEntities && spec.returnMode === 'path') {
+    // 'path' mode: outer rels mirror the per-page walks (one slot per
+    // walked edge, deduped by rel id across the page's paths). direction is
+    // relative to the walk at the position the edge was crossed; first
+    // path to contribute an edge wins, matching the Cosmos provider.
     const relMap = new Map<string, TraversalRelationship>();
     for (const entry of paged) {
-      for (const rel of entry.relationshipPath) {
+      for (let i = 0; i < entry.relationshipPath.length; i++) {
+        const rel = entry.relationshipPath[i]!;
         if (!relMap.has(rel.id)) {
+          const fromId = entry.entityPath[i]!;
           relMap.set(rel.id, {
             id: rel.id,
             type: rel.relationshipType,
             sourceEntityId: rel.sourceEntityId,
             targetEntityId: rel.targetEntityId,
-            direction: 'outbound',
+            direction: fromId === rel.sourceEntityId ? 'outbound' : 'inbound',
             properties: rel.properties,
           });
         }
@@ -287,25 +328,64 @@ export async function executeFallbackTraversal(
   }
 
   if (!suppressEntities && spec.returnMode === 'path') {
+    // Resolve the full walked entity sequence per path. The frontier only
+    // carries the terminal StoredEntity; intermediates live as IDs in
+    // entry.entityPath, so we batch-resolve them in one storage call.
+    const pathEntityIds = new Set<string>();
+    for (const entry of paged) {
+      for (const id of entry.entityPath) {
+        pathEntityIds.add(id);
+      }
+    }
+    const pathEntityMap = pathEntityIds.size > 0
+      ? await storage.getEntities(repositoryId, [...pathEntityIds])
+      : new Map<string, StoredEntity>();
+    if (pathEntityIds.size > 0) {
+      storageCalls++;
+    }
+
     paths = paged.map((entry) => ({
       length: entry.entityPath.length - 1,
-      entities: [(() => {
-        const e = projectEntity(entry.entity, detailLevel) as TraversalEntity;
-        if (!spec.includeProvenance) delete (e as unknown as Record<string, unknown>)['provenance'];
-        return e;
-      })()],
-      relationships: entry.relationshipPath.map((rel) => ({
-        id: rel.id,
-        type: rel.relationshipType,
-        sourceEntityId: rel.sourceEntityId,
-        targetEntityId: rel.targetEntityId,
-        direction: 'outbound' as const,
-        properties: rel.properties,
-      })),
+      entities: entry.entityPath.map((id) => {
+        const stored = pathEntityMap.get(id);
+        if (!stored) {
+          throw new EntityNotFoundError(id);
+        }
+        const projected = projectEntity(stored, detailLevel) as TraversalEntity;
+        if (!spec.includeProvenance) {
+          delete (projected as unknown as Record<string, unknown>)['provenance'];
+        }
+        return projected;
+      }),
+      relationships: entry.relationshipPath.map((rel, i) => {
+        // Direction is relative to the walk at this hop: 'outbound' when the
+        // walk crossed the edge in stored topology, 'inbound' when reversed.
+        const fromId = entry.entityPath[i]!;
+        return {
+          id: rel.id,
+          type: rel.relationshipType,
+          sourceEntityId: rel.sourceEntityId,
+          targetEntityId: rel.targetEntityId,
+          direction: fromId === rel.sourceEntityId ? ('outbound' as const) : ('inbound' as const),
+          properties: rel.properties,
+        };
+      }),
     }));
   }
 
   const executionTimeMs = Date.now() - startTime;
+
+  // 'all' mode: returned/total/hasMore are computed against the union of
+  // entities+relationships actually in the page (matches the Cosmos
+  // provider's per-page semantic). 'terminal'/'path' keep the existing
+  // "full pre-pagination total, page-size returned" semantic.
+  const returned = spec.returnMode === 'all' ? total : paged.length;
+  const hasMore = spec.returnMode === 'all'
+    ? offset + limit < unionFullLength
+    : offset + limit < total;
+  const truncated = spec.returnMode === 'all'
+    ? unionFullLength > limit + offset
+    : total > limit + offset;
 
   return {
     entities,
@@ -313,15 +393,15 @@ export async function executeFallbackTraversal(
     paths,
     aggregations,
     total,
-    returned: paged.length,
-    hasMore: offset + limit < total,
+    returned,
+    hasMore,
     queryMetadata: {
       executionTimeMs,
       appliedLimits: {
         maxResults: limit,
       },
-      truncated: total > limit + offset,
-      truncationReason: total > limit + offset ? 'result_limit' : undefined,
+      truncated,
+      truncationReason: truncated ? 'result_limit' : undefined,
     },
   };
 }
@@ -340,7 +420,7 @@ async function executeSingleStep(
   step: TraversalStep,
   onStorageCall: () => void,
 ): Promise<FrontierEntry[]> {
-  // Phase 1: Collect all relationships from the frontier (N queries, 1 per frontier entity)
+  // Step 1: Collect all relationships from the frontier (N queries, 1 per frontier entity)
   const direction = mapDirection(step.direction);
   const pendingEdges: Array<{
     entry: FrontierEntry;
@@ -371,12 +451,12 @@ async function executeSingleStep(
 
   if (pendingEdges.length === 0) return [];
 
-  // Phase 2: Batch-resolve all target entities in one call
+  // Step 2: Batch-resolve all target entities in one call
   const uniqueTargetIds = [...new Set(pendingEdges.map((e) => e.targetId))];
   const entityMap = await storage.getEntities(repositoryId, uniqueTargetIds);
   onStorageCall();
 
-  // Phase 3: Assemble the next frontier with client-side filtering
+  // Step 3: Assemble the next frontier with client-side filtering
   const nextFrontier: FrontierEntry[] = [];
 
   for (const { entry, rel, targetId } of pendingEdges) {
@@ -497,4 +577,84 @@ function getTargetId(rel: StoredRelationship, currentEntityId: string): string {
     return rel.targetEntityId;
   }
   return rel.sourceEntityId;
+}
+
+/** Dedup frontier entries by entity id, preserving first occurrence. */
+function dedupEntriesById(entries: FrontierEntry[]): FrontierEntry[] {
+  const seen = new Set<string>();
+  const result: FrontierEntry[] = [];
+  for (const entry of entries) {
+    if (!seen.has(entry.entity.id)) {
+      seen.add(entry.entity.id);
+      result.push(entry);
+    }
+  }
+  return result;
+}
+
+/**
+ * A single element of the 'all'-mode interleaved union. Tagged so the page
+ * splitter can route entries to `entities[]` and edges to `relationships[]`.
+ */
+type UnionElement =
+  | { kind: 'entity'; entry: FrontierEntry }
+  | { kind: 'relationship'; rel: StoredRelationship };
+
+/**
+ * Build the BFS-layer-ordered union for 'all' mode. Order mirrors what
+ * Cosmos's `.union(identity, outE(r1), outE(r1).inV(), outE(r1).inV().outE(r2), …)`
+ * would emit logically: start frontier → step-1 edges → step-1 vertices →
+ * step-2 edges → step-2 vertices → … . Entities dedup by id; relationships
+ * dedup by id. spec.dedup is ignored — 'all' is inherently deduped.
+ *
+ * Cosmos itself does not guarantee this exact ordering (a `.union().dedup()`
+ * stream is unordered); the in-memory provider's ordering is the
+ * deterministic spec used for pagination, and both providers honour
+ * "every union element appears in exactly one page".
+ */
+function buildAllModeUnion(entries: FrontierEntry[]): UnionElement[] {
+  if (entries.length === 0) return [];
+
+  let maxDepth = 0;
+  const byDepth = new Map<number, FrontierEntry[]>();
+  for (const entry of entries) {
+    const depth = entry.relationshipPath.length;
+    if (depth > maxDepth) maxDepth = depth;
+    let bucket = byDepth.get(depth);
+    if (!bucket) {
+      bucket = [];
+      byDepth.set(depth, bucket);
+    }
+    bucket.push(entry);
+  }
+
+  const seenEntities = new Set<string>();
+  const seenRels = new Set<string>();
+  const result: UnionElement[] = [];
+
+  for (const entry of byDepth.get(0) ?? []) {
+    if (!seenEntities.has(entry.entity.id)) {
+      seenEntities.add(entry.entity.id);
+      result.push({ kind: 'entity', entry });
+    }
+  }
+
+  for (let depth = 1; depth <= maxDepth; depth++) {
+    const bucket = byDepth.get(depth) ?? [];
+    for (const entry of bucket) {
+      const newRel = entry.relationshipPath[depth - 1];
+      if (newRel && !seenRels.has(newRel.id)) {
+        seenRels.add(newRel.id);
+        result.push({ kind: 'relationship', rel: newRel });
+      }
+    }
+    for (const entry of bucket) {
+      if (!seenEntities.has(entry.entity.id)) {
+        seenEntities.add(entry.entity.id);
+        result.push({ kind: 'entity', entry });
+      }
+    }
+  }
+
+  return result;
 }

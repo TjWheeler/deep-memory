@@ -46,6 +46,23 @@ export interface EnsureSchemaResult {
 }
 
 /**
+ * Internal entity-read options shared by `getEntity`, `getEntityBySlug`,
+ * `getEntities`, and `findEntities`.
+ *
+ * `loadEmbeddings` defaults to `false`. When `false`, providers must not ship
+ * the stored embedding over the wire — this is the AI-agent hot-path
+ * contract. When `true`, providers populate `StoredEntity.embedding` from the
+ * underlying store. The only legitimate caller is the vector-search path in
+ * `SearchOrchestrator.searchByConcept`.
+ *
+ * Providers that do not separate light/full reads (e.g. the in-memory
+ * provider, which always carries the full entity) may ignore this option.
+ */
+export interface EntityReadOptions {
+  loadEmbeddings?: boolean;
+}
+
+/**
  * StorageProvider — the primary persistence interface.
  *
  * Must be supplied when creating a DeepMemory instance. Handles all
@@ -101,14 +118,17 @@ export interface StorageProvider {
   getEntity(
     repositoryId: string,
     entityId: string,
+    options?: EntityReadOptions,
   ): Promise<StoredEntity | null>;
   getEntityBySlug(
     repositoryId: string,
     slug: string,
+    options?: EntityReadOptions,
   ): Promise<StoredEntity | null>;
   getEntities(
     repositoryId: string,
     entityIds: string[],
+    options?: EntityReadOptions,
   ): Promise<Map<string, StoredEntity>>;
   updateEntity(
     repositoryId: string,
@@ -121,14 +141,23 @@ export interface StorageProvider {
     repositoryId: string,
     ids: string[],
   ): Promise<{ deleted: string[]; notFound: string[] }>;
-  /** Delete all entities of a given type and their associated relationships */
+  /**
+   * Delete all entities of a given type and their associated relationships.
+   *
+   * `deletedRelationships` may be `undefined` when the provider does not count
+   * cascaded edges. The CosmosDB provider skips the edge-count fan-out
+   * (a `bothE()` walk across every partition the type touches) because the
+   * count itself is rarely consumed — vocabulary cascade-delete discards it.
+   * SQL Server and in-memory providers continue to return the exact number.
+   */
   deleteEntitiesByType(
     repositoryId: string,
     entityType: string,
-  ): Promise<{ deletedEntities: number; deletedRelationships: number }>;
+  ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }>;
   findEntities(
     repositoryId: string,
     query: StorageFindQuery,
+    options?: EntityReadOptions,
   ): Promise<PaginatedResult<StoredEntity>>;
 
   // ─── Relationships ─────────────────────────────────────────────────

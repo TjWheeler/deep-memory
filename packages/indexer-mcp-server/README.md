@@ -114,7 +114,7 @@ Phase-aware quality gate: *"Is there anything wrong? What should I check?"* Runs
 
 | Phase | Quick scope | Full scope (adds) |
 |-------|-------------|-------------------|
-| Extract / Extraction Review | Tier 1 validation, property coverage, orphan relationships, duplicates, label quality | LLM verification (Phase B.7) |
+| Extract / Extraction Review | Tier 1 validation, property coverage, orphan relationships, duplicates, label quality | LLM verification (Full Validation) |
 | Full Validation | Validation verdicts, pending corrections | — |
 | Consolidate / Consolidation Review | Merge confidence, alias specificity, type consistency, cross-source merges | — |
 | Import | Import completeness | — |

@@ -47,8 +47,10 @@ Each provider's canonical documentation lives in its package README. The `docs/`
 
 - [SQL Server Storage Provider](../packages/storage-sqlserver/README.md) — Persistent multi-tenant graph storage backed by SQL Server.
 - [CosmosDB Gremlin Storage Provider](../packages/storage-cosmosdb/README.md) — Native graph storage backed by Azure CosmosDB Gremlin API. Includes local emulator setup (Windows + WSL2) and Azure production deployment.
+- [CosmosDB Gremlin Compatibility & Performance Notes](cosmosdb-gremlin-compatibility.md) — What we've verified works (and doesn't) in CosmosDB's Gremlin subset, plus the performance-critical operator differences. **Required reading before changing emitted Gremlin** in the compiler or any storage-cosmosdb query module.
 - [CosmosDB Adaptive Import](storage-cosmosdb-adaptive-import.md) — How `importBulk` adapts concurrency to RU-constrained CosmosDB tiers: control loop, throttle detection via the connection's retry counter, circuit breaker, and operator visibility.
 - [Embeddings Provider (OpenAI)](../packages/embeddings-openai/README.md) — Setup and usage for the OpenAI-compatible embeddings provider.
+- [Embeddings Quickstart](../quickstart-embeddings.md) — Wiring an embeddings provider into the MCP server (bundled vLLM, OpenAI, Ollama, Azure OpenAI) to enable semantic search.
 
 ### MCP servers
 

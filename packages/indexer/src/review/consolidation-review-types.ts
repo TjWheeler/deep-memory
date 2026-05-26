@@ -1,5 +1,5 @@
 /**
- * Types for consolidation review diagnostics (Phase C.5).
+ * Types for consolidation review diagnostics.
  *
  * Analyzes merge decisions from consolidation to identify false merges,
  * overly generic aliases, and cross-source merge anomalies.

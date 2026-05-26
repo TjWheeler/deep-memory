@@ -5,7 +5,14 @@
       "args": ["packages/mcp-server/dist/index.js"],
       "env": {
         "DEEP_MEMORY_ACTOR_ID": "mcp-agent",
-        "DEEP_MEMORY_ACTOR_TYPE": "agent"
+        "DEEP_MEMORY_ACTOR_TYPE": "agent",
+        "DEEP_MEMORY_STORAGE": "sqlserver",
+        "DEEP_MEMORY_SQL_HOST": "localhost",
+        "DEEP_MEMORY_SQL_PORT": "1435",
+        "DEEP_MEMORY_SQL_DATABASE": "deep-memory",
+        "DEEP_MEMORY_SQL_USER": "sa",
+        "DEEP_MEMORY_SQL_PASSWORD": "DeepMem@Dev1234",
+        "DEEP_MEMORY_SQL_TRUST_CERT": "true"
       }
     },
     "deep-memory-indexer": {

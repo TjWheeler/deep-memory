@@ -43,10 +43,13 @@ export interface EmbeddingEntity {
   summary?: string;
 }
 
-/** Paginated result from the entity loader */
+/**
+ * Result from the entity loader. The orchestrator does its own work-splitting
+ * from `EmbeddingsDependencies.totalEntities`, so the page doesn't need to
+ * report a total — it just delivers a contiguous slice of entities.
+ */
 export interface EmbeddingEntityPage {
   items: EmbeddingEntity[];
-  total: number;
 }
 
 /** Response shape from the OpenAI /v1/embeddings endpoint */
@@ -82,7 +85,7 @@ interface ResolvedWorker {
 }
 
 /**
- * Orchestrates the embedding phase (Phase E) with progress tracking,
+ * Orchestrates the embedding pipeline phase with progress tracking,
  * stop signal support, and optional multi-worker parallelism.
  *
  * Single-worker mode: top-level endpoint/model in config.

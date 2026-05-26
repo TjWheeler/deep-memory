@@ -273,6 +273,22 @@ export function runStorageProviderConformanceTests(
         expect(result.items[0]!.label).toBe('Alpha');
       });
 
+      it('finds entities by search term case-insensitively', async () => {
+        // Locks the invariant that searchTerm matching is case-insensitive on
+        // every provider. In-memory lowercases both sides; SQL Server's LIKE
+        // is case-insensitive under the default *_CI_AS collation; Cosmos
+        // routes through CONTAINS(..., @term, true) on the Document endpoint.
+        await provider.createEntity(repoId, makeEntity('e1', 'test-type', 'Alpha'));
+
+        const result = await provider.findEntities(repoId, {
+          searchTerm: 'ALPHA',
+          limit: 10,
+          offset: 0,
+        });
+        expect(result.items).toHaveLength(1);
+        expect(result.items[0]!.label).toBe('Alpha');
+      });
+
       it('finds entities by type filter', async () => {
         await provider.createEntity(repoId, makeEntity('e1', 'type-a', 'A'));
         await provider.createEntity(repoId, makeEntity('e2', 'type-b', 'B'));

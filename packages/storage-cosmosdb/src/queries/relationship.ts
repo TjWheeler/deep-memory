@@ -3,44 +3,48 @@
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { StoredRelationship, RelationshipQueryOptions } from '@utaba/deep-memory/types';
 import type { PaginatedResult } from '@utaba/deep-memory/types';
-import { relationshipFromGremlin, relationshipToGremlinProps } from '../mapping.js';
-import { DuplicateRelationshipError, matchesPropertyFilters } from '@utaba/deep-memory';
+import {
+  buildRelationshipPropertyLadder,
+  relationshipFromGremlin,
+  relationshipToLadderBindings,
+} from '../mapping.js';
+import { DuplicateRelationshipError, matchesPropertyFilters, buildEdgeProjectChain } from '@utaba/deep-memory';
+
+// Sentinel returned by the duplicate-detection branch of the coalesce upsert
+// pattern. Mirrors entity.ts — single round-trip create.
+const DUPLICATE_SENTINEL = '__duplicate';
+
+// Fixed-shape property ladder — identical query string across every edge
+// create regardless of which optional fields are populated, so the Cosmos
+// plan cache reuses one compiled plan.
+const RELATIONSHIP_CREATE_QUERY =
+  `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
+  `unfold().constant('${DUPLICATE_SENTINEL}'),` +
+  `g.V().has('repositoryId', rid).hasId(srcId).has('entityType')` +
+  `.addE(edgeLabel)` +
+  `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+  `.property('id', relId).property('repositoryId', rid)${buildRelationshipPropertyLadder()}` +
+  `)`;
 
 export async function createRelationship(
   conn: CosmosDbConnection,
   repositoryId: string,
   relationship: StoredRelationship,
 ): Promise<StoredRelationship> {
-  // Check for duplicate — scoped by repositoryId so the same relationship id
-  // in a different repo does not cause a false-positive collision.
-  const existing = await conn.submit(
-    "g.E().has('repositoryId', rid).has('id', relId).count()",
-    { rid: repositoryId, relId: relationship.id },
-  );
-  if (Number(existing.items[0] ?? 0) > 0) {
-    throw new DuplicateRelationshipError(relationship.id);
-  }
-
-  const props = relationshipToGremlinProps(repositoryId, relationship);
   const bindings: Record<string, unknown> = {
+    rid: repositoryId,
     relId: relationship.id,
     srcId: relationship.sourceEntityId,
     tgtId: relationship.targetEntityId,
-    rid: repositoryId,
     edgeLabel: relationship.relationshipType,
+    ...relationshipToLadderBindings(relationship),
   };
-  const propParts: string[] = [];
-  let idx = 0;
 
-  for (const [key, value] of Object.entries(props)) {
-    const paramName = `p${idx++}`;
-    bindings[paramName] = value;
-    propParts.push(`.property('${key}', ${paramName})`);
+  const result = await conn.submit(RELATIONSHIP_CREATE_QUERY, bindings);
+
+  if (result.items[0] === DUPLICATE_SENTINEL) {
+    throw new DuplicateRelationshipError(relationship.id);
   }
-
-  // addE requires source and target vertex references
-  const query = `g.V().has('repositoryId', rid).has('id', srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).has('id', tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
-  await conn.submit(query, bindings);
 
   return relationship;
 }
@@ -50,8 +54,13 @@ export async function getRelationship(
   repositoryId: string,
   relationshipId: string,
 ): Promise<StoredRelationship | null> {
+  const projection = buildEdgeProjectChain();
+  // Edge-id lookup: g.E().hasId(relId) is engine-routed by doc id; the
+  // `has('repositoryId', rid)` predicate after it still doesn't push partition
+  // routing down (issue #2 in plans/performance-issues.md). When the source
+  // vertex id is known, callers should partition-route via the vertex instead.
   const result = await conn.submit(
-    "g.E().has('id', relId).has('repositoryId', rid).valueMap(true)",
+    `g.E().hasId(relId).has('repositoryId', rid).${projection}`,
     { relId: relationshipId, rid: repositoryId },
   );
   if (result.items.length === 0) return null;
@@ -67,8 +76,10 @@ export async function getEntityRelationships(
   const limit = options?.limit ?? 50;
   const offset = options?.offset ?? 0;
   const direction = options?.direction ?? 'both';
+  const hasPropertyFilters =
+    options?.propertyFilters != null && options.propertyFilters.length > 0;
 
-  const bindings: Record<string, unknown> = {
+  const baseBindings: Record<string, unknown> = {
     rid: repositoryId,
     eid: entityId,
   };
@@ -77,14 +88,14 @@ export async function getEntityRelationships(
   let edgeTraversal: string;
   switch (direction) {
     case 'outbound':
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').outE()";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').outE()";
       break;
     case 'inbound':
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').inE()";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').inE()";
       break;
     case 'both':
     default:
-      edgeTraversal = "g.V().has('repositoryId', rid).has('id', eid).has('entityType').bothE()";
+      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').bothE()";
       break;
   }
 
@@ -94,7 +105,7 @@ export async function getEntityRelationships(
     const typeParams: string[] = [];
     options.relationshipTypes.forEach((t, i) => {
       const paramName = `rtype${i}`;
-      bindings[paramName] = t;
+      baseBindings[paramName] = t;
       typeParams.push(paramName);
     });
     typeFilter = `.hasLabel(${typeParams.join(', ')})`;
@@ -107,36 +118,44 @@ export async function getEntityRelationships(
   let unionQuery: string | null = null;
   if (direction === 'outbound') {
     // outE + inE where bidirectional=true
-    unionQuery = `g.V().has('repositoryId', rid).has('id', eid).has('entityType').union(outE()${typeFilter}, inE()${typeFilter}.has('bidirectional', true))`;
+    unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(outE()${typeFilter}, inE()${typeFilter}.has('bidirectional', true))`;
   } else if (direction === 'inbound') {
-    unionQuery = `g.V().has('repositoryId', rid).has('id', eid).has('entityType').union(inE()${typeFilter}, outE()${typeFilter}.has('bidirectional', true))`;
+    unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(inE()${typeFilter}, outE()${typeFilter}.has('bidirectional', true))`;
   }
 
   const baseQuery = unionQuery ?? `${edgeTraversal}${typeFilter}`;
+  const projection = buildEdgeProjectChain();
 
-  // Count
-  const countResult = await conn.submit(`${baseQuery}.dedup().count()`, bindings);
-  const total = Number(countResult.items[0] ?? 0);
+  // Count and data round-trips are independent — run them in parallel to halve
+  // wall-clock latency. When `propertyFilters` is set the filter runs
+  // client-side after the fetch, so a server-side count would overstate the
+  // matched total — match the findEntities pattern and surface
+  // `total: undefined` in that case.
+  const dataBindings = { ...baseBindings, rangeStart: offset, rangeEnd: offset + limit };
+  const [countResult, dataResult] = await Promise.all([
+    hasPropertyFilters
+      ? Promise.resolve(null)
+      : conn.submit(`${baseQuery}.dedup().count()`, baseBindings),
+    conn.submit(
+      `${baseQuery}.dedup().range(rangeStart, rangeEnd).${projection}`,
+      dataBindings,
+    ),
+  ]);
 
-  // Data
-  bindings['rangeStart'] = offset;
-  bindings['rangeEnd'] = offset + limit;
-  const dataResult = await conn.submit(
-    `${baseQuery}.dedup().range(rangeStart, rangeEnd).valueMap(true)`,
-    bindings,
-  );
+  const rawItems = dataResult.items as Record<string, unknown>[];
+  let items = rawItems.map(relationshipFromGremlin);
 
-  let items = (dataResult.items as Record<string, unknown>[]).map(relationshipFromGremlin);
-
-  // Post-filter by property filters
-  if (options?.propertyFilters && options.propertyFilters.length > 0) {
-    items = items.filter(rel => matchesPropertyFilters(rel.properties, options.propertyFilters!));
+  if (hasPropertyFilters) {
+    items = items.filter(rel => matchesPropertyFilters(rel.properties, options!.propertyFilters!));
   }
+
+  const total = countResult ? Number(countResult.items[0] ?? 0) : undefined;
+  const hasMore = total != null ? offset + rawItems.length < total : rawItems.length === limit;
 
   return {
     items,
     total,
-    hasMore: offset + limit < total,
+    hasMore,
     limit,
     offset,
   };
@@ -148,29 +167,28 @@ export async function deleteRelationship(
   relationshipId: string,
 ): Promise<void> {
   await conn.submit(
-    "g.E().has('id', relId).has('repositoryId', rid).drop()",
+    "g.E().hasId(relId).has('repositoryId', rid).drop()",
     { relId: relationshipId, rid: repositoryId },
   );
 }
 
 
+/**
+ * Single round-trip type-delete via the aggregate-side-effect pattern: the
+ * bucket records the edge ids that were actually dropped, giving an exact
+ * `deletedRelationships` count without a separate count query.
+ */
 export async function deleteRelationshipsByType(
   conn: CosmosDbConnection,
   repositoryId: string,
   relationshipType: string,
 ): Promise<{ deletedRelationships: number }> {
-  const countResult = await conn.submit(
-    "g.E().has('repositoryId', rid).hasLabel(rtype).count()",
+  const result = await conn.submit(
+    "g.E().has('repositoryId', rid).hasLabel(rtype)" +
+      ".aggregate('found').by('id').drop().cap('found')",
     { rid: repositoryId, rtype: relationshipType },
   );
-  const deletedRelationships = Number(countResult.items[0] ?? 0);
-
-  if (deletedRelationships > 0) {
-    await conn.submit(
-      "g.E().has('repositoryId', rid).hasLabel(rtype).drop()",
-      { rid: repositoryId, rtype: relationshipType },
-    );
-  }
-
+  const bucket = result.items[0];
+  const deletedRelationships = Array.isArray(bucket) ? bucket.length : 0;
   return { deletedRelationships };
 }

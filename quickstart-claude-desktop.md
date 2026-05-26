@@ -90,6 +90,8 @@ You should see output ending with something like `Changed database context to 'm
 
 The database will now restart automatically every time Docker Desktop starts. You only need to do Step 3 once.
 
+> **About the port:** the config below uses port **1435**, not SQL Server's default of 1433. 
+
 ---
 
 ## Step 4 — Tell Claude Desktop about the memory server
@@ -265,6 +267,7 @@ In a Docker-managed volume named `deep-memory_sqlserver_data`. To delete everyth
 
 - **See what Claude can do with memory.** Ask: *"What tools do you have for working with memory?"* — Claude will list them.
 - **Try a different starter kit.** The Conversations kit is for personal long-term memory. Other kits suit different domains: see [README.md](README.md#starter-kits) for the list.
+- **Enable semantic search.** By default, Claude can only find memories by exact label, type, or graph traversal — not by meaning. [quickstart-embeddings.md](quickstart-embeddings.md) walks through plugging in an embeddings provider (OpenAI is two extra lines in the config above) so `memory_search_by_concept` works.
 - **Move to Claude Code (the CLI).** The same database works with Claude Code — see [quickstart-sqlserver.md](quickstart-sqlserver.md).
 - **Export your memory.** Ask Claude: *"Export my 'personal' repository to a file so I can back it up."* Deep Memory writes a `.dkg` archive you can keep, share, or import later.
 - **Indexing your own documents.** If you want to load existing notes, manuals, or other documents into a knowledge graph rather than building it up conversationally, see [quickstart-indexer.md](quickstart-indexer.md).

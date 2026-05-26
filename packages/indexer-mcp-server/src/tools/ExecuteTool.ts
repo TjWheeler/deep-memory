@@ -380,8 +380,13 @@ export class ExecuteTool extends BaseToolController {
     });
     await deepMemory.ensureSchema();
 
-    const firstPage = await storage.findEntities(repositoryId, { limit: 1, offset: 0 });
-    const entityCount = firstPage.total;
+    // RepositoryStats is the authoritative count source. findEntities.total
+    // could be used here for unfiltered queries, but PaginatedResult.total is
+    // `number | undefined` (some provider/query combinations don't compute it)
+    // and the embedding orchestrator needs a guaranteed number to split work
+    // across workers.
+    const stats = await storage.getRepositoryStats(repositoryId);
+    const entityCount = stats.entityCount;
 
     const estimate = buildEmbedEstimate(embeddingsConfig, entityCount);
 
@@ -400,7 +405,6 @@ export class ExecuteTool extends BaseToolController {
       loadEntities: async (limit, offset) => {
         const page = await storage.findEntities(repositoryId, { limit, offset });
         return {
-          total: page.total,
           items: page.items.map(e => ({
             id: e.id,
             label: e.label,
@@ -525,7 +529,7 @@ export class ExecuteTool extends BaseToolController {
         const stateWriter = new ProcessStateWriter(processDir);
         await stateWriter.appendIteration({
           date: new Date().toISOString().split('T')[0]!,
-          goal: 'Phase B.7 full extraction validation',
+          goal: 'Full extraction validation',
           result: 'Validation completed',
         });
       }

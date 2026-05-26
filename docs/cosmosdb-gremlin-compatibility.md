@@ -104,7 +104,7 @@ Verified either by live probe (cited below) or by being in production code that 
 | `coalesce(<traversal>, <fallback>)` | First-non-empty. Used at both the by-modulator level (for missing-field defaults) and the query level (for upsert via `fold().coalesce(unfold(), addV(...))`). |
 | `fold()` | Collapses a stream to a single list-valued traverser. Idiom for upsert: `g.V().has(...).fold().coalesce(unfold()..., addV(...)...)`. |
 | `unfold()` | Inverse of `fold()` — emits each list element as a separate traverser. |
-| `choose(<pred>, <true-branch>, <false-branch>)` | Conditional execution. **Not yet probed** — needs validation before Phase 10 uses it for the skip-sentinel pattern. |
+| `choose(<predicateTraversal>, <true-branch>, <false-branch>)` | Conditional execution. **Verified working** — Phase 10 probe 2026-05-26. Used for the "fixed-shape property ladder" pattern: `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('key', vN), __.identity())` skips a `.property(...)` write at runtime when the binding equals the sentinel. All three sub-traversals must be anonymous (`__.` prefix). Composes inside `addV().property(...).choose(...)` chains and survives across the `fold().coalesce(unfold()..., addV()...)` upsert shape. |
 
 ### Repeat / variable-depth
 
@@ -213,13 +213,15 @@ g.addV('Person').property('entityType', p0).property('label', p1)...
 
 When the property *key* (`'entityType'`, `'label'`, …) is interpolated into the query string, every write of a different shape becomes a unique query. CosmosDB can't reuse a compiled plan across them. Property *values* go through bindings (parameterized), which is correct security-wise, but the key interpolation defeats plan caching.
 
-**Workaround:** Use a fixed-shape ladder where both key and value flow through bindings:
+**Resolution (Phase 10, 2026-05-26):** every create/upsert/insert path in `packages/storage-cosmosdb/src/queries/` now emits one of seven module-level constant query strings (one per `addV` / `addE` create + one per upsert + one per `_repository` create). The query shape is fixed by:
 
-```gremlin
-.property(k0, v0).property(k1, v1).property(k2, v2)...
-```
+1. **String-literal property keys** (`'entityType'`, `'entityLabel'`, …) in the canonical fixed order defined in [packages/storage-cosmosdb/src/mapping.ts](../packages/storage-cosmosdb/src/mapping.ts).
+2. **`choose`-skip wrapper** for optional fields: `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('key', vN), __.identity())`. When the binding `vN` equals the sentinel (`''`), the choose's predicate evaluates false and the `__.identity()` branch fires — no property is written. This keeps the query string constant regardless of which optional fields the caller populated.
+3. **The `id` and `repositoryId` slots are written separately on the create branch only** (`.property('id', vid).property('repositoryId', rid)`) because Cosmos rejects partition-key mutation after `unfold()`. The ladder excludes them so the same ladder string can be reused unchanged in both the create branch and the upsert update branch.
 
-Same query string across all writes of the same shape (one shape per entity type, one per relationship type). The Gremlin server's parser/planner can cache the plan. **Latency win** under high write volume (bulk import path). See [Performance issue #20](../plans/performance-issues.md) — currently catalogued, Phase 10 of the perf-fixes plan will switch to fixed-shape ladders.
+The sentinel choice — empty string `''` — preserves the `isNull`/`isNotNull` PropertyFilter contract: choose-skipped properties are GENUINELY absent on the vertex, so `hasNot('summary')` correctly finds entities written without a summary. Confirmed via `local-tests/phase10-shape-probe2.mjs` test C/D.
+
+This is the resolved form of [Performance issue #20](../plans/performance-issues.md). Plan-cache observability is Azure-only — the emulator does not surface it.
 
 ---
 
@@ -464,6 +466,7 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 | Live shape probes — Phase 3 (2026-05-25) | `hasId(x)` single-id and `hasId(within(x, y, z))` batch forms work on both `g.V()` and `g.E()` — drop-in replacements for the equivalent `has('id', ...)` shapes. |
 | Live shape probes — Phase 4 (2026-05-25) | `simplePath()` placed before `.path()` filters cycle-revisiting traversers in the CosmosDB Gremlin subset. Composes correctly with the Phase 1 two-by projection `.path().by(<vertexProject>).by(<edgeProject>)`. |
 | Live shape probes — Phase 5 (2026-05-25) | (1) `aggregate('bucket')` accepts mixed vertex+edge accumulation; `aggregate('bucket').by(<projection>)` projects at aggregate time on a live element. (2) `cap('bucket').unfold()` strips by-modulator property accessors — only `.id()`/`.label()`/`.valueMap(true)` survive. (3) The union-with-shared-prefix shape is NOT quadratic on the engine — CosmosDB recognises the shared prefix and walks it once; both shapes have identical RU at every depth in unbounded mode. (4) `range()` pushdown through `union(...).dedup()` short-circuits the walk once the cap is hit; side-effect aggregation has no equivalent — the bounded union shape is up to 21× cheaper than the equivalent aggregation shape at depth 3 with cap=200 on Mining-Fleet–size data. |
+| Live shape probes — Phase 10 (2026-05-26) | (1) `choose(predicateTraversal, trueTraversal, falseTraversal)` works in the CosmosDB Gremlin subset; all three sub-traversals must be anonymous (`__.`-prefixed). (2) The `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('k', vN), __.identity())` pattern leaves the property GENUINELY absent on the vertex when `vN` equals the sentinel — verified via `hasNot('summary')` finding choose-skipped vertices, preserving the `isNull` PropertyFilter contract. (3) Property values can be bound through parameters in both required and choose-skipped slots; the same fixed query string handles every write of any entity/edge type. (4) The fixed-shape ladder composes correctly with the upsert `fold().coalesce(unfold()<ladder>, addV().property('id', vid).property('repositoryId', rid)<ladder>)` pattern — both branches reuse the SAME ladder string. |
 | Performance catalogue | [plans/performance-issues.md](../plans/performance-issues.md) — 20 ranked RU/round-trip issues, drawn from code review and Cosmos documentation. |
 | Performance fixes plan | [plans/performance-fixes-2026-05-25.md](../plans/performance-fixes-2026-05-25.md) — phased plan that consumes this doc and adds findings back to it as each phase probes new shapes. |
 
@@ -471,6 +474,6 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 
 ## To-probe before next changes
 
-- `choose(neq(sentinel), property(k, v), identity())` for the optional-property-skip pattern — Phase 10 (fixed-shape property ladders).
 - `T.id` vs bare `id` token as a by-modulator argument — empirically `id` works; `T.id` not yet tested.
 - `select('id')` behaviour on edges where the projected map has a discriminator-prefixed key (e.g. if we project `__id` instead of `id` to avoid colliding with Gremlin's `id` token).
+- Plan-cache empirical validation on the live Azure account — the emulator does not surface a clear plan-cache signal, so the Phase 10 latency win is currently structural-only. Capture a 50-write burst against Azure to confirm tail latency drops below first-call cost.

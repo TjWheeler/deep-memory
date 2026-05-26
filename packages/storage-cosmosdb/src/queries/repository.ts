@@ -10,7 +10,13 @@ import type {
   RepositoryUpdate,
 } from '@utaba/deep-memory/types';
 import type { PaginatedResult, DeleteProgressCallback } from '@utaba/deep-memory/types';
-import { repositoryFromGremlin, repositorySummaryFromGremlin, buildRepositoryProjectChain } from '../mapping.js';
+import {
+  buildRepositoryProjectChain,
+  buildRepositoryPropertyLadder,
+  repositoryConfigToLadderBindings,
+  repositoryFromGremlin,
+  repositorySummaryFromGremlin,
+} from '../mapping.js';
 import { DuplicateRepositoryError, RepositoryNotFoundError } from '@utaba/deep-memory';
 
 const REPO_LABEL = '_repository';
@@ -32,6 +38,12 @@ function propertyChain(bindings: Record<string, unknown>, props: Record<string, 
   return { chain: parts.join(''), nextIndex: idx };
 }
 
+// Phase 10: fixed-shape property ladder for `_repository` vertex creation.
+// Same query string across every createRepository call regardless of which
+// optional fields (description / type / legal / owner / metadata) are set.
+const REPOSITORY_CREATE_QUERY =
+  `g.addV('${REPO_LABEL}').property('id', vid).property('repositoryId', rid)${buildRepositoryPropertyLadder()}`;
+
 export async function createRepository(
   conn: CosmosDbConnection,
   config: StorageRepositoryConfig,
@@ -50,24 +62,10 @@ export async function createRepository(
   const bindings: Record<string, unknown> = {
     vid: vertexId,
     rid: config.repositoryId,
+    ...repositoryConfigToLadderBindings(config),
   };
 
-  const props: Record<string, string | number | boolean | null | undefined> = {
-    repoLabel: config.label,
-    description: config.description,
-    type: config.type,
-    legal: config.legal,
-    owner: config.owner,
-    governanceConfig: JSON.stringify(config.governanceConfig),
-    metadata: config.metadata ? JSON.stringify(config.metadata) : undefined,
-    createdAt: config.createdAt,
-    createdBy: config.createdBy,
-  };
-
-  const { chain } = propertyChain(bindings, props, 0);
-
-  const query = `g.addV('${REPO_LABEL}').property('id', vid).property('repositoryId', rid)${chain}`;
-  await conn.submit(query, bindings);
+  await conn.submit(REPOSITORY_CREATE_QUERY, bindings);
 
   return {
     repositoryId: config.repositoryId,
@@ -134,6 +132,10 @@ export async function listRepositories(
   };
 }
 
+// Phase 10 note: updateRepository, like updateEntity, intentionally keeps a
+// variable-shape query. Partial-update semantics would otherwise need a
+// three-way discriminator per slot. `_repository` writes are extremely rare
+// (one per repo per config change) so a missed plan-cache is negligible.
 export async function updateRepository(
   conn: CosmosDbConnection,
   repositoryId: string,

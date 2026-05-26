@@ -306,15 +306,151 @@ export function changeRecordFromGremlin(props: Record<string, unknown>): Vocabul
   };
 }
 
-// ─── Property serialization helpers ───────────────────────────────
+// ─── Phase 10 — fixed-shape property ladders ──────────────────────
+//
+// Every addV / addE / upsert write uses a canonical fixed-length property
+// ladder so the Gremlin server can reuse the compiled plan across writes.
+// Required slots emit `.property('key', pN)`; optional slots emit
+// `.choose(__.constant(pN).is(neq(absentSentinel)), __.property('key', pN),
+// __.identity())` — the choose-skip drops the property at runtime when the
+// binding equals the sentinel, keeping the query string constant regardless
+// of which optional fields the caller supplied.
+//
+// `id` and `repositoryId` are NOT part of these ladders — both are written
+// explicitly at create time (`.property('id', vid).property('repositoryId',
+// rid)`) and are immutable on update (Cosmos rejects partition-key mutation).
+//
+// Slot order is FIXED. Adding a new slot goes at the END only; reordering
+// or removing breaks the cached plan + introduces a different query string.
+//
+// Verified live 2026-05-26 — see local-tests/phase10-shape-probe*.mjs and
+// docs/cosmosdb-gremlin-compatibility.md (choose-skip / fixed-ladder entries).
 
-/** Build a flat property map for a vertex from a StoredEntity. */
-export function entityToGremlinProps(
-  repositoryId: string,
+/** Binding value used to signal an absent optional string slot. */
+export const ABSENT_STRING_SENTINEL = '';
+
+/** Binding name in the emitted query referencing the absent-sentinel value. */
+const SENTINEL_BINDING = 'absentSentinel';
+
+const ENTITY_REQUIRED_SLOTS = [
+  'entityType',
+  'entityLabel',
+  'slug',
+  'properties',
+  'createdBy',
+  'createdByType',
+  'createdAt',
+  'modifiedBy',
+  'modifiedByType',
+  'modifiedAt',
+] as const;
+
+const ENTITY_OPTIONAL_SLOTS = [
+  'summary',
+  'data',
+  'dataFormat',
+  'embedding',
+  'createdInConversation',
+  'createdFromMessage',
+  'modifiedInConversation',
+  'modifiedFromMessage',
+] as const;
+
+const RELATIONSHIP_REQUIRED_SLOTS = [
+  'relationshipType',
+  'sourceEntityId',
+  'targetEntityId',
+  'bidirectional',
+  'properties',
+  'createdBy',
+  'createdByType',
+  'createdAt',
+  'modifiedBy',
+  'modifiedByType',
+  'modifiedAt',
+] as const;
+
+const RELATIONSHIP_OPTIONAL_SLOTS = [
+  'createdInConversation',
+  'createdFromMessage',
+  'modifiedInConversation',
+  'modifiedFromMessage',
+] as const;
+
+const REPOSITORY_REQUIRED_SLOTS = [
+  'repoLabel',
+  'governanceConfig',
+  'createdAt',
+  'createdBy',
+] as const;
+
+const REPOSITORY_OPTIONAL_SLOTS = [
+  'description',
+  'type',
+  'legal',
+  'owner',
+  'metadata',
+] as const;
+
+function buildLadder(
+  required: readonly string[],
+  optional: readonly string[],
+  paramPrefix: string,
+): string {
+  const parts: string[] = [];
+  let i = 0;
+  for (const slot of required) {
+    parts.push(`.property('${slot}', ${paramPrefix}${i++})`);
+  }
+  for (const slot of optional) {
+    parts.push(
+      `.choose(__.constant(${paramPrefix}${i}).is(neq(${SENTINEL_BINDING})),` +
+        ` __.property('${slot}', ${paramPrefix}${i}),` +
+        ` __.identity())`,
+    );
+    i++;
+  }
+  return parts.join('');
+}
+
+function buildLadderBindings(
+  required: readonly string[],
+  optional: readonly string[],
+  paramPrefix: string,
+  values: Record<string, string | number | boolean | null | undefined>,
+): Record<string, string | number | boolean> {
+  const bindings: Record<string, string | number | boolean> = {};
+  let i = 0;
+  for (const slot of required) {
+    const v = values[slot];
+    if (v == null) {
+      throw new Error(`Phase 10 fixed-ladder: required slot '${slot}' is null/undefined`);
+    }
+    bindings[`${paramPrefix}${i++}`] = v;
+  }
+  for (const slot of optional) {
+    const v = values[slot];
+    bindings[`${paramPrefix}${i++}`] = v ?? ABSENT_STRING_SENTINEL;
+  }
+  return bindings;
+}
+
+/**
+ * Emit the entity property ladder — same Gremlin string for every entity
+ * write regardless of which optional fields are present. Prepend the
+ * vertex-create prefix (e.g. `addV(vertexLabel).property('id', vid)
+ * .property('repositoryId', rid)`) when on a create branch; on an update
+ * branch (existing vertex via `unfold()`) use this chain directly.
+ */
+export function buildEntityPropertyLadder(): string {
+  return buildLadder(ENTITY_REQUIRED_SLOTS, ENTITY_OPTIONAL_SLOTS, 'p');
+}
+
+/** Build the canonical entity ladder bindings (p0..p17 + absentSentinel). */
+export function entityToLadderBindings(
   entity: StoredEntity,
 ): Record<string, string | number | boolean> {
-  const props: Record<string, string | number | boolean> = {
-    repositoryId,
+  const bindings = buildLadderBindings(ENTITY_REQUIRED_SLOTS, ENTITY_OPTIONAL_SLOTS, 'p', {
     entityType: entity.entityType,
     entityLabel: entity.label,
     slug: entity.slug,
@@ -325,40 +461,93 @@ export function entityToGremlinProps(
     modifiedBy: entity.provenance.modifiedBy,
     modifiedByType: entity.provenance.modifiedByType,
     modifiedAt: entity.provenance.modifiedAt,
-  };
-  if (entity.summary != null) props['summary'] = entity.summary;
-  if (entity.data != null) props['data'] = entity.data;
-  if (entity.dataFormat != null) props['dataFormat'] = entity.dataFormat;
-  if (entity.provenance.createdInConversation != null) props['createdInConversation'] = entity.provenance.createdInConversation;
-  if (entity.provenance.createdFromMessage != null) props['createdFromMessage'] = entity.provenance.createdFromMessage;
-  if (entity.provenance.modifiedInConversation != null) props['modifiedInConversation'] = entity.provenance.modifiedInConversation;
-  if (entity.provenance.modifiedFromMessage != null) props['modifiedFromMessage'] = entity.provenance.modifiedFromMessage;
-  if (entity.embedding != null) props['embedding'] = JSON.stringify(entity.embedding);
-  return props;
+    summary: entity.summary,
+    data: entity.data,
+    dataFormat: entity.dataFormat,
+    embedding: entity.embedding != null ? JSON.stringify(entity.embedding) : undefined,
+    createdInConversation: entity.provenance.createdInConversation,
+    createdFromMessage: entity.provenance.createdFromMessage,
+    modifiedInConversation: entity.provenance.modifiedInConversation,
+    modifiedFromMessage: entity.provenance.modifiedFromMessage,
+  });
+  bindings[SENTINEL_BINDING] = ABSENT_STRING_SENTINEL;
+  return bindings;
 }
 
-/** Build a flat property map for an edge from a StoredRelationship. */
-export function relationshipToGremlinProps(
-  repositoryId: string,
+/** Edge counterpart of `buildEntityPropertyLadder()` — different slot list. */
+export function buildRelationshipPropertyLadder(): string {
+  return buildLadder(RELATIONSHIP_REQUIRED_SLOTS, RELATIONSHIP_OPTIONAL_SLOTS, 'p');
+}
+
+/** Build the canonical relationship ladder bindings (p0..p14 + absentSentinel). */
+export function relationshipToLadderBindings(
   rel: StoredRelationship,
 ): Record<string, string | number | boolean> {
-  const props: Record<string, string | number | boolean> = {
-    repositoryId,
-    relationshipType: rel.relationshipType,
-    sourceEntityId: rel.sourceEntityId,
-    targetEntityId: rel.targetEntityId,
-    bidirectional: rel.bidirectional,
-    properties: JSON.stringify(rel.properties ?? {}),
-    createdBy: rel.provenance.createdBy,
-    createdByType: rel.provenance.createdByType,
-    createdAt: rel.provenance.createdAt,
-    modifiedBy: rel.provenance.modifiedBy,
-    modifiedByType: rel.provenance.modifiedByType,
-    modifiedAt: rel.provenance.modifiedAt,
-  };
-  if (rel.provenance.createdInConversation != null) props['createdInConversation'] = rel.provenance.createdInConversation;
-  if (rel.provenance.createdFromMessage != null) props['createdFromMessage'] = rel.provenance.createdFromMessage;
-  if (rel.provenance.modifiedInConversation != null) props['modifiedInConversation'] = rel.provenance.modifiedInConversation;
-  if (rel.provenance.modifiedFromMessage != null) props['modifiedFromMessage'] = rel.provenance.modifiedFromMessage;
-  return props;
+  const bindings = buildLadderBindings(
+    RELATIONSHIP_REQUIRED_SLOTS,
+    RELATIONSHIP_OPTIONAL_SLOTS,
+    'p',
+    {
+      relationshipType: rel.relationshipType,
+      sourceEntityId: rel.sourceEntityId,
+      targetEntityId: rel.targetEntityId,
+      bidirectional: rel.bidirectional,
+      properties: JSON.stringify(rel.properties ?? {}),
+      createdBy: rel.provenance.createdBy,
+      createdByType: rel.provenance.createdByType,
+      createdAt: rel.provenance.createdAt,
+      modifiedBy: rel.provenance.modifiedBy,
+      modifiedByType: rel.provenance.modifiedByType,
+      modifiedAt: rel.provenance.modifiedAt,
+      createdInConversation: rel.provenance.createdInConversation,
+      createdFromMessage: rel.provenance.createdFromMessage,
+      modifiedInConversation: rel.provenance.modifiedInConversation,
+      modifiedFromMessage: rel.provenance.modifiedFromMessage,
+    },
+  );
+  bindings[SENTINEL_BINDING] = ABSENT_STRING_SENTINEL;
+  return bindings;
+}
+
+/**
+ * Repository property ladder — slot list matches the writable surface of
+ * StorageRepositoryConfig (the `id` and `repositoryId` slots are written
+ * separately by the caller).
+ */
+export function buildRepositoryPropertyLadder(): string {
+  return buildLadder(REPOSITORY_REQUIRED_SLOTS, REPOSITORY_OPTIONAL_SLOTS, 'p');
+}
+
+/** Build the canonical repository ladder bindings. */
+export function repositoryConfigToLadderBindings(
+  config: {
+    label: string;
+    governanceConfig: unknown;
+    createdAt: string;
+    createdBy: string;
+    description?: string;
+    type?: string;
+    legal?: string;
+    owner?: string;
+    metadata?: Record<string, unknown>;
+  },
+): Record<string, string | number | boolean> {
+  const bindings = buildLadderBindings(
+    REPOSITORY_REQUIRED_SLOTS,
+    REPOSITORY_OPTIONAL_SLOTS,
+    'p',
+    {
+      repoLabel: config.label,
+      governanceConfig: JSON.stringify(config.governanceConfig),
+      createdAt: config.createdAt,
+      createdBy: config.createdBy,
+      description: config.description,
+      type: config.type,
+      legal: config.legal,
+      owner: config.owner,
+      metadata: config.metadata != null ? JSON.stringify(config.metadata) : undefined,
+    },
+  );
+  bindings[SENTINEL_BINDING] = ABSENT_STRING_SENTINEL;
+  return bindings;
 }

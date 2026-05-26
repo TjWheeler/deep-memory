@@ -19,7 +19,14 @@
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { ExportChunk, ImportChunk, BulkImportOptions } from '@utaba/deep-memory/types';
 import type { BulkImportResult, StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
-import { entityFromGremlin, entityToGremlinProps, relationshipFromGremlin, relationshipToGremlinProps } from '../mapping.js';
+import {
+  buildEntityPropertyLadder,
+  buildRelationshipPropertyLadder,
+  entityFromGremlin,
+  entityToLadderBindings,
+  relationshipFromGremlin,
+  relationshipToLadderBindings,
+} from '../mapping.js';
 import { resolveController, runAdaptive } from './adaptive-import.js';
 
 const EXPORT_BATCH_SIZE = 100;
@@ -190,6 +197,39 @@ export async function importBulk(
   return { entitiesImported, relationshipsImported, errors };
 }
 
+// ─── Phase 10 — fixed-shape query templates ──────────────────────
+//
+// Same Gremlin string across every entity/relationship write regardless of
+// which optional fields are populated. Computed once at module load. The
+// upsert update branch reuses the SAME ladder as the create branch — Cosmos
+// already rejects `.property('repositoryId', ...)` after `unfold()`, and the
+// ladder excludes `id` and `repositoryId` (both written explicitly only on
+// the create branch).
+
+const ENTITY_LADDER_CHAIN = buildEntityPropertyLadder();
+const RELATIONSHIP_LADDER_CHAIN = buildRelationshipPropertyLadder();
+
+const INSERT_ENTITY_QUERY =
+  `g.addV(vertexLabel).property('id', vid).property('repositoryId', rid)${ENTITY_LADDER_CHAIN}`;
+
+const INSERT_RELATIONSHIP_QUERY =
+  `g.V().has('repositoryId', rid).hasId(srcId).has('entityType')` +
+  `.addE(edgeLabel)` +
+  `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+  `.property('id', relId).property('repositoryId', rid)${RELATIONSHIP_LADDER_CHAIN}`;
+
+const UPSERT_ENTITY_QUERY =
+  `g.V().has('repositoryId', rid).hasId(vid).has('entityType').fold().coalesce(` +
+  `unfold()${ENTITY_LADDER_CHAIN},` +
+  ` addV(vertexLabel).property('id', vid).property('repositoryId', rid)${ENTITY_LADDER_CHAIN})`;
+
+const UPSERT_RELATIONSHIP_QUERY =
+  `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
+  `unfold()${RELATIONSHIP_LADDER_CHAIN},` +
+  ` g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)` +
+  `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+  `.property('id', relId).property('repositoryId', rid)${RELATIONSHIP_LADDER_CHAIN})`;
+
 // ─── Direct insert (no existence check) ─────────────────────────
 
 /** Insert an entity directly — assumes it does not exist. */
@@ -198,22 +238,13 @@ async function insertEntity(
   repositoryId: string,
   entity: StoredEntity,
 ): Promise<void> {
-  const props = entityToGremlinProps(repositoryId, entity);
   const bindings: Record<string, unknown> = {
+    rid: repositoryId,
     vid: entity.id,
     vertexLabel: entity.entityType,
+    ...entityToLadderBindings(entity),
   };
-  const propParts: string[] = [];
-  let idx = 0;
-
-  for (const [key, value] of Object.entries(props)) {
-    const paramName = `p${idx++}`;
-    bindings[paramName] = value;
-    propParts.push(`.property('${key}', ${paramName})`);
-  }
-
-  const query = `g.addV(vertexLabel).property('id', vid)${propParts.join('')}`;
-  await conn.submit(query, bindings);
+  await conn.submit(INSERT_ENTITY_QUERY, bindings);
 }
 
 /** Insert a relationship directly — assumes it does not exist. */
@@ -222,25 +253,15 @@ async function insertRelationship(
   repositoryId: string,
   rel: StoredRelationship,
 ): Promise<void> {
-  const props = relationshipToGremlinProps(repositoryId, rel);
   const bindings: Record<string, unknown> = {
+    rid: repositoryId,
     relId: rel.id,
     srcId: rel.sourceEntityId,
     tgtId: rel.targetEntityId,
-    rid: repositoryId,
     edgeLabel: rel.relationshipType,
+    ...relationshipToLadderBindings(rel),
   };
-  const propParts: string[] = [];
-  let idx = 0;
-
-  for (const [key, value] of Object.entries(props)) {
-    const paramName = `p${idx++}`;
-    bindings[paramName] = value;
-    propParts.push(`.property('${key}', ${paramName})`);
-  }
-
-  const query = `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
-  await conn.submit(query, bindings);
+  await conn.submit(INSERT_RELATIONSHIP_QUERY, bindings);
 }
 
 // ─── Atomic upsert (single query with coalesce) ─────────────────
@@ -248,84 +269,48 @@ async function insertRelationship(
 /**
  * Upsert an entity using Gremlin's coalesce pattern — single query.
  * Replaces the old 2-query check-then-create/update approach.
+ *
+ * Phase 10: both branches share the same fixed-shape entity ladder (which
+ * omits `id` and `repositoryId`). The create branch prepends `.property('id',
+ * vid).property('repositoryId', rid)` to addV; the update branch (after
+ * `unfold`) relies on those system properties already being set. Cosmos
+ * rejects `.property('repositoryId', ...)` after `unfold()` at parse time,
+ * so excluding `repositoryId` from the ladder is required for correctness
+ * as well as plan-cache shape.
  */
 async function upsertEntity(
   conn: CosmosDbConnection,
   repositoryId: string,
   entity: StoredEntity,
 ): Promise<void> {
-  const props = entityToGremlinProps(repositoryId, entity);
   const bindings: Record<string, unknown> = {
-    vid: entity.id,
     rid: repositoryId,
+    vid: entity.id,
     vertexLabel: entity.entityType,
+    ...entityToLadderBindings(entity),
   };
-  const createPropParts: string[] = [];
-  const updatePropParts: string[] = [];
-  let idx = 0;
-
-  for (const [key, value] of Object.entries(props)) {
-    const paramName = `p${idx++}`;
-    bindings[paramName] = value;
-    const part = `.property('${key}', ${paramName})`;
-    createPropParts.push(part);
-    // Cosmos rejects `.property('repositoryId', ...)` after `unfold()` as
-    // "Partition key property of a vertex is readonly" — and rejects it at
-    // parse time, so the create branch failing too even when no existing
-    // vertex matches. Omit the partition key from the update branch; the
-    // partition key is already pinned by `has('repositoryId', rid)` upstream
-    // and cannot legally change.
-    if (key !== 'repositoryId') updatePropParts.push(part);
-  }
-
-  // coalesce: find existing → update it, or create new
-  const query =
-    `g.V().has('repositoryId', rid).hasId(vid).has('entityType').fold().coalesce(` +
-    `unfold()${updatePropParts.join('')},` +
-    ` addV(vertexLabel).property('id', vid)${createPropParts.join('')})`;
-  await conn.submit(query, bindings);
+  await conn.submit(UPSERT_ENTITY_QUERY, bindings);
 }
 
 /**
  * Upsert a relationship using Gremlin's coalesce pattern — single query.
  * Replaces the old 2-query check-then-create/update approach.
+ *
+ * The E() lookup is scoped by repositoryId so an edge with the same id in a
+ * different repo cannot be matched and silently overwritten.
  */
 async function upsertRelationship(
   conn: CosmosDbConnection,
   repositoryId: string,
   rel: StoredRelationship,
 ): Promise<void> {
-  const props = relationshipToGremlinProps(repositoryId, rel);
   const bindings: Record<string, unknown> = {
+    rid: repositoryId,
     relId: rel.id,
     srcId: rel.sourceEntityId,
     tgtId: rel.targetEntityId,
-    rid: repositoryId,
     edgeLabel: rel.relationshipType,
+    ...relationshipToLadderBindings(rel),
   };
-  const createPropParts: string[] = [];
-  const updatePropParts: string[] = [];
-  let idx = 0;
-
-  for (const [key, value] of Object.entries(props)) {
-    const paramName = `p${idx++}`;
-    bindings[paramName] = value;
-    const part = `.property('${key}', ${paramName})`;
-    createPropParts.push(part);
-    // Same partition-key constraint as upsertEntity above — Cosmos rejects
-    // mutating the partition key on the update branch at parse time.
-    if (key !== 'repositoryId') updatePropParts.push(part);
-  }
-
-  // coalesce: find existing → update it, or create new edge.
-  // The E() lookup is scoped by repositoryId so an edge with the same id in a
-  // different repo cannot be matched and silently overwritten.
-  const createEdge =
-    `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)` +
-    `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
-    `.property('id', relId)${createPropParts.join('')}`;
-  const query =
-    `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
-    `unfold()${updatePropParts.join('')}, ${createEdge})`;
-  await conn.submit(query, bindings);
+  await conn.submit(UPSERT_RELATIONSHIP_QUERY, bindings);
 }

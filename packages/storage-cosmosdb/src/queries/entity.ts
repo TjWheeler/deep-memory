@@ -6,9 +6,10 @@ import type { StoredEntity, StoredEntityUpdate } from '@utaba/deep-memory/types'
 import type { StorageFindQuery, PaginatedResult, PropertyFilter } from '@utaba/deep-memory/types';
 import type { EntityReadOptions } from '@utaba/deep-memory/providers';
 import {
+  buildEntityPropertyLadder,
   entityFromDocument,
   entityFromGremlin,
-  entityToGremlinProps,
+  entityToLadderBindings,
   STORED_ENTITY_FIELDS,
 } from '../mapping.js';
 import {
@@ -24,35 +25,29 @@ import {
 // duplicate path returns this string, which we translate into the typed error.
 const DUPLICATE_SENTINEL = '__duplicate';
 
+// Phase 10: fixed-shape property ladder — same Gremlin string for every entity
+// create regardless of which optional fields are populated. Computed once at
+// module load so the string is reused across calls (helps Node's string
+// interner as well as Cosmos's plan cache).
+const ENTITY_CREATE_QUERY =
+  `g.V().has('repositoryId', rid).hasId(vid).fold().coalesce(` +
+  `unfold().constant('${DUPLICATE_SENTINEL}'),` +
+  `addV(vertexLabel).property('id', vid).property('repositoryId', rid)${buildEntityPropertyLadder()}` +
+  `)`;
+
 export async function createEntity(
   conn: CosmosDbConnection,
   repositoryId: string,
   entity: StoredEntity,
 ): Promise<StoredEntity> {
-  const props = entityToGremlinProps(repositoryId, entity);
   const bindings: Record<string, unknown> = {
     rid: repositoryId,
     vid: entity.id,
     vertexLabel: entity.entityType,
+    ...entityToLadderBindings(entity),
   };
-  const propParts: string[] = [];
-  let idx = 0;
 
-  for (const [key, value] of Object.entries(props)) {
-    const paramName = `p${idx++}`;
-    bindings[paramName] = value;
-    propParts.push(`.property('${key}', ${paramName})`);
-  }
-
-  // Single round-trip: if a vertex with this id already exists in the
-  // partition, the unfold().constant(...) branch fires and returns the sentinel
-  // string. Otherwise the addV branch creates the new vertex.
-  const query =
-    `g.V().has('repositoryId', rid).hasId(vid).fold().coalesce(` +
-    `unfold().constant('${DUPLICATE_SENTINEL}'),` +
-    `addV(vertexLabel).property('id', vid)${propParts.join('')}` +
-    `)`;
-  const result = await conn.submit(query, bindings);
+  const result = await conn.submit(ENTITY_CREATE_QUERY, bindings);
 
   if (result.items[0] === DUPLICATE_SENTINEL) {
     throw new DuplicateEntityError(entity.id);
@@ -122,6 +117,16 @@ export async function getEntities(
   }
   return map;
 }
+
+// Phase 10 note: updateEntity intentionally KEEPS its variable-shape query.
+// A fixed-shape ladder for updates would require a three-way discriminator
+// per slot (set / drop / leave) with two-level choose-and-sideEffect-drop
+// branches — significant Gremlin complexity for a per-call plan-cache win
+// that is much smaller than the bulk-import write path Phase 10 primarily
+// targets (issue #20 in plans/performance-issues.md is framed around the
+// "every create is a unique query" case, not partial-update calls). If the
+// reembed loop ever profiles as plan-parse-bound, revisit by introducing a
+// two-sentinel ladder shape — until then variable is fine.
 
 export async function updateEntity(
   conn: CosmosDbConnection,

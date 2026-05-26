@@ -6,12 +6,20 @@ import {
   buildEdgeProjectChain,
 } from '@utaba/deep-memory';
 import {
+  ABSENT_STRING_SENTINEL,
   STORED_ENTITY_FIELDS,
   STORED_RELATIONSHIP_FIELDS,
   STORED_REPOSITORY_FIELDS,
+  buildEntityPropertyLadder,
+  buildRelationshipPropertyLadder,
   buildRepositoryProjectChain,
+  buildRepositoryPropertyLadder,
   entityFromDocument,
+  entityToLadderBindings,
+  relationshipToLadderBindings,
+  repositoryConfigToLadderBindings,
 } from './mapping.js';
+import type { StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
 
 // Phase 1 perf-fixes contract: the GremlinCompiler emits a fixed project chain
 // listing the keys the storage-cosmosdb mappers consume. The two lists live
@@ -191,5 +199,200 @@ describe('buildRepositoryProjectChain (Phase 2)', () => {
     // optional
     expect(chain).toMatch(/coalesce\(values\('description'\), constant\(''\)\)/);
     expect(chain).toMatch(/coalesce\(values\('metadata'\), constant\(''\)\)/);
+  });
+});
+
+// ─── Phase 10 fixed-shape property ladders ───────────────────────
+//
+// Two contracts the cosmos-side write paths depend on:
+//   1. The emitted Gremlin string is INVARIANT across writes — same chain
+//      regardless of which optional fields the caller populated. (Plan-cache
+//      depends on this.)
+//   2. The bindings dict that `*ToLadderBindings` returns is canonical: every
+//      slot is present (even when absent — sentinel-filled), and the slot
+//      order matches the chain's parameter order so the choose-skip steps
+//      can read the right value.
+// Validated live against the emulator in local-tests/phase10-shape-probe*.mjs.
+
+describe('Phase 10 — entity property ladder', () => {
+  const baseEntity: StoredEntity = {
+    id: 'eid-1',
+    slug: 'Person:alice',
+    entityType: 'Person',
+    label: 'Alice',
+    properties: { role: 'engineer' },
+    provenance: {
+      createdBy: 'agent-1',
+      createdByType: 'agent',
+      createdAt: '2026-05-26T00:00:00Z',
+      modifiedBy: 'agent-1',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-26T00:00:00Z',
+    },
+  };
+
+  it('emits the same chain string regardless of optional-slot population', () => {
+    expect(buildEntityPropertyLadder()).toBe(buildEntityPropertyLadder());
+  });
+
+  it('chain contains every required slot as plain .property and every optional slot via choose-skip', () => {
+    const chain = buildEntityPropertyLadder();
+    // Required slots — bare .property('key', pN)
+    for (const slot of [
+      'entityType', 'entityLabel', 'slug', 'properties',
+      'createdBy', 'createdByType', 'createdAt',
+      'modifiedBy', 'modifiedByType', 'modifiedAt',
+    ]) {
+      expect(chain).toMatch(new RegExp(`\\.property\\('${slot}',\\s*p\\d+\\)`));
+    }
+    // Optional slots — choose-skip wrapper referencing the sentinel binding
+    for (const slot of [
+      'summary', 'data', 'dataFormat', 'embedding',
+      'createdInConversation', 'createdFromMessage',
+      'modifiedInConversation', 'modifiedFromMessage',
+    ]) {
+      expect(chain).toMatch(
+        new RegExp(`__\\.constant\\(p\\d+\\)\\.is\\(neq\\(absentSentinel\\)\\),\\s*__\\.property\\('${slot}',\\s*p\\d+\\)`),
+      );
+    }
+  });
+
+  it('chain does NOT include id or repositoryId — those are written separately by the caller', () => {
+    const chain = buildEntityPropertyLadder();
+    expect(chain).not.toMatch(/\.property\('id',/);
+    expect(chain).not.toMatch(/\.property\('repositoryId',/);
+  });
+
+  it('entityToLadderBindings emits every slot including absentSentinel', () => {
+    const bindings = entityToLadderBindings(baseEntity);
+    // Required slots populated
+    expect(bindings['p0']).toBe('Person'); // entityType
+    expect(bindings['p1']).toBe('Alice');  // entityLabel
+    expect(bindings['p2']).toBe('Person:alice'); // slug
+    expect(bindings['p3']).toBe('{"role":"engineer"}'); // properties JSON
+    // Optional slots default to the sentinel
+    expect(bindings['p10']).toBe(ABSENT_STRING_SENTINEL); // summary
+    expect(bindings['p11']).toBe(ABSENT_STRING_SENTINEL); // data
+    expect(bindings['p13']).toBe(ABSENT_STRING_SENTINEL); // embedding
+    expect(bindings['absentSentinel']).toBe(ABSENT_STRING_SENTINEL);
+  });
+
+  it('entityToLadderBindings stringifies the embedding when present', () => {
+    const bindings = entityToLadderBindings({ ...baseEntity, embedding: [0.1, 0.2, 0.3] });
+    expect(bindings['p13']).toBe('[0.1,0.2,0.3]');
+  });
+
+  it('entityToLadderBindings emits sentinel for an explicit empty string the same way as undefined', () => {
+    // Empty string and undefined collapse to absent on read (`unwrapOptStr`).
+    // Both must produce the sentinel binding so the choose-skip uniformly
+    // drops the property — confirming the read-path semantic is preserved.
+    const a = entityToLadderBindings({ ...baseEntity, summary: undefined });
+    const b = entityToLadderBindings({ ...baseEntity, summary: '' });
+    expect(a['p10']).toBe(ABSENT_STRING_SENTINEL);
+    // '' is itself the sentinel — equality check, not collapse.
+    expect(b['p10']).toBe('');
+  });
+
+  it('entityToLadderBindings throws if a required slot is null', () => {
+    const broken = {
+      ...baseEntity,
+      entityType: null as unknown as string,
+    };
+    expect(() => entityToLadderBindings(broken)).toThrow(/required slot 'entityType'/);
+  });
+});
+
+describe('Phase 10 — relationship property ladder', () => {
+  const baseRel: StoredRelationship = {
+    id: 'rel-1',
+    relationshipType: 'KNOWS',
+    sourceEntityId: 'src',
+    targetEntityId: 'tgt',
+    properties: {},
+    bidirectional: true,
+    provenance: {
+      createdBy: 'agent-1',
+      createdByType: 'agent',
+      createdAt: '2026-05-26T00:00:00Z',
+      modifiedBy: 'agent-1',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-26T00:00:00Z',
+    },
+  };
+
+  it('chain references every required slot plainly and every optional slot via choose-skip', () => {
+    const chain = buildRelationshipPropertyLadder();
+    for (const slot of [
+      'relationshipType', 'sourceEntityId', 'targetEntityId',
+      'bidirectional', 'properties',
+      'createdBy', 'createdByType', 'createdAt',
+      'modifiedBy', 'modifiedByType', 'modifiedAt',
+    ]) {
+      expect(chain).toMatch(new RegExp(`\\.property\\('${slot}',\\s*p\\d+\\)`));
+    }
+    for (const slot of [
+      'createdInConversation', 'createdFromMessage',
+      'modifiedInConversation', 'modifiedFromMessage',
+    ]) {
+      expect(chain).toMatch(
+        new RegExp(`__\\.constant\\(p\\d+\\)\\.is\\(neq\\(absentSentinel\\)\\),\\s*__\\.property\\('${slot}',\\s*p\\d+\\)`),
+      );
+    }
+    // Same id/repositoryId-omission contract as entities.
+    expect(chain).not.toMatch(/\.property\('id',/);
+    expect(chain).not.toMatch(/\.property\('repositoryId',/);
+  });
+
+  it('relationshipToLadderBindings preserves the boolean bidirectional and sentinels absent provenance', () => {
+    const bindings = relationshipToLadderBindings(baseRel);
+    expect(bindings['p3']).toBe(true); // bidirectional
+    expect(bindings['p11']).toBe(ABSENT_STRING_SENTINEL); // createdInConversation
+    expect(bindings['p14']).toBe(ABSENT_STRING_SENTINEL); // modifiedFromMessage
+    expect(bindings['absentSentinel']).toBe(ABSENT_STRING_SENTINEL);
+  });
+});
+
+describe('Phase 10 — repository property ladder', () => {
+  it('chain references every required slot plainly and every optional slot via choose-skip', () => {
+    const chain = buildRepositoryPropertyLadder();
+    for (const slot of ['repoLabel', 'governanceConfig', 'createdAt', 'createdBy']) {
+      expect(chain).toMatch(new RegExp(`\\.property\\('${slot}',\\s*p\\d+\\)`));
+    }
+    for (const slot of ['description', 'type', 'legal', 'owner', 'metadata']) {
+      expect(chain).toMatch(
+        new RegExp(`__\\.constant\\(p\\d+\\)\\.is\\(neq\\(absentSentinel\\)\\),\\s*__\\.property\\('${slot}',\\s*p\\d+\\)`),
+      );
+    }
+  });
+
+  it('repositoryConfigToLadderBindings stringifies governanceConfig and metadata', () => {
+    const bindings = repositoryConfigToLadderBindings({
+      label: 'Test',
+      governanceConfig: { mode: 'open' },
+      createdAt: '2026-05-26T00:00:00Z',
+      createdBy: 'user-1',
+      description: 'A test repo',
+      metadata: { foo: 'bar' },
+    });
+    expect(bindings['p0']).toBe('Test');
+    expect(bindings['p1']).toBe('{"mode":"open"}');
+    expect(bindings['p4']).toBe('A test repo');
+    expect(bindings['p8']).toBe('{"foo":"bar"}');
+    expect(bindings['absentSentinel']).toBe(ABSENT_STRING_SENTINEL);
+  });
+
+  it('repositoryConfigToLadderBindings emits sentinels for absent optional fields', () => {
+    const bindings = repositoryConfigToLadderBindings({
+      label: 'Test',
+      governanceConfig: { mode: 'open' },
+      createdAt: '2026-05-26T00:00:00Z',
+      createdBy: 'user-1',
+    });
+    // description / type / legal / owner / metadata all absent
+    expect(bindings['p4']).toBe(ABSENT_STRING_SENTINEL);
+    expect(bindings['p5']).toBe(ABSENT_STRING_SENTINEL);
+    expect(bindings['p6']).toBe(ABSENT_STRING_SENTINEL);
+    expect(bindings['p7']).toBe(ABSENT_STRING_SENTINEL);
+    expect(bindings['p8']).toBe(ABSENT_STRING_SENTINEL);
   });
 });

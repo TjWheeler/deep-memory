@@ -22,7 +22,8 @@ export type DeepMemoryErrorCode =
   | 'GRAPH_TRAVERSAL_PROVIDER_REQUIRED'
   | 'TRAVERSAL_VALIDATION_FAILED'
   | 'TRAVERSAL_VOCABULARY_ERROR'
-  | 'TRAVERSAL_TIMEOUT';
+  | 'TRAVERSAL_TIMEOUT'
+  | 'UNSUPPORTED_QUERY';
 
 /** Base error class for all Deep Memory errors */
 export class DeepMemoryError extends Error {
@@ -386,5 +387,22 @@ export class TraversalTimeoutError extends DeepMemoryError {
     );
     this.name = 'TraversalTimeoutError';
     this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * Thrown when a query is syntactically valid but the active provider cannot
+ * execute it efficiently or correctly — e.g. a substring search on a backend
+ * with no server-side text predicate, where the only safe implementation would
+ * fan out across the entire partition. The caller should adjust the query
+ * (add type filters, narrow the scope) or use a provider-specific alternative.
+ */
+export class UnsupportedQueryError extends DeepMemoryError {
+  readonly provider: string;
+
+  constructor(provider: string, message: string, suggestion?: string) {
+    super('UNSUPPORTED_QUERY', message, suggestion);
+    this.name = 'UnsupportedQueryError';
+    this.provider = provider;
   }
 }

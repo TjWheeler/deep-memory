@@ -5,7 +5,12 @@ import type { StoredEntity, StoredEntityUpdate } from '@utaba/deep-memory/types'
 import type { StorageFindQuery, PaginatedResult } from '@utaba/deep-memory/types';
 import type { EntityReadOptions } from '@utaba/deep-memory/providers';
 import { entityFromGremlin, entityToGremlinProps } from '../mapping.js';
-import { DuplicateEntityError, EntityNotFoundError, buildVertexProjectChain } from '@utaba/deep-memory';
+import {
+  DuplicateEntityError,
+  EntityNotFoundError,
+  UnsupportedQueryError,
+  buildVertexProjectChain,
+} from '@utaba/deep-memory';
 
 // Sentinel returned by the duplicate-detection branch of the
 // fold().coalesce(unfold().constant('__duplicate'), addV/addE) pattern.
@@ -245,6 +250,24 @@ export async function findEntities(
   const needsClientFilter = Boolean(query.searchTerm) || hasPropertyFilter;
 
   if (needsClientFilter) {
+    // Phase 8: reject the unfiltered fan-out. Without entityTypes, the
+    // JS-filter path would load every vertex in the partition just to filter
+    // in memory — CosmosDB Gremlin silently drops TextP.containing(), so
+    // searchTerm and properties cannot be evaluated server-side. Require the
+    // caller to narrow by entityTypes first.
+    /*Tim Notes and TODO:
+      This is a bad design and poor implementation.
+      The core issue stems from the fact that the gremlin queries are case sensitive.
+      What I will look at is using the Record endpoint for this query specifically to allow case insensitive.
+    */
+    if (!query.entityTypes || query.entityTypes.length === 0) {
+      throw new UnsupportedQueryError(
+        'cosmosdb',
+        "find_entities with 'searchTerm' or 'properties' requires 'entityTypes' on the CosmosDB provider — vector / text search across all types is unsupported in this provider.",
+        "Provide 'entityTypes' to narrow the candidate set, or use 'memory_search_by_concept' for semantic search across types.",
+      );
+    }
+
     const dataResult = await conn.submit(
       `g.V()${filterClause}.${projection}`,
       bindings,

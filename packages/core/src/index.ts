@@ -29,6 +29,7 @@ export {
   TraversalValidationError,
   TraversalVocabularyError,
   TraversalTimeoutError,
+  UnsupportedQueryError,
 } from './core/errors.js';
 export type { DeepMemoryErrorCode } from './core/errors.js';
 

@@ -264,8 +264,11 @@ export function runStorageProviderConformanceTests(
         await provider.createEntity(repoId, makeEntity('e1', 'test-type', 'Alpha'));
         await provider.createEntity(repoId, makeEntity('e2', 'test-type', 'Beta'));
 
+        // Pass entityTypes alongside searchTerm so the test is portable to
+        // providers that require type narrowing before applying text filters.
         const result = await provider.findEntities(repoId, {
           searchTerm: 'alpha',
+          entityTypes: ['test-type'],
           limit: 10,
           offset: 0,
         });

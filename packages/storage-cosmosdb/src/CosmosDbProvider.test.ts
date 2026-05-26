@@ -16,7 +16,12 @@ import type {
   StoredRelationship,
   TraversalSpec,
 } from '@utaba/deep-memory/types';
-import { DuplicateEntityError, DuplicateRelationshipError, EntityNotFoundError } from '@utaba/deep-memory';
+import {
+  DuplicateEntityError,
+  DuplicateRelationshipError,
+  EntityNotFoundError,
+  UnsupportedQueryError,
+} from '@utaba/deep-memory';
 
 const TEST_REPO = '40000000-0000-4000-a000-000000000099';
 
@@ -557,5 +562,109 @@ describe('Phase 7 single-round-trip delete paths', () => {
     const issued = stub.calls[stub.calls.length - 1]!;
     expect(issued.query).not.toContain('.count()');
     expect(issued.query).toContain("aggregate('found').by('id')");
+  });
+});
+
+// ─── Phase 8 — findEntities JS-filter requires entityTypes ───────────
+//
+// CosmosDB Gremlin silently drops TextP.containing(), so searchTerm /
+// properties filters run client-side after loading every type-matched
+// vertex into memory. Without entityTypes, "type-matched" means every
+// vertex in the partition — an unbounded fan-out. The guard rejects
+// these queries with a typed error before issuing any Gremlin.
+
+describe('Phase 8 findEntities requires entityTypes for JS-filter path', () => {
+  it('throws UnsupportedQueryError when searchTerm is set without entityTypes', async () => {
+    const { provider, stub } = makeProvider();
+    const before = stub.calls.length;
+
+    await expect(
+      provider.findEntities(TEST_REPO, { searchTerm: 'alpha', limit: 10, offset: 0 }),
+    ).rejects.toBeInstanceOf(UnsupportedQueryError);
+
+    const after = stub.calls.length;
+    expect(after - before).toBe(0);
+  });
+
+  it('throws UnsupportedQueryError when properties is set without entityTypes', async () => {
+    const { provider, stub } = makeProvider();
+    const before = stub.calls.length;
+
+    await expect(
+      provider.findEntities(TEST_REPO, {
+        properties: { role: 'admin' },
+        limit: 10,
+        offset: 0,
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedQueryError);
+
+    const after = stub.calls.length;
+    expect(after - before).toBe(0);
+  });
+
+  it('throws UnsupportedQueryError when entityTypes is an empty array', async () => {
+    const { provider, stub } = makeProvider();
+    const before = stub.calls.length;
+
+    await expect(
+      provider.findEntities(TEST_REPO, {
+        searchTerm: 'alpha',
+        entityTypes: [],
+        limit: 10,
+        offset: 0,
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedQueryError);
+
+    const after = stub.calls.length;
+    expect(after - before).toBe(0);
+  });
+
+  it('proceeds to the JS-filter Gremlin query when entityTypes is provided', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    const result = await provider.findEntities(TEST_REPO, {
+      searchTerm: 'alpha',
+      entityTypes: ['Person'],
+      limit: 10,
+      offset: 0,
+    });
+    const after = stub.calls.length;
+
+    expect(after - before).toBe(1);
+    expect(result.items).toEqual([]);
+
+    const issued = stub.calls[stub.calls.length - 1]!;
+    expect(issued.query).toContain("has('entityType', within(");
+    // JS-filter path: no server-side range, no count.
+    expect(issued.query).not.toContain('.range(');
+    expect(issued.query).not.toContain('.count()');
+  });
+
+  it('uses the fast (server-paginated) path when no searchTerm or properties are present', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes('.count()')) {
+        return { items: [0] };
+      }
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    await provider.findEntities(TEST_REPO, {
+      // No entityTypes — fast path doesn't require them; only the JS-filter
+      // path does, and only when searchTerm/properties force client-side work.
+      limit: 10,
+      offset: 0,
+    });
+    const after = stub.calls.length;
+
+    // Fast path issues count + data — two storage calls.
+    expect(after - before).toBe(2);
   });
 });

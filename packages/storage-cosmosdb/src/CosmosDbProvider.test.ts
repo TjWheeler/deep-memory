@@ -1,7 +1,7 @@
 // Focused unit tests for CosmosDbProvider behaviors that do not need a live
-// emulator. Currently covers the Phase 2 vocabulary cache: shape of the
-// query/binding emitted by traversal compilation, cache hit/miss counts,
-// invalidation on saveVocabulary.
+// emulator. Covers the vocabulary cache (shape of the query/binding emitted
+// by traversal compilation, cache hit/miss counts, invalidation on
+// saveVocabulary) and the single-round-trip create / update / delete paths.
 //
 // We bracket-access the private `conn` property to inject a stub. The
 // production constructor does not call any methods on the connection until a
@@ -90,7 +90,7 @@ const SIMPLE_TRAVERSAL: TraversalSpec = {
   returnMode: 'all',
 };
 
-describe('Phase 2 vocabulary cache', () => {
+describe('vocabulary cache', () => {
   it('two consecutive traverse calls only fetch the vocabulary once', async () => {
     const { provider, stub } = makeProvider();
 
@@ -148,7 +148,7 @@ describe('Phase 2 vocabulary cache', () => {
   });
 });
 
-describe('Phase 2 non-traversal read paths emit projection chains, not valueMap(true)', () => {
+describe('non-traversal read paths emit projection chains, not valueMap(true)', () => {
   it('getEntity emits the vertex project chain by default (no embedding key)', async () => {
     const { provider, stub } = makeProvider();
     await provider.getEntity(TEST_REPO, '40000000-0000-4000-a000-deadbeef0001');
@@ -209,7 +209,7 @@ describe('Phase 2 non-traversal read paths emit projection chains, not valueMap(
   });
 });
 
-// ─── Phase 6 — single round-trip create / update ─────────────────────
+// ─── Single round-trip create / update ───────────────────────────────
 //
 // The fold().coalesce(unfold().constant('__duplicate'), addV/addE) pattern
 // removes the existence-check round-trip. updateEntity appends the read
@@ -222,7 +222,7 @@ function makeEntity(id: string): StoredEntity {
     id,
     slug: `slug-${id}`,
     entityType: 'Person',
-    label: 'Phase 6 Probe',
+    label: 'Single-Round-Trip Probe',
     properties: { age: 30 },
     provenance: {
       createdBy: 'test',
@@ -254,7 +254,7 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
   };
 }
 
-describe('Phase 6 single-round-trip create / update', () => {
+describe('single-round-trip create / update', () => {
   it('createEntity issues exactly one storage call on success', async () => {
     const { provider, stub } = makeProvider();
     // Default stub returns { items: [] } — simulate the addV branch firing by
@@ -425,17 +425,16 @@ describe('Phase 6 single-round-trip create / update', () => {
   });
 });
 
-// ─── Phase 7 — single round-trip delete paths ────────────────────────
+// ─── Single round-trip delete paths ──────────────────────────────────
 //
 // The aggregate('found').by('id').drop().cap('found') pattern collapses the
 // previous existence-check + drop into one Gremlin round-trip per chunk. The
 // bucket emits a list of ids the drop actually touched; the caller derives
 // notFound = requestedIds - foundIds client-side.
 //
-// Shape verified live against the Cosmos emulator 2026-05-25 — see
-// local-tests/phase7-shape-probe.mjs.
+// Shape verified live against the Cosmos emulator 2026-05-25.
 
-describe('Phase 7 single-round-trip delete paths', () => {
+describe('single-round-trip delete paths', () => {
   const ENTITY_A = '40000000-0000-4000-a000-000000007001';
   const ENTITY_B = '40000000-0000-4000-a000-000000007002';
   const ENTITY_MISSING = '40000000-0000-4000-a000-000000007999';

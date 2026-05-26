@@ -1,5 +1,5 @@
 /**
- * Consolidation review diagnostics engine (Phase C.5).
+ * Consolidation review diagnostics engine.
  *
  * Runs 5 automated checks against consolidation output:
  *   1. Merge confidence — breakdown by confidence band, flags low-confidence merges

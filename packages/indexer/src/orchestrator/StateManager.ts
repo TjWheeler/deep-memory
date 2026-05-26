@@ -620,7 +620,7 @@ export class StateManager {
     return Phase.COMPLETE;
   }
 
-  // ── Full Validation (Phase B.7) ──────────────────────────────────
+  // ── Full Extraction Validation ──────────────────────────────────
 
   /** Save full validation progress to disk */
   async saveFullValidationProgress(progress: unknown): Promise<void> {

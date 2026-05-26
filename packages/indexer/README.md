@@ -280,7 +280,7 @@ AI runs full extraction → post-extraction review (orphans, label variants)
        ↓
 Human approves corrections → AI applies them
        ↓
-[Optional, safety-critical] AI runs Phase B.7 full validation
+[Optional, safety-critical] AI runs full extraction validation
        ↓
 AI runs consolidation → consolidation review → human reviews merges
        ↓
@@ -289,7 +289,7 @@ AI re-consolidates from corrected data (idempotent rebuild)
 Knowledge graph populated and verified
 ```
 
-The first extraction on a new domain or model always requires tuning. The validation layer catches systematic errors (like chart misinterpretation), the extraction review phase catches chunking artifacts (orphan relationships, label variants), and the consolidation review catches false merges. See [Post-Extraction Review Guide](https://github.com/TjWheeler/deep-memory/blob/main/docs/indexer-review-guide.md) for the Phase B.6 process.
+The first extraction on a new domain or model always requires tuning. The validation layer catches systematic errors (like chart misinterpretation), the extraction review phase catches chunking artifacts (orphan relationships, label variants), and the consolidation review catches false merges. See [Post-Extraction Review Guide](https://github.com/TjWheeler/deep-memory/blob/main/docs/indexer-review-guide.md) for the extraction-review process.
 
 ## See also
 

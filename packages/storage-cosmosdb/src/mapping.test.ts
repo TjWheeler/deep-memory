@@ -21,13 +21,13 @@ import {
 } from './mapping.js';
 import type { StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
 
-// Phase 1 perf-fixes contract: the GremlinCompiler emits a fixed project chain
-// listing the keys the storage-cosmosdb mappers consume. The two lists live
-// in different packages (the compiler in core can't import from
-// storage-cosmosdb because the dependency graph runs the other way). This
-// test asserts they don't drift.
+// Cross-package projection contract: the GremlinCompiler emits a fixed
+// project chain listing the keys the storage-cosmosdb mappers consume. The
+// two lists live in different packages (the compiler in core can't import
+// from storage-cosmosdb because the dependency graph runs the other way).
+// This test asserts they don't drift.
 
-describe('Gremlin projection field-list sync (Phase 1 contract)', () => {
+describe('Gremlin projection field-list sync', () => {
   it('vertex projection fields match the stored-entity mapper input set', () => {
     expect(
       [...GREMLIN_VERTEX_PROJECTION_FIELDS].sort(),
@@ -40,18 +40,18 @@ describe('Gremlin projection field-list sync (Phase 1 contract)', () => {
     ).toEqual([...STORED_RELATIONSHIP_FIELDS].sort());
   });
 
-  it('neither list includes embedding (Phase 1 contract: never wire-ship embeddings on read)', () => {
+  it('neither list includes embedding (never wire-ship embeddings on read)', () => {
     expect(GREMLIN_VERTEX_PROJECTION_FIELDS).not.toContain('embedding');
     expect(STORED_ENTITY_FIELDS).not.toContain('embedding');
   });
 });
 
-// Phase 2 perf-fixes contract: the public project-chain builders return the
+// Project-chain shape contract: the public project-chain builders return the
 // exact Gremlin string the non-traversal read paths emit. The chain text is
 // covered by the GremlinCompiler unit tests for the compiler side; the tests
 // below pin shape invariants used by every read-path caller.
 
-describe('buildVertexProjectChain / buildEdgeProjectChain (Phase 2 contract)', () => {
+describe('buildVertexProjectChain / buildEdgeProjectChain', () => {
   it('vertex chain default omits embedding', () => {
     expect(buildVertexProjectChain()).not.toMatch(/'embedding'/);
   });
@@ -177,7 +177,7 @@ describe('entityFromDocument (Cosmos NoSQL Document-endpoint shape)', () => {
   });
 });
 
-describe('buildRepositoryProjectChain (Phase 2)', () => {
+describe('buildRepositoryProjectChain', () => {
   it('emits a project chain covering the STORED_REPOSITORY_FIELDS keys', () => {
     const chain = buildRepositoryProjectChain();
     for (const field of STORED_REPOSITORY_FIELDS) {
@@ -202,19 +202,19 @@ describe('buildRepositoryProjectChain (Phase 2)', () => {
   });
 });
 
-// ─── Phase 10 fixed-shape property ladders ───────────────────────
+// ─── Fixed-shape property ladders ────────────────────────────────
 //
 // Two contracts the cosmos-side write paths depend on:
 //   1. The emitted Gremlin string is INVARIANT across writes — same chain
-//      regardless of which optional fields the caller populated. (Plan-cache
-//      depends on this.)
+//      regardless of which optional fields the caller populated, so the
+//      server-side plan cache reuses one compiled plan.
 //   2. The bindings dict that `*ToLadderBindings` returns is canonical: every
 //      slot is present (even when absent — sentinel-filled), and the slot
 //      order matches the chain's parameter order so the choose-skip steps
 //      can read the right value.
-// Validated live against the emulator in local-tests/phase10-shape-probe*.mjs.
+// Validated live against the emulator 2026-05-26.
 
-describe('Phase 10 — entity property ladder', () => {
+describe('entity property ladder', () => {
   const baseEntity: StoredEntity = {
     id: 'eid-1',
     slug: 'Person:alice',
@@ -302,7 +302,7 @@ describe('Phase 10 — entity property ladder', () => {
   });
 });
 
-describe('Phase 10 — relationship property ladder', () => {
+describe('relationship property ladder', () => {
   const baseRel: StoredRelationship = {
     id: 'rel-1',
     relationshipType: 'KNOWS',
@@ -352,7 +352,7 @@ describe('Phase 10 — relationship property ladder', () => {
   });
 });
 
-describe('Phase 10 — repository property ladder', () => {
+describe('repository property ladder', () => {
   it('chain references every required slot plainly and every optional slot via choose-skip', () => {
     const chain = buildRepositoryPropertyLadder();
     for (const slot of ['repoLabel', 'governanceConfig', 'createdAt', 'createdBy']) {

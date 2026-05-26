@@ -10,12 +10,12 @@ const DEFAULT_ESTIMATED_FANOUT_PER_HOP = 10;
 
 // ─── Read-path projections ────────────────────────────────────────
 //
-// Phase 1 of the 2026-05-25 perf-fixes plan: stop wire-shipping `embedding`
-// (and any other unused properties) on every traversal. We emit explicit
-// project chains listing only the keys the storage-cosmosdb mappers consume.
+// Goal: stop wire-shipping `embedding` (and any other unused properties) on
+// every traversal. We emit explicit project chains listing only the keys the
+// storage-cosmosdb mappers consume.
 //
 // CosmosDB Gremlin shape constraints (live-validated 2026-05-25 against the
-// emulator; see local-tests/baseline/phase1-shape-probe-results.md):
+// emulator):
 //
 //   1. A single `.path().by(project(...))` across mixed vertex+edge objects
 //      crashes when an edge lacks a vertex-only key. The working form is two
@@ -167,8 +167,8 @@ export class GremlinCompiler implements TraversalCompiler {
 
     if (spec.start.entityId) {
       const p = nextParam(spec.start.entityId);
-      // Phase 3: hasId(x) is a direct doc fetch by system id; has('id', x) is
-      // a property-equality lookup that goes through the property index.
+      // hasId(x) is a direct doc fetch by system id; has('id', x) is a
+      // property-equality lookup that goes through the property index.
       // See docs/cosmosdb-gremlin-compatibility.md §Performance.
       parts.push(`.hasId(${p})`);
     } else if (spec.start.entityType) {

@@ -27,14 +27,14 @@ describe('GremlinCompiler', () => {
     const result = compiler.compile(spec, emptyVocab);
 
     expect(result.query).toContain('g.V()');
-    // Phase 3: entityId-anchored starts emit hasId(p) (direct doc fetch by
-    // system id), not has('id', p) (property-equality lookup).
+    // entityId-anchored starts emit hasId(p) (direct doc fetch by system id),
+    // not has('id', p) (property-equality lookup).
     expect(result.query).toMatch(/\.hasId\(p\d+\)/);
     expect(result.query).not.toContain(".has('id',");
     expect(result.query).toContain('.out(');
     expect(result.query).toContain('.dedup()');
     expect(result.query).toContain('.range(');
-    // Phase 1: vertex project chain replaces valueMap(true) on the terminal mode.
+    // Vertex project chain (not valueMap(true)) on the terminal mode.
     expect(result.query).toContain(".project('__kind','id','entityType'");
     expect(result.query).toContain(".by(constant('v'))");
     expect(result.query).toContain('.by(id)');
@@ -206,7 +206,7 @@ describe('GremlinCompiler', () => {
     expect(result.params['_offset']).toBe(10);
   });
 
-  it('emits hasId() for entityId-anchored starts (Phase 3)', () => {
+  it('emits hasId() for entityId-anchored starts', () => {
     // Direct doc fetch by system id, not property-equality lookup. See
     // docs/cosmosdb-gremlin-compatibility.md §Performance.
     const spec: TraversalSpec = {
@@ -246,7 +246,7 @@ describe('GremlinCompiler', () => {
     expect(result.estimatedFanOut).toBeLessThanOrEqual(10000);
   });
 
-  // ─── 'all' mode — union + server-side dedup (Phase 2/3 revised) ──
+  // ─── 'all' mode — union + server-side dedup ──
 
   it("compiles 'all' mode as a union of every depth's edges and vertices", () => {
     const spec: TraversalSpec = {
@@ -263,7 +263,7 @@ describe('GremlinCompiler', () => {
     // Each branch is an anonymous traversal rooted with __.
     expect(result.query).toContain('.union(');
     expect(result.query).toContain('__.identity()');
-    // Phase 1: branches end in their own per-type project chain.
+    // Branches end in their own per-type project chain.
     expect(result.query).toMatch(/__\.outE\(p\d+\)\.project\('__kind','id','relationshipType'/);
     expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.project\('__kind','id','entityType'/);
     expect(result.query).toMatch(/__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)\.project\('__kind','id','relationshipType'/);
@@ -314,8 +314,8 @@ describe('GremlinCompiler', () => {
     const result = compiler.compile(spec, emptyVocab);
     expect(result.query).toContain('.outE(');
     expect(result.query).toContain('.inV()');
-    // Phase 1: two-by round-robin — vertex project then edge project. A single
-    // by() across mixed path objects crashes when an edge lacks a vertex-only key.
+    // Two-by round-robin — vertex project then edge project. A single by()
+    // across mixed path objects crashes when an edge lacks a vertex-only key.
     expect(result.query).toMatch(
       /\.path\(\)\.by\(project\('__kind','id','entityType'.+\)\.by\(project\('__kind','id','relationshipType'/,
     );
@@ -334,7 +334,7 @@ describe('GremlinCompiler', () => {
     expect(result.query).not.toContain('.dedup()');
   });
 
-  // ─── Phase 4: simplePath() for cycle prevention in 'path' mode ──
+  // ─── simplePath() for cycle prevention in 'path' mode ──
 
   it("always emits .simplePath() before .range() and .path() in 'path' mode, and never in 'terminal' or 'all'", () => {
     const pathSpec: TraversalSpec = {

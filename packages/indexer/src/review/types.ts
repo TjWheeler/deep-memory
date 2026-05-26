@@ -1,5 +1,5 @@
 /**
- * Types for extraction review diagnostics (Phase B.6).
+ * Types for extraction review diagnostics.
  *
  * ReviewDiagnostics runs 5 automated checks against extraction outputs
  * and produces a structured report with per-document and aggregate metrics.

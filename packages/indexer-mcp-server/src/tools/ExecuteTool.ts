@@ -529,7 +529,7 @@ export class ExecuteTool extends BaseToolController {
         const stateWriter = new ProcessStateWriter(processDir);
         await stateWriter.appendIteration({
           date: new Date().toISOString().split('T')[0]!,
-          goal: 'Phase B.7 full extraction validation',
+          goal: 'Full extraction validation',
           result: 'Validation completed',
         });
       }

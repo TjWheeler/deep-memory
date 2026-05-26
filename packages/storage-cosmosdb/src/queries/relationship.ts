@@ -11,11 +11,12 @@ import {
 import { DuplicateRelationshipError, matchesPropertyFilters, buildEdgeProjectChain } from '@utaba/deep-memory';
 
 // Sentinel returned by the duplicate-detection branch of the coalesce upsert
-// pattern. Mirrors entity.ts — Phase 6 single-round-trip create.
+// pattern. Mirrors entity.ts — single round-trip create.
 const DUPLICATE_SENTINEL = '__duplicate';
 
-// Phase 10: fixed-shape property ladder, identical query string across every
-// edge create regardless of which optional fields are populated.
+// Fixed-shape property ladder — identical query string across every edge
+// create regardless of which optional fields are populated, so the Cosmos
+// plan cache reuses one compiled plan.
 const RELATIONSHIP_CREATE_QUERY =
   `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
   `unfold().constant('${DUPLICATE_SENTINEL}'),` +
@@ -56,8 +57,8 @@ export async function getRelationship(
   const projection = buildEdgeProjectChain();
   // Edge-id lookup: g.E().hasId(relId) is engine-routed by doc id; the
   // `has('repositoryId', rid)` predicate after it still doesn't push partition
-  // routing down (issue #2, Phase 7 partition-routes via the source vertex
-  // when its id is known).
+  // routing down (issue #2 in plans/performance-issues.md). When the source
+  // vertex id is known, callers should partition-route via the vertex instead.
   const result = await conn.submit(
     `g.E().hasId(relId).has('repositoryId', rid).${projection}`,
     { relId: relationshipId, rid: repositoryId },
@@ -125,9 +126,10 @@ export async function getEntityRelationships(
   const baseQuery = unionQuery ?? `${edgeTraversal}${typeFilter}`;
   const projection = buildEdgeProjectChain();
 
-  // Phase 9: parallel count + data. When `propertyFilters` is set the filter
-  // runs client-side after the fetch, so a server-side count would overstate
-  // the matched total — match the findEntities pattern and surface
+  // Count and data round-trips are independent — run them in parallel to halve
+  // wall-clock latency. When `propertyFilters` is set the filter runs
+  // client-side after the fetch, so a server-side count would overstate the
+  // matched total — match the findEntities pattern and surface
   // `total: undefined` in that case.
   const dataBindings = { ...baseBindings, rangeStart: offset, rangeEnd: offset + limit };
   const [countResult, dataResult] = await Promise.all([
@@ -172,10 +174,9 @@ export async function deleteRelationship(
 
 
 /**
- * Phase 7: collapse the count + drop into a single round-trip via the
- * aggregate-side-effect pattern. The bucket records the edge ids that were
- * actually dropped, giving an exact `deletedRelationships` count without the
- * separate count query.
+ * Single round-trip type-delete via the aggregate-side-effect pattern: the
+ * bucket records the edge ids that were actually dropped, giving an exact
+ * `deletedRelationships` count without a separate count query.
  */
 export async function deleteRelationshipsByType(
   conn: CosmosDbConnection,

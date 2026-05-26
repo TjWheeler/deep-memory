@@ -26,7 +26,7 @@ interface CheckpointHistoryEntry {
 }
 
 /**
- * CheckpointManager — Phase D periodic validation during import.
+ * CheckpointManager — periodic validation during the import pipeline phase.
  *
  * Runs Tier 1 and optionally Tier 2 validation on batches of imported documents.
  * Pauses the pipeline when errors are found and supports resume after human review.

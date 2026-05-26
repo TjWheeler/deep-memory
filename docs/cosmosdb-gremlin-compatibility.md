@@ -4,7 +4,7 @@ CosmosDB's Gremlin implementation is a **subset** of Apache TinkerPop. Queries t
 
 **How to use this doc:** before changing emitted Gremlin in `GremlinCompiler.ts` or `packages/storage-cosmosdb/src/queries/`, scan the relevant section here. Before assuming a TinkerPop pattern works, **probe it live against the emulator first** — see [§Probing methodology](#probing-methodology).
 
-**How to add findings:** when you live-validate a new shape (works or doesn't), append it to the appropriate section with a one-line provenance note (which plan, which phase, which probe file). Keep entries scannable.
+**How to add findings:** when you live-validate a new shape (works or doesn't), append it to the appropriate section with a one-line provenance note (the date and, if useful, the probe script). Keep entries scannable.
 
 ---
 
@@ -49,8 +49,8 @@ Verified either by live probe (cited below) or by being in production code that 
 |---|---|
 | `g.V().has('repositoryId', x)` | Partition-scoped vertex start. `repositoryId` is the partition key; this predicate routes the query to a single physical partition. |
 | `g.V().hasId(x)` | Direct doc fetch by system id. Cheaper than `has('id', x)` (property-equality lookup). Always pair with the partition predicate. |
-| `g.V().hasId(within(x, y, z))` | Batch doc fetch by system id. Live-validated 2026-05-25 (Phase 3 probe) against vertices and edges. Same semantics as `has('id', within(...))` but routes via the doc-id index rather than the property index. |
-| `g.E().hasId(x)` | Edge variant of the above. Works in the emulator (Phase 3 probe). Without a partition predicate, the engine still fans out — pair with `has('repositoryId', rid)` for partition-scoped routing where the source vertex id is not known. |
+| `g.V().hasId(within(x, y, z))` | Batch doc fetch by system id. Live-validated 2026-05-25 against vertices and edges. Same semantics as `has('id', within(...))` but routes via the doc-id index rather than the property index. |
+| `g.E().hasId(x)` | Edge variant of the above. Works in the emulator (live-validated 2026-05-25). Without a partition predicate, the engine still fans out — pair with `has('repositoryId', rid)` for partition-scoped routing where the source vertex id is not known. |
 | `g.V().has('id', x)` | Property-equality lookup on `id`. Works but slower than `hasId`. See [§Performance](#performance-critical-operator-differences). |
 | `out(t)`, `in(t)`, `both(t)` | Simple vertex-to-vertex steps. Type args are optional. |
 | `outE(t)`, `inE(t)`, `bothE(t)` | Edge-explicit steps. |
@@ -65,13 +65,13 @@ Verified either by live probe (cited below) or by being in production code that 
 | `valueMap(true)` | Multi-cardinality property map including `id` and `label`. Property values are array-wrapped (e.g. `entityType: ["Person"]`). Ships **all** properties on the vertex/edge including large blobs like `embedding`. **High RU cost.** Prefer explicit `project()` chains for read paths. |
 | `valueMap('f1', 'f2', ...)` | Restricted-key valueMap. Lower cost. Used in `getTimeline`. |
 | `values('field')` | Returns the value(s) of a single property. Used in `getRepositoryStats` to fetch the vocabulary JSON. |
-| `project('k1','k2',...).by(...).by(...)` | Explicit projection — keys are arg list, values come from sequential `by()` modulators in order. **The right tool for projecting only the fields you actually consume.** Phase 1 probe 2026-05-25 ([plans/performance-fixes-2026-05-25.md](../plans/performance-fixes-2026-05-25.md) Phase 1). |
+| `project('k1','k2',...).by(...).by(...)` | Explicit projection — keys are arg list, values come from sequential `by()` modulators in order. **The right tool for projecting only the fields you actually consume.** Live-validated 2026-05-25. |
 | `.by(id)` | Use `id` as the by-modulator argument to extract the system id. `id` is a Gremlin **token**, not a string — `by(id)` works, `by('id')` does not (the latter is a property-name lookup). |
 | `.by('propertyName')` | Property-value as by-modulator. Required properties only — see [§Constraints](#constraints--patterns-that-fail) for the optional-field case. |
 | `.by(constant(literal))` | Literal value as by-modulator. Used to inject discriminator fields like `__kind: 'v'`/`'e'`. |
-| `.by(coalesce(values('foo'), constant(default)))` | Missing-field-safe property read. Required for optional properties. Phase 1 probe 2026-05-25. |
+| `.by(coalesce(values('foo'), constant(default)))` | Missing-field-safe property read. Required for optional properties. Live-validated 2026-05-25. |
 | `path()` | Collects every traversed object (vertices and edges in walk order) into a Path object. |
-| `path().by(<vertexProject>).by(<edgeProject>)` | Two-by **round-robin** on a mixed vertex+edge path: by-1 applies to vertices, by-2 to edges, alternating in path order. **Verified working.** Phase 1 probe 2026-05-25 — single-by across mixed objects crashes; this is the working alternative. |
+| `path().by(<vertexProject>).by(<edgeProject>)` | Two-by **round-robin** on a mixed vertex+edge path: by-1 applies to vertices, by-2 to edges, alternating in path order. **Verified working.** Live-validated 2026-05-25 — single-by across mixed objects crashes; this is the working alternative. |
 
 ### Pagination and counting
 
@@ -86,7 +86,7 @@ Verified either by live probe (cited below) or by being in production code that 
 | Operator | Notes |
 |---|---|
 | `dedup()` | Dedup by object identity. Works on vertices and edges. |
-| `dedup().by(select('id'))` | Dedup on a projected-map field. **Required form** when the upstream stream is `project(...)` output, because the items are Maps, not vertices. Phase 1 probe 2026-05-25 — `dedup().by('id')` on projected maps **does not work** (see [§Constraints](#constraints--patterns-that-fail)). |
+| `dedup().by(select('id'))` | Dedup on a projected-map field. **Required form** when the upstream stream is `project(...)` output, because the items are Maps, not vertices. Live-validated 2026-05-25 — `dedup().by('id')` on projected maps **does not work** (see [§Constraints](#constraints--patterns-that-fail)). |
 
 ### Predicates (within `.has(key, pred)`)
 
@@ -104,7 +104,7 @@ Verified either by live probe (cited below) or by being in production code that 
 | `coalesce(<traversal>, <fallback>)` | First-non-empty. Used at both the by-modulator level (for missing-field defaults) and the query level (for upsert via `fold().coalesce(unfold(), addV(...))`). |
 | `fold()` | Collapses a stream to a single list-valued traverser. Idiom for upsert: `g.V().has(...).fold().coalesce(unfold()..., addV(...)...)`. |
 | `unfold()` | Inverse of `fold()` — emits each list element as a separate traverser. |
-| `choose(<predicateTraversal>, <true-branch>, <false-branch>)` | Conditional execution. **Verified working** — Phase 10 probe 2026-05-26. Used for the "fixed-shape property ladder" pattern: `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('key', vN), __.identity())` skips a `.property(...)` write at runtime when the binding equals the sentinel. All three sub-traversals must be anonymous (`__.` prefix). Composes inside `addV().property(...).choose(...)` chains and survives across the `fold().coalesce(unfold()..., addV()...)` upsert shape. |
+| `choose(<predicateTraversal>, <true-branch>, <false-branch>)` | Conditional execution. **Verified working** — live-validated 2026-05-26. Used for the "fixed-shape property ladder" pattern: `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('key', vN), __.identity())` skips a `.property(...)` write at runtime when the binding equals the sentinel. All three sub-traversals must be anonymous (`__.` prefix). Composes inside `addV().property(...).choose(...)` chains and survives across the `fold().coalesce(unfold()..., addV()...)` upsert shape. |
 
 ### Repeat / variable-depth
 
@@ -113,8 +113,8 @@ Verified either by live probe (cited below) or by being in production code that 
 | `repeat(<traversal>).times(n)` | Bounded repeat. |
 | `repeat(<traversal>).until(<pred>)` | Conditional termination. |
 | `repeat(...).emit()` | Emit intermediate frontiers (`emit()` before `repeat` for intermediates, after for terminal-only). |
-| `simplePath()` | Cycle prevention via no-repeat-vertex. **Verified working** — Phase 4 probe 2026-05-25. Placed **before** `.path()` so it filters traversers (not the collected Path objects). Composes cleanly with `.path().by(...).by(...)` two-by projection — the projection runs after the filter. Confirmed at depth 1 and depth 2; cycle-rejecting walks reduce the path count vs the same walk without it. Also composes with `.emit().repeat(...).times(N).simplePath().path()` for multi-length emission (see entry below). |
-| `.emit().repeat(<step>).times(N).path()` | Emit a path at every iteration boundary (length 0, 1, …, N). **Verified working** — Phase 4 probe 2026-05-25. Used by `findPaths` to surface paths of any length up to `maxDepth` in one round-trip — replaces the previous N-deep BFS that issued K-per-frontier-vertex queries per layer. Composes with `.simplePath()` placed after `.times(N)`; cycles are filtered globally rather than per-iteration. The first emission (length 0, just the start vertex alone) is included; callers filter it out by checking the terminal vertex against the target. |
+| `simplePath()` | Cycle prevention via no-repeat-vertex. **Verified working** — live-validated 2026-05-25. Placed **before** `.path()` so it filters traversers (not the collected Path objects). Composes cleanly with `.path().by(...).by(...)` two-by projection — the projection runs after the filter. Confirmed at depth 1 and depth 2; cycle-rejecting walks reduce the path count vs the same walk without it. Also composes with `.emit().repeat(...).times(N).simplePath().path()` for multi-length emission (see entry below). |
+| `.emit().repeat(<step>).times(N).path()` | Emit a path at every iteration boundary (length 0, 1, …, N). **Verified working** — live-validated 2026-05-25. Used by `findPaths` to surface paths of any length up to `maxDepth` in one round-trip — replaces the previous N-deep BFS that issued K-per-frontier-vertex queries per layer. Composes with `.simplePath()` placed after `.times(N)`; cycles are filtered globally rather than per-iteration. The first emission (length 0, just the start vertex alone) is included; callers filter it out by checking the terminal vertex against the target. |
 
 ### Mutation
 
@@ -157,7 +157,7 @@ Each entry: the pattern, the symptom (with the literal error text where availabl
 .path().by(<vertexProject>).by(<edgeProject>)
 ```
 
-Gremlin applies the modulators alternately to objects in path order (vertex-edge-vertex-edge-…). **Verified working** — Phase 1 probe 2026-05-25.
+Gremlin applies the modulators alternately to objects in path order (vertex-edge-vertex-edge-…). **Verified working** — live-validated 2026-05-25.
 
 ### `dedup().by('id')` on projected maps
 
@@ -174,7 +174,7 @@ Gremlin applies the modulators alternately to objects in path order (vertex-edge
 .dedup().by(select('id'))
 ```
 
-**Verified working** — Phase 1 probe 2026-05-25.
+**Verified working** — live-validated 2026-05-25.
 
 ### Bare `.by('optionalField')` on a vertex without that property
 
@@ -193,7 +193,7 @@ project('id','data').by(id).by('data')
 
 For required fields (which by data contract should always be present), bare `.by('field')` is fine — and if the field is genuinely missing, you want to know about it. Decide field-by-field at compile time.
 
-**Verified working** — Phase 1 probe 2026-05-25.
+**Verified working** — live-validated 2026-05-25.
 
 ### `TextP.containing()` for substring search
 
@@ -213,13 +213,13 @@ g.addV('Person').property('entityType', p0).property('label', p1)...
 
 When the property *key* (`'entityType'`, `'label'`, …) is interpolated into the query string, every write of a different shape becomes a unique query. CosmosDB can't reuse a compiled plan across them. Property *values* go through bindings (parameterized), which is correct security-wise, but the key interpolation defeats plan caching.
 
-**Resolution (Phase 10, 2026-05-26):** every create/upsert/insert path in `packages/storage-cosmosdb/src/queries/` now emits one of seven module-level constant query strings (one per `addV` / `addE` create + one per upsert + one per `_repository` create). The query shape is fixed by:
+**Resolution (2026-05-26):** every create/upsert/insert path in `packages/storage-cosmosdb/src/queries/` now emits one of seven module-level constant query strings (one per `addV` / `addE` create + one per upsert + one per `_repository` create). The query shape is fixed by:
 
 1. **String-literal property keys** (`'entityType'`, `'entityLabel'`, …) in the canonical fixed order defined in [packages/storage-cosmosdb/src/mapping.ts](../packages/storage-cosmosdb/src/mapping.ts).
 2. **`choose`-skip wrapper** for optional fields: `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('key', vN), __.identity())`. When the binding `vN` equals the sentinel (`''`), the choose's predicate evaluates false and the `__.identity()` branch fires — no property is written. This keeps the query string constant regardless of which optional fields the caller populated.
 3. **The `id` and `repositoryId` slots are written separately on the create branch only** (`.property('id', vid).property('repositoryId', rid)`) because Cosmos rejects partition-key mutation after `unfold()`. The ladder excludes them so the same ladder string can be reused unchanged in both the create branch and the upsert update branch.
 
-The sentinel choice — empty string `''` — preserves the `isNull`/`isNotNull` PropertyFilter contract: choose-skipped properties are GENUINELY absent on the vertex, so `hasNot('summary')` correctly finds entities written without a summary. Confirmed via `local-tests/phase10-shape-probe2.mjs` test C/D.
+The sentinel choice — empty string `''` — preserves the `isNull`/`isNotNull` PropertyFilter contract: choose-skipped properties are GENUINELY absent on the vertex, so `hasNot('summary')` correctly finds entities written without a summary. Confirmed by live probe 2026-05-26.
 
 This is the resolved form of [Performance issue #20](../plans/performance-issues.md). Plan-cache observability is Azure-only — the emulator does not surface it.
 
@@ -236,7 +236,7 @@ In CosmosDB Gremlin, `id` is the **system id** — the document id used for part
 - `g.V().has('repositoryId', rid).hasId(x)` — partition predicate routes to one partition, then a direct doc fetch. Cheap.
 - `g.V().has('repositoryId', rid).has('id', x)` — partition predicate routes to one partition, then an index seek on the `id` property. More RU, more latency.
 
-Use `hasId` for entity-id-anchored starts. The compiler currently emits `has('id', p0)` (Phase 3 of the perf-fixes plan switches to `hasId`).
+Use `hasId` for entity-id-anchored starts. The compiler emits `hasId(p0)` on every entityId-anchored traversal start.
 
 ### `g.E().has('repositoryId', rid)` doesn't always push partition down
 
@@ -248,7 +248,7 @@ Edges in CosmosDB Gremlin live in the source vertex's partition, but `g.E().has(
 g.V().has('repositoryId', rid).hasId(srcId).has('entityType').outE().hasId(relId)
 ```
 
-When only the relationship id is known, the `g.E().hasId(relId).has('repositoryId', rid)` form is still correct but inherently fans out. See [Performance issue #2](../plans/performance-issues.md) and Phase 7 of the perf-fixes plan.
+When only the relationship id is known, the `g.E().hasId(relId).has('repositoryId', rid)` form is still correct but inherently fans out. See [Performance issue #2](../plans/performance-issues.md).
 
 ### `valueMap(true)` ships every property
 
@@ -256,7 +256,7 @@ For an entity with a 1536-float `embedding` (the default for `text-embedding-3-l
 
 In `'path'` mode the same vertex is shipped once per containing path — so a vertex visited by K walks ships K × 30 KB. RU and bandwidth both scale linearly with that.
 
-**Preferred:** use explicit `.project(...).by(...)` chains listing only the fields the mapper consumes. Phase 1 of the perf-fixes plan replaces `valueMap(true)` with project chains on every read path except the export path (where the embedding is intentionally included).
+**Preferred:** use explicit `.project(...).by(...)` chains listing only the fields the mapper consumes. Every read path except the export path emits project chains; only the bulk-export path still uses `valueMap(true)` (it must include the embedding so a re-import is field-for-field faithful).
 
 ### Union branches with shared prefix are NOT a quadratic-compute problem (surprising — verified)
 
@@ -462,11 +462,11 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 | Finding category | Source |
 |---|---|
 | Operators in production use | [packages/storage-cosmosdb/src/queries/](../packages/storage-cosmosdb/src/queries/) — every Gremlin string in these files has been exercised against the emulator at least once via the test suite. |
-| Live shape probes — Phase 1 (2026-05-25) | `path()` two-by round-robin; `'all'` union per-branch project + `dedup().by(select('id'))`; `coalesce(values, constant)` for optional fields; failure modes of single-by mixed projection, `dedup().by('id')`, and bare `.by('optionalField')`. |
-| Live shape probes — Phase 3 (2026-05-25) | `hasId(x)` single-id and `hasId(within(x, y, z))` batch forms work on both `g.V()` and `g.E()` — drop-in replacements for the equivalent `has('id', ...)` shapes. |
-| Live shape probes — Phase 4 (2026-05-25) | `simplePath()` placed before `.path()` filters cycle-revisiting traversers in the CosmosDB Gremlin subset. Composes correctly with the Phase 1 two-by projection `.path().by(<vertexProject>).by(<edgeProject>)`. |
-| Live shape probes — Phase 5 (2026-05-25) | (1) `aggregate('bucket')` accepts mixed vertex+edge accumulation; `aggregate('bucket').by(<projection>)` projects at aggregate time on a live element. (2) `cap('bucket').unfold()` strips by-modulator property accessors — only `.id()`/`.label()`/`.valueMap(true)` survive. (3) The union-with-shared-prefix shape is NOT quadratic on the engine — CosmosDB recognises the shared prefix and walks it once; both shapes have identical RU at every depth in unbounded mode. (4) `range()` pushdown through `union(...).dedup()` short-circuits the walk once the cap is hit; side-effect aggregation has no equivalent — the bounded union shape is up to 21× cheaper than the equivalent aggregation shape at depth 3 with cap=200 on Mining-Fleet–size data. |
-| Live shape probes — Phase 10 (2026-05-26) | (1) `choose(predicateTraversal, trueTraversal, falseTraversal)` works in the CosmosDB Gremlin subset; all three sub-traversals must be anonymous (`__.`-prefixed). (2) The `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('k', vN), __.identity())` pattern leaves the property GENUINELY absent on the vertex when `vN` equals the sentinel — verified via `hasNot('summary')` finding choose-skipped vertices, preserving the `isNull` PropertyFilter contract. (3) Property values can be bound through parameters in both required and choose-skipped slots; the same fixed query string handles every write of any entity/edge type. (4) The fixed-shape ladder composes correctly with the upsert `fold().coalesce(unfold()<ladder>, addV().property('id', vid).property('repositoryId', rid)<ladder>)` pattern — both branches reuse the SAME ladder string. |
+| Live shape probes — projection (2026-05-25) | `path()` two-by round-robin; `'all'` union per-branch project + `dedup().by(select('id'))`; `coalesce(values, constant)` for optional fields; failure modes of single-by mixed projection, `dedup().by('id')`, and bare `.by('optionalField')`. |
+| Live shape probes — id lookup (2026-05-25) | `hasId(x)` single-id and `hasId(within(x, y, z))` batch forms work on both `g.V()` and `g.E()` — drop-in replacements for the equivalent `has('id', ...)` shapes. |
+| Live shape probes — simplePath (2026-05-25) | `simplePath()` placed before `.path()` filters cycle-revisiting traversers in the CosmosDB Gremlin subset. Composes correctly with the two-by projection `.path().by(<vertexProject>).by(<edgeProject>)`. |
+| Live shape probes — aggregation vs union (2026-05-25) | (1) `aggregate('bucket')` accepts mixed vertex+edge accumulation; `aggregate('bucket').by(<projection>)` projects at aggregate time on a live element. (2) `cap('bucket').unfold()` strips by-modulator property accessors — only `.id()`/`.label()`/`.valueMap(true)` survive. (3) The union-with-shared-prefix shape is NOT quadratic on the engine — CosmosDB recognises the shared prefix and walks it once; both shapes have identical RU at every depth in unbounded mode. (4) `range()` pushdown through `union(...).dedup()` short-circuits the walk once the cap is hit; side-effect aggregation has no equivalent — the bounded union shape is up to 21× cheaper than the equivalent aggregation shape at depth 3 with cap=200 on Mining-Fleet–size data. |
+| Live shape probes — fixed-shape ladder (2026-05-26) | (1) `choose(predicateTraversal, trueTraversal, falseTraversal)` works in the CosmosDB Gremlin subset; all three sub-traversals must be anonymous (`__.`-prefixed). (2) The `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('k', vN), __.identity())` pattern leaves the property GENUINELY absent on the vertex when `vN` equals the sentinel — verified via `hasNot('summary')` finding choose-skipped vertices, preserving the `isNull` PropertyFilter contract. (3) Property values can be bound through parameters in both required and choose-skipped slots; the same fixed query string handles every write of any entity/edge type. (4) The fixed-shape ladder composes correctly with the upsert `fold().coalesce(unfold()<ladder>, addV().property('id', vid).property('repositoryId', rid)<ladder>)` pattern — both branches reuse the SAME ladder string. |
 | Performance catalogue | [plans/performance-issues.md](../plans/performance-issues.md) — 20 ranked RU/round-trip issues, drawn from code review and Cosmos documentation. |
 | Performance fixes plan | [plans/performance-fixes-2026-05-25.md](../plans/performance-fixes-2026-05-25.md) — phased plan that consumes this doc and adds findings back to it as each phase probes new shapes. |
 
@@ -476,4 +476,4 @@ The RU cost of every query is returned in the `x-ms-total-request-charge` respon
 
 - `T.id` vs bare `id` token as a by-modulator argument — empirically `id` works; `T.id` not yet tested.
 - `select('id')` behaviour on edges where the projected map has a discriminator-prefixed key (e.g. if we project `__id` instead of `id` to avoid colliding with Gremlin's `id` token).
-- Plan-cache empirical validation on the live Azure account — the emulator does not surface a clear plan-cache signal, so the Phase 10 latency win is currently structural-only. Capture a 50-write burst against Azure to confirm tail latency drops below first-call cost.
+- Plan-cache empirical validation on the live Azure account — the emulator does not surface a clear plan-cache signal, so the fixed-shape ladder's latency win is currently structural-only. Capture a 50-write burst against Azure to confirm tail latency drops below first-call cost.

@@ -16,8 +16,8 @@ import type { VocabularyChangeRecord } from '@utaba/deep-memory/types';
 // list and asserts equality.
 //
 // `embedding` is intentionally excluded — read paths never ship the embedding
-// over the wire. The vector-search path will pass an explicit `loadEmbeddings`
-// option (Phase 2) to opt back in.
+// over the wire. The vector-search path passes an explicit `loadEmbeddings`
+// option to opt back in.
 //
 // Synthetic projection-only fields (`__kind`) are NOT stored properties and
 // are not in this list — the compiler adds them as discriminator markers but
@@ -306,15 +306,16 @@ export function changeRecordFromGremlin(props: Record<string, unknown>): Vocabul
   };
 }
 
-// ─── Phase 10 — fixed-shape property ladders ──────────────────────
+// ─── Fixed-shape property ladders ─────────────────────────────────
 //
 // Every addV / addE / upsert write uses a canonical fixed-length property
-// ladder so the Gremlin server can reuse the compiled plan across writes.
-// Required slots emit `.property('key', pN)`; optional slots emit
-// `.choose(__.constant(pN).is(neq(absentSentinel)), __.property('key', pN),
-// __.identity())` — the choose-skip drops the property at runtime when the
-// binding equals the sentinel, keeping the query string constant regardless
-// of which optional fields the caller supplied.
+// ladder so the Gremlin server can reuse a single compiled plan across all
+// writes of a given vertex/edge family. Required slots emit `.property('key',
+// pN)`; optional slots emit `.choose(__.constant(pN).is(neq(absentSentinel)),
+// __.property('key', pN), __.identity())` — the choose-skip drops the
+// property at runtime when the binding equals the sentinel, keeping the
+// query string constant regardless of which optional fields the caller
+// supplied.
 //
 // `id` and `repositoryId` are NOT part of these ladders — both are written
 // explicitly at create time (`.property('id', vid).property('repositoryId',
@@ -323,8 +324,8 @@ export function changeRecordFromGremlin(props: Record<string, unknown>): Vocabul
 // Slot order is FIXED. Adding a new slot goes at the END only; reordering
 // or removing breaks the cached plan + introduces a different query string.
 //
-// Verified live 2026-05-26 — see local-tests/phase10-shape-probe*.mjs and
-// docs/cosmosdb-gremlin-compatibility.md (choose-skip / fixed-ladder entries).
+// Live-validated 2026-05-26 — see docs/cosmosdb-gremlin-compatibility.md
+// (choose-skip / fixed-ladder entries).
 
 /** Binding value used to signal an absent optional string slot. */
 export const ABSENT_STRING_SENTINEL = '';
@@ -424,7 +425,7 @@ function buildLadderBindings(
   for (const slot of required) {
     const v = values[slot];
     if (v == null) {
-      throw new Error(`Phase 10 fixed-ladder: required slot '${slot}' is null/undefined`);
+      throw new Error(`Fixed-shape ladder: required slot '${slot}' is null/undefined`);
     }
     bindings[`${paramPrefix}${i++}`] = v;
   }

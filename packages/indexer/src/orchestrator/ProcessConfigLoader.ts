@@ -51,7 +51,7 @@ export interface IndexProcessConfig {
     verificationModel?: string;
     checkpointInterval?: number;
   };
-  /** Full extraction validation configuration (Phase B.7) */
+  /** Full extraction validation configuration */
   fullValidation?: {
     workers?: FullValidationWorkerConfig[];
     defaultWorker?: string;
@@ -60,7 +60,7 @@ export interface IndexProcessConfig {
     maxCost?: number;
     maxRetries?: number;
   };
-  /** Embeddings configuration (Phase E) */
+  /** Embeddings configuration */
   embeddings?: {
     endpoint: string;
     model: string;
@@ -98,7 +98,7 @@ export interface IndexProcessSecrets {
   consolidation?: {
     apiKey?: string;
   };
-  /** API keys for full validation workers (Phase B.7) */
+  /** API keys for full validation workers */
   validation?: {
     workers?: Record<string, { apiKey?: string }>;
   };
@@ -214,7 +214,7 @@ export async function loadProcessConfig(
       }
     : undefined;
 
-  // Build full validation config (Phase B.7)
+  // Build full extraction validation config
   let fullValidation: FullValidationConfig | undefined;
   if (processConfig.fullValidation?.workers && processConfig.fullValidation.workers.length > 0) {
     // Merge worker secrets
@@ -233,7 +233,7 @@ export async function loadProcessConfig(
     };
   }
 
-  // Build embeddings config (Phase E)
+  // Build embeddings config
   const embeddings = processConfig.embeddings
     ? {
         ...processConfig.embeddings,

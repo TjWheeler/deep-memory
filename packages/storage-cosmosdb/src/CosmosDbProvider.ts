@@ -136,7 +136,7 @@ interface RawTraversalResult {
   relationshipMap: Map<string, StoredRelationship>;
   /**
    * First-seen walk direction per deduped edge id. Populated only for
-   * `'path'` mode (the `'all'` union has no walk context, see Phase 7).
+   * `'path'` mode — the `'all'` mode's deduped union carries no walk context.
    */
   pathRelFirstDirection: Map<string, 'outbound' | 'inbound'>;
   executionTimeMs: number;
@@ -562,8 +562,8 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   }
 
   /**
-   * Phase 7: collapse the per-chunk existence-check + drop into a single
-   * round-trip via the aggregate-side-effect pattern.
+   * Single round-trip bulk-delete via the aggregate-side-effect pattern:
+   * collapses the per-chunk existence-check + drop into one Gremlin call.
    *
    *   g.V()...hasId(within(...)).has('entityType')
    *     .aggregate('found').by('id')   // collects the ids that match
@@ -655,11 +655,11 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   }
 
   /**
-   * Phase 7: collapse the per-chunk existence-check + REST batch delete into a
-   * single Gremlin round-trip via the aggregate-side-effect pattern. Replaces
-   * the previous REST-API atomic batch delete path — Gremlin drop on edges is
-   * routed by the engine and the bucket gives back the exact ids that were
-   * actually dropped, so `notFound` can be derived client-side.
+   * Single round-trip bulk relationship delete via the aggregate-side-effect
+   * pattern: collapses the per-chunk existence-check + drop into one Gremlin
+   * call. Gremlin drop on edges is routed by the engine and the bucket gives
+   * back the exact ids that were actually dropped, so `notFound` can be
+   * derived client-side.
    *
    * Source-id partition routing is not exposed on this method (the public
    * surface accepts only edge ids), so the lookup may fan out across
@@ -715,26 +715,21 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   }
 
   /**
-   * Phase 4 compiler-model rewrite of exploreNeighborhood.
+   * Compiler-model implementation of exploreNeighborhood.
    *
-   * Strategy (plan §3 + Option A): for each depth `d` from 1 to
-   * `options.depth`, build a cumulative `TraversalSpec` with `d` steps and
-   * `returnMode: 'all'`, run it through {@link executeTraversal}, then walk
-   * one BFS layer client-side from the previous frontier using the returned
-   * edges.
+   * Strategy: for each depth `d` from 1 to `options.depth`, build a
+   * cumulative `TraversalSpec` with `d` steps and `returnMode: 'all'`, run
+   * it through {@link executeTraversal}, then walk one BFS layer client-side
+   * from the previous frontier using the returned edges.
    *
    * The server-side step direction is fixed to `'both'` (catches every edge
    * in either direction). The directional + bidirectional filter is applied
    * client-side per hop — i.e. `direction: 'outbound'` includes inbound edges
-   * where `bidirectional` is true. This is the contract the pre-Phase-4
-   * Cosmos BFS in (now-deleted) `packages/storage-cosmosdb/src/queries/
-   * traversal.ts` already implemented (it emitted
-   * `union(outE(), inE().has('bidirectional', true))` directly server-side
-   * for `direction: 'outbound'`, and the symmetric shape for `'inbound'`).
-   * The CosmosDB Gremlin compiler does not natively express that
-   * `union(outE, inE.has(bidirectional))` shape, so the filter moves
-   * client-side; the plan's §6 observable-outputs rule requires preserving
-   * the behaviour.
+   * where `bidirectional` is true. The CosmosDB Gremlin compiler does not
+   * natively express the `union(outE, inE.has(bidirectional))` shape that
+   * would push this filter server-side, so it stays client-side; the
+   * observable contract (which edges count toward "outbound" given
+   * bidirectionality) is preserved.
    *
    * Round-trips per call: `options.depth` (one per layer). The previous BFS
    * was `1 + fanout + fanout² + …` round-trips for the same depth.
@@ -755,9 +750,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         start: { entityId },
         steps: buildExploreSteps(d, options),
         returnMode: 'all',
-        // Phase 4 fetches the cumulative subgraph at depth `d` and reconstructs
-        // layers client-side. The result can include every edge and vertex
-        // reachable in ≤d hops in either direction; size the limit generously.
+        // Each round-trip fetches the cumulative subgraph at depth `d` and
+        // we reconstruct layers client-side. The result can include every
+        // edge and vertex reachable in ≤d hops in either direction; size
+        // the limit generously.
         limit: 10_000,
         // Use 'full' + includeProvenance so executeTraversal returns full
         // StoredEntity rows (StorageNeighborhood embeds StoredEntity).
@@ -878,12 +874,12 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   }
 
   /**
-   * Phase 4 compiler-model rewrite of findPaths.
+   * Compiler-model implementation of findPaths.
    *
-   * Strategy (plan §3): build a `TraversalSpec` with a single `'both'`
-   * direction step in `repeat()` mode with `emitIntermediates: true` and
-   * `returnMode: 'path'`, run it once. The compiler always emits
-   * `.simplePath()` in path mode for cycle prevention, producing
+   * Strategy: build a `TraversalSpec` with a single `'both'` direction step
+   * in `repeat()` mode with `emitIntermediates: true` and `returnMode:
+   * 'path'`, run it once. The compiler always emits `.simplePath()` in path
+   * mode for cycle prevention, producing
    * `.emit().repeat(bothE().otherV()).times(maxDepth).simplePath()
    * .range(...).path().by(<v>).by(<e>)`, which yields paths of every length
    * from 0 (the start vertex alone) to `maxDepth`. Live-probed against the
@@ -1107,7 +1103,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       return projected;
     };
 
-    // direction is mode-specific (Phase 7):
+    // direction is mode-specific:
     //   'all'  — always 'outbound' (stored topology; the deduped union has
     //            no walk context). Callers derive walk direction relative
     //            to any anchor via sourceEntityId / targetEntityId.
@@ -1138,10 +1134,8 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     } else {
       // 'path' — emit one TraversalPath per Gremlin path row, with per-edge
       // walk direction. The outer `relationships` array dedups by rel id and
-      // stamps the first-seen direction — the previous Cosmos traverseImpl
-      // carried this same first-writer-wins `relMap` semantic (see
-      // bugfix-23-05 §Phase 7); the plan's §6 observable-outputs rule
-      // requires preserving it.
+      // stamps the first-seen direction (first-writer-wins) — this matches
+      // the observable contract that callers depend on for path rendering.
       paths = raw.pathRows.map((row) => ({
         length: Math.max(row.entityIds.length - 1, 0),
         entities: row.entityIds.map((id) => {
@@ -1392,8 +1386,8 @@ function unwrapGremlinValue(val: unknown): unknown {
 }
 
 /**
- * Build the per-step TraversalSpec steps for the Phase 4
- * exploreNeighborhood rewrite at a given cumulative depth.
+ * Build the per-step TraversalSpec steps for exploreNeighborhood at a given
+ * cumulative depth.
  *
  * Server-side step direction is fixed to `'both'` (catches every edge in
  * either direction). The directional + bidirectional filter and entity-type

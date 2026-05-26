@@ -52,7 +52,7 @@ export interface FullValidationProgressCallbacks {
 }
 
 /**
- * FullValidationOrchestrator — manages the full Phase B.7 validation run.
+ * FullValidationOrchestrator — manages the full extraction-validation run.
  *
  * Responsibilities:
  * - Build batches from extraction outputs (grouped by source document)

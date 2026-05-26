@@ -131,7 +131,7 @@ export type {
   PropertyVerdict,
 } from './types/validation.js';
 
-// Full Validation (Phase B.7)
+// Full Extraction Validation
 export { FullValidationWorker } from './validation/FullValidationWorker.js';
 export { summarizeVocabularyForValidation } from './validation/VocabularySummarizer.js';
 export { ValidationToolProvider } from './validation/ValidationToolProvider.js';

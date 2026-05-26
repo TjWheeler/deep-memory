@@ -10,11 +10,11 @@
 //   1. Cursor-based pagination using ID ordering instead of offset-based range()
 //      (avoids O(n²) scan on large repositories)
 //
-// Phase 2 perf-fixes exception: this file is the one read path that
-// intentionally keeps `valueMap(true)`. Export must include every stored
-// property including the embedding so a re-import is field-for-field
-// faithful. Do not migrate to the project chain helpers — they strip
-// fields the import path expects.
+// `valueMap(true)` exception: this is the one read path that intentionally
+// keeps it. Export must include every stored property — including the
+// embedding — so a re-import is field-for-field faithful. Do not migrate to
+// the project-chain helpers used elsewhere; they strip fields the import path
+// expects.
 
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { ExportChunk, ImportChunk, BulkImportOptions } from '@utaba/deep-memory/types';
@@ -197,14 +197,14 @@ export async function importBulk(
   return { entitiesImported, relationshipsImported, errors };
 }
 
-// ─── Phase 10 — fixed-shape query templates ──────────────────────
+// ─── Fixed-shape query templates ─────────────────────────────────
 //
 // Same Gremlin string across every entity/relationship write regardless of
-// which optional fields are populated. Computed once at module load. The
-// upsert update branch reuses the SAME ladder as the create branch — Cosmos
-// already rejects `.property('repositoryId', ...)` after `unfold()`, and the
-// ladder excludes `id` and `repositoryId` (both written explicitly only on
-// the create branch).
+// which optional fields are populated, so the Cosmos plan cache reuses one
+// compiled plan. Computed once at module load. The upsert update branch
+// reuses the SAME ladder as the create branch — Cosmos already rejects
+// `.property('repositoryId', ...)` after `unfold()`, and the ladder excludes
+// `id` and `repositoryId` (both written explicitly only on the create branch).
 
 const ENTITY_LADDER_CHAIN = buildEntityPropertyLadder();
 const RELATIONSHIP_LADDER_CHAIN = buildRelationshipPropertyLadder();
@@ -270,8 +270,8 @@ async function insertRelationship(
  * Upsert an entity using Gremlin's coalesce pattern — single query.
  * Replaces the old 2-query check-then-create/update approach.
  *
- * Phase 10: both branches share the same fixed-shape entity ladder (which
- * omits `id` and `repositoryId`). The create branch prepends `.property('id',
+ * Both branches share the same fixed-shape entity ladder (which omits `id`
+ * and `repositoryId`). The create branch prepends `.property('id',
  * vid).property('repositoryId', rid)` to addV; the update branch (after
  * `unfold`) relies on those system properties already being set. Cosmos
  * rejects `.property('repositoryId', ...)` after `unfold()` at parse time,

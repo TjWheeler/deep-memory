@@ -1,5 +1,5 @@
 /**
- * Types for Phase B.7: Full Extraction Validation.
+ * Types for full extraction validation.
  *
  * LLM-powered validation of every extracted entity and relationship
  * against source documents. Workers have tool access to navigate

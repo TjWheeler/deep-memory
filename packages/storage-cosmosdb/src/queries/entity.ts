@@ -20,15 +20,14 @@ import {
 } from '@utaba/deep-memory';
 
 // Sentinel returned by the duplicate-detection branch of the
-// fold().coalesce(unfold().constant('__duplicate'), addV/addE) pattern.
-// Phase 6: single round-trip create — the create succeeds inline or the
-// duplicate path returns this string, which we translate into the typed error.
+// fold().coalesce(unfold().constant('__duplicate'), addV/addE) pattern. The
+// create succeeds inline or the duplicate path returns this string, which we
+// translate into the typed error — single round-trip either way.
 const DUPLICATE_SENTINEL = '__duplicate';
 
-// Phase 10: fixed-shape property ladder — same Gremlin string for every entity
-// create regardless of which optional fields are populated. Computed once at
-// module load so the string is reused across calls (helps Node's string
-// interner as well as Cosmos's plan cache).
+// Fixed-shape property ladder — same Gremlin string for every entity create
+// regardless of which optional fields are populated, so the Cosmos plan cache
+// reuses one compiled plan. Computed once at module load.
 const ENTITY_CREATE_QUERY =
   `g.V().has('repositoryId', rid).hasId(vid).fold().coalesce(` +
   `unfold().constant('${DUPLICATE_SENTINEL}'),` +
@@ -118,15 +117,15 @@ export async function getEntities(
   return map;
 }
 
-// Phase 10 note: updateEntity intentionally KEEPS its variable-shape query.
-// A fixed-shape ladder for updates would require a three-way discriminator
-// per slot (set / drop / leave) with two-level choose-and-sideEffect-drop
-// branches — significant Gremlin complexity for a per-call plan-cache win
-// that is much smaller than the bulk-import write path Phase 10 primarily
-// targets (issue #20 in plans/performance-issues.md is framed around the
-// "every create is a unique query" case, not partial-update calls). If the
-// reembed loop ever profiles as plan-parse-bound, revisit by introducing a
-// two-sentinel ladder shape — until then variable is fine.
+// updateEntity intentionally KEEPS a variable-shape query (unlike createEntity).
+// A fixed-shape ladder for updates would require a three-way discriminator per
+// slot (set / drop / leave) with two-level choose-and-sideEffect-drop branches
+// — significant Gremlin complexity for a per-call plan-cache win that matters
+// far less here than on the bulk-import create path. The plan-cache concern is
+// framed around the "every create is a unique query" case (issue #20 in
+// plans/performance-issues.md), not partial-update calls. If the reembed loop
+// ever profiles as plan-parse-bound, revisit by introducing a two-sentinel
+// ladder shape — until then variable is fine.
 
 export async function updateEntity(
   conn: CosmosDbConnection,
@@ -175,8 +174,8 @@ export async function updateEntity(
   if (updates.provenance.modifiedInConversation != null) addProp('modifiedInConversation', updates.provenance.modifiedInConversation);
   if (updates.provenance.modifiedFromMessage != null) addProp('modifiedFromMessage', updates.provenance.modifiedFromMessage);
 
-  // Phase 6: append the read-projection onto the update so the updated state
-  // comes back in a single round-trip (was: update, then a separate getEntity).
+  // Append the read-projection onto the update so the updated state comes
+  // back in a single round-trip (instead of update + separate getEntity).
   // Embeddings stay off the wire — callers that need the embedding pass the
   // option through the public StorageProvider.getEntity call themselves.
   const projection = buildVertexProjectChain();
@@ -203,12 +202,11 @@ export async function deleteEntity(
 }
 
 /**
- * Phase 7: collapse the 3-step (count entities + count edges via `bothE()`
- * fan-out + drop) into a single round-trip via the aggregate-side-effect
- * pattern. The bucket records the vertex ids that the drop touched, giving an
- * exact entity count; the cascaded edge count is skipped because the
- * `bothE().dedup().count()` it required walked every incident edge across
- * every partition the type touches — and the value is currently discarded by
+ * Single round-trip type-delete via the aggregate-side-effect pattern: the
+ * bucket records the vertex ids that the drop touched, giving an exact entity
+ * count. The cascaded edge count is intentionally skipped — computing it
+ * required a `bothE().dedup().count()` that walked every incident edge across
+ * every partition the type touches, and the value is currently discarded by
  * the only caller (VocabularyEngine.cascadeDeleteData).
  *
  * Returns `deletedRelationships: undefined` to signal the field is genuinely

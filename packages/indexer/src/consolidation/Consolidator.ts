@@ -61,7 +61,7 @@ interface EntityCandidate {
 }
 
 /**
- * Consolidation phase (Phase C) — deduplicates entities across all extraction
+ * Consolidation pipeline phase — deduplicates entities across all extraction
  * outputs, assigns GUIDs, resolves relationship references, and produces an
  * ExportArchive ready for import.
  *

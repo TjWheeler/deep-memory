@@ -38,9 +38,10 @@ function propertyChain(bindings: Record<string, unknown>, props: Record<string, 
   return { chain: parts.join(''), nextIndex: idx };
 }
 
-// Phase 10: fixed-shape property ladder for `_repository` vertex creation.
-// Same query string across every createRepository call regardless of which
-// optional fields (description / type / legal / owner / metadata) are set.
+// Fixed-shape property ladder for `_repository` vertex creation: the emitted
+// query string is identical across every createRepository call regardless of
+// which optional fields (description / type / legal / owner / metadata) are
+// set, so the server-side plan cache reuses one compiled plan.
 const REPOSITORY_CREATE_QUERY =
   `g.addV('${REPO_LABEL}').property('id', vid).property('repositoryId', rid)${buildRepositoryPropertyLadder()}`;
 
@@ -109,10 +110,8 @@ export async function listRepositories(
     baseBindings['filterType'] = filter.type;
   }
 
-  // Phase 9: parallel count + data. Phase 11 will replace this whole
-  // function with a `_repository_index` sentinel-vertex read; in the meantime,
-  // running the two existing round-trips in parallel cuts wall-clock latency
-  // in half on a slow account.
+  // Count and data round-trips are independent — run them in parallel to halve
+  // wall-clock latency on a slow account.
   const projection = buildRepositoryProjectChain();
   const dataBindings = { ...baseBindings, rangeStart: offset, rangeEnd: offset + limit };
   const [countResult, dataResult] = await Promise.all([
@@ -132,10 +131,10 @@ export async function listRepositories(
   };
 }
 
-// Phase 10 note: updateRepository, like updateEntity, intentionally keeps a
-// variable-shape query. Partial-update semantics would otherwise need a
-// three-way discriminator per slot. `_repository` writes are extremely rare
-// (one per repo per config change) so a missed plan-cache is negligible.
+// updateRepository intentionally keeps a variable-shape query (unlike the
+// fixed-shape create path). Partial-update semantics would otherwise need a
+// three-way discriminator per slot, and `_repository` writes are extremely
+// rare (one per repo per config change) so a missed plan-cache is negligible.
 export async function updateRepository(
   conn: CosmosDbConnection,
   repositoryId: string,

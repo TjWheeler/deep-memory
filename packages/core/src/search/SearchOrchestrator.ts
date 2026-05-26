@@ -138,8 +138,8 @@ export class SearchOrchestrator {
     // Get all entities (paginated scan — for production, a vector index would be used).
     // Vector-search is the one legitimate consumer of stored embeddings on read,
     // so opt in via the storage `loadEmbeddings` option. Without it, providers
-    // that strip embeddings on the wire (Phase 2 CosmosDB perf-fix) return no
-    // embeddings and the cosine path falls back to embedding entities on the fly.
+    // that strip embeddings on the wire (e.g. CosmosDB) return no embeddings
+    // and the cosine path falls back to embedding entities on the fly.
     const allEntities = await this.storage.findEntities(
       this.repositoryId,
       {

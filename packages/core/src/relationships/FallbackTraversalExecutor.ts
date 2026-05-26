@@ -293,7 +293,7 @@ export async function executeFallbackTraversal(
     // 'all' mode: relationships come from the union page slice computed above,
     // so the response stays a self-consistent window into the union ordering.
     // direction is always 'outbound' (= stored topology) — the deduped union
-    // carries no walk context, per Phase 7 contract.
+    // carries no walk context, so walk direction cannot be derived here.
     relationships = pagedAllRels.map((rel) => ({
       id: rel.id,
       type: rel.relationshipType,
@@ -420,7 +420,7 @@ async function executeSingleStep(
   step: TraversalStep,
   onStorageCall: () => void,
 ): Promise<FrontierEntry[]> {
-  // Phase 1: Collect all relationships from the frontier (N queries, 1 per frontier entity)
+  // Step 1: Collect all relationships from the frontier (N queries, 1 per frontier entity)
   const direction = mapDirection(step.direction);
   const pendingEdges: Array<{
     entry: FrontierEntry;
@@ -451,12 +451,12 @@ async function executeSingleStep(
 
   if (pendingEdges.length === 0) return [];
 
-  // Phase 2: Batch-resolve all target entities in one call
+  // Step 2: Batch-resolve all target entities in one call
   const uniqueTargetIds = [...new Set(pendingEdges.map((e) => e.targetId))];
   const entityMap = await storage.getEntities(repositoryId, uniqueTargetIds);
   onStorageCall();
 
-  // Phase 3: Assemble the next frontier with client-side filtering
+  // Step 3: Assemble the next frontier with client-side filtering
   const nextFrontier: FrontierEntry[] = [];
 
   for (const { entry, rel, targetId } of pendingEdges) {

@@ -107,9 +107,9 @@ When prompt caching is active, the extraction logs include cache token fields:
 
 After the first chunk, subsequent chunks should show high `cache_read_tokens` and zero `cache_creation_tokens`. If they don't, the system prompt is changing between chunks (which defeats caching).
 
-## Tool-Use Capability (Phase B.7)
+## Tool-Use Capability
 
-This provider implements `chatCompletionWithTools` for Phase B.7 full validation — multi-turn tool-use conversations where the LLM calls source navigation tools (read, search, headings) between turns. Uses native Anthropic tool_use content blocks with prompt caching.
+This provider implements `chatCompletionWithTools` for full extraction validation — multi-turn tool-use conversations where the LLM calls source navigation tools (read, search, headings) between turns. Uses native Anthropic tool_use content blocks with prompt caching.
 
 ## Documentation
 

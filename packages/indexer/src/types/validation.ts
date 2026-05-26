@@ -95,7 +95,7 @@ export interface Tier2Result {
   passed: boolean;
 }
 
-/** Checkpoint result during Phase D import */
+/** Checkpoint result captured during a single import-phase batch */
 export interface CheckpointResult {
   batchNumber: number;
   documentsInBatch: number;
@@ -118,7 +118,7 @@ export interface ValidationConfig {
   verificationEndpoint?: string;
   /** Model for Tier 2 verification */
   verificationModel?: string;
-  /** Phase D checkpoint interval (documents per checkpoint, 0 to disable) */
+  /** Import-phase checkpoint interval (documents per checkpoint, 0 to disable) */
   checkpointInterval: number;
   /** Whether to pause on warnings (default: only pause on errors) */
   pauseOnWarnings?: boolean;

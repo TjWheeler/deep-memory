@@ -85,7 +85,7 @@ interface ResolvedWorker {
 }
 
 /**
- * Orchestrates the embedding phase (Phase E) with progress tracking,
+ * Orchestrates the embedding pipeline phase with progress tracking,
  * stop signal support, and optional multi-worker parallelism.
  *
  * Single-worker mode: top-level endpoint/model in config.

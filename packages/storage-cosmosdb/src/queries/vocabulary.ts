@@ -75,8 +75,8 @@ export async function getVocabularyChangeLog(
   const limit = options?.limit ?? 10;
   const offset = options?.offset ?? 0;
 
-  // Phase 9: parallel count + data. No property filters here, so the count
-  // is exact and `total` is always a number.
+  // Count and data round-trips are independent — run them in parallel. No
+  // property filters here, so the count is exact and `total` is always a number.
   const [countResult, dataResult] = await Promise.all([
     conn.submit(
       "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').count()",

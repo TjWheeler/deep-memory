@@ -359,9 +359,9 @@ describe('FallbackTraversalExecutor', () => {
     }
   });
 
-  // ─── Phase 7: relationship direction in 'path' / 'all' modes ───
+  // ─── Relationship direction in 'path' / 'all' modes ───
 
-  it('path mode: inbound step reports direction=inbound (Phase 7)', async () => {
+  it('path mode: inbound step reports direction=inbound', async () => {
     // Edge stored as comp-1 → REQUIRES_FLUID → fluid-1. Walking inbound from
     // fluid-1 crosses the edge target → source, so direction must be 'inbound'.
     const spec: TraversalSpec = {
@@ -380,7 +380,7 @@ describe('FallbackTraversalExecutor', () => {
     expect(result.relationships![0]!.direction).toBe('inbound');
   });
 
-  it('path mode: both-direction step assigns direction per-walk (Phase 7)', async () => {
+  it('path mode: both-direction step assigns direction per-walk', async () => {
     // From comp-1 with direction:'both' two walks fan out:
     //   outbound: comp-1 -REQUIRES_FLUID→ fluid-1   (crosses source → target)
     //   inbound : equip-1 -HAS_COMPONENT→ comp-1    (crosses target → source)
@@ -402,7 +402,7 @@ describe('FallbackTraversalExecutor', () => {
     expect(directionByTerminal.get('equip-1')).toBe('inbound');
   });
 
-  it("all mode: every relationship has direction='outbound' regardless of walk direction (Phase 7)", async () => {
+  it("all mode: every relationship has direction='outbound' regardless of walk direction", async () => {
     // Same both-direction fanout from comp-1; in 'all' mode direction
     // reflects stored topology (always 'outbound'), not walk direction.
     const spec: TraversalSpec = {
@@ -420,7 +420,7 @@ describe('FallbackTraversalExecutor', () => {
   });
 });
 
-// ─── Nexus/Orion regression — issue B (path-mode dedup) + Phase 3b ──
+// ─── Nexus/Orion regression — issue B (path-mode dedup) + 'all'-mode dedup ──
 
 describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', () => {
   let storage: InMemoryStorageProvider;
@@ -503,7 +503,7 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
     expect(withoutDedup.paths!.length).toBe(6);
   });
 
-  it('all mode dedups entities by id always, preserves every distinct edge (Phase 3b)', async () => {
+  it('all mode dedups entities by id always, preserves every distinct edge', async () => {
     const spec: TraversalSpec = {
       start: { entityType: 'Person' },
       steps: [{ direction: 'out', relationshipTypes: ['WORKS_AT'] }],
@@ -541,9 +541,9 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
     expect(withDedup.relationships!.length).toBe(withoutDedup.relationships!.length);
   });
 
-  // ─── Phase 6: 'all'-mode pagination over interleaved entity+edge union ─
+  // ─── 'all'-mode pagination over interleaved entity+edge union ─
 
-  it('all mode paginates the entity+edge union together (Phase 6, page 1: start-frontier persons)', async () => {
+  it('all mode paginates the entity+edge union together (page 1: start-frontier persons)', async () => {
     // Union layout for this scenario (6 Persons → WORKS_AT → 2 Orgs):
     //   positions 0-5  : 6 Person entities (depth-0 vertices)
     //   positions 6-11 : 6 WORKS_AT edges (depth-1 edges)
@@ -568,7 +568,7 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
     expect(result.entities.every((e) => (e as { entityType: string }).entityType === 'Person')).toBe(true);
   });
 
-  it('all mode pagination spans entities and edges across pages without overlap (Phase 6)', async () => {
+  it('all mode pagination spans entities and edges across pages without overlap', async () => {
     // Page through the same 14-element union in chunks of 10.
     const baseSpec: TraversalSpec = {
       start: { entityType: 'Person' },

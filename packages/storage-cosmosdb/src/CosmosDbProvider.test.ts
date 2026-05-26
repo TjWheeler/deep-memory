@@ -982,3 +982,240 @@ describe('Step E indexing-policy diagnostic', () => {
     warn.mockRestore();
   });
 });
+
+// ─── System-vertex partition routing ─────────────────────────────────
+//
+// hasId is post-routing in Cosmos Gremlin — without a partition predicate
+// the engine fans the lookup out to every physical partition. Every system-
+// vertex query whose repositoryId is known must therefore scope via
+// `has('repositoryId', rid)` BEFORE `hasId(vid)`. These tests lock the
+// emission shape so the 7 violations the 2026-05-26 audit caught do not
+// regress.
+
+describe('system-vertex queries scope by partition before hasId', () => {
+  function partitionPredicateBeforeHasId(query: string): boolean {
+    const partitionIdx = query.indexOf("has('repositoryId', rid)");
+    if (partitionIdx === -1) return false;
+    const hasIdIdx = query.indexOf('hasId(vid)');
+    if (hasIdIdx === -1) return false;
+    return partitionIdx < hasIdIdx;
+  }
+
+  it("getVocabulary issues g.V().has('repositoryId', rid).hasId(vid)…", async () => {
+    const { provider, stub } = makeProvider();
+    await provider.getVocabulary(TEST_REPO);
+
+    const last = stub.calls[stub.calls.length - 1]!;
+    expect(partitionPredicateBeforeHasId(last.query)).toBe(true);
+    expect(last.params!['rid']).toBe(TEST_REPO);
+    expect(last.params!['vid']).toBe(`vocab:${TEST_REPO}`);
+  });
+
+  it('saveVocabulary existence check and update branch both scope by partition first', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      // Force the existence-check to report "exists" so the update branch runs.
+      if (query.includes("hasLabel('_vocabulary').count()")) return { items: [1] };
+      return { items: [] };
+    };
+
+    await provider.saveVocabulary(TEST_REPO, {
+      version: '1.0.0',
+      lastModified: '2026-05-26T00:00:00.000Z',
+      modifiedBy: 'test',
+      entityTypes: [],
+      relationshipTypes: [],
+    });
+
+    const existence = stub.calls.find((c) => c.query.includes("hasLabel('_vocabulary').count()"));
+    const update = stub.calls.find((c) => c.query.includes(".property('vocabulary', vocabJson)"));
+    expect(existence).toBeDefined();
+    expect(update).toBeDefined();
+    expect(partitionPredicateBeforeHasId(existence!.query)).toBe(true);
+    expect(partitionPredicateBeforeHasId(update!.query)).toBe(true);
+    expect(existence!.params!['rid']).toBe(TEST_REPO);
+    expect(update!.params!['rid']).toBe(TEST_REPO);
+  });
+
+  it('saveVocabulary create branch keeps repositoryId on the addV (already correct)', async () => {
+    const { provider, stub } = makeProvider();
+    // Default stub returns { items: [] } for the existence check → addV fires.
+
+    await provider.saveVocabulary(TEST_REPO, {
+      version: '1.0.0',
+      lastModified: '2026-05-26T00:00:00.000Z',
+      modifiedBy: 'test',
+      entityTypes: [],
+      relationshipTypes: [],
+    });
+
+    const addv = stub.calls.find((c) => c.query.startsWith("g.addV('_vocabulary')"));
+    expect(addv).toBeDefined();
+    expect(addv!.query).toContain(".property('repositoryId', rid)");
+    expect(addv!.params!['rid']).toBe(TEST_REPO);
+  });
+
+  it('createRepository existence check scopes by partition before hasId', async () => {
+    const { provider, stub } = makeProvider();
+    // Default stub returns { items: [] } for every query — existence check
+    // returns 0 (no duplicate), index read returns [], addV+sideEffect submits
+    // succeed silently.
+    await provider.createRepository({
+      repositoryId: TEST_REPO,
+      label: 'Test',
+      governanceConfig: { mode: 'open' },
+      createdAt: '2026-05-26T00:00:00.000Z',
+      createdBy: 'test',
+    });
+
+    const existence = stub.calls.find(
+      (c) => c.query.includes(".has('label', lbl).count()"),
+    );
+    expect(existence).toBeDefined();
+    expect(partitionPredicateBeforeHasId(existence!.query)).toBe(true);
+    expect(existence!.params!['rid']).toBe(TEST_REPO);
+  });
+
+  it('getRepository scopes by partition before hasId', async () => {
+    const { provider, stub } = makeProvider();
+    await provider.getRepository(TEST_REPO);
+
+    const last = stub.calls[stub.calls.length - 1]!;
+    expect(partitionPredicateBeforeHasId(last.query)).toBe(true);
+    expect(last.params!['rid']).toBe(TEST_REPO);
+    expect(last.params!['vid']).toBe(`repo:${TEST_REPO}`);
+  });
+
+  it('updateRepository scopes by partition before hasId', async () => {
+    const { provider, stub } = makeProvider();
+
+    // updateRepository first calls getRepository(existing). Stub the
+    // projection-bearing read to return a populated repo so the update
+    // path proceeds rather than throwing RepositoryNotFoundError.
+    const fakeRepo = {
+      repositoryId: TEST_REPO,
+      repoLabel: 'Existing',
+      governanceConfig: '{"mode":"open"}',
+      createdAt: '2026-05-26T00:00:00.000Z',
+      createdBy: 'test',
+    };
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes("hasLabel('_repository').project(")) {
+        return { items: [fakeRepo] };
+      }
+      return { items: [] };
+    };
+
+    await provider.updateRepository(TEST_REPO, { label: 'Updated' });
+
+    const update = stub.calls.find(
+      (c) => c.query.includes("hasLabel('_repository').property("),
+    );
+    expect(update).toBeDefined();
+    expect(partitionPredicateBeforeHasId(update!.query)).toBe(true);
+    expect(update!.params!['rid']).toBe(TEST_REPO);
+  });
+});
+
+// ─── _repository_index sentinel ──────────────────────────────────────
+//
+// listRepositories no longer issues `g.V().hasLabel('_repository')` (cross-
+// partition scan). Instead it reads the sentinel in the fixed `_index`
+// partition and hydrates each id via partition-scoped getRepository.
+
+describe('_repository_index sentinel', () => {
+  it('listRepositories reads the sentinel and never issues a cross-partition _repository scan', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith("g.V().has('repositoryId', pk).hasId(sid).values('repositoryIds')")) {
+        return { items: [JSON.stringify([])] };
+      }
+      return { items: [] };
+    };
+
+    await provider.listRepositories();
+
+    // No cross-partition scan
+    expect(
+      stub.calls.some((c) =>
+        c.query.startsWith("g.V().hasLabel('_repository')"),
+      ),
+    ).toBe(false);
+    // Sentinel read happened
+    const sentinelRead = stub.calls.find((c) =>
+      c.query.includes("has('repositoryId', pk).hasId(sid).values('repositoryIds')"),
+    );
+    expect(sentinelRead).toBeDefined();
+    expect(sentinelRead!.params!['pk']).toBe('_index');
+    expect(sentinelRead!.params!['sid']).toBe('_repository_index');
+  });
+
+  it('listRepositories hydrates each id from the sentinel via partition-scoped getRepository', async () => {
+    const { provider, stub } = makeProvider();
+    const RID_A = '40000000-0000-4000-a000-000000008001';
+    const RID_B = '40000000-0000-4000-a000-000000008002';
+
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes(".values('repositoryIds')")) {
+        return { items: [JSON.stringify([RID_A, RID_B])] };
+      }
+      if (query.includes("hasLabel('_repository').project(")) {
+        const rid = params!['rid'] as string;
+        return {
+          items: [{
+            repositoryId: rid,
+            repoLabel: `Repo ${rid.slice(0, 8)}`,
+            governanceConfig: '{"mode":"open"}',
+            createdAt: '2026-05-26T00:00:00.000Z',
+            createdBy: 'test',
+          }],
+        };
+      }
+      return { items: [] };
+    };
+
+    const result = await provider.listRepositories();
+
+    const hydrationCalls = stub.calls.filter((c) =>
+      c.query.includes("hasLabel('_repository').project("),
+    );
+    expect(hydrationCalls).toHaveLength(2);
+    // Each hydration is partition-scoped
+    for (const call of hydrationCalls) {
+      expect(call.query).toContain("has('repositoryId', rid)");
+      expect(call.query).toContain('hasId(vid)');
+    }
+    expect(result.items.map((r) => r.repositoryId).sort()).toEqual([RID_A, RID_B].sort());
+    expect(result.total).toBe(2);
+  });
+
+  it('createRepository updates the sentinel via single-submit cross-partition sideEffect', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.includes(".values('repositoryIds')")) {
+        return { items: [JSON.stringify([])] };
+      }
+      return { items: [] };
+    };
+
+    await provider.createRepository({
+      repositoryId: TEST_REPO,
+      label: 'Test',
+      governanceConfig: { mode: 'open' },
+      createdAt: '2026-05-26T00:00:00.000Z',
+      createdBy: 'test',
+    });
+
+    const addv = stub.calls.find((c) => c.query.includes("g.addV('_repository')"));
+    expect(addv).toBeDefined();
+    expect(addv!.query).toContain('.sideEffect(');
+    expect(addv!.query).toContain("has('repositoryId', pk).hasId(sid).property('repositoryIds', updatedIndex)");
+    const updated = JSON.parse(addv!.params!['updatedIndex'] as string);
+    expect(updated).toEqual([TEST_REPO]);
+  });
+});

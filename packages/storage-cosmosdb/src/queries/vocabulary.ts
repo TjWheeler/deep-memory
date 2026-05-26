@@ -25,9 +25,13 @@ export async function getVocabulary(
   // valueMap(true) shipped every property on the vocab vertex (label,
   // repositoryId, etc.) for no reason. `.values('vocabulary').limit(1)`
   // returns just the JSON string — smaller wire payload, single column read.
+  //
+  // `has('repositoryId', rid)` scopes the lookup to a single partition before
+  // `hasId(vid)`; `hasId` is post-routing in Cosmos Gremlin and fans out
+  // across all partitions without the partition predicate.
   const result = await conn.submit(
-    "g.V().hasId(vid).hasLabel('_vocabulary').values('vocabulary').limit(1)",
-    { vid: vocabVertexId(repositoryId) },
+    "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_vocabulary').values('vocabulary').limit(1)",
+    { vid: vocabVertexId(repositoryId), rid: repositoryId },
   );
   if (result.items.length === 0) return EMPTY_VOCABULARY();
   const raw = result.items[0];
@@ -48,16 +52,18 @@ export async function saveVocabulary(
   const vid = vocabVertexId(repositoryId);
   const vocabJson = JSON.stringify(vocabulary);
 
-  // Upsert: try to update existing, create if not found
+  // Upsert: try to update existing, create if not found.
+  // Both branches scope by `has('repositoryId', rid)` before `hasId(vid)` —
+  // hasId alone fans out across all partitions in Cosmos Gremlin.
   const existing = await conn.submit(
-    "g.V().hasId(vid).hasLabel('_vocabulary').count()",
-    { vid },
+    "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_vocabulary').count()",
+    { vid, rid: repositoryId },
   );
 
   if (Number(existing.items[0] ?? 0) > 0) {
     await conn.submit(
-      "g.V().hasId(vid).hasLabel('_vocabulary').property('vocabulary', vocabJson)",
-      { vid, vocabJson },
+      "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_vocabulary').property('vocabulary', vocabJson)",
+      { vid, rid: repositoryId, vocabJson },
     );
   } else {
     await conn.submit(

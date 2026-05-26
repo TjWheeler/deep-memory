@@ -330,7 +330,12 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         schemaCreated = true;
       }
 
-      // 5. Step E — indexing-policy diagnostic. Always runs (operators may
+      // 5. Bootstrap the `_repository_index` sentinel. Idempotent — first run
+      // does a one-time cross-partition scan to backfill existing repos, every
+      // subsequent run is a single cheap doc-fetch that returns null.
+      await repoQueries.ensureRepositoryIndex(this.conn);
+
+      // 6. Step E — indexing-policy diagnostic. Always runs (operators may
       // drift policy between calls). Never fails ensureSchema — see helper.
       await this.runIndexingPolicyDiagnostic();
 

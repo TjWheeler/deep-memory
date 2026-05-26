@@ -203,7 +203,7 @@ g.V().has('label', TextP.containing('foo'))
 
 **Symptom:** Silently returns no rows (no error). The TinkerPop `TextP` predicates are not supported in CosmosDB's subset.
 
-**Workaround:** Load the candidate set with available predicates (`within`, equality, range) and filter client-side, OR maintain a separate full-text index (Azure AI Search sidecar), OR restrict the JS-filter fallback to queries that already have a tight `entityTypes` constraint. See [Performance issue #5](../plans/performance-issues.md) and the Phase 8 fix in the perf-fixes plan.
+**Workaround (current):** `findEntities` routes `searchTerm` and `properties` queries through the **Cosmos NoSQL (Document) endpoint** via `CosmosDocumentClient` — a separate code path from the Gremlin connection, sharing the same backing container. See the "Cosmos SQL `findEntities` path" section below for the wire shape, indexing-policy requirements, and an RU baseline. The old approach (load candidate set, filter client-side) is gone.
 
 ### Property-key interpolation prevents server-side plan caching
 
@@ -347,6 +347,60 @@ g.V().has('repositoryId', rid).has('entityType').group().by('entityType').by(cou
 Fine on small repos; expensive at millions of vertices because the engine has to touch every matching doc to build the group. `getRepositoryStats` uses this — its RU scales with the partition's vertex count, not with the number of distinct types.
 
 **Mitigation options:** write-side counter vertex (atomic increments on every mutation), or eventual-consistency stats refreshed on a schedule. Currently deferred — see [Performance issue #11](../plans/performance-issues.md).
+
+---
+
+## Cosmos SQL `findEntities` path
+
+`findEntities` does **not** use the Gremlin endpoint. It routes entirely through the Cosmos NoSQL (Document) endpoint via `CosmosDocumentClient` — raw `fetch` + HMAC, no SDK dep, sharing the backing container with the Gremlin reads. The reason is in the section above: `TextP.containing()` silently returns zero rows, so substring `searchTerm` cannot be expressed server-side in the Gremlin subset, and the JS-filter workaround loaded every type-matched vertex into Node memory.
+
+The SQL rewrite (Step D of [plans/findentities-cosmos-fanout-2026-05-25.md](../plans/findentities-cosmos-fanout-2026-05-25.md)) issues two parallel queries against the same `WHERE` clause:
+
+```sql
+-- data
+SELECT <projection> FROM c
+WHERE c.repositoryId = @rid
+  [AND c.entityType[0]._value IN (@etype0, @etype1, ...)]
+  [AND (CONTAINS(c.entityLabel[0]._value, @term, true)
+     OR CONTAINS(c.slug[0]._value,        @term, true)
+     OR CONTAINS(c.summary[0]._value,     @term, true))]
+  [AND CONTAINS(c.properties[0]._value, @kv0, false) AND ...]
+ORDER BY c.id OFFSET @off LIMIT @lim
+
+-- count (skipped when query.properties is non-empty)
+SELECT VALUE COUNT(1) FROM c WHERE <same clause>
+```
+
+The `count` is skipped on `properties` queries because the `CONTAINS` on the JSON-stringified blob is **approximate** — exact-match verification happens client-side after the page lands. Counting the approximate set would overstate `total`, so `PaginatedResult.total` is `undefined` for those queries by convention.
+
+### Path conventions (the `[0]._value` gotcha)
+
+Every Gremlin-managed property is stored as `[{ "_value": ..., "id": "..." }]` when read from the Document endpoint. The SQL must address `c.<field>[0]._value`, **including the `entityType` filter** — `c.entityType = @t` returns zero docs at `indexUtilizationRatio=0.00`. The only flat scalars are `c.id`, `c.repositoryId`, and the Gremlin label token `c.label` (which is **stale after `updateEntity`** — read `c.entityType[0]._value` for authoritative type).
+
+### Indexing-policy requirement
+
+The SQL rewrite assumes the default Cosmos indexing policy (`includedPaths: /*`, only `/_etag` excluded). All six guarded paths — `/entityLabel`, `/slug`, `/summary`, `/entityType`, `/properties`, `/repositoryId` — must be indexed or `CONTAINS` falls back to scan.
+
+`CosmosDbProvider.ensureSchema()` includes an indexing-policy diagnostic (Step E): after schema version is settled, it fetches container metadata and `console.warn`s if any guarded path is in `excludedPaths`. Code-managed containers (`ensureSchema()` provisions them) get the default policy and never warn. Operators provisioning via ARM/Bicep outside this codebase should review the template — the warning will surface mismatches at startup.
+
+### RU baseline (200-entity emulator workload, 2026-05-26)
+
+Full results: [local-tests/baseline/findentities-cosmos-sql-results.md](../local-tests/baseline/findentities-cosmos-sql-results.md). Probe script: [local-tests/findentities-cosmos-sql-probe.mjs](../local-tests/findentities-cosmos-sql-probe.mjs).
+
+| Query shape | items | total | RU | calls |
+|---|---:|---:|---:|---:|
+| no filters | 25 | 200 | 10.89 | 2 |
+| `entityTypes: ['Person']` | 25 | 150 | 14.46 | 2 |
+| `searchTerm: 'ALICE'` | 25 | 39 | 23.06 | 2 |
+| `searchTerm` + `entityTypes` | 25 | 39 | 21.65 | 2 |
+| `properties: { role: 'engineer' }` | 25 | undefined | 7.91 | 1 |
+| offset 50, limit 25 | 25 | 200 | 10.57 | 2 |
+
+Compared to the deleted Gremlin JS-filter path at the same fixture (~10 RU to load 150 Person vertices, ~12 RU for the whole 200-vertex partition): **the new path scales with page size; the old path scaled with type population.** At 4500 entities (Mining Fleet scale) the old path would project ~300 RU per call; the new path stays at ~25 RU regardless of population. The qualitative wins — case-insensitive `CONTAINS` server-side, no `UnsupportedQueryError` for cross-type substring queries — were the actual motivation; the RU number confirms it isn't a regression at small scale either.
+
+### Case-insensitive contract
+
+The third argument to `CONTAINS(field, @term, true)` is `ignoreCase`. The conformance test (`packages/core/src/providers-builtin/conformance.ts`) locks the invariant cross-provider — `searchTerm: 'ALPHA'` matches an entity labelled `'Alpha'`. In-memory lowercases both sides; SQL Server's default `*_CI_AS` collation gives the same; Cosmos now matches via the third-arg flag instead of a JS fallback.
 
 ---
 

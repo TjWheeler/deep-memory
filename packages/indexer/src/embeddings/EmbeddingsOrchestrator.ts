@@ -43,10 +43,13 @@ export interface EmbeddingEntity {
   summary?: string;
 }
 
-/** Paginated result from the entity loader */
+/**
+ * Result from the entity loader. The orchestrator does its own work-splitting
+ * from `EmbeddingsDependencies.totalEntities`, so the page doesn't need to
+ * report a total — it just delivers a contiguous slice of entities.
+ */
 export interface EmbeddingEntityPage {
   items: EmbeddingEntity[];
-  total: number;
 }
 
 /** Response shape from the OpenAI /v1/embeddings endpoint */

@@ -1,15 +1,21 @@
 // Entity CRUD Gremlin queries
 
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
+import type { CosmosDocumentClient, CosmosQueryParameter } from '../CosmosDocumentClient.js';
 import type { StoredEntity, StoredEntityUpdate } from '@utaba/deep-memory/types';
-import type { StorageFindQuery, PaginatedResult } from '@utaba/deep-memory/types';
+import type { StorageFindQuery, PaginatedResult, PropertyFilter } from '@utaba/deep-memory/types';
 import type { EntityReadOptions } from '@utaba/deep-memory/providers';
-import { entityFromGremlin, entityToGremlinProps } from '../mapping.js';
+import {
+  entityFromDocument,
+  entityFromGremlin,
+  entityToGremlinProps,
+  STORED_ENTITY_FIELDS,
+} from '../mapping.js';
 import {
   DuplicateEntityError,
   EntityNotFoundError,
-  UnsupportedQueryError,
   buildVertexProjectChain,
+  matchesPropertyFilters,
 } from '@utaba/deep-memory';
 
 // Sentinel returned by the duplicate-detection branch of the
@@ -219,112 +225,149 @@ export async function deleteEntitiesByType(
   return { deletedEntities, deletedRelationships: undefined };
 }
 
+/**
+ * Build the Document-endpoint SQL path for a Gremlin-managed property.
+ * Every user property on a Gremlin vertex is stored as `[{_value, id}]` when
+ * read through the Document endpoint — so a top-level scalar reference like
+ * `c.entityType` silently returns no rows. Always go through `[0]._value`.
+ * See local-tests/baseline/phase-cosmos-sql-shape-probe-results.md.
+ */
+function sqlPath(key: string): string {
+  return `c.${key}[0]._value`;
+}
+
+/**
+ * Build the `WHERE` clause + parameter array shared by the data query and the
+ * `SELECT VALUE COUNT(1)` query, so the two are guaranteed to count the same
+ * set by construction.
+ *
+ * Property filters are emitted as approximate `CONTAINS` on the JSON-stringified
+ * `c.properties[0]._value` blob; the caller verifies exact-match client-side
+ * (see `findEntities`).
+ */
+function buildWhereClause(
+  query: StorageFindQuery,
+  repositoryId: string,
+): { sqlWhere: string; params: CosmosQueryParameter[] } {
+  const params: CosmosQueryParameter[] = [{ name: '@rid', value: repositoryId }];
+  // `IS_DEFINED(c.entityType)` mirrors the old Gremlin `.has('entityType')`
+  // presence check — it excludes the `_repository`, `_vocabulary`, and
+  // `_vocabulary_change` system vertices that share the partition with the
+  // repository's entities. Without this filter, those vertices leak into
+  // both the data page and the COUNT(1), breaking pagination math.
+  const predicates: string[] = ['c.repositoryId = @rid', 'IS_DEFINED(c.entityType)'];
+
+  if (query.entityTypes && query.entityTypes.length > 0) {
+    const typeParamNames: string[] = [];
+    query.entityTypes.forEach((t, i) => {
+      const name = `@etype${i}`;
+      params.push({ name, value: t });
+      typeParamNames.push(name);
+    });
+    // Gotcha: must use the `[0]._value` path even for the type filter — the
+    // flat `c.entityType` form returns 0 docs with indexUtilizationRatio=0.00.
+    predicates.push(`${sqlPath('entityType')} IN (${typeParamNames.join(', ')})`);
+  }
+
+  if (query.searchTerm) {
+    params.push({ name: '@term', value: query.searchTerm });
+    predicates.push(
+      `(CONTAINS(${sqlPath('entityLabel')}, @term, true) ` +
+        `OR CONTAINS(${sqlPath('slug')}, @term, true) ` +
+        `OR CONTAINS(${sqlPath('summary')}, @term, true))`,
+    );
+  }
+
+  if (query.properties != null) {
+    let i = 0;
+    for (const [key, value] of Object.entries(query.properties)) {
+      // JSON.stringify on a single-entry object produces `{"key":<json-value>}`;
+      // strip the outer braces to get the substring that must appear inside
+      // the stored blob. Works uniformly for strings, numbers, booleans, and
+      // nested arrays/objects. False positives are filtered client-side via
+      // `matchesPropertyFilters` after JSON-parsing each returned doc.
+      const fragment = JSON.stringify({ [key]: value }).slice(1, -1);
+      const name = `@kv${i++}`;
+      params.push({ name, value: fragment });
+      // ignoreCase=false: property keys/values are canonical, no case folding.
+      predicates.push(`CONTAINS(${sqlPath('properties')}, ${name}, false)`);
+    }
+  }
+
+  return { sqlWhere: `WHERE ${predicates.join(' AND ')}`, params };
+}
+
+/**
+ * Build the projection field list for the data SELECT. Mirrors the Gremlin
+ * fast path's `buildVertexProjectChain({ withEmbedding })`: embedding is
+ * heavy (large JSON-stringified float array) and not shipped unless the
+ * caller asks via `EntityReadOptions.loadEmbeddings`.
+ */
+function buildSelectClause(loadEmbeddings: boolean): string {
+  const fields = ['c.id', ...STORED_ENTITY_FIELDS.filter((f) => f !== 'id').map((f) => `c.${f}`)];
+  if (loadEmbeddings) fields.push('c.embedding');
+  return `SELECT ${fields.join(', ')}`;
+}
+
 export async function findEntities(
-  conn: CosmosDbConnection,
+  docClient: CosmosDocumentClient,
   repositoryId: string,
   query: StorageFindQuery,
   options?: EntityReadOptions,
 ): Promise<PaginatedResult<StoredEntity>> {
-  const bindings: Record<string, unknown> = { rid: repositoryId };
-  let filterClause = ".has('repositoryId', rid).has('entityType')";
+  const { sqlWhere, params } = buildWhereClause(query, repositoryId);
 
-  // Entity type filter
-  if (query.entityTypes && query.entityTypes.length > 0) {
-    const typeParams: string[] = [];
-    query.entityTypes.forEach((t, i) => {
-      const paramName = `etype${i}`;
-      bindings[paramName] = t;
-      typeParams.push(paramName);
-    });
-    filterClause += `.has('entityType', within(${typeParams.join(', ')}))`;
-  }
+  const dataParams: CosmosQueryParameter[] = [
+    ...params,
+    { name: '@off', value: query.offset },
+    { name: '@lim', value: query.limit },
+  ];
+  const selectClause = buildSelectClause(options?.loadEmbeddings === true);
+  // ORDER BY c.id pins pagination order deterministically — without it,
+  // Cosmos may return overlapping/missing rows across page requests. c.id is
+  // covered by the default indexing policy, so no extra RU on the sort itself.
+  const dataSql = `${selectClause} FROM c ${sqlWhere} ORDER BY c.id OFFSET @off LIMIT @lim`;
+  const countSql = `SELECT VALUE COUNT(1) FROM c ${sqlWhere}`;
 
-  const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
-
-  // searchTerm and properties can't be filtered server-side: CosmosDB Gremlin
-  // silently drops TextP.containing(), and properties are stored as a JSON blob.
-  // When either is present, load all type-matched vertices and filter in memory
-  // so pagination and total counts reflect the real result set.
-  const hasPropertyFilter =
+  // The properties prefilter is approximate (substring CONTAINS on the
+  // JSON-stringified blob), so COUNT(1) over the same WHERE clause would
+  // overcount by the false-positive rate. Report `total: undefined` and let
+  // callers paginate on `hasMore` instead.
+  const skipCount =
     query.properties != null && Object.keys(query.properties).length > 0;
-  const needsClientFilter = Boolean(query.searchTerm) || hasPropertyFilter;
 
-  if (needsClientFilter) {
-    // Phase 8: reject the unfiltered fan-out. Without entityTypes, the
-    // JS-filter path would load every vertex in the partition just to filter
-    // in memory — CosmosDB Gremlin silently drops TextP.containing(), so
-    // searchTerm and properties cannot be evaluated server-side. Require the
-    // caller to narrow by entityTypes first.
-    /*Tim Notes and TODO:
-      This is a bad design and poor implementation.
-      The core issue stems from the fact that the gremlin queries are case sensitive.
-      What I will look at is using the Record endpoint for this query specifically to allow case insensitive.
-    */
-    if (!query.entityTypes || query.entityTypes.length === 0) {
-      throw new UnsupportedQueryError(
-        'cosmosdb',
-        "find_entities with 'searchTerm' or 'properties' requires 'entityTypes' on the CosmosDB provider — vector / text search across all types is unsupported in this provider.",
-        "Provide 'entityTypes' to narrow the candidate set, or use 'memory_search_by_concept' for semantic search across types.",
-      );
-    }
+  const [dataResult, countResult] = await Promise.all([
+    docClient.query<Record<string, unknown>>(dataSql, dataParams, {
+      partitionKey: repositoryId,
+    }),
+    skipCount
+      ? Promise.resolve(null)
+      : docClient.query<number>(countSql, params, { partitionKey: repositoryId }),
+  ]);
 
-    const dataResult = await conn.submit(
-      `g.V()${filterClause}.${projection}`,
-      bindings,
+  let items = dataResult.documents.map(entityFromDocument);
+
+  if (query.properties != null && Object.keys(query.properties).length > 0) {
+    const filters: PropertyFilter[] = Object.entries(query.properties).map(
+      ([key, value]) => ({ key, operator: 'eq', value }),
     );
-    let items = (dataResult.items as Record<string, unknown>[]).map(entityFromGremlin);
-
-    if (query.searchTerm) {
-      const term = query.searchTerm.toLowerCase();
-      items = items.filter(
-        (e) =>
-          e.label.toLowerCase().includes(term) ||
-          e.slug.toLowerCase().includes(term) ||
-          (e.summary != null && e.summary.toLowerCase().includes(term)),
-      );
-    }
-
-    if (hasPropertyFilter) {
-      items = items.filter((entity) => {
-        for (const [key, value] of Object.entries(query.properties!)) {
-          if (entity.properties[key] !== value) return false;
-        }
-        return true;
-      });
-    }
-
-    const total = items.length;
-    const paged = items.slice(query.offset, query.offset + query.limit);
-
-    return {
-      items: paged,
-      total,
-      hasMore: query.offset + query.limit < total,
-      limit: query.limit,
-      offset: query.offset,
-    };
+    items = items.filter((entity) => matchesPropertyFilters(entity.properties, filters));
   }
 
-  // Fast path: server-side pagination when no client-side filters are needed.
-  const countResult = await conn.submit(
-    `g.V()${filterClause}.count()`,
-    bindings,
-  );
-  const total = Number(countResult.items[0] ?? 0);
+  const total =
+    countResult && countResult.documents.length > 0
+      ? Number(countResult.documents[0])
+      : undefined;
 
-  bindings['rangeStart'] = query.offset;
-  bindings['rangeEnd'] = query.offset + query.limit;
-  const dataResult = await conn.submit(
-    `g.V()${filterClause}.range(rangeStart, rangeEnd).${projection}`,
-    bindings,
-  );
-
-  const items = (dataResult.items as Record<string, unknown>[]).map(entityFromGremlin);
+  const hasMore =
+    total != null
+      ? query.offset + items.length < total
+      : items.length === query.limit;
 
   return {
     items,
     total,
-    hasMore: query.offset + query.limit < total,
+    hasMore,
     limit: query.limit,
     offset: query.offset,
   };

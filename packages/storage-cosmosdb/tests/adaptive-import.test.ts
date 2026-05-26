@@ -9,7 +9,7 @@ import {
   resolveController,
   runAdaptive,
 } from '../src/queries/adaptive-import.js';
-import { usageScope, type UsageAccumulator } from '../src/CosmosDbConnection.js';
+import { usageScope, type UsageAccumulator } from '../src/usage.js';
 
 describe('AdaptiveConcurrencyController', () => {
   it('starts at the configured start concurrency', () => {

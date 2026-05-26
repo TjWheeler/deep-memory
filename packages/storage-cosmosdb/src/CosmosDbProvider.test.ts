@@ -20,8 +20,8 @@ import {
   DuplicateEntityError,
   DuplicateRelationshipError,
   EntityNotFoundError,
-  UnsupportedQueryError,
 } from '@utaba/deep-memory';
+import type { CosmosQueryParameter, CosmosQueryResult } from './CosmosDocumentClient.js';
 
 const TEST_REPO = '40000000-0000-4000-a000-000000000099';
 
@@ -563,108 +563,423 @@ describe('Phase 7 single-round-trip delete paths', () => {
     expect(issued.query).not.toContain('.count()');
     expect(issued.query).toContain("aggregate('found').by('id')");
   });
+
+  // ─── upsertEntity / upsertRelationship partition-key constraint ────
+  //
+  // Cosmos rejects `.property('repositoryId', ...)` after `unfold()` at
+  // parse time as "Partition key property of a vertex is readonly", which
+  // killed the entire coalesce — including the create branch on brand-new
+  // entities. The fix splits propParts into update vs create; this test
+  // locks the SQL shape so the bug doesn't come back.
+
+  function makeStoredEntity(id: string): StoredEntity {
+    const now = new Date().toISOString();
+    return {
+      id,
+      slug: 'test-type:' + id,
+      entityType: 'test-type',
+      label: id,
+      summary: 'S',
+      properties: { key: 'value' },
+      provenance: {
+        createdBy: 'x', createdByType: 'agent', createdAt: now,
+        modifiedBy: 'x', modifiedByType: 'agent', modifiedAt: now,
+      },
+    };
+  }
+
+  function makeStoredRelationship(id: string): StoredRelationship {
+    const now = new Date().toISOString();
+    return {
+      id,
+      relationshipType: 'LINKS',
+      sourceEntityId: 'src',
+      targetEntityId: 'tgt',
+      properties: {},
+      bidirectional: false,
+      provenance: {
+        createdBy: 'x', createdByType: 'agent', createdAt: now,
+        modifiedBy: 'x', modifiedByType: 'agent', modifiedAt: now,
+      },
+    };
+  }
+
+  function splitCoalesceBranches(query: string): { update: string; create: string } {
+    const idx = query.indexOf('unfold()');
+    expect(idx).toBeGreaterThan(-1);
+    const tail = query.slice(idx);
+    // Branches are separated by `, ` at the top level of coalesce(...).
+    // For these single-shot queries, the only `, ` outside a binding param
+    // list is the one separating unfold from addV/addE.
+    const splitIdx = tail.indexOf(', ');
+    expect(splitIdx).toBeGreaterThan(-1);
+    return { update: tail.slice(0, splitIdx), create: tail.slice(splitIdx + 2) };
+  }
+
+  it("upsertEntity omits .property('repositoryId', ...) on the unfold branch but keeps it on addV", async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-000000007100';
+
+    await provider.importBulk(TEST_REPO, [
+      { entities: [makeStoredEntity(ENTITY_ID)] },
+    ]);
+
+    const upsert = stub.calls.find((c) => c.query.includes('addV(vertexLabel)'));
+    expect(upsert).toBeDefined();
+    const { update, create } = splitCoalesceBranches(upsert!.query);
+    expect(update).not.toMatch(/\.property\('repositoryId',/);
+    expect(create).toMatch(/\.property\('repositoryId',/);
+  });
+
+  it("upsertRelationship omits .property('repositoryId', ...) on the unfold branch but keeps it on addE", async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-000000007101';
+
+    await provider.importBulk(TEST_REPO, [
+      { relationships: [makeStoredRelationship(REL_ID)] },
+    ]);
+
+    const upsert = stub.calls.find((c) => c.query.includes('addE(edgeLabel)'));
+    expect(upsert).toBeDefined();
+    const { update, create } = splitCoalesceBranches(upsert!.query);
+    expect(update).not.toMatch(/\.property\('repositoryId',/);
+    expect(create).toMatch(/\.property\('repositoryId',/);
+  });
 });
 
-// ─── Phase 8 — findEntities JS-filter requires entityTypes ───────────
+// ─── Step D — findEntities routes through the Document (SQL) endpoint ─
 //
-// CosmosDB Gremlin silently drops TextP.containing(), so searchTerm /
-// properties filters run client-side after loading every type-matched
-// vertex into memory. Without entityTypes, "type-matched" means every
-// vertex in the partition — an unbounded fan-out. The guard rejects
-// these queries with a typed error before issuing any Gremlin.
+// The Gremlin JS-filter fan-out is gone. All findEntities calls — with or
+// without searchTerm / properties — go through CosmosDocumentClient.query
+// against the Cosmos NoSQL endpoint. The Gremlin connection is no longer
+// touched on this path. These tests inject a stub docClient and assert the
+// SQL shape, parameter binding, parallel COUNT, and properties prefilter +
+// client-side exact-match.
 
-describe('Phase 8 findEntities requires entityTypes for JS-filter path', () => {
-  it('throws UnsupportedQueryError when searchTerm is set without entityTypes', async () => {
-    const { provider, stub } = makeProvider();
-    const before = stub.calls.length;
+interface DocQueryCall {
+  sql: string;
+  parameters: CosmosQueryParameter[];
+  partitionKey: string | undefined;
+}
 
-    await expect(
-      provider.findEntities(TEST_REPO, { searchTerm: 'alpha', limit: 10, offset: 0 }),
-    ).rejects.toBeInstanceOf(UnsupportedQueryError);
+interface DocClientStub {
+  query<T>(
+    sql: string,
+    parameters: CosmosQueryParameter[],
+    options: { partitionKey?: string },
+  ): Promise<CosmosQueryResult<T>>;
+  calls: DocQueryCall[];
+  /** Override per test to shape returned documents/count by SQL inspection. */
+  respond: (sql: string) => unknown[];
+}
 
-    const after = stub.calls.length;
-    expect(after - before).toBe(0);
+function makeDocClientStub(): DocClientStub {
+  const stub: DocClientStub = {
+    calls: [],
+    respond: () => [],
+    async query<T>(
+      sql: string,
+      parameters: CosmosQueryParameter[],
+      options: { partitionKey?: string },
+    ): Promise<CosmosQueryResult<T>> {
+      stub.calls.push({ sql, parameters, partitionKey: options.partitionKey });
+      return {
+        documents: stub.respond(sql) as T[],
+        requestCharge: 0,
+        queryMetrics: null,
+        continuationToken: null,
+      };
+    },
+  };
+  return stub;
+}
+
+function makeProviderWithDocStub(): { provider: CosmosDbProvider; doc: DocClientStub } {
+  const { provider } = makeProvider();
+  const doc = makeDocClientStub();
+  (provider as unknown as { docClient: DocClientStub }).docClient = doc;
+  return { provider, doc };
+}
+
+describe('Step D findEntities SQL shape', () => {
+  it('binds the partition predicate and pins the partition key on every query', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
+
+    await provider.findEntities(TEST_REPO, { limit: 10, offset: 0 });
+
+    expect(doc.calls).toHaveLength(2);
+    for (const call of doc.calls) {
+      expect(call.sql).toContain('c.repositoryId = @rid');
+      expect(call.parameters).toContainEqual({ name: '@rid', value: TEST_REPO });
+      expect(call.partitionKey).toBe(TEST_REPO);
+    }
   });
 
-  it('throws UnsupportedQueryError when properties is set without entityTypes', async () => {
-    const { provider, stub } = makeProvider();
-    const before = stub.calls.length;
+  it('filters out _repository / _vocabulary system vertices via IS_DEFINED(c.entityType)', async () => {
+    // Regression — the system vertices share the partition with entities and
+    // lack an `entityType` property; without this filter they leak into the
+    // result page and break pagination math (conformance suite caught this
+    // running against the live emulator on 2026-05-26).
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
 
-    await expect(
-      provider.findEntities(TEST_REPO, {
-        properties: { role: 'admin' },
-        limit: 10,
-        offset: 0,
-      }),
-    ).rejects.toBeInstanceOf(UnsupportedQueryError);
+    await provider.findEntities(TEST_REPO, { limit: 10, offset: 0 });
 
-    const after = stub.calls.length;
-    expect(after - before).toBe(0);
+    for (const call of doc.calls) {
+      expect(call.sql).toContain('IS_DEFINED(c.entityType)');
+    }
   });
 
-  it('throws UnsupportedQueryError when entityTypes is an empty array', async () => {
-    const { provider, stub } = makeProvider();
-    const before = stub.calls.length;
+  it('emits searchTerm as OR of case-insensitive CONTAINS across label/slug/summary', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
 
-    await expect(
-      provider.findEntities(TEST_REPO, {
-        searchTerm: 'alpha',
-        entityTypes: [],
-        limit: 10,
-        offset: 0,
-      }),
-    ).rejects.toBeInstanceOf(UnsupportedQueryError);
+    await provider.findEntities(TEST_REPO, { searchTerm: 'ALPHA', limit: 10, offset: 0 });
 
-    const after = stub.calls.length;
-    expect(after - before).toBe(0);
+    const data = doc.calls.find((c) => !c.sql.includes('COUNT(1)'))!;
+    expect(data.sql).toContain('CONTAINS(c.entityLabel[0]._value, @term, true)');
+    expect(data.sql).toContain('CONTAINS(c.slug[0]._value, @term, true)');
+    expect(data.sql).toContain('CONTAINS(c.summary[0]._value, @term, true)');
+    expect(data.parameters).toContainEqual({ name: '@term', value: 'ALPHA' });
   });
 
-  it('proceeds to the JS-filter Gremlin query when entityTypes is provided', async () => {
-    const { provider, stub } = makeProvider();
-    stub.submit = async (query, params) => {
-      stub.calls.push({ query, params });
-      return { items: [] };
-    };
+  it('routes entityTypes through the [0]._value path (gotcha — c.entityType silently returns 0 docs)', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
 
-    const before = stub.calls.length;
-    const result = await provider.findEntities(TEST_REPO, {
-      searchTerm: 'alpha',
-      entityTypes: ['Person'],
-      limit: 10,
-      offset: 0,
-    });
-    const after = stub.calls.length;
-
-    expect(after - before).toBe(1);
-    expect(result.items).toEqual([]);
-
-    const issued = stub.calls[stub.calls.length - 1]!;
-    expect(issued.query).toContain("has('entityType', within(");
-    // JS-filter path: no server-side range, no count.
-    expect(issued.query).not.toContain('.range(');
-    expect(issued.query).not.toContain('.count()');
-  });
-
-  it('uses the fast (server-paginated) path when no searchTerm or properties are present', async () => {
-    const { provider, stub } = makeProvider();
-    stub.submit = async (query, params) => {
-      stub.calls.push({ query, params });
-      if (query.includes('.count()')) {
-        return { items: [0] };
-      }
-      return { items: [] };
-    };
-
-    const before = stub.calls.length;
     await provider.findEntities(TEST_REPO, {
-      // No entityTypes — fast path doesn't require them; only the JS-filter
-      // path does, and only when searchTerm/properties force client-side work.
+      entityTypes: ['Person', 'Project'],
       limit: 10,
       offset: 0,
     });
-    const after = stub.calls.length;
 
-    // Fast path issues count + data — two storage calls.
-    expect(after - before).toBe(2);
+    const data = doc.calls.find((c) => !c.sql.includes('COUNT(1)'))!;
+    expect(data.sql).toContain('c.entityType[0]._value IN (@etype0, @etype1)');
+    expect(data.sql).not.toContain('c.entityType =');
+    expect(data.parameters).toContainEqual({ name: '@etype0', value: 'Person' });
+    expect(data.parameters).toContainEqual({ name: '@etype1', value: 'Project' });
+  });
+
+  it('runs data + COUNT(1) in parallel and returns exact total when no properties filter', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [42] : []);
+
+    const result = await provider.findEntities(TEST_REPO, {
+      searchTerm: 'alice',
+      limit: 10,
+      offset: 0,
+    });
+
+    expect(doc.calls).toHaveLength(2);
+    expect(doc.calls.some((c) => c.sql.startsWith('SELECT VALUE COUNT(1)'))).toBe(true);
+    expect(result.total).toBe(42);
+  });
+
+  it('skips COUNT(1) and reports total: undefined when properties filter is present', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = () => [];
+
+    const result = await provider.findEntities(TEST_REPO, {
+      properties: { role: 'engineer' },
+      limit: 10,
+      offset: 0,
+    });
+
+    expect(doc.calls).toHaveLength(1);
+    expect(doc.calls[0]!.sql).not.toContain('COUNT(1)');
+    expect(result.total).toBeUndefined();
+  });
+
+  it('emits a CONTAINS prefilter for each properties key and exact-matches client-side', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+
+    // Stored properties as a JSON-stringified blob, matching the Gremlin-managed
+    // [{_value, id}] document shape from the probe.
+    const truePositive = {
+      id: 'e1',
+      label: 'Person',
+      repositoryId: TEST_REPO,
+      entityType:  [{ _value: 'Person', id: 'a' }],
+      entityLabel: [{ _value: 'Alice',  id: 'b' }],
+      slug:        [{ _value: 'alice',  id: 'c' }],
+      properties:  [{ _value: '{"role":"engineer","seniority":"staff"}', id: 'd' }],
+      createdBy:        [{ _value: 'test',                       id: 'p1' }],
+      createdByType:    [{ _value: 'agent',                      id: 'p2' }],
+      createdAt:        [{ _value: '2026-05-26T00:00:00.000Z',   id: 'p3' }],
+      modifiedBy:       [{ _value: 'test',                       id: 'p4' }],
+      modifiedByType:   [{ _value: 'agent',                      id: 'p5' }],
+      modifiedAt:       [{ _value: '2026-05-26T00:00:00.000Z',   id: 'p6' }],
+    };
+    // False positive: the substring `"role":"engineer"` appears literally
+    // *inside another property's value* (e.g. summary). Server-side CONTAINS
+    // accepts it; client-side matchesPropertyFilters must reject it because
+    // the actual `role` property is `manager`.
+    const falsePositive = {
+      ...truePositive,
+      id: 'e2',
+      properties:  [{ _value: '{"role":"manager","note":"\\"role\\":\\"engineer\\""}', id: 'd2' }],
+    };
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : [truePositive, falsePositive]);
+
+    const result = await provider.findEntities(TEST_REPO, {
+      properties: { role: 'engineer' },
+      limit: 10,
+      offset: 0,
+    });
+
+    const data = doc.calls[0]!;
+    expect(data.sql).toContain('CONTAINS(c.properties[0]._value, @kv0, false)');
+    expect(data.parameters).toContainEqual({ name: '@kv0', value: '"role":"engineer"' });
+
+    // Only the true positive survives the client-side exact-match.
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]!.id).toBe('e1');
+  });
+
+  it('pages with ORDER BY c.id + OFFSET + LIMIT for deterministic pagination', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
+
+    await provider.findEntities(TEST_REPO, { limit: 25, offset: 50 });
+
+    const data = doc.calls.find((c) => !c.sql.includes('COUNT(1)'))!;
+    expect(data.sql).toMatch(/ORDER BY c\.id\s+OFFSET @off\s+LIMIT @lim/);
+    expect(data.parameters).toContainEqual({ name: '@off', value: 50 });
+    expect(data.parameters).toContainEqual({ name: '@lim', value: 25 });
+  });
+
+  it('excludes c.embedding from the SELECT projection by default', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
+
+    await provider.findEntities(TEST_REPO, { limit: 10, offset: 0 });
+
+    const data = doc.calls.find((c) => !c.sql.includes('COUNT(1)'))!;
+    expect(data.sql).not.toContain('c.embedding');
+  });
+
+  it('includes c.embedding when loadEmbeddings: true', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
+
+    await provider.findEntities(TEST_REPO, { limit: 10, offset: 0 }, { loadEmbeddings: true });
+
+    const data = doc.calls.find((c) => !c.sql.includes('COUNT(1)'))!;
+    expect(data.sql).toContain('c.embedding');
+  });
+});
+
+// ─── Step E — indexing-policy diagnostic in ensureSchema ──────────────
+//
+// `ensureSchema()` reads the container's indexing policy after the schema
+// version is settled and warns when `excludedPaths` would force the
+// findEntities SQL rewrite to scan. Code-managed containers get the default
+// policy (everything indexed). This guard catches containers provisioned via
+// external ARM/Bicep that strip indexing on the searched paths.
+//
+// The diagnostic is unit-tested in isolation by invoking
+// `runIndexingPolicyDiagnostic` directly via the private-access cast — going
+// through `ensureSchema()` would require stubbing the module-scoped
+// `cosmosRestPut` helper as well, which is covered by Step F's live run.
+
+interface ContainerPropertiesStub {
+  getContainerProperties(): Promise<{
+    id: string;
+    partitionKey: { paths: string[]; kind: string };
+    indexingPolicy: {
+      indexingMode: string;
+      automatic: boolean;
+      includedPaths: Array<{ path: string }>;
+      excludedPaths: Array<{ path: string }>;
+    };
+  }>;
+}
+
+function injectContainerPropertiesStub(
+  provider: CosmosDbProvider,
+  excludedPaths: Array<{ path: string }>,
+  override?: Partial<ContainerPropertiesStub>,
+): void {
+  const stub: ContainerPropertiesStub = {
+    getContainerProperties: async () => ({
+      id: 'c',
+      partitionKey: { paths: ['/repositoryId'], kind: 'Hash' },
+      indexingPolicy: {
+        indexingMode: 'consistent',
+        automatic: true,
+        includedPaths: [{ path: '/*' }],
+        excludedPaths,
+      },
+    }),
+    ...override,
+  };
+  (provider as unknown as { docClient: ContainerPropertiesStub }).docClient = stub;
+}
+
+async function callDiagnostic(provider: CosmosDbProvider): Promise<void> {
+  await (provider as unknown as { runIndexingPolicyDiagnostic(): Promise<void> })
+    .runIndexingPolicyDiagnostic();
+}
+
+describe('Step E indexing-policy diagnostic', () => {
+  it('does not warn when the default policy is applied (only /_etag excluded)', async () => {
+    const { provider } = makeProvider();
+    injectContainerPropertiesStub(provider, [{ path: '/"_etag"/?' }]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await callDiagnostic(provider);
+
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('warns when /properties/* is excluded, naming the offending guard and source', async () => {
+    const { provider } = makeProvider();
+    injectContainerPropertiesStub(provider, [
+      { path: '/"_etag"/?' },
+      { path: '/properties/*' },
+    ]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await callDiagnostic(provider);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = warn.mock.calls[0]![0] as string;
+    expect(message).toContain('/properties');
+    expect(message).toContain('/properties/*');
+    expect(message).not.toContain('/entityLabel');
+    warn.mockRestore();
+  });
+
+  it('warns and lists every guarded path when the root wildcard /* is excluded', async () => {
+    const { provider } = makeProvider();
+    injectContainerPropertiesStub(provider, [{ path: '/*' }]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await callDiagnostic(provider);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = warn.mock.calls[0]![0] as string;
+    for (const guard of ['/entityLabel', '/slug', '/summary', '/entityType', '/properties', '/repositoryId']) {
+      expect(message).toContain(guard);
+    }
+    warn.mockRestore();
+  });
+
+  it('warns but does not throw when getContainerProperties fails', async () => {
+    const { provider } = makeProvider();
+    (provider as unknown as { docClient: ContainerPropertiesStub }).docClient = {
+      getContainerProperties: async () => {
+        throw new Error('network down');
+      },
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(callDiagnostic(provider)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toContain('could not verify indexing policy');
+    expect(warn.mock.calls[0]![0]).toContain('network down');
+    warn.mockRestore();
   });
 });

@@ -426,7 +426,13 @@ export class EntityManager {
     maxRetries?: number;
     errorThresholdToAbort?: number;
     delayBetweenBatchesMs?: number;
-    onProgress?: (processed: number, total: number, failed: number) => void | Promise<void>;
+    /**
+     * Total is `number | undefined` because PaginatedResult.total may be
+     * undefined under some provider/query combinations. For the unfiltered
+     * count this method issues, total is always exact in practice — callers
+     * that need a guaranteed number should fall back to RepositoryStats.
+     */
+    onProgress?: (processed: number, total: number | undefined, failed: number) => void | Promise<void>;
     /**
      * Called for every entity that fails during the run — embedBatch retry
      * exhaustion (every entity in the batch fires) and per-entity storage
@@ -448,7 +454,12 @@ export class EntityManager {
     const errorThreshold = options?.errorThresholdToAbort;
     const signal = options?.signal;
 
-    // Count total entities
+    // Count total entities. `total` is the exact count for unfiltered
+    // findEntities calls on every provider — but PaginatedResult.total is
+    // `number | undefined` (the properties-filtered Cosmos path returns
+    // undefined; that does not apply here, but the type is shared). We
+    // tolerate undefined defensively: the loop falls back to running until
+    // pages run dry, and the empty-page break below still terminates.
     const firstPage = await this.storage.findEntities(this.repositoryId, { limit: 1, offset: 0 });
     const total = firstPage.total;
 
@@ -457,7 +468,7 @@ export class EntityManager {
     const allErrors: Array<{ entityId: string; error: string }> = [];
     let offset = 0;
 
-    while (offset < total) {
+    while (total === undefined || offset < total) {
       if (signal?.aborted) {
         throw new OperationAbortedError('reembedAll');
       }
@@ -493,9 +504,11 @@ export class EntityManager {
         throw new OperationAbortedError('reembedAll');
       }
 
-      // Rate limiting: pause between batches if configured
+      // Rate limiting: pause between batches if configured. When total is
+      // unknown, pause as long as the page came back full (= more probably).
       const delayMs = options?.delayBetweenBatchesMs ?? 0;
-      if (delayMs > 0 && offset < total) {
+      const moreLikely = total === undefined ? page.items.length === batchSize : offset < total;
+      if (delayMs > 0 && moreLikely) {
         await new Promise<void>((resolve) => { setTimeout(resolve, delayMs); });
       }
     }

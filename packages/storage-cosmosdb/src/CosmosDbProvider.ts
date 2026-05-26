@@ -34,7 +34,6 @@ import type {
   UsageSink,
 } from '@utaba/deep-memory/types';
 import type { ExportChunk, ImportChunk, BulkImportOptions, DeleteProgressCallback } from '@utaba/deep-memory/types';
-import crypto from 'node:crypto';
 import {
   GremlinCompiler,
   ProviderError,
@@ -44,8 +43,11 @@ import {
   createSafeSink,
   matchesPropertyFilters,
 } from '@utaba/deep-memory';
-import { CosmosDbConnection, usageScope } from './CosmosDbConnection.js';
-import type { UsageAccumulator } from './CosmosDbConnection.js';
+import { CosmosDbConnection } from './CosmosDbConnection.js';
+import { CosmosDocumentClient } from './CosmosDocumentClient.js';
+import { usageScope } from './usage.js';
+import type { UsageAccumulator } from './usage.js';
+import { cosmosRestPut } from './cosmos-rest-auth.js';
 import { entityFromGremlin, relationshipFromGremlin } from './mapping.js';
 import * as repoQueries from './queries/repository.js';
 import * as vocabQueries from './queries/vocabulary.js';
@@ -86,6 +88,20 @@ export interface CosmosDbProviderConfig {
 const PROVIDER_NAME = 'cosmosdb';
 const SCHEMA_VERSION = 1;
 const META_VERTEX_ID = '_meta:schema';
+
+/**
+ * Indexing-policy paths that `findEntities` SQL relies on. If a container's
+ * `excludedPaths` covers any of these (directly or via wildcard), the rewrite
+ * falls back to scan — see {@link CosmosDbProvider.runIndexingPolicyDiagnostic}.
+ */
+const GUARDED_INDEX_PATHS = [
+  '/entityLabel',
+  '/slug',
+  '/summary',
+  '/entityType',
+  '/properties',
+  '/repositoryId',
+] as const;
 
 /**
  * Raw, un-projected output from {@link CosmosDbProvider.executeTraversal}.
@@ -141,6 +157,7 @@ const VOCABULARY_CACHE_TTL_MS = 60_000;
  */
 export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider {
   private readonly conn: CosmosDbConnection;
+  private readonly docClient: CosmosDocumentClient;
   private readonly config: CosmosDbProviderConfig;
   private readonly compiler = new GremlinCompiler();
   private readonly reportUsage: UsageSink | undefined;
@@ -163,6 +180,20 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       maxRetries: config.maxRetries,
       defaultTimeoutMs: config.defaultTimeoutMs,
       rejectUnauthorized: config.rejectUnauthorized,
+    });
+    // Document (NoSQL SQL) endpoint client — used by query paths the Gremlin
+    // subset can't express server-side (substring + case-insensitive search,
+    // structured property predicates). RU accumulates into the same
+    // usageScope as `conn`, so one public-method call emits one usage record
+    // even when both endpoints are touched.
+    this.docClient = new CosmosDocumentClient({
+      restEndpoint: this.getRestEndpoint(),
+      key: config.key,
+      database: config.database,
+      container: config.container,
+      rejectUnauthorized: config.rejectUnauthorized ?? true,
+      maxRetries: config.maxRetries,
+      defaultTimeoutMs: config.defaultTimeoutMs,
     });
   }
 
@@ -285,18 +316,12 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       if (existing.items.length > 0) {
         const props = existing.items[0] as Record<string, unknown>;
         const version = Number(unwrapGremlinValue(props['schemaVersion']) ?? 0);
-        if (version >= SCHEMA_VERSION && !databaseCreated && !schemaCreated) {
-          return {
-            databaseCreated: false,
-            schemaCreated: false,
-            alreadyUpToDate: true,
-            schemaVersion: SCHEMA_VERSION,
-          };
+        if (version < SCHEMA_VERSION || databaseCreated || schemaCreated) {
+          await this.conn.submit(
+            "g.V().hasId(metaId).hasLabel('_meta').property('schemaVersion', ver)",
+            { metaId: META_VERTEX_ID, ver: SCHEMA_VERSION },
+          );
         }
-        await this.conn.submit(
-          "g.V().hasId(metaId).hasLabel('_meta').property('schemaVersion', ver)",
-          { metaId: META_VERTEX_ID, ver: SCHEMA_VERSION },
-        );
       } else {
         await this.conn.submit(
           "g.addV('_meta').property('id', metaId).property('repositoryId', pk).property('schemaVersion', ver)",
@@ -304,6 +329,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         );
         schemaCreated = true;
       }
+
+      // 5. Step E — indexing-policy diagnostic. Always runs (operators may
+      // drift policy between calls). Never fails ensureSchema — see helper.
+      await this.runIndexingPolicyDiagnostic();
 
       return {
         databaseCreated,
@@ -315,6 +344,59 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       throw new ProviderError(
         `Failed to ensure CosmosDB schema: ${err instanceof Error ? err.message : String(err)}`,
         'Verify the CosmosDB REST endpoint is accessible and the Gremlin endpoint is reachable.',
+      );
+    }
+  }
+
+  /**
+   * Step E — verify the container's indexing policy covers every path that
+   * the SQL `findEntities` rewrite hits. The probe (2026-05-26) confirmed
+   * code-managed containers get the Cosmos default policy (everything
+   * indexed). This guard is for operator-facing protection: externally
+   * provisioned containers (ARM/Bicep) can have `excludedPaths` set, which
+   * would force `findEntities` to scan rather than index-lookup.
+   *
+   * Single GET against the colls resource, minimal RU. Never fails
+   * `ensureSchema` — a diagnostic must not break provisioning.
+   */
+  private async runIndexingPolicyDiagnostic(): Promise<void> {
+    let policy: { excludedPaths: Array<{ path: string }> };
+    try {
+      const props = await this.docClient.getContainerProperties();
+      policy = props.indexingPolicy;
+    } catch (err: unknown) {
+      console.warn(
+        `[CosmosDbProvider] could not verify indexing policy on container ` +
+          `${this.config.container}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+
+    const offending: string[] = [];
+    for (const entry of policy.excludedPaths) {
+      // Cosmos exclusion paths end in `/?` (exact) or `/*` (subtree). Strip
+      // the wildcard to get the prefix the exclusion governs.
+      const prefix = entry.path.replace(/\/[?*]$/, '');
+      if (prefix === '' || prefix === '/') {
+        // Root wildcard — every guarded path is excluded.
+        for (const guard of GUARDED_INDEX_PATHS) {
+          offending.push(`${guard} (covered by ${entry.path})`);
+        }
+        break;
+      }
+      for (const guard of GUARDED_INDEX_PATHS) {
+        if (prefix === guard || guard.startsWith(prefix + '/')) {
+          offending.push(`${guard} (excluded by ${entry.path})`);
+        }
+      }
+    }
+
+    if (offending.length > 0) {
+      console.warn(
+        `[CosmosDbProvider] Container ${this.config.container} has indexing-policy ` +
+          `excludedPaths that cover paths used by findEntities. The query will ` +
+          `fall back to scan and may exceed RU budgets:\n  ${offending.join('\n  ')}\n` +
+          `Verify the ARM/Bicep template that provisioned the container.`,
       );
     }
   }
@@ -532,7 +614,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   async findEntities(repositoryId: string, query: StorageFindQuery, options?: EntityReadOptions): Promise<PaginatedResult<StoredEntity>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('findEntities', repositoryId, () =>
-      entityQueries.findEntities(this.conn, repositoryId, query, options),
+      entityQueries.findEntities(this.docClient, repositoryId, query, options),
     );
   }
 
@@ -1335,67 +1417,3 @@ function buildExploreSteps(depth: number, options: StorageExploreOptions): Trave
   return steps;
 }
 
-// ─── CosmosDB REST API helpers for database/container provisioning ──
-
-/**
- * Generate a CosmosDB REST API authorization token.
- * See: https://learn.microsoft.com/en-us/rest/api/cosmos-db/access-control-on-cosmosdb-resources
- */
-function cosmosAuthToken(
-  verb: string,
-  resourceType: string,
-  resourceLink: string,
-  date: string,
-  key: string,
-): string {
-  const payload = `${verb.toLowerCase()}\n${resourceType.toLowerCase()}\n${resourceLink}\n${date.toLowerCase()}\n\n`;
-  const keyBuffer = Buffer.from(key, 'base64');
-  const hmac = crypto.createHmac('sha256', keyBuffer);
-  hmac.update(payload);
-  const signature = hmac.digest('base64');
-  return encodeURIComponent(`type=master&ver=1.0&sig=${signature}`);
-}
-
-/**
- * Create a CosmosDB resource (database or container) via REST API.
- * Returns true if the resource was created, false if it already existed.
- */
-async function cosmosRestPut(
-  restBase: string,
-  key: string,
-  urlPath: string,
-  resourceLink: string,
-  resourceType: string,
-  body: Record<string, unknown>,
-  rejectUnauthorized: boolean,
-): Promise<boolean> {
-  const date = new Date().toUTCString();
-  const token = cosmosAuthToken('post', resourceType, resourceLink, date, key);
-
-  const url = `${restBase}/${urlPath}`;
-
-  const options: RequestInit = {
-    method: 'POST',
-    headers: {
-      'Authorization': token,
-      'x-ms-version': '2018-12-31',
-      'x-ms-date': date,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  };
-
-  // For self-signed certs (emulator), disable TLS verification process-wide.
-  // Caller explicitly opted in via rejectUnauthorized: false.
-  if (!rejectUnauthorized) {
-    process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
-  }
-
-  const response = await fetch(url, options);
-
-  if (response.status === 201) return true; // Created
-  if (response.status === 409) return false; // Already exists
-
-  const text = await response.text();
-  throw new Error(`CosmosDB REST ${response.status}: ${text}`);
-}

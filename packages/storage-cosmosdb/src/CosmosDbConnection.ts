@@ -5,25 +5,7 @@
 
 // @ts-expect-error — gremlin has no type declarations
 import gremlin from 'gremlin';
-import { AsyncLocalStorage } from 'node:async_hooks';
-
-/** Per-operation RU accumulator kept in async-local storage. */
-export interface UsageAccumulator {
-  /** Total request charge (RU) across all submits in the current operation. */
-  ru: number;
-  /** Number of gremlin submit() calls. */
-  calls: number;
-  /** Number of transient-retry waits observed. */
-  retries: number;
-}
-
-/**
- * Module-level AsyncLocalStorage so any `submit()` executed inside a
- * `usageScope.run(...)` block contributes its RU/retry counts to the active
- * accumulator. Providers wrap each public method in a scope and read the
- * aggregated result when the method returns.
- */
-export const usageScope = new AsyncLocalStorage<UsageAccumulator>();
+import { usageScope } from './usage.js';
 
 export interface CosmosDbConnectionConfig {
   /** Gremlin WebSocket endpoint (e.g. wss://localhost:8901/) */

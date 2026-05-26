@@ -260,17 +260,29 @@ async function upsertEntity(
     rid: repositoryId,
     vertexLabel: entity.entityType,
   };
-  const propParts: string[] = [];
+  const createPropParts: string[] = [];
+  const updatePropParts: string[] = [];
   let idx = 0;
 
   for (const [key, value] of Object.entries(props)) {
     const paramName = `p${idx++}`;
     bindings[paramName] = value;
-    propParts.push(`.property('${key}', ${paramName})`);
+    const part = `.property('${key}', ${paramName})`;
+    createPropParts.push(part);
+    // Cosmos rejects `.property('repositoryId', ...)` after `unfold()` as
+    // "Partition key property of a vertex is readonly" — and rejects it at
+    // parse time, so the create branch failing too even when no existing
+    // vertex matches. Omit the partition key from the update branch; the
+    // partition key is already pinned by `has('repositoryId', rid)` upstream
+    // and cannot legally change.
+    if (key !== 'repositoryId') updatePropParts.push(part);
   }
 
   // coalesce: find existing → update it, or create new
-  const query = `g.V().has('repositoryId', rid).hasId(vid).has('entityType').fold().coalesce(unfold()${propParts.join('')}, addV(vertexLabel).property('id', vid)${propParts.join('')})`;
+  const query =
+    `g.V().has('repositoryId', rid).hasId(vid).has('entityType').fold().coalesce(` +
+    `unfold()${updatePropParts.join('')},` +
+    ` addV(vertexLabel).property('id', vid)${createPropParts.join('')})`;
   await conn.submit(query, bindings);
 }
 
@@ -291,19 +303,29 @@ async function upsertRelationship(
     rid: repositoryId,
     edgeLabel: rel.relationshipType,
   };
-  const propParts: string[] = [];
+  const createPropParts: string[] = [];
+  const updatePropParts: string[] = [];
   let idx = 0;
 
   for (const [key, value] of Object.entries(props)) {
     const paramName = `p${idx++}`;
     bindings[paramName] = value;
-    propParts.push(`.property('${key}', ${paramName})`);
+    const part = `.property('${key}', ${paramName})`;
+    createPropParts.push(part);
+    // Same partition-key constraint as upsertEntity above — Cosmos rejects
+    // mutating the partition key on the update branch at parse time.
+    if (key !== 'repositoryId') updatePropParts.push(part);
   }
 
   // coalesce: find existing → update it, or create new edge.
   // The E() lookup is scoped by repositoryId so an edge with the same id in a
   // different repo cannot be matched and silently overwritten.
-  const createEdge = `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel).to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType')).property('id', relId)${propParts.join('')}`;
-  const query = `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(unfold()${propParts.join('')}, ${createEdge})`;
+  const createEdge =
+    `g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)` +
+    `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+    `.property('id', relId)${createPropParts.join('')}`;
+  const query =
+    `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
+    `unfold()${updatePropParts.join('')}, ${createEdge})`;
   await conn.submit(query, bindings);
 }

@@ -35,7 +35,7 @@ import type {
   AdaptiveConcurrencyOptions,
 } from '@utaba/deep-memory/types';
 import { ImportThrottleAbortError } from '@utaba/deep-memory';
-import { usageScope, type UsageAccumulator } from '../CosmosDbConnection.js';
+import { usageScope, type UsageAccumulator } from '../usage.js';
 
 const DEFAULT_MIN = 1;
 const DEFAULT_START = 5;

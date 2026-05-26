@@ -274,7 +274,13 @@ export class MemoryRepository {
      * Called after each batch completes. Internal plumbing — the {@link DeepMemory}
      * facade wires this to `globalEventBus.emit('reembed:progress', ...)`.
      */
-    onProgress?: (progress: { processed: number; totalEntities: number; failed: number }) => void | Promise<void>;
+    /**
+     * `totalEntities` is `number | undefined` because it derives from
+     * PaginatedResult.total, which may be undefined for some provider/query
+     * combinations. The {@link DeepMemory.reembedAll} facade coerces it to
+     * a number via the cached RepositoryStats before emitting an event.
+     */
+    onProgress?: (progress: { processed: number; totalEntities: number | undefined; failed: number }) => void | Promise<void>;
     /**
      * Called for every entity that fails to re-embed (embedBatch retries
      * exhausted, or storage write failure). Internal plumbing — the facade

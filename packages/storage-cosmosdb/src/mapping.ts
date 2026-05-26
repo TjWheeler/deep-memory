@@ -177,6 +177,76 @@ export function entityFromGremlin(props: Record<string, unknown>): StoredEntity 
   };
 }
 
+// ─── Document-endpoint mapping ────────────────────────────────────
+//
+// Cosmos NoSQL (Document) endpoint sees Gremlin-managed properties as
+// `[{ _value, id }]` arrays rather than flat scalars. The Gremlin reserved
+// scalars (`id`, the partition-key `repositoryId`, the vertex `label` token)
+// stay flat on the document. Probed and confirmed 2026-05-26 — see
+// local-tests/baseline/phase-cosmos-sql-shape-probe-results.md.
+
+/** Pluck the underlying value of a Gremlin-managed property from a Document-endpoint doc. */
+function pluckDocValue(doc: Record<string, unknown>, key: string): unknown {
+  const arr = doc[key];
+  if (Array.isArray(arr) && arr.length > 0) {
+    const entry = arr[0] as Record<string, unknown> | undefined;
+    if (entry && typeof entry === 'object') {
+      return entry['_value'];
+    }
+  }
+  return undefined;
+}
+
+function pluckDocStr(doc: Record<string, unknown>, key: string): string {
+  const v = pluckDocValue(doc, key);
+  return typeof v === 'string' ? v : String(v ?? '');
+}
+
+function pluckDocOptStr(doc: Record<string, unknown>, key: string): string | undefined {
+  const v = pluckDocValue(doc, key);
+  return v != null && v !== '' ? String(v) : undefined;
+}
+
+function provenanceFromDocument(doc: Record<string, unknown>): Provenance {
+  return {
+    createdBy: pluckDocStr(doc, 'createdBy'),
+    createdByType: (pluckDocStr(doc, 'createdByType') || 'agent') as 'user' | 'agent',
+    createdAt: pluckDocStr(doc, 'createdAt'),
+    createdInConversation: pluckDocOptStr(doc, 'createdInConversation'),
+    createdFromMessage: pluckDocOptStr(doc, 'createdFromMessage'),
+    modifiedBy: pluckDocStr(doc, 'modifiedBy'),
+    modifiedByType: (pluckDocStr(doc, 'modifiedByType') || 'agent') as 'user' | 'agent',
+    modifiedAt: pluckDocStr(doc, 'modifiedAt'),
+    modifiedInConversation: pluckDocOptStr(doc, 'modifiedInConversation'),
+    modifiedFromMessage: pluckDocOptStr(doc, 'modifiedFromMessage'),
+  };
+}
+
+/**
+ * Project a Document-endpoint result row into a StoredEntity. Distinct from
+ * `entityFromGremlin` (which reads the projected `valueMap`-style shape) —
+ * here every Gremlin-managed property is `[{_value, id}]` while `id` and the
+ * `label` token are flat. The `entityType` *property* (not the `label` token)
+ * is authoritative — see `packages/storage-cosmosdb/src/queries/entity.ts`
+ * for the matching write-path decision.
+ */
+export function entityFromDocument(doc: Record<string, unknown>): StoredEntity {
+  const id = typeof doc['id'] === 'string' ? doc['id'] : String(doc['id'] ?? '');
+  const embeddingStr = pluckDocOptStr(doc, 'embedding');
+  return {
+    id,
+    slug: pluckDocStr(doc, 'slug'),
+    entityType: pluckDocStr(doc, 'entityType'),
+    label: pluckDocStr(doc, 'entityLabel'),
+    summary: pluckDocOptStr(doc, 'summary'),
+    properties: safeParseJson(pluckDocValue(doc, 'properties'), {}),
+    data: pluckDocOptStr(doc, 'data'),
+    dataFormat: pluckDocOptStr(doc, 'dataFormat'),
+    provenance: provenanceFromDocument(doc),
+    embedding: embeddingStr ? safeParseJson<number[] | undefined>(embeddingStr, undefined) : undefined,
+  };
+}
+
 // ─── Relationship mapping ─────────────────────────────────────────
 
 export function relationshipFromGremlin(props: Record<string, unknown>): StoredRelationship {

@@ -85,7 +85,7 @@ describe('FindEntitiesTool', () => {
     const result = await tool.execute({ repositoryId: repoId, includeRelationshipSummary: true }) as any;
     const aliceResult = result.items.find((e: any) => e.label === 'Alice');
     expect(aliceResult.relationshipSummary).toBeDefined();
-    expect(aliceResult.relationshipSummary.outbound['WORKS_AT']).toBe(1);
+    expect(aliceResult.relationshipSummary.out['WORKS_AT']).toBe(1);
   });
 
   it('filters by singular entityType param', async () => {
@@ -110,6 +110,6 @@ describe('FindEntitiesTool', () => {
     await repo.createEntities([{ entityType: 'person', label: 'Lonely' }]);
 
     const result = await tool.execute({ repositoryId: repoId, includeRelationshipSummary: true }) as any;
-    expect(result.items[0].relationshipSummary).toEqual({ outbound: {}, inbound: {} });
+    expect(result.items[0].relationshipSummary).toEqual({ out: {}, in: {} });
   });
 });

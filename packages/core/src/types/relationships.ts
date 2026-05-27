@@ -2,8 +2,13 @@
 
 import type { Provenance } from './provenance.js';
 
-/** Direction filter for relationship queries */
-export type RelationshipDirection = 'outbound' | 'inbound' | 'both';
+/**
+ * Direction filter for relationship queries, relative to the queried entity.
+ * - `'out'`  — edges where the entity is the source
+ * - `'in'`   — edges where the entity is the target
+ * - `'both'` — edges in either direction
+ */
+export type RelationshipDirection = 'out' | 'in' | 'both';
 
 /** Public relationship representation */
 export interface Relationship {
@@ -56,10 +61,15 @@ export interface EnrichedRelationship {
   provenance: Provenance;
 }
 
-/** Aggregated relationship counts by type and direction */
+/**
+ * Aggregated relationship counts by type, keyed by direction relative to the
+ * entity the summary belongs to.
+ * - `out` — edges where the entity is the source
+ * - `in`  — edges where the entity is the target
+ */
 export interface RelationshipSummary {
-  outbound: Record<string, number>;
-  inbound: Record<string, number>;
+  out: Record<string, number>;
+  in: Record<string, number>;
 }
 
 /** Result of a bulk relationship removal */

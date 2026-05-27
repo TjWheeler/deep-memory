@@ -442,9 +442,9 @@ export class InMemoryStorageProvider implements StorageProvider {
       const isBidirectionalTarget = rel.bidirectional && isTarget;
 
       switch (direction) {
-        case 'outbound':
+        case 'out':
           return isSource || isBidirectionalTarget;
-        case 'inbound':
+        case 'in':
           return isTarget || (rel.bidirectional && isSource);
         case 'both':
         default:
@@ -578,17 +578,17 @@ export class InMemoryStorageProvider implements StorageProvider {
           let matchesDirection = false;
           let connectedEntityId: string | undefined;
 
-          if (isSource && (options.direction === 'outbound' || options.direction === 'both')) {
+          if (isSource && (options.direction === 'out' || options.direction === 'both')) {
             matchesDirection = true;
             connectedEntityId = rel.targetEntityId;
-          } else if (isTarget && (options.direction === 'inbound' || options.direction === 'both')) {
+          } else if (isTarget && (options.direction === 'in' || options.direction === 'both')) {
             matchesDirection = true;
             connectedEntityId = rel.sourceEntityId;
           } else if (rel.bidirectional) {
-            if (isSource && options.direction === 'inbound') {
+            if (isSource && options.direction === 'in') {
               matchesDirection = true;
               connectedEntityId = rel.targetEntityId;
-            } else if (isTarget && options.direction === 'outbound') {
+            } else if (isTarget && options.direction === 'out') {
               matchesDirection = true;
               connectedEntityId = rel.sourceEntityId;
             }

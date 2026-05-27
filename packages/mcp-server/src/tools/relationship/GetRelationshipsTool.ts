@@ -11,7 +11,7 @@ export class GetRelationshipsTool extends BaseToolController {
         repositoryId: { type: 'string', description: 'Repository containing the entity' },
         entityId: { type: 'string', description: 'Entity ID (GUID) or slug' },
         relationshipTypes: { type: 'array', items: { type: 'string' }, description: 'Filter by relationship type(s)' },
-        direction: { type: 'string', enum: ['outbound', 'inbound', 'both'], description: 'Direction filter (default: both)' },
+        direction: { type: 'string', enum: ['out', 'in', 'both'], description: 'Direction filter relative to the queried entity (default: both)' },
         limit: { type: 'number', description: 'Max results (default 20, max 100)' },
         offset: { type: 'number', description: 'Pagination offset (default 0)' },
         propertyFilters: { type: 'array', items: { type: 'object', properties: { key: { type: 'string' }, operator: { type: 'string', enum: ['eq', 'neq', 'isNull', 'isNotNull', 'gt', 'lt', 'gte', 'lte', 'contains'] }, value: {} }, required: ['key', 'operator'] }, description: 'Filter by relationship property values (AND)' },
@@ -27,7 +27,7 @@ export class GetRelationshipsTool extends BaseToolController {
     const limit = Math.min(rawLimit ?? 20, 100);
     const result = await repo.getRelationships(resolvedId, {
       relationshipTypes: params['relationshipTypes'] as string[] | undefined,
-      direction: params['direction'] as 'outbound' | 'inbound' | 'both' | undefined,
+      direction: params['direction'] as 'out' | 'in' | 'both' | undefined,
       limit,
       offset: (params['offset'] as number | undefined) ?? 0,
       propertyFilters: params['propertyFilters'] as import('@utaba/deep-memory').PropertyFilter[] | undefined,

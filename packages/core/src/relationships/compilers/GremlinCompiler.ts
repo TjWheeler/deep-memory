@@ -223,10 +223,14 @@ export class GremlinCompiler implements TraversalCompiler {
       const branches: string[] = [`__.identity().${VERTEX_PROJECT_EXPR}`];
       let prefix = '';
       for (const { edge, vertex, entityFilters } of compiledSteps) {
-        // Edge at depth i — pre-project to edge shape
-        branches.push(`__${prefix}${edge}.${EDGE_PROJECT_EXPR}`);
-        // Vertex at depth i, with this depth's entity filters applied — pre-project to vertex shape
+        // Vertex at depth i, with this depth's entity filters applied — emitted
+        // BEFORE the edge branch so the deduped stream is closed under entity
+        // references within a single hop: an edge in any .range() prefix is
+        // preceded by the vertex it newly introduced. Single-hop pagination
+        // therefore returns a referentially self-contained slice for any limit.
         branches.push(`__${prefix}${edge}${vertex}${entityFilters}.${VERTEX_PROJECT_EXPR}`);
+        // Edge at depth i
+        branches.push(`__${prefix}${edge}.${EDGE_PROJECT_EXPR}`);
         // Deeper branches walk through the unfiltered vertex hop
         prefix = `${prefix}${edge}${vertex}`;
         estimatedFanOut *= DEFAULT_ESTIMATED_FANOUT_PER_HOP;

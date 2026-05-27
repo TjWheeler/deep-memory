@@ -122,7 +122,7 @@ interface RawTraversalResult {
   pathRows: Array<{
     entityIds: string[];
     relationshipIds: string[];
-    relationshipDirections: Array<'outbound' | 'inbound'>;
+    relationshipDirections: Array<'out' | 'in'>;
   }>;
   /**
    * Lookup table — populated for `'all'` and `'path'` modes. Includes every
@@ -138,7 +138,7 @@ interface RawTraversalResult {
    * First-seen walk direction per deduped edge id. Populated only for
    * `'path'` mode — the `'all'` mode's deduped union carries no walk context.
    */
-  pathRelFirstDirection: Map<string, 'outbound' | 'inbound'>;
+  pathRelFirstDirection: Map<string, 'out' | 'in'>;
   executionTimeMs: number;
   requestCharge: number | undefined;
   compiledQuery: string;
@@ -729,11 +729,11 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    *
    * The server-side step direction is fixed to `'both'` (catches every edge
    * in either direction). The directional + bidirectional filter is applied
-   * client-side per hop — i.e. `direction: 'outbound'` includes inbound edges
+   * client-side per hop — i.e. `direction: 'out'` includes inbound edges
    * where `bidirectional` is true. The CosmosDB Gremlin compiler does not
    * natively express the `union(outE, inE.has(bidirectional))` shape that
    * would push this filter server-side, so it stays client-side; the
-   * observable contract (which edges count toward "outbound" given
+   * observable contract (which edges count toward `'out'` given
    * bidirectionality) is preserved.
    *
    * Round-trips per call: `options.depth` (one per layer). The previous BFS
@@ -793,17 +793,17 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
           let matchesDirection = false;
           let connectedId: string | undefined;
 
-          if (isSource && (options.direction === 'outbound' || options.direction === 'both')) {
+          if (isSource && (options.direction === 'out' || options.direction === 'both')) {
             matchesDirection = true;
             connectedId = rel.targetEntityId;
-          } else if (isTarget && (options.direction === 'inbound' || options.direction === 'both')) {
+          } else if (isTarget && (options.direction === 'in' || options.direction === 'both')) {
             matchesDirection = true;
             connectedId = rel.sourceEntityId;
           } else if (rel.bidirectional) {
-            if (isSource && options.direction === 'inbound') {
+            if (isSource && options.direction === 'in') {
               matchesDirection = true;
               connectedId = rel.targetEntityId;
-            } else if (isTarget && options.direction === 'outbound') {
+            } else if (isTarget && options.direction === 'out') {
               matchesDirection = true;
               connectedId = rel.sourceEntityId;
             }
@@ -1109,14 +1109,14 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     };
 
     // direction is mode-specific:
-    //   'all'  — always 'outbound' (stored topology; the deduped union has
+    //   'all'  — always 'out' (stored topology; the deduped union has
     //            no walk context). Callers derive walk direction relative
     //            to any anchor via sourceEntityId / targetEntityId.
     //   'path' — relative to the last hop within each walk; callers stamp
     //            via the `direction` argument.
     const projectStoredRelationship = (
       rel: StoredRelationship,
-      direction: 'outbound' | 'inbound' = 'outbound',
+      direction: 'out' | 'in' = 'out',
     ): ProjectedRelationship => ({
       id: rel.id,
       type: rel.relationshipType,
@@ -1130,10 +1130,43 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     let relationships: ProjectedRelationship[] | undefined;
     let paths: NonNullable<TraversalResult['paths']> | undefined;
 
+    // Server-side row count BEFORE greedy-expand. The compiler's union emits
+    // vertices before edges at each depth so the deduped stream is closed
+    // under per-hop entity references; this preserved count is what hasMore /
+    // truncated anchor to, independent of any client-side endpoint backfill.
+    const rangeRowCount =
+      spec.returnMode === 'all'
+        ? raw.allEntities.length + raw.allRelationships.length
+        : 0;
+
     if (spec.returnMode === 'terminal') {
       entities = raw.terminalEntities.map(projectStoredEntity);
       relationships = undefined;
     } else if (spec.returnMode === 'all') {
+      // Greedy-expand: pull endpoint vertices into the page if any edge in
+      // the slice references a vertex that fell outside the server-side
+      // range window. Happens at multi-hop page boundaries where a deeper
+      // edge's near endpoint sits in a prior page. One batched getEntities
+      // round-trip; soft-limit cost on the visible page size. The pulled-in
+      // vertices will reappear at their natural union position in a later
+      // page — that duplication is the documented cost of "each page is
+      // independently usable".
+      const missingIds = new Set<string>();
+      for (const rel of raw.allRelationships) {
+        if (!raw.entityMap.has(rel.sourceEntityId)) {
+          missingIds.add(rel.sourceEntityId);
+        }
+        if (!raw.entityMap.has(rel.targetEntityId)) {
+          missingIds.add(rel.targetEntityId);
+        }
+      }
+      if (missingIds.size > 0) {
+        const fetched = await this.getEntities(repositoryId, [...missingIds]);
+        for (const stored of fetched.values()) {
+          raw.allEntities.push(stored);
+          raw.entityMap.set(stored.id, stored);
+        }
+      }
       entities = raw.allEntities.map(projectStoredEntity);
       relationships = raw.allRelationships.map((r) => projectStoredRelationship(r));
     } else {
@@ -1165,13 +1198,14 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         }),
       }));
       relationships = Array.from(raw.relationshipMap.values()).map((rel) =>
-        projectStoredRelationship(rel, raw.pathRelFirstDirection.get(rel.id) ?? 'outbound'),
+        projectStoredRelationship(rel, raw.pathRelFirstDirection.get(rel.id) ?? 'out'),
       );
     }
 
     const limit = spec.limit ?? 50;
     // 'all' mode returns an interleaved entity+edge union — total must count
-    // both so callers see the true page size.
+    // both so callers see the true page size (including any greedy-expanded
+    // endpoint vertices).
     let total: number;
     if (spec.returnMode === 'path') {
       total = paths?.length ?? 0;
@@ -1180,6 +1214,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     } else {
       total = entities.length;
     }
+
+    // hasMore / truncated anchor to the request's pagination signal, not the
+    // post-expand visible page size. 'all' mode uses the pre-expand row count
+    // from the server-side .range() — greedy-expand can only inflate the page
+    // and would otherwise spuriously trip the >= limit heuristic when the
+    // server-side slice was actually short of `limit`.
+    const paginationSignal =
+      spec.returnMode === 'all' ? rangeRowCount : total;
+    const truncated = paginationSignal >= limit;
 
     const queryMetadata: QueryMetadata = {
       executionTimeMs: raw.executionTimeMs,
@@ -1192,8 +1235,8 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         maxResults: limit,
         maxDepth: spec.steps?.length,
       },
-      truncated: total >= limit,
-      truncationReason: total >= limit ? 'result_limit' : undefined,
+      truncated,
+      truncationReason: truncated ? 'result_limit' : undefined,
     };
 
     return {
@@ -1202,7 +1245,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       paths,
       total,
       returned: total,
-      hasMore: total >= limit,
+      hasMore: truncated,
       queryMetadata,
     };
   }
@@ -1301,7 +1344,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       // where each object is a projected Map with a `__kind` discriminator.
       //
       // Direction per edge is computed during the walk using a lastVertexId
-      // cursor: 'outbound' when the walk crossed source → target, 'inbound'
+      // cursor: 'out' when the walk crossed source → target, 'in'
       // when it crossed target → source.
       for (const item of result.items) {
         const pathData = item as { objects?: unknown[] };
@@ -1309,7 +1352,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
         const pathEntityIds: string[] = [];
         const pathRelIds: string[] = [];
-        const pathRelDirections: Array<'outbound' | 'inbound'> = [];
+        const pathRelDirections: Array<'out' | 'in'> = [];
         let lastVertexId: string | null = null;
 
         for (const obj of pathData.objects) {
@@ -1324,8 +1367,8 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
             const stored = relationshipFromGremlin(props);
             raw.relationshipMap.set(stored.id, stored);
             pathRelIds.push(stored.id);
-            const direction: 'outbound' | 'inbound' =
-              lastVertexId === stored.sourceEntityId ? 'outbound' : 'inbound';
+            const direction: 'out' | 'in' =
+              lastVertexId === stored.sourceEntityId ? 'out' : 'in';
             pathRelDirections.push(direction);
             if (!raw.pathRelFirstDirection.has(stored.id)) {
               raw.pathRelFirstDirection.set(stored.id, direction);

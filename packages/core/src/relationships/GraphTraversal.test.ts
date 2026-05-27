@@ -101,7 +101,7 @@ describe('GraphTraversal', () => {
 
     it('filters by direction', async () => {
       const result = await traversal.exploreNeighborhood('person:bob', {
-        direction: 'outbound',
+        direction: 'out',
       });
       // Bob outbound: knows (bidirectional counts), works_at Acme, leads ProjectX
       const layer = result.layers[0];

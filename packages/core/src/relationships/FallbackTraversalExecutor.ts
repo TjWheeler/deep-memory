@@ -6,7 +6,7 @@ import type { StorageProvider } from '../providers/StorageProvider.js';
 import type { TraversalSpec, TraversalStep, TraversalResult, TraversalRelationship, TraversalPath, TraversalAggregation, TraversalEntity } from '../types/traversal.js';
 import type { RelationshipSummary } from '../types/relationships.js';
 import type { StoredEntity, DetailLevel } from '../types/entities.js';
-import type { StoredRelationship, RelationshipDirection } from '../types/relationships.js';
+import type { StoredRelationship } from '../types/relationships.js';
 import { projectEntity } from '../entities/entityProjection.js';
 import { matchesPropertyFilters } from './PropertyFilterMatcher.js';
 import { EntityNotFoundError } from '../core/errors.js';
@@ -163,13 +163,45 @@ export async function executeFallbackTraversal(
     unionFullLength = unionElements.length;
     const pageSlice = unionElements.slice(offset, offset + limit);
     const pageEntries: FrontierEntry[] = [];
+    const pageEntityIds = new Set<string>();
     for (const element of pageSlice) {
       if (element.kind === 'entity') {
-        pageEntries.push(element.entry);
+        if (!pageEntityIds.has(element.entry.entity.id)) {
+          pageEntityIds.add(element.entry.entity.id);
+          pageEntries.push(element.entry);
+        }
       } else {
         pagedAllRels.push(element.rel);
       }
     }
+
+    // Greedy-expand: pull endpoint vertices into the page if any edge in the
+    // slice references a vertex that fell outside the window — happens at
+    // multi-hop page boundaries where a deeper edge's near endpoint sits in a
+    // prior page. Sourced from the full union, no extra storage call. The page
+    // may exceed `limit` (soft limit), and the pulled-in vertex reappears at
+    // its natural union position in a later page; that duplication is the
+    // documented cost of "each page is independently usable".
+    if (pagedAllRels.length > 0) {
+      const entityIndex = new Map<string, FrontierEntry>();
+      for (const el of unionElements) {
+        if (el.kind === 'entity' && !entityIndex.has(el.entry.entity.id)) {
+          entityIndex.set(el.entry.entity.id, el.entry);
+        }
+      }
+      for (const rel of pagedAllRels) {
+        for (const endpointId of [rel.sourceEntityId, rel.targetEntityId]) {
+          if (!pageEntityIds.has(endpointId)) {
+            const entry = entityIndex.get(endpointId);
+            if (entry) {
+              pageEntityIds.add(endpointId);
+              pageEntries.push(entry);
+            }
+          }
+        }
+      }
+    }
+
     paged = pageEntries;
     total = pageEntries.length + pagedAllRels.length;
   } else {
@@ -209,13 +241,13 @@ export async function executeFallbackTraversal(
             direction: 'both',
             limit: 10000,
           });
-          const summary: RelationshipSummary = { outbound: {}, inbound: {} };
+          const summary: RelationshipSummary = { out: {}, in: {} };
           for (const rel of result.items) {
             if (rel.sourceEntityId === entry.entity.id) {
-              summary.outbound[rel.relationshipType] = (summary.outbound[rel.relationshipType] ?? 0) + 1;
+              summary.out[rel.relationshipType] = (summary.out[rel.relationshipType] ?? 0) + 1;
             }
             if (rel.targetEntityId === entry.entity.id) {
-              summary.inbound[rel.relationshipType] = (summary.inbound[rel.relationshipType] ?? 0) + 1;
+              summary.in[rel.relationshipType] = (summary.in[rel.relationshipType] ?? 0) + 1;
             }
           }
           return summary;
@@ -292,14 +324,14 @@ export async function executeFallbackTraversal(
   if (!suppressEntities && spec.returnMode === 'all') {
     // 'all' mode: relationships come from the union page slice computed above,
     // so the response stays a self-consistent window into the union ordering.
-    // direction is always 'outbound' (= stored topology) — the deduped union
+    // direction is always 'out' (= stored topology) — the deduped union
     // carries no walk context, so walk direction cannot be derived here.
     relationships = pagedAllRels.map((rel) => ({
       id: rel.id,
       type: rel.relationshipType,
       sourceEntityId: rel.sourceEntityId,
       targetEntityId: rel.targetEntityId,
-      direction: 'outbound',
+      direction: 'out',
       properties: rel.properties,
     }));
   } else if (!suppressEntities && spec.returnMode === 'path') {
@@ -318,7 +350,7 @@ export async function executeFallbackTraversal(
             type: rel.relationshipType,
             sourceEntityId: rel.sourceEntityId,
             targetEntityId: rel.targetEntityId,
-            direction: fromId === rel.sourceEntityId ? 'outbound' : 'inbound',
+            direction: fromId === rel.sourceEntityId ? 'out' : 'in',
             properties: rel.properties,
           });
         }
@@ -358,15 +390,15 @@ export async function executeFallbackTraversal(
         return projected;
       }),
       relationships: entry.relationshipPath.map((rel, i) => {
-        // Direction is relative to the walk at this hop: 'outbound' when the
-        // walk crossed the edge in stored topology, 'inbound' when reversed.
+        // Direction is relative to the walk at this hop: 'out' when the
+        // walk crossed the edge in stored topology, 'in' when reversed.
         const fromId = entry.entityPath[i]!;
         return {
           id: rel.id,
           type: rel.relationshipType,
           sourceEntityId: rel.sourceEntityId,
           targetEntityId: rel.targetEntityId,
-          direction: fromId === rel.sourceEntityId ? ('outbound' as const) : ('inbound' as const),
+          direction: fromId === rel.sourceEntityId ? ('out' as const) : ('in' as const),
           properties: rel.properties,
         };
       }),
@@ -421,7 +453,7 @@ async function executeSingleStep(
   onStorageCall: () => void,
 ): Promise<FrontierEntry[]> {
   // Step 1: Collect all relationships from the frontier (N queries, 1 per frontier entity)
-  const direction = mapDirection(step.direction);
+  const direction = step.direction;
   const pendingEdges: Array<{
     entry: FrontierEntry;
     rel: StoredRelationship;
@@ -562,15 +594,6 @@ async function resolveEntity(
   return storage.getEntityBySlug(repositoryId, idOrSlug);
 }
 
-/** Map traversal direction to storage direction. */
-function mapDirection(direction: 'out' | 'in' | 'both'): RelationshipDirection {
-  switch (direction) {
-    case 'out': return 'outbound';
-    case 'in': return 'inbound';
-    case 'both': return 'both';
-  }
-}
-
 /** Get the target entity ID from a relationship relative to the current entity. */
 function getTargetId(rel: StoredRelationship, currentEntityId: string): string {
   if (rel.sourceEntityId === currentEntityId) {
@@ -601,11 +624,16 @@ type UnionElement =
   | { kind: 'relationship'; rel: StoredRelationship };
 
 /**
- * Build the BFS-layer-ordered union for 'all' mode. Order mirrors what
- * Cosmos's `.union(identity, outE(r1), outE(r1).inV(), outE(r1).inV().outE(r2), …)`
- * would emit logically: start frontier → step-1 edges → step-1 vertices →
- * step-2 edges → step-2 vertices → … . Entities dedup by id; relationships
- * dedup by id. spec.dedup is ignored — 'all' is inherently deduped.
+ * Build the BFS-layer-ordered union for 'all' mode. Order mirrors what the
+ * Gremlin compiler emits for Cosmos: start frontier → step-1 vertices →
+ * step-1 edges → step-2 vertices → step-2 edges → … . Vertices precede edges
+ * at each depth so any slice prefix is closed under per-hop entity references
+ * — an edge in the slice is always preceded by the vertex it newly
+ * introduced. Cross-depth references at multi-hop page boundaries are still
+ * possible; the page slicer's greedy-expand handles those.
+ *
+ * Entities dedup by id; relationships dedup by id. spec.dedup is ignored —
+ * 'all' is inherently deduped.
  *
  * Cosmos itself does not guarantee this exact ordering (a `.union().dedup()`
  * stream is unordered); the in-memory provider's ordering is the
@@ -642,16 +670,16 @@ function buildAllModeUnion(entries: FrontierEntry[]): UnionElement[] {
   for (let depth = 1; depth <= maxDepth; depth++) {
     const bucket = byDepth.get(depth) ?? [];
     for (const entry of bucket) {
+      if (!seenEntities.has(entry.entity.id)) {
+        seenEntities.add(entry.entity.id);
+        result.push({ kind: 'entity', entry });
+      }
+    }
+    for (const entry of bucket) {
       const newRel = entry.relationshipPath[depth - 1];
       if (newRel && !seenRels.has(newRel.id)) {
         seenRels.add(newRel.id);
         result.push({ kind: 'relationship', rel: newRel });
-      }
-    }
-    for (const entry of bucket) {
-      if (!seenEntities.has(entry.entity.id)) {
-        seenEntities.add(entry.entity.id);
-        result.push({ kind: 'entity', entry });
       }
     }
   }

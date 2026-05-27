@@ -60,7 +60,7 @@ Projection works with traversals too — add \`projection\` to aggregate propert
           items: {
             type: 'object',
             properties: {
-              direction: { type: 'string', enum: ['out', 'in', 'both'], description: 'Direction to traverse' },
+              direction: { type: 'string', enum: ['out', 'in', 'both'], description: 'Direction to traverse, relative to the entity at the start of the hop' },
               relationshipTypes: { type: 'array', items: { type: 'string' }, description: 'Relationship types to follow (omit for all)' },
               entityTypes: { type: 'array', items: { type: 'string' }, description: 'Filter target entities by type' },
               relationshipFilter: { type: 'array', items: propertyFilterSchema, description: 'Filter relationships by property values' },
@@ -95,7 +95,7 @@ Projection works with traversals too — add \`projection\` to aggregate propert
         offset: { type: 'number', description: 'Pagination offset (default: 0)' },
         detailLevel: { type: 'string', enum: ['brief', 'summary', 'full'], description: 'Detail level for entities (default: summary)' },
         dedup: { type: 'boolean', description: 'Deduplicate entities (default: true)' },
-        includeRelationshipSummary: { type: 'boolean', description: 'Attach outbound/inbound relationship counts by type to each entity (default: true). Set false to reduce response size.' },
+        includeRelationshipSummary: { type: 'boolean', description: 'Attach out/in relationship counts by type to each entity (default: true). Set false to reduce response size.' },
       },
       required: ['repositoryId', 'start'],
     };

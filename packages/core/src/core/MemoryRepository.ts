@@ -370,7 +370,7 @@ export class MemoryRepository {
 
   async getRelationships(
     entityId: string,
-    options?: { relationshipTypes?: string[]; direction?: 'outbound' | 'inbound' | 'both'; limit?: number; offset?: number; propertyFilters?: import('../types/queries.js').PropertyFilter[] },
+    options?: { relationshipTypes?: string[]; direction?: 'out' | 'in' | 'both'; limit?: number; offset?: number; propertyFilters?: import('../types/queries.js').PropertyFilter[] },
   ): Promise<PaginatedResult<Relationship>> {
     return this.relationshipManager.getForEntity(entityId, options);
   }
@@ -394,7 +394,7 @@ export class MemoryRepository {
       }
     }
 
-    return { outbound, inbound };
+    return { out: outbound, in: inbound };
   }
 
   async getRelationshipsForEntities(entityIds: string[]): Promise<Relationship[]> {
@@ -667,9 +667,10 @@ export class MemoryRepository {
 ### Step 1 — Discover before you traverse
 
 Before following relationships from an entity, check that it actually has relationships.
-Graph queries include \`relationshipSummary\` on every returned entity by default
-(outbound and inbound counts by type). Inspect this before traversing — entities with
-zero outbound counts for the relationship type you need have no connections to follow.
+Graph queries include \`relationshipSummary\` on every returned entity by default —
+\`out\` (entity is source) and \`in\` (entity is target) counts by relationship type.
+Inspect this before traversing: entities with zero counts for the relationship type
+you need have no connections to follow.
 To skip summaries and reduce response size, set \`includeRelationshipSummary: false\`.
 
 ### Step 2 — Use projection for aggregation

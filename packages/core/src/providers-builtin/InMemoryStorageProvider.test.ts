@@ -203,11 +203,11 @@ describe('InMemoryStorageProvider', () => {
       await storage.createRelationship(repoId, makeRelationship('r1', 'knows', 'a', 'b'));
       await storage.createRelationship(repoId, makeRelationship('r2', 'knows', 'c', 'a'));
 
-      const outbound = await storage.getEntityRelationships(repoId, 'a', { direction: 'outbound' });
+      const outbound = await storage.getEntityRelationships(repoId, 'a', { direction: 'out' });
       expect(outbound.items).toHaveLength(1);
       expect(outbound.items[0].targetEntityId).toBe('b');
 
-      const inbound = await storage.getEntityRelationships(repoId, 'a', { direction: 'inbound' });
+      const inbound = await storage.getEntityRelationships(repoId, 'a', { direction: 'in' });
       expect(inbound.items).toHaveLength(1);
       expect(inbound.items[0].sourceEntityId).toBe('c');
 

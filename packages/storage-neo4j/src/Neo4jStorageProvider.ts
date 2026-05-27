@@ -2,7 +2,7 @@
 // StorageProvider. CRUD methods are added incrementally; the `implements
 // StorageProvider` declaration is added once the surface is complete.
 
-import type { EnsureSchemaResult } from '@utaba/deep-memory/providers';
+import type { EnsureSchemaResult, EntityReadOptions } from '@utaba/deep-memory/providers';
 import type {
   DeleteProgressCallback,
   MemoryVocabulary,
@@ -11,6 +11,8 @@ import type {
   RepositoryFilter,
   RepositoryUpdate,
   StorageRepositoryConfig,
+  StoredEntity,
+  StoredEntityUpdate,
   StoredRepository,
   StoredRepositorySummary,
   UsageSink,
@@ -29,6 +31,7 @@ import {
   repositoryFromRecord,
   repositorySummaryFromRecord,
 } from './mapping.js';
+import * as entityQueries from './queries/entity.js';
 import * as vocabQueries from './queries/vocabulary.js';
 import { getSchemaCypher, SCHEMA_VERSION } from './schema.js';
 import {
@@ -76,6 +79,14 @@ const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> =
   getVocabulary: (args) => args[0] as string,
   saveVocabulary: (args) => args[0] as string,
   getVocabularyChangeLog: (args) => args[0] as string,
+  createEntity: (args) => args[0] as string,
+  getEntity: (args) => args[0] as string,
+  getEntityBySlug: (args) => args[0] as string,
+  getEntities: (args) => args[0] as string,
+  updateEntity: (args) => args[0] as string,
+  deleteEntity: (args) => args[0] as string,
+  deleteEntities: (args) => args[0] as string,
+  deleteEntitiesByType: (args) => args[0] as string,
 };
 
 /** Configuration for `Neo4jStorageProvider`. */
@@ -654,5 +665,97 @@ export class Neo4jStorageProvider {
     options?: PaginationOptions,
   ): Promise<PaginatedResult<VocabularyChangeRecord>> {
     return vocabQueries.getVocabularyChangeLog(this.connection, repositoryId, options);
+  }
+
+  // ─── Entities ──────────────────────────────────────────────────────
+
+  /**
+   * Create a new entity. Strategy A (`CREATE` + catch constraint violation)
+   * per probe P4 — `MERGE`-with-discriminator is marginally faster on the
+   * happy path but mutates the existing node on collisions, polluting the
+   * durable graph with a discriminator property.
+   */
+  public async createEntity(
+    repositoryId: string,
+    entity: StoredEntity,
+  ): Promise<StoredEntity> {
+    return entityQueries.createEntity(this.connection, repositoryId, entity);
+  }
+
+  /** Read a single entity by id; `null` when not found. */
+  public async getEntity(
+    repositoryId: string,
+    entityId: string,
+    options?: EntityReadOptions,
+  ): Promise<StoredEntity | null> {
+    return entityQueries.getEntity(this.connection, repositoryId, entityId, options);
+  }
+
+  /** Read a single entity by slug; `null` when not found. */
+  public async getEntityBySlug(
+    repositoryId: string,
+    slug: string,
+    options?: EntityReadOptions,
+  ): Promise<StoredEntity | null> {
+    return entityQueries.getEntityBySlug(this.connection, repositoryId, slug, options);
+  }
+
+  /**
+   * Batch read by ids. Absent ids do not appear in the returned `Map`; empty
+   * input returns an empty map without a round-trip.
+   */
+  public async getEntities(
+    repositoryId: string,
+    entityIds: string[],
+    options?: EntityReadOptions,
+  ): Promise<Map<string, StoredEntity>> {
+    return entityQueries.getEntities(this.connection, repositoryId, entityIds, options);
+  }
+
+  /**
+   * Variable-shape projection-on-write update (D23) — single round-trip
+   * MATCH+SET+RETURN. Empty record array → `EntityNotFoundError`.
+   */
+  public async updateEntity(
+    repositoryId: string,
+    entityId: string,
+    updates: StoredEntityUpdate,
+  ): Promise<StoredEntity> {
+    return entityQueries.updateEntity(this.connection, repositoryId, entityId, updates);
+  }
+
+  /**
+   * Delete a single entity (and its incident relationships via `DETACH
+   * DELETE`). Throws `EntityNotFoundError` when the match returns zero rows.
+   */
+  public async deleteEntity(
+    repositoryId: string,
+    entityId: string,
+  ): Promise<void> {
+    return entityQueries.deleteEntity(this.connection, repositoryId, entityId);
+  }
+
+  /**
+   * Bulk delete by ids — single round-trip. Returns the ids actually
+   * deleted; missing ids land in `notFound`.
+   */
+  public async deleteEntities(
+    repositoryId: string,
+    ids: string[],
+  ): Promise<{ deleted: string[]; notFound: string[] }> {
+    return entityQueries.deleteEntities(this.connection, repositoryId, ids);
+  }
+
+  /**
+   * Delete every entity of a type plus their incident relationships, with
+   * exact counts (entity + relationship) returned in one round-trip — a
+   * strict improvement over Cosmos's `deletedRelationships: undefined` path
+   * (Gremlin would fan out across every partition the type touches).
+   */
+  public async deleteEntitiesByType(
+    repositoryId: string,
+    entityType: string,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
+    return entityQueries.deleteEntitiesByType(this.connection, repositoryId, entityType);
   }
 }

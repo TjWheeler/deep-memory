@@ -238,6 +238,104 @@ export function changeRecordFromProperties(
 }
 
 /**
+ * Field list projected by entity read paths — `getEntity`, `getEntityBySlug`,
+ * `getEntities`, `findEntities`, `updateEntity` (projection-on-write).
+ *
+ * The list deliberately excludes `embedding` and `repositoryId`:
+ *  - `embedding` is a heavy native `list<float>` carried only when callers
+ *    opt in via `EntityReadOptions.loadEmbeddings`. `buildEntityProjection`
+ *    appends it when requested.
+ *  - `repositoryId` is the scope discriminator, not a `StoredEntity` field.
+ *
+ * Keeping this list in lockstep with `entityFromProperties` is enforced by the
+ * co-located mapping tests — adding a new field requires updating both.
+ */
+export const STORED_ENTITY_FIELDS = [
+  'id',
+  'entityType',
+  'label',
+  'slug',
+  'summary',
+  'properties',
+  'data',
+  'dataFormat',
+  'createdBy',
+  'createdByType',
+  'createdAt',
+  'createdInConversation',
+  'createdFromMessage',
+  'modifiedBy',
+  'modifiedByType',
+  'modifiedAt',
+  'modifiedInConversation',
+  'modifiedFromMessage',
+] as const;
+
+/**
+ * Build a `RETURN` projection chain for an entity read. The result is a
+ * comma-separated list of `n.<field> AS <field>` clauses that the caller
+ * appends after `RETURN ` (or after `SET ... RETURN ` for projection-on-write).
+ *
+ * `embedding` is opt-in: pass `loadEmbeddings: true` to add `n.embedding AS
+ * embedding` to the tail. Probe P6 confirmed that `RETURN n.<field> AS <field>`
+ * after a `SET` returns the post-SET state in one round-trip — no re-MATCH.
+ *
+ * `alias` defaults to `'n'`; the fulltext-index search branch uses `'node'`.
+ */
+export function buildEntityProjection(options?: {
+  loadEmbeddings?: boolean;
+  alias?: string;
+}): string {
+  const alias = options?.alias ?? 'n';
+  const parts = STORED_ENTITY_FIELDS.map((field) => `${alias}.${field} AS ${field}`);
+  if (options?.loadEmbeddings === true) {
+    parts.push(`${alias}.embedding AS embedding`);
+  }
+  return parts.join(', ');
+}
+
+/**
+ * Build the parameter map for the fixed-shape `CREATE` entity template. Every
+ * field gets a binding on every call so the planner reuses one cached plan
+ * across all entity creates (D15 — plan-cache friendliness).
+ *
+ * Optional fields bind as `null`. Neo4j drops null properties on write (probe
+ * P6 Test 4 confirmed this) — symmetric with the read mapping where absent
+ * properties round-trip as `undefined` via `optionalString`. The umbrella
+ * `:_Entity` label is the only label written on the node — per probe P5,
+ * per-type labels add ~12 ms cold compile + ~1.2 ms steady-state per call with
+ * no offsetting benefit, since every provider read filters via the indexed
+ * `n.entityType` property.
+ *
+ * `embedding` is bound as the native `number[]` (driver maps directly per
+ * probe P2 — no JSON-stringify step) or `null` when absent.
+ */
+export function entityToParams(entity: StoredEntity): Record<string, unknown> {
+  const p = entity.provenance;
+  return {
+    id: entity.id,
+    entityType: entity.entityType,
+    label: entity.label,
+    slug: entity.slug,
+    summary: entity.summary ?? null,
+    properties: JSON.stringify(entity.properties),
+    data: entity.data ?? null,
+    dataFormat: entity.dataFormat ?? null,
+    embedding: entity.embedding ?? null,
+    createdBy: p.createdBy,
+    createdByType: p.createdByType,
+    createdAt: p.createdAt,
+    createdInConversation: p.createdInConversation ?? null,
+    createdFromMessage: p.createdFromMessage ?? null,
+    modifiedBy: p.modifiedBy,
+    modifiedByType: p.modifiedByType,
+    modifiedAt: p.modifiedAt,
+    modifiedInConversation: p.modifiedInConversation ?? null,
+    modifiedFromMessage: p.modifiedFromMessage ?? null,
+  };
+}
+
+/**
  * Build the parameter map for `createRepository`'s fixed-shape `CREATE` Cypher.
  * Optional fields become `null` (Neo4j drops null properties on write, so the
  * resulting node has no property by that name — symmetric with read where

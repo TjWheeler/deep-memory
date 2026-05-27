@@ -15,6 +15,7 @@ import type {
   QueryMetadata,
   RelationshipQueryOptions,
   RepositoryFilter,
+  RepositoryStats,
   RepositoryUpdate,
   StorageExploreOptions,
   StorageFindQuery,
@@ -24,6 +25,8 @@ import type {
   StoragePathOptions,
   StoragePathResult,
   StorageRepositoryConfig,
+  StorageTimelineOptions,
+  StorageTimelineResult,
   StoredEntity,
   StoredEntityUpdate,
   StoredRelationship,
@@ -54,6 +57,8 @@ import {
 } from './mapping.js';
 import * as entityQueries from './queries/entity.js';
 import * as relationshipQueries from './queries/relationship.js';
+import * as repositoryQueries from './queries/repository.js';
+import * as timelineQueries from './queries/timeline.js';
 import * as vocabQueries from './queries/vocabulary.js';
 import { getSchemaCypher, SCHEMA_VERSION } from './schema.js';
 import {
@@ -119,6 +124,8 @@ const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> =
   traverse: (args) => args[0] as string,
   exploreNeighborhood: (args) => args[0] as string,
   findPaths: (args) => args[0] as string,
+  getTimeline: (args) => args[0] as string,
+  getRepositoryStats: (args) => args[0] as string,
 };
 
 /** Configuration for `Neo4jStorageProvider`. */
@@ -1300,6 +1307,46 @@ export class Neo4jStorageProvider {
       paths: paginated,
       totalPaths: matchingPaths.length,
     };
+  }
+
+  // ─── Timeline ──────────────────────────────────────────────────────
+
+  /**
+   * Reconstruct the timeline event stream for an entity. One server
+   * round-trip: the centre entity's provenance scalars plus every incident
+   * edge's id + createdAt arrive in a single tuple via `OPTIONAL MATCH +
+   * collect()`. The provider walks the row client-side to emit
+   * `entity:created` / `entity:updated` / `relationship:created` events.
+   *
+   * Cosmos pays two round-trips for the same information because Gremlin
+   * cannot bind an aggregated edge list to a vertex projection in one shot —
+   * a platform divergence, not an inherent trade-off.
+   */
+  public async getTimeline(
+    repositoryId: string,
+    entityId: string,
+    options: StorageTimelineOptions,
+  ): Promise<StorageTimelineResult> {
+    return timelineQueries.getTimeline(this.connection, repositoryId, entityId, options);
+  }
+
+  // ─── Stats ─────────────────────────────────────────────────────────
+
+  /**
+   * Aggregate repository statistics — entity / relationship totals, per-type
+   * breakdowns, vocabulary version. Two parallel native-aggregation round-
+   * trips (`count(n)` per `entityType`, `count(r)` per `type(r)`); the
+   * vocabulary version comes from the cached `_Vocabulary` node so a warm
+   * cache costs exactly two round-trips total.
+   *
+   * Strict improvement over Cosmos's Gremlin `.group().by().by(count())`
+   * shape — Cypher's native aggregation collapses each metric to a one-
+   * statement plan that hits the `(repositoryId, entityType)` and
+   * relationship-property indexes directly.
+   */
+  public async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
+    const vocabulary = await this.getVocabularyCached(repositoryId);
+    return repositoryQueries.getRepositoryStats(this.connection, repositoryId, vocabulary);
   }
 }
 

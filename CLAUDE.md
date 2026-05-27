@@ -45,6 +45,7 @@ Entry points by task:
 | Touch the indexer pipeline | [packages/indexer/README.md](packages/indexer/README.md) plus the phase-specific guide under `docs/indexer-*.md` |
 | Identity / dedup / labels / slugs | [docs/identity-pattern.md](docs/identity-pattern.md) |
 | Provider usage telemetry | [docs/usage-tracking.md](docs/usage-tracking.md) |
+| Write a changeset | [docs/changeset-guide.md](docs/changeset-guide.md) — **load before writing any `.changeset/*.md` file**; covers format, fixed-group bumps, and replaces git-history mining |
 
 A complete documentation index sits in [docs/README.md](docs/README.md). Treat it as a table of contents — open it when you do not know which doc covers a topic, not as a doc to read in full.
 

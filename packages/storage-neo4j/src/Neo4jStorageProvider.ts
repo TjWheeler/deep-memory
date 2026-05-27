@@ -132,6 +132,10 @@ const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> =
   getTimeline: (args) => args[0] as string,
   getRepositoryStats: (args) => args[0] as string,
   importBulk: (args) => args[0] as string,
+  // `executeNativeQuery` is cross-repository by design. The first positional
+  // argument is `repositoryId` for interface symmetry but is intentionally
+  // not stamped on the sink record — the call is not scoped to one repository.
+  executeNativeQuery: () => undefined,
   // `exportAll` is intentionally omitted from this map. The Proxy emits one
   // sink record at promise resolution; an `AsyncIterable` returns
   // synchronously and is consumed across an arbitrary number of awaits, so
@@ -1476,6 +1480,47 @@ export class Neo4jStorageProvider {
   public async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
     const vocabulary = await this.getVocabularyCached(repositoryId);
     return repositoryQueries.getRepositoryStats(this.connection, repositoryId, vocabulary);
+  }
+
+  // ─── Native Query ──────────────────────────────────────────────────
+
+  /**
+   * Execute a raw Cypher statement with caller-supplied bindings.
+   *
+   * ⚠️  ELEVATED PRIVILEGE — SYSTEM-LEVEL OPERATION ⚠️
+   *
+   * This method is an unscoped pass-through: it does not filter by
+   * repository, does not inject the `$rid` binding, and performs no
+   * validation on the Cypher string. A single call can read or mutate any
+   * node or relationship in the database regardless of which repository it
+   * belongs to.
+   *
+   * DO NOT expose this method to AI agents, end users, or any untrusted
+   * caller. It is intended for:
+   *   - administrative tooling (migrations, diagnostics, repairs)
+   *   - internal library operations that need cross-repository reach
+   *
+   * `repositoryId` is accepted for interface symmetry but is intentionally
+   * ignored here — the caller is trusted to scope the query themselves.
+   * Because the call is cross-repository by design, the emitted usage
+   * record carries no `repositoryId` (see `TRACKED_METHODS`).
+   *
+   * For agent-facing graph queries use {@link traverse}, which enforces the
+   * repositoryId scope predicate.
+   */
+  public async executeNativeQuery(
+    _repositoryId: string,
+    query: string,
+    params?: Record<string, unknown>,
+  ): Promise<unknown[]> {
+    const result = await this.connection.executeSystemQuery(query, params ?? {}, {
+      crossRepository: true,
+    });
+    // Each driver `Record` is mapped to a plain object keyed by RETURN /
+    // YIELD column name. Driver-specific value shapes (Node, Relationship,
+    // BigInt) flow through untouched — admin tooling is responsible for
+    // interpreting them.
+    return result.records.map((record) => record.toObject());
   }
 }
 

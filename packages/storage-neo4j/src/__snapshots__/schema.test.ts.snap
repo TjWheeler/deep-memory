@@ -1,0 +1,18 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`schema > matches the snapshot — locks the verbatim Cypher 25 text 1`] = `
+[
+  "CREATE CONSTRAINT dm_entity_unique IF NOT EXISTS
+FOR (n:_Entity) REQUIRE (n.repositoryId, n.id) IS UNIQUE",
+  "CREATE CONSTRAINT dm_entity_slug_unique IF NOT EXISTS
+FOR (n:_Entity) REQUIRE (n.repositoryId, n.slug) IS UNIQUE",
+  "CREATE CONSTRAINT dm_repository_unique IF NOT EXISTS
+FOR (n:_Repository) REQUIRE n.repositoryId IS UNIQUE",
+  "CREATE INDEX dm_entity_type_lookup IF NOT EXISTS
+FOR (n:_Entity) ON (n.repositoryId, n.entityType)",
+  "CREATE INDEX dm_entity_modified IF NOT EXISTS
+FOR (n:_Entity) ON (n.repositoryId, n.modifiedAt)",
+  "CREATE FULLTEXT INDEX dm_entity_text IF NOT EXISTS
+FOR (n:_Entity) ON EACH [n.label, n.summary]",
+]
+`;

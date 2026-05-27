@@ -1,5 +1,12 @@
 # @utaba/deep-memory-storage-cosmosdb
 
+## 1.0.0
+
+### Patch Changes
+
+- Updated dependencies [e4d470f]
+  - @utaba/deep-memory@1.0.0
+
 ## 0.17.0
 
 ### Minor Changes

@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-indexer-mcp-server",
-  "version": "0.16.1",
+  "version": "0.16.2",
   "private": true,
   "description": "Indexer MCP server — phase-aware indexing pipeline tools for AI agents",
   "type": "module",

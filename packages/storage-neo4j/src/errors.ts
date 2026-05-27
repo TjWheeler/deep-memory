@@ -10,6 +10,7 @@
 import {
   DuplicateEntityError,
   DuplicateRelationshipError,
+  DuplicateRepositoryError,
   ProviderError,
 } from '@utaba/deep-memory';
 
@@ -19,21 +20,23 @@ const SYNTAX_ERROR_CODE = 'Neo.ClientError.Statement.SyntaxError';
 /**
  * Context describing what the caller was trying to do when the driver error
  * fired. Used so a constraint violation can be turned into a useful
- * `DuplicateEntityError(id)` / `DuplicateRelationshipError(id)` rather than a
- * generic `ProviderError`.
+ * `DuplicateEntityError(id)` / `DuplicateRelationshipError(id)` /
+ * `DuplicateRepositoryError(id)` rather than a generic `ProviderError`.
  *
  * Callers pass whichever identifiers they already have in scope — the helper
- * picks the right typed error based on `kind`. When neither id is available,
- * the helper falls back to `ProviderError` with the original code preserved
- * in the suggestion message.
+ * picks the right typed error based on `kind`. When no id is available, the
+ * helper falls back to `ProviderError` with the original code preserved in the
+ * suggestion message.
  */
 export interface DriverErrorContext {
   /** What the caller was operating on when the driver error fired. */
-  kind?: 'entity' | 'relationship';
+  kind?: 'entity' | 'relationship' | 'repository';
   /** Entity id (when `kind === 'entity'`). */
   entityId?: string;
   /** Relationship id (when `kind === 'relationship'`). */
   relationshipId?: string;
+  /** Repository id (when `kind === 'repository'`). */
+  repositoryId?: string;
   /** Free-form operation label (e.g. `'createEntity'`) — included in the message. */
   operation?: string;
 }
@@ -46,12 +49,12 @@ interface DriverError {
 /**
  * Convert a driver-thrown error into one of the project's typed errors.
  *
- * - `'Neo.ClientError.Schema.ConstraintValidationFailed'` → `DuplicateEntityError`
- *   or `DuplicateRelationshipError` based on `context.kind` (the only Neo4j
- *   uniqueness constraints we declare are entity-level — see D7 — so the
- *   `entity` branch is the practical hot path; the `relationship` branch
- *   exists for forward compatibility with any future per-type relationship
- *   constraint).
+ * - `'Neo.ClientError.Schema.ConstraintValidationFailed'` →
+ *   `DuplicateEntityError` / `DuplicateRelationshipError` /
+ *   `DuplicateRepositoryError` based on `context.kind`. When `kind` is
+ *   omitted, the helper inspects the constraint-violation message to pick
+ *   the right branch (the message names the offending label —
+ *   `_Repository` / `_Entity` / a relationship type — see probe P3).
  * - `'Neo.ClientError.Statement.SyntaxError'` → `ProviderError` (programming
  *   bug in this package; should never surface to end users).
  * - Anything else → `ProviderError` with the original error attached as
@@ -64,6 +67,7 @@ export function mapDriverError(error: unknown, context: DriverErrorContext = {})
   if (
     error instanceof DuplicateEntityError ||
     error instanceof DuplicateRelationshipError ||
+    error instanceof DuplicateRepositoryError ||
     error instanceof ProviderError
   ) {
     throw error;
@@ -75,6 +79,9 @@ export function mapDriverError(error: unknown, context: DriverErrorContext = {})
 
   if (code === CONSTRAINT_VIOLATION_CODE) {
     const kind = inferConstraintKind(context, message);
+    if (kind === 'repository' && context.repositoryId !== undefined) {
+      throw new DuplicateRepositoryError(context.repositoryId);
+    }
     if (kind === 'entity' && context.entityId !== undefined) {
       throw new DuplicateEntityError(context.entityId);
     }
@@ -83,7 +90,7 @@ export function mapDriverError(error: unknown, context: DriverErrorContext = {})
     }
     throw new ProviderError(
       `Neo4j constraint violation${formatOperation(context)}: ${message || code}`,
-      'Inspect the failing Cypher and the schema constraints — the affected (repositoryId, id) or (repositoryId, slug) pair already exists.',
+      'Inspect the failing Cypher and the schema constraints — the affected unique key already exists.',
     );
   }
 
@@ -103,15 +110,16 @@ export function mapDriverError(error: unknown, context: DriverErrorContext = {})
 function inferConstraintKind(
   context: DriverErrorContext,
   message: string,
-): 'entity' | 'relationship' {
-  if (context.kind === 'relationship') return 'relationship';
-  if (context.kind === 'entity') return 'entity';
+): 'entity' | 'relationship' | 'repository' {
+  if (context.kind !== undefined) return context.kind;
   // Neo4j formats constraint-violation messages as
   //   "Node(...) already exists with label `_Entity` ..." OR
+  //   "Node(...) already exists with label `_Repository` ..." OR
   //   "Relationship(...) already exists with type `KNOWS` ..."
-  // We discriminate on the leading noun. No context.kind means the caller did
-  // not know — best-effort inference from the message text.
+  // We discriminate on the leading noun and (for nodes) the label embedded in
+  // the message. Probe P3 captured the exact format on neo4j:5.26-community.
   if (message.startsWith('Relationship')) return 'relationship';
+  if (message.includes('`_Repository`')) return 'repository';
   return 'entity';
 }
 

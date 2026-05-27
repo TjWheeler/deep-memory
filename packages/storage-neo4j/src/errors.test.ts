@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DuplicateEntityError,
   DuplicateRelationshipError,
+  DuplicateRepositoryError,
   ProviderError,
 } from '@utaba/deep-memory';
 import { mapDriverError } from './errors.js';
@@ -29,6 +30,27 @@ describe('mapDriverError', () => {
       "Node(0) already exists with label `_Entity` ...",
     );
     expect(() => mapDriverError(err, { entityId: 'e1' })).toThrowError(DuplicateEntityError);
+  });
+
+  it('maps constraint violation + repository context → DuplicateRepositoryError', () => {
+    const err = fakeDriverError(
+      'Neo.ClientError.Schema.ConstraintValidationFailed',
+      "Node(0) already exists with label `_Repository` and properties `repositoryId` = 'r1'",
+    );
+    expect(() =>
+      mapDriverError(err, { kind: 'repository', repositoryId: 'r1', operation: 'createRepository' }),
+    ).toThrowError(DuplicateRepositoryError);
+  });
+
+  it('infers repository kind from the message when context.kind is omitted', () => {
+    // The _Repository label in the message routes to the repository branch
+    // even without an explicit context.kind — the entity-level constraint
+    // would surface `_Entity` instead. See probe P3.
+    const err = fakeDriverError(
+      'Neo.ClientError.Schema.ConstraintValidationFailed',
+      "Node(0) already exists with label `_Repository` and properties `repositoryId` = 'r1'",
+    );
+    expect(() => mapDriverError(err, { repositoryId: 'r1' })).toThrowError(DuplicateRepositoryError);
   });
 
   it('maps constraint violation + relationship context → DuplicateRelationshipError', () => {
@@ -65,6 +87,9 @@ describe('mapDriverError', () => {
   it('rethrows typed errors unchanged', () => {
     const original = new DuplicateEntityError('e1');
     expect(() => mapDriverError(original)).toThrowError(original);
+
+    const repoErr = new DuplicateRepositoryError('r1');
+    expect(() => mapDriverError(repoErr)).toThrowError(repoErr);
   });
 
   it('handles errors that lack a code or message gracefully', () => {

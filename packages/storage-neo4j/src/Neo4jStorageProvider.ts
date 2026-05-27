@@ -3,9 +3,29 @@
 // StorageProvider` declaration is added once the surface is complete.
 
 import type { EnsureSchemaResult } from '@utaba/deep-memory/providers';
-import type { UsageSink } from '@utaba/deep-memory/types';
-import { ProviderError, createSafeSink } from '@utaba/deep-memory';
+import type {
+  DeleteProgressCallback,
+  PaginatedResult,
+  RepositoryFilter,
+  RepositoryUpdate,
+  StorageRepositoryConfig,
+  StoredRepository,
+  StoredRepositorySummary,
+  UsageSink,
+} from '@utaba/deep-memory/types';
+import {
+  ProviderError,
+  RepositoryNotFoundError,
+  createSafeSink,
+} from '@utaba/deep-memory';
 import { Neo4jConnection, type Neo4jConnectionConfig } from './Neo4jConnection.js';
+import { mapDriverError } from './errors.js';
+import {
+  bigintToSafeNumber,
+  repositoryCreateParams,
+  repositoryFromRecord,
+  repositorySummaryFromRecord,
+} from './mapping.js';
 import { getSchemaCypher, SCHEMA_VERSION } from './schema.js';
 import {
   buildUsageDetails,
@@ -14,6 +34,7 @@ import {
 } from './usageScope.js';
 
 const PROVIDER_NAME = 'neo4j';
+const DELETE_BATCH_SIZE = 500;
 
 /**
  * Public methods that emit a usage record per call. The value extracts the
@@ -29,6 +50,15 @@ const PROVIDER_NAME = 'neo4j';
  */
 const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> = {
   ensureSchema: () => undefined,
+  createRepository: (args) => {
+    const cfg = args[0] as { repositoryId?: string } | undefined;
+    return cfg?.repositoryId;
+  },
+  getRepository: (args) => args[0] as string,
+  listRepositories: () => undefined,
+  updateRepository: (args) => args[0] as string,
+  deleteRepository: (args) => args[0] as string,
+  deleteAllContents: (args) => args[0] as string,
 };
 
 /** Configuration for `Neo4jStorageProvider`. */
@@ -211,5 +241,323 @@ export class Neo4jStorageProvider {
       { key: META_KEY, version },
       { crossRepository: true },
     );
+  }
+
+  // ─── Repository ────────────────────────────────────────────────────
+
+  /**
+   * Create a new repository. Fixed-shape `CREATE` template — every optional
+   * field is bound on every call so the server plan-caches one entry across
+   * all repository creates. Optional fields bound as `null` are not persisted
+   * (Cypher drops null property values on write — symmetric with read).
+   *
+   * The `(:_Repository) REQUIRE n.repositoryId IS UNIQUE` constraint surfaces
+   * duplicates as `Neo.ClientError.Schema.ConstraintValidationFailed`, which
+   * `mapDriverError({ kind: 'repository', ... })` routes to
+   * `DuplicateRepositoryError`.
+   */
+  public async createRepository(config: StorageRepositoryConfig): Promise<StoredRepository> {
+    try {
+      await this.connection.executeQuery(
+        `CREATE (r:_Repository {
+          repositoryId: $rid,
+          type: $type,
+          label: $label,
+          description: $description,
+          legal: $legal,
+          owner: $owner,
+          governanceConfig: $governanceConfig,
+          metadata: $metadata,
+          createdAt: $createdAt,
+          createdBy: $createdBy
+        })`,
+        repositoryCreateParams(config),
+        { repositoryId: config.repositoryId },
+      );
+    } catch (err) {
+      mapDriverError(err, {
+        kind: 'repository',
+        repositoryId: config.repositoryId,
+        operation: 'createRepository',
+      });
+    }
+
+    const result: StoredRepository = {
+      repositoryId: config.repositoryId,
+      label: config.label,
+      governanceConfig: config.governanceConfig,
+      createdAt: config.createdAt,
+      createdBy: config.createdBy,
+    };
+    if (config.type !== undefined) result.type = config.type;
+    if (config.description !== undefined) result.description = config.description;
+    if (config.legal !== undefined) result.legal = config.legal;
+    if (config.owner !== undefined) result.owner = config.owner;
+    if (config.metadata !== undefined) result.metadata = config.metadata;
+    return result;
+  }
+
+  public async getRepository(repositoryId: string): Promise<StoredRepository | null> {
+    const result = await this.connection.executeQuery(
+      'MATCH (r:_Repository {repositoryId: $rid}) RETURN r',
+      {},
+      { repositoryId, routing: 'READ' },
+    );
+    const record = result.records[0];
+    if (record === undefined) return null;
+    return repositoryFromRecord(record);
+  }
+
+  public async listRepositories(
+    filter?: RepositoryFilter,
+  ): Promise<PaginatedResult<StoredRepositorySummary>> {
+    const limit = filter?.limit ?? 20;
+    const offset = filter?.offset ?? 0;
+    const typeFilter = filter?.type;
+
+    const wherePredicates: string[] = [];
+    // SKIP / LIMIT take Cypher INTEGER; passing a JS number sends a FLOAT and
+    // the planner rejects it with `Neo.ClientError.Statement.ArgumentError`.
+    // With `useBigInt: true` on the driver, BigInt round-trips as INTEGER.
+    const params: Record<string, unknown> = { offset: BigInt(offset), limit: BigInt(limit) };
+    if (typeFilter !== undefined) {
+      wherePredicates.push('r.type = $filterType');
+      params['filterType'] = typeFilter;
+    }
+    const whereClause = wherePredicates.length > 0 ? `WHERE ${wherePredicates.join(' AND ')}` : '';
+
+    // listRepositories is cross-repository by definition (D18 — no sentinel
+    // index, direct scan against the dm_repository_unique constraint's
+    // backing index). Both queries route through executeSystemQuery; the
+    // composite scan is cheap because there is no partition fan-out cost on
+    // Neo4j and the constraint's auto-index covers _Repository lookups.
+    const [dataResult, countResult] = await Promise.all([
+      this.connection.executeSystemQuery(
+        `MATCH (r:_Repository) ${whereClause} RETURN r ORDER BY r.repositoryId SKIP $offset LIMIT $limit`,
+        params,
+        { crossRepository: true, routing: 'READ' },
+      ),
+      this.connection.executeSystemQuery(
+        `MATCH (r:_Repository) ${whereClause} RETURN count(r) AS total`,
+        typeFilter !== undefined ? { filterType: typeFilter } : {},
+        { crossRepository: true, routing: 'READ' },
+      ),
+    ]);
+
+    const items = dataResult.records.map((record) => repositorySummaryFromRecord(record));
+    const totalRaw = countResult.records[0]?.get('total');
+    const total = totalRaw === undefined ? 0 : bigintToSafeNumber(totalRaw);
+
+    return {
+      items,
+      total,
+      hasMore: offset + items.length < total,
+      limit,
+      offset,
+    };
+  }
+
+  /**
+   * Variable-shape Cypher (per D23 trade-off — repository writes are rare so
+   * the plan-cache cost is negligible). Projection-on-write returns the
+   * updated row in one round-trip; empty-rowset → `RepositoryNotFoundError`.
+   */
+  public async updateRepository(
+    repositoryId: string,
+    updates: RepositoryUpdate,
+  ): Promise<StoredRepository> {
+    const setClauses: string[] = [];
+    const params: Record<string, unknown> = {};
+
+    if (updates.label !== undefined) {
+      setClauses.push('r.label = $label');
+      params['label'] = updates.label;
+    }
+    if (updates.description !== undefined) {
+      setClauses.push('r.description = $description');
+      params['description'] = updates.description;
+    }
+    if (updates.type !== undefined) {
+      setClauses.push('r.type = $type');
+      params['type'] = updates.type;
+    }
+    if (updates.legal !== undefined) {
+      setClauses.push('r.legal = $legal');
+      params['legal'] = updates.legal;
+    }
+    if (updates.owner !== undefined) {
+      setClauses.push('r.owner = $owner');
+      params['owner'] = updates.owner;
+    }
+    if (updates.governanceConfig !== undefined) {
+      setClauses.push('r.governanceConfig = $governanceConfig');
+      params['governanceConfig'] = JSON.stringify(updates.governanceConfig);
+    }
+    if (updates.metadata !== undefined) {
+      // Shallow merge with the existing metadata bag — same contract as the
+      // SQL Server and Cosmos providers. Requires reading the current value
+      // first so the merge happens server-side via the SET clause.
+      const existing = await this.getRepository(repositoryId);
+      if (existing === null) throw new RepositoryNotFoundError(repositoryId);
+      const merged = { ...existing.metadata, ...updates.metadata };
+      setClauses.push('r.metadata = $metadata');
+      params['metadata'] = JSON.stringify(merged);
+    }
+
+    if (setClauses.length === 0) {
+      const existing = await this.getRepository(repositoryId);
+      if (existing === null) throw new RepositoryNotFoundError(repositoryId);
+      return existing;
+    }
+
+    const cypher = `MATCH (r:_Repository {repositoryId: $rid}) SET ${setClauses.join(', ')} RETURN r`;
+    const result = await this.connection.executeQuery(cypher, params, { repositoryId });
+    const record = result.records[0];
+    if (record === undefined) throw new RepositoryNotFoundError(repositoryId);
+    return repositoryFromRecord(record);
+  }
+
+  /**
+   * Drop every node and relationship scoped to `repositoryId`, including the
+   * `_Repository` node itself. Two-stage chunked wipe driven by app-side loops
+   * so the progress callback fires at a useful cadence:
+   *
+   *   1. Drain relationships in batches via `CALL ( ) { ... } IN TRANSACTIONS`.
+   *   2. Drain nodes (entities + system) in batches via the same form with
+   *      `DETACH DELETE` (catches any straggler edges).
+   *
+   * `IN TRANSACTIONS` can only run on auto-commit sessions — `executeWrite`
+   * fails with `Neo.DatabaseError.Transaction.TransactionStartFailed` per
+   * probe P13. The chokepoint's `executeImplicitInTransactions` is the only
+   * legitimate entry point for this pattern.
+   */
+  public async deleteRepository(
+    repositoryId: string,
+    onProgress?: DeleteProgressCallback,
+  ): Promise<void> {
+    const { totalEntities, totalRelationships } = await this.countRepositoryContents(repositoryId);
+
+    let relationshipsDeleted = 0;
+    let entitiesDeleted = 0;
+
+    while (true) {
+      const summary = await this.connection.executeImplicitInTransactions(
+        `CALL () {
+           MATCH ()-[r {repositoryId: $rid}]-()
+           WITH r LIMIT $batchSize
+           DELETE r
+         } IN TRANSACTIONS OF $batchSize ROWS`,
+        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
+        { batchSize: BigInt(DELETE_BATCH_SIZE) },
+        { repositoryId },
+      );
+      const stats = summary.counters.updates();
+      const deletedThisBatch = stats['relationshipsDeleted'] ?? 0;
+      if (deletedThisBatch === 0) break;
+      relationshipsDeleted = Math.min(relationshipsDeleted + deletedThisBatch, totalRelationships);
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
+    }
+
+    while (true) {
+      const summary = await this.connection.executeImplicitInTransactions(
+        `CALL () {
+           MATCH (n {repositoryId: $rid})
+           WITH n LIMIT $batchSize
+           DETACH DELETE n
+         } IN TRANSACTIONS OF $batchSize ROWS`,
+        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
+        { batchSize: BigInt(DELETE_BATCH_SIZE) },
+        { repositoryId },
+      );
+      const stats = summary.counters.updates();
+      const deletedThisBatch = stats['nodesDeleted'] ?? 0;
+      if (deletedThisBatch === 0) break;
+      // The match drains _Entity, _Vocabulary, _VocabularyChangeLog AND the
+      // _Repository node itself — system nodes inflate the raw counter past
+      // the user-facing entity total. Cap so the callback never reports more
+      // than it promised.
+      entitiesDeleted = Math.min(entitiesDeleted + deletedThisBatch, totalEntities);
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
+    }
+  }
+
+  /**
+   * Drop every entity and relationship scoped to `repositoryId` but preserve
+   * the `_Repository` and `_Vocabulary` / `_VocabularyChangeLog` system nodes.
+   * Same chunked-wipe contract as `deleteRepository`, restricted to the
+   * `:_Entity` umbrella label for nodes.
+   */
+  public async deleteAllContents(
+    repositoryId: string,
+    onProgress?: DeleteProgressCallback,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+    const { totalEntities, totalRelationships } = await this.countRepositoryContents(repositoryId);
+
+    let relationshipsDeleted = 0;
+    let entitiesDeleted = 0;
+
+    while (true) {
+      const summary = await this.connection.executeImplicitInTransactions(
+        `CALL () {
+           MATCH (:_Entity {repositoryId: $rid})-[r {repositoryId: $rid}]-(:_Entity {repositoryId: $rid})
+           WITH r LIMIT $batchSize
+           DELETE r
+         } IN TRANSACTIONS OF $batchSize ROWS`,
+        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
+        { batchSize: BigInt(DELETE_BATCH_SIZE) },
+        { repositoryId },
+      );
+      const stats = summary.counters.updates();
+      const deletedThisBatch = stats['relationshipsDeleted'] ?? 0;
+      if (deletedThisBatch === 0) break;
+      relationshipsDeleted = Math.min(relationshipsDeleted + deletedThisBatch, totalRelationships);
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
+    }
+
+    while (true) {
+      const summary = await this.connection.executeImplicitInTransactions(
+        `CALL () {
+           MATCH (n:_Entity {repositoryId: $rid})
+           WITH n LIMIT $batchSize
+           DETACH DELETE n
+         } IN TRANSACTIONS OF $batchSize ROWS`,
+        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
+        { batchSize: BigInt(DELETE_BATCH_SIZE) },
+        { repositoryId },
+      );
+      const stats = summary.counters.updates();
+      const deletedThisBatch = stats['nodesDeleted'] ?? 0;
+      if (deletedThisBatch === 0) break;
+      entitiesDeleted = Math.min(entitiesDeleted + deletedThisBatch, totalEntities);
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
+    }
+
+    return { deletedEntities: totalEntities, deletedRelationships: totalRelationships };
+  }
+
+  /**
+   * One-shot pre-count used by `deleteRepository` / `deleteAllContents`. The
+   * entity count uses the umbrella `:_Entity` label so system nodes
+   * (`_Repository` / `_Vocabulary`) are excluded — that matches the
+   * user-facing semantics of the progress callback.
+   */
+  private async countRepositoryContents(
+    repositoryId: string,
+  ): Promise<{ totalEntities: number; totalRelationships: number }> {
+    const [entitiesResult, relationshipsResult] = await Promise.all([
+      this.connection.executeQuery(
+        'MATCH (n:_Entity {repositoryId: $rid}) RETURN count(n) AS total',
+        {},
+        { repositoryId, routing: 'READ' },
+      ),
+      this.connection.executeQuery(
+        'MATCH ()-[r {repositoryId: $rid}]-() RETURN count(r) AS total',
+        {},
+        { repositoryId, routing: 'READ' },
+      ),
+    ]);
+    const totalEntities = bigintToSafeNumber(entitiesResult.records[0]?.get('total') ?? 0);
+    const totalRelationships = bigintToSafeNumber(relationshipsResult.records[0]?.get('total') ?? 0);
+    return { totalEntities, totalRelationships };
   }
 }

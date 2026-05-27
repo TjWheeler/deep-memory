@@ -206,6 +206,41 @@ export class Neo4jConnection {
     }
   }
 
+  /**
+   * Run a repository-scoped Cypher statement that uses `CALL ( ) { ... } IN
+   * TRANSACTIONS OF $batchSize ROWS` semantics.
+   *
+   * `IN TRANSACTIONS` is only valid in implicit (auto-commit) transactions —
+   * the managed `executeWrite` / `executeRead` helpers open an explicit
+   * transaction internally and the server rejects the statement with
+   * `Neo.DatabaseError.Transaction.TransactionStartFailed`. Probe P13
+   * (local-tests/baseline/neo4j-call-in-transactions-results.md) captured the
+   * exact failure mode and the empty-match / partial-batch behaviour the
+   * chunked-wipe path relies on.
+   *
+   * Same `$rid` injection + scope assertion as `executeQuery`, so the chunked
+   * delete still flows through the D3b layer 2 lifeline. Returns only the
+   * summary because the chunked-wipe subquery yields no rows; counters live on
+   * `summary.counters.updates()`.
+   */
+  public async executeImplicitInTransactions(
+    cypher: string,
+    params: CypherParams,
+    options: { repositoryId: string },
+  ): Promise<ResultSummary> {
+    this.assertRepositoryId(options.repositoryId);
+    this.assertScoped(cypher);
+    const session = this.driver.session({ database: this.database });
+    try {
+      const result = await session.run(cypher, { ...params, rid: options.repositoryId });
+      recordRoundTrip(result.summary, result.records.length);
+      this.surfaceNotifications(cypher, result.summary);
+      return result.summary;
+    } finally {
+      await session.close();
+    }
+  }
+
   private async runManaged<T>(
     mode: 'read' | 'write',
     repositoryId: string,

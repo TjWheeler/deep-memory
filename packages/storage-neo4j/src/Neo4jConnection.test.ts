@@ -53,6 +53,48 @@ describe('Neo4jConnection.executeQuery isolation enforcement', () => {
   });
 });
 
+// ─── 1b. executeImplicitInTransactions — same isolation contract as executeQuery
+
+describe('Neo4jConnection.executeImplicitInTransactions isolation enforcement', () => {
+  it('throws ProviderError when the Cypher string omits the $rid token', async () => {
+    const connection = new Neo4jConnection({
+      uri: 'bolt://localhost:7687',
+      username: 'neo4j',
+      password: 'unused',
+    });
+    try {
+      await expect(
+        connection.executeImplicitInTransactions(
+          'CALL () { MATCH (n) DETACH DELETE n } IN TRANSACTIONS OF 500 ROWS',
+          {},
+          { repositoryId: 'repo-a' },
+        ),
+      ).rejects.toBeInstanceOf(ProviderError);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it('throws ProviderError when repositoryId is empty', async () => {
+    const connection = new Neo4jConnection({
+      uri: 'bolt://localhost:7687',
+      username: 'neo4j',
+      password: 'unused',
+    });
+    try {
+      await expect(
+        connection.executeImplicitInTransactions(
+          'CALL () { MATCH (n {repositoryId: $rid}) DETACH DELETE n } IN TRANSACTIONS OF 500 ROWS',
+          {},
+          { repositoryId: '' },
+        ),
+      ).rejects.toBeInstanceOf(ProviderError);
+    } finally {
+      await connection.close();
+    }
+  });
+});
+
 // ─── 2. executeSystemQuery — crossRepository flag enforced ───────────────
 
 describe('Neo4jConnection.executeSystemQuery', () => {

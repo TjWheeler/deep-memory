@@ -20,6 +20,13 @@ import { ProviderError } from '@utaba/deep-memory';
 import type { StoredEntity } from '@utaba/deep-memory/types';
 import type { StoredRelationship } from '@utaba/deep-memory/types';
 import type { Provenance } from '@utaba/deep-memory/types';
+import type {
+  GovernanceConfig,
+  RepositoryMetadata,
+  StorageRepositoryConfig,
+  StoredRepository,
+  StoredRepositorySummary,
+} from '@utaba/deep-memory/types';
 
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
@@ -28,9 +35,14 @@ const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
  * Minimal structural shape compatible with `neo4j-driver`'s `Record` class.
  * Keeping the type local lets the mapper compile without importing the driver,
  * which the isolation grep test forbids outside `Neo4jConnection.ts`.
+ *
+ * `keys` is `PropertyKey[]` rather than `string[]` because the driver's
+ * `Record<T extends RecordShape>` types `keys` as `(keyof T)[]`, which TS
+ * widens to `PropertyKey`. All of our projections use string-keyed Cypher
+ * aliases, so the helpers filter to string keys at consumption time.
  */
 export interface DriverRecord {
-  keys: ReadonlyArray<string>;
+  keys: ReadonlyArray<PropertyKey>;
   get(key: string): unknown;
 }
 
@@ -124,6 +136,89 @@ export function relationshipFromProperties(
   };
 }
 
+/**
+ * Map a driver record to a `StoredRepository`. Accepts both `RETURN r` (alias
+ * resolves to a `Node` with `.properties`) and explicit projection forms.
+ *
+ * `governanceConfig` and `metadata` are stored as JSON strings on the node;
+ * read paths parse them back here so the public surface always sees the live
+ * object shape. Optional string fields (`type`, `description`, `legal`,
+ * `owner`) round-trip through `optionalString`.
+ */
+export function repositoryFromRecord(record: DriverRecord, alias = 'r'): StoredRepository {
+  return repositoryFromProperties(extractPropertyBag(record, alias));
+}
+
+/**
+ * Lighter projection used by `listRepositories` — omits `legal`, `owner`,
+ * `metadata`, `createdAt`, `createdBy` per the `StoredRepositorySummary`
+ * contract. Same JSON-parse-on-read for `governanceConfig`.
+ */
+export function repositorySummaryFromRecord(
+  record: DriverRecord,
+  alias = 'r',
+): StoredRepositorySummary {
+  return repositorySummaryFromProperties(extractPropertyBag(record, alias));
+}
+
+export function repositoryFromProperties(props: Record<string, unknown>): StoredRepository {
+  const type = optionalString(props, 'type');
+  const description = optionalString(props, 'description');
+  const legal = optionalString(props, 'legal');
+  const owner = optionalString(props, 'owner');
+  const metadata = parseOptionalJsonObject<RepositoryMetadata>(props, 'metadata');
+  const repo: StoredRepository = {
+    repositoryId: requireString(props, 'repositoryId'),
+    label: requireString(props, 'label'),
+    governanceConfig: parseRequiredJsonObject<GovernanceConfig>(props, 'governanceConfig'),
+    createdAt: requireString(props, 'createdAt'),
+    createdBy: requireString(props, 'createdBy'),
+  };
+  if (type !== undefined) repo.type = type;
+  if (description !== undefined) repo.description = description;
+  if (legal !== undefined) repo.legal = legal;
+  if (owner !== undefined) repo.owner = owner;
+  if (metadata !== undefined) repo.metadata = metadata;
+  return repo;
+}
+
+export function repositorySummaryFromProperties(
+  props: Record<string, unknown>,
+): StoredRepositorySummary {
+  const type = optionalString(props, 'type');
+  const description = optionalString(props, 'description');
+  const summary: StoredRepositorySummary = {
+    repositoryId: requireString(props, 'repositoryId'),
+    label: requireString(props, 'label'),
+    governanceConfig: parseRequiredJsonObject<GovernanceConfig>(props, 'governanceConfig'),
+  };
+  if (type !== undefined) summary.type = type;
+  if (description !== undefined) summary.description = description;
+  return summary;
+}
+
+/**
+ * Build the parameter map for `createRepository`'s fixed-shape `CREATE` Cypher.
+ * Optional fields become `null` (Neo4j drops null properties on write, so the
+ * resulting node has no property by that name — symmetric with read where
+ * absent properties map to `undefined`).
+ */
+export function repositoryCreateParams(
+  config: StorageRepositoryConfig,
+): Record<string, unknown> {
+  return {
+    type: config.type ?? null,
+    label: config.label,
+    description: config.description ?? null,
+    legal: config.legal ?? null,
+    owner: config.owner ?? null,
+    governanceConfig: JSON.stringify(config.governanceConfig),
+    metadata: config.metadata !== undefined ? JSON.stringify(config.metadata) : null,
+    createdAt: config.createdAt,
+    createdBy: config.createdBy,
+  };
+}
+
 // ─── Internal helpers ────────────────────────────────────────────────
 
 function extractPropertyBag(record: DriverRecord, alias: string): Record<string, unknown> {
@@ -134,6 +229,7 @@ function extractPropertyBag(record: DriverRecord, alias: string): Record<string,
   }
   const bag: Record<string, unknown> = {};
   for (const key of record.keys) {
+    if (typeof key !== 'string') continue;
     bag[key] = record.get(key);
   }
   return bag;
@@ -245,6 +341,51 @@ function parsePropertiesBlob(props: Record<string, unknown>): Record<string, unk
     );
   }
   return parsed as Record<string, unknown>;
+}
+
+function parseRequiredJsonObject<T>(props: Record<string, unknown>, key: string): T {
+  const raw = props[key];
+  if (typeof raw !== 'string' || raw === '') {
+    throw new ProviderError(
+      `Neo4j record field "${key}" must be a non-empty JSON string (got ${describeType(raw)}).`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new ProviderError(`Neo4j record field "${key}" is not valid JSON: ${detail}.`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new ProviderError(
+      `Neo4j record field "${key}" must decode to a JSON object (got ${describeType(parsed)}).`,
+    );
+  }
+  return parsed as T;
+}
+
+function parseOptionalJsonObject<T>(props: Record<string, unknown>, key: string): T | undefined {
+  const raw = props[key];
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  if (typeof raw !== 'string') {
+    throw new ProviderError(
+      `Neo4j record field "${key}" must be a JSON string (got ${describeType(raw)}).`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new ProviderError(`Neo4j record field "${key}" is not valid JSON: ${detail}.`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new ProviderError(
+      `Neo4j record field "${key}" must decode to a JSON object (got ${describeType(parsed)}).`,
+    );
+  }
+  return parsed as T;
 }
 
 function parseEmbedding(props: Record<string, unknown>): number[] | undefined {

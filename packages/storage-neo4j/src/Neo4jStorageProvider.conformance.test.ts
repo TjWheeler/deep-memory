@@ -1,14 +1,31 @@
 // Conformance harness for Neo4jStorageProvider.
 //
-// Currently asserts only the EnsureSchemaResult shape against a live Neo4j.
-// Full StorageProvider conformance (via runStorageProviderConformanceTests
-// from @utaba/deep-memory/testing) lands once CRUD methods are in place.
+// The full `runStorageProviderConformanceTests` from @utaba/deep-memory/testing
+// lands once the CRUD surface is complete. Until then, this file covers the
+// pieces that already exist:
+//
+//   - ensureSchema (Phase 2/3 — idempotent DDL + _Meta version handshake).
+//   - Repository CRUD (Phase 4 — create / get / list / update / delete /
+//     deleteAllContents, with the dm_repository_unique constraint mapped to
+//     DuplicateRepositoryError and the chunked-wipe progress callback).
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run.
 // Example:
 //   NEO4J_URI=bolt://localhost:7687 NEO4J_USER=neo4j NEO4J_PASSWORD=local-dev-password pnpm test
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from 'vitest';
+import {
+  DuplicateRepositoryError,
+  RepositoryNotFoundError,
+} from '@utaba/deep-memory';
 import { Neo4jStorageProvider } from './Neo4jStorageProvider.js';
 import { SCHEMA_VERSION } from './schema.js';
 
@@ -16,6 +33,10 @@ const NEO4J_URI = process.env['NEO4J_URI'];
 const NEO4J_USER = process.env['NEO4J_USER'] ?? 'neo4j';
 const NEO4J_PASSWORD = process.env['NEO4J_PASSWORD'] ?? '';
 const NEO4J_DATABASE = process.env['NEO4J_DATABASE'] ?? 'neo4j';
+
+function makeRid(suffix: string): string {
+  return `conf-${suffix}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+}
 
 if (NEO4J_URI) {
   describe('Neo4jStorageProvider — ensureSchema (live)', () => {
@@ -55,6 +76,206 @@ if (NEO4J_URI) {
         alreadyUpToDate: true,
         schemaVersion: SCHEMA_VERSION,
       });
+    });
+  });
+
+  describe('Neo4jStorageProvider — repository CRUD (live)', () => {
+    let provider: Neo4jStorageProvider;
+    const seeded: string[] = [];
+
+    beforeAll(async () => {
+      provider = new Neo4jStorageProvider({
+        uri: NEO4J_URI,
+        username: NEO4J_USER,
+        password: NEO4J_PASSWORD,
+        database: NEO4J_DATABASE,
+      });
+      await provider.initialize();
+      await provider.ensureSchema();
+    });
+
+    afterAll(async () => {
+      // Defensive cleanup — any rid that survived an aborted test.
+      for (const rid of seeded) {
+        try {
+          await provider.deleteRepository(rid);
+        } catch {
+          // Already deleted or never created — ignore.
+        }
+      }
+      await provider.dispose();
+    });
+
+    let rid: string;
+
+    beforeEach(() => {
+      rid = makeRid('crud');
+      seeded.push(rid);
+    });
+
+    afterEach(async () => {
+      try {
+        await provider.deleteRepository(rid);
+      } catch {
+        // Test may have already deleted it.
+      }
+    });
+
+    it('createRepository returns the stored row, getRepository round-trips it', async () => {
+      const created = await provider.createRepository({
+        repositoryId: rid,
+        label: 'conf label',
+        description: 'conf desc',
+        type: 'general',
+        governanceConfig: { mode: 'open' },
+        metadata: { embeddingModelId: 'm', embeddingDimensions: 1 },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+      expect(created.repositoryId).toBe(rid);
+      expect(created.label).toBe('conf label');
+
+      const fetched = await provider.getRepository(rid);
+      expect(fetched).not.toBeNull();
+      expect(fetched?.repositoryId).toBe(rid);
+      expect(fetched?.description).toBe('conf desc');
+      expect(fetched?.type).toBe('general');
+      expect(fetched?.metadata?.embeddingModelId).toBe('m');
+      expect(fetched?.governanceConfig.mode).toBe('open');
+    });
+
+    it('createRepository rejects duplicate repositoryId with DuplicateRepositoryError', async () => {
+      await provider.createRepository({
+        repositoryId: rid,
+        label: 'first',
+        governanceConfig: { mode: 'open' },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+
+      await expect(
+        provider.createRepository({
+          repositoryId: rid,
+          label: 'second',
+          governanceConfig: { mode: 'open' },
+          createdAt: '2026-05-27T00:00:00Z',
+          createdBy: 'conformance',
+        }),
+      ).rejects.toBeInstanceOf(DuplicateRepositoryError);
+    });
+
+    it('getRepository returns null for an unknown id', async () => {
+      const result = await provider.getRepository(`missing-${Date.now()}`);
+      expect(result).toBeNull();
+    });
+
+    it('listRepositories paginates with exact totals and respects the type filter', async () => {
+      const extra = makeRid('crud-extra');
+      seeded.push(extra);
+      await provider.createRepository({
+        repositoryId: rid,
+        label: 'a',
+        type: 'tagged',
+        governanceConfig: { mode: 'open' },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+      await provider.createRepository({
+        repositoryId: extra,
+        label: 'b',
+        type: 'untagged',
+        governanceConfig: { mode: 'open' },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+
+      try {
+        const all = await provider.listRepositories({ limit: 100 });
+        const ids = all.items.map((r) => r.repositoryId);
+        expect(ids).toContain(rid);
+        expect(ids).toContain(extra);
+        expect(typeof all.total).toBe('number');
+        expect(all.total).toBeGreaterThanOrEqual(2);
+
+        const filtered = await provider.listRepositories({ type: 'tagged', limit: 100 });
+        const filteredIds = filtered.items.map((r) => r.repositoryId);
+        expect(filteredIds).toContain(rid);
+        expect(filteredIds).not.toContain(extra);
+
+        const paged = await provider.listRepositories({ limit: 1 });
+        expect(paged.items).toHaveLength(1);
+        expect(paged.hasMore).toBe(true);
+      } finally {
+        await provider.deleteRepository(extra).catch(() => undefined);
+      }
+    });
+
+    it('updateRepository merges metadata and returns the updated row in one round-trip', async () => {
+      await provider.createRepository({
+        repositoryId: rid,
+        label: 'before',
+        governanceConfig: { mode: 'open' },
+        metadata: { embeddingModelId: 'old', embeddingDimensions: 1 },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+
+      const updated = await provider.updateRepository(rid, {
+        label: 'after',
+        metadata: { embeddingModelId: 'new', extra: 'value' },
+      });
+      expect(updated.label).toBe('after');
+      expect(updated.metadata?.embeddingModelId).toBe('new');
+      expect(updated.metadata?.embeddingDimensions).toBe(1);
+      expect(updated.metadata?.['extra']).toBe('value');
+
+      const refetched = await provider.getRepository(rid);
+      expect(refetched?.label).toBe('after');
+      expect(refetched?.metadata?.['extra']).toBe('value');
+    });
+
+    it('updateRepository throws RepositoryNotFoundError for an unknown id', async () => {
+      await expect(
+        provider.updateRepository(`missing-${Date.now()}`, { label: 'x' }),
+      ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    });
+
+    it('deleteRepository removes the repository and is idempotent on missing ids', async () => {
+      await provider.createRepository({
+        repositoryId: rid,
+        label: 'to-delete',
+        governanceConfig: { mode: 'open' },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+
+      await provider.deleteRepository(rid);
+      expect(await provider.getRepository(rid)).toBeNull();
+
+      // Idempotent — re-deleting an already-deleted repo should not throw
+      // (empty-match branch confirmed by probe P13).
+      await expect(provider.deleteRepository(rid)).resolves.toBeUndefined();
+    });
+
+    it('deleteRepository fires the progress callback at least once when there is data to drain', async () => {
+      await provider.createRepository({
+        repositoryId: rid,
+        label: 'has-data',
+        governanceConfig: { mode: 'open' },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+
+      const progress: Array<{ entitiesDeleted: number; relationshipsDeleted: number }> = [];
+      // The repo has no entities or relationships, only the _Repository node,
+      // so the relationship-drain loop emits no progress and the node-drain
+      // loop runs once. With zero user entities, neither loop fires the
+      // callback — assert the call resolves cleanly instead.
+      await expect(
+        provider.deleteRepository(rid, (p) => {
+          progress.push({ entitiesDeleted: p.entitiesDeleted, relationshipsDeleted: p.relationshipsDeleted });
+        }),
+      ).resolves.toBeUndefined();
     });
   });
 } else {

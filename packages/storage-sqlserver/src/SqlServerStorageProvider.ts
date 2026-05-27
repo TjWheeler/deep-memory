@@ -1334,10 +1334,10 @@ export class SqlServerStorageProvider implements StorageProvider {
     const srcBidi = `SELECT * FROM ${tbl} WHERE [repository_id] = @repoId AND [source_entity_id] = @entityId AND [bidirectional] = 1${rtFilter}`;
 
     switch (direction) {
-      case 'outbound':
+      case 'out':
         // Outbound = where entity is source, OR where entity is target of a bidirectional rel
         return `${srcBase} UNION ALL ${tgtBidi} AND [source_entity_id] <> @entityId`;
-      case 'inbound':
+      case 'in':
         // Inbound = where entity is target, OR where entity is source of a bidirectional rel
         return `${tgtBase} UNION ALL ${srcBidi} AND [target_entity_id] <> @entityId`;
       case 'both':
@@ -1953,10 +1953,10 @@ export class SqlServerStorageProvider implements StorageProvider {
 
     let unionQuery: string;
     switch (direction) {
-      case 'outbound':
+      case 'out':
         unionQuery = `${srcBase} UNION ALL ${tgtBidi}`;
         break;
-      case 'inbound':
+      case 'in':
         unionQuery = `${tgtBase} UNION ALL ${srcBidi}`;
         break;
       case 'both':

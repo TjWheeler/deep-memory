@@ -70,7 +70,7 @@ export interface TraversalSpec {
   dedup?: boolean;
 
   /**
-   * Whether to include a relationship summary (outbound/inbound counts by type)
+   * Whether to include a relationship summary (out/in counts by type)
    * on each entity in the result. Default: false.
    *
    * Native GraphTraversalProviders (Gremlin, Cypher) can return this in a single
@@ -140,7 +140,12 @@ export interface TraversalStart {
  * A single step in the traversal — one hop along a relationship edge.
  */
 export interface TraversalStep {
-  /** Direction to traverse. */
+  /**
+   * Direction to traverse, relative to the entity at the start of the hop:
+   * - `'out'`  — follow edges where the current entity is the source
+   * - `'in'`   — follow edges where the current entity is the target
+   * - `'both'` — follow edges in either direction
+   */
   direction: 'out' | 'in' | 'both';
 
   /**
@@ -261,18 +266,18 @@ export interface TraversalRelationship {
   /**
    * Walk direction at the last hop, with mode-specific semantics:
    *
-   * - **`'path'` mode** — `'outbound'` when the walk crossed the edge from
-   *   `sourceEntityId` to `targetEntityId`, `'inbound'` when it crossed in
+   * - **`'path'` mode** — `'out'` when the walk crossed the edge from
+   *   `sourceEntityId` to `targetEntityId`, `'in'` when it crossed in
    *   the opposite direction. Computed relative to the entity at the
    *   start of the hop within each `TraversalPath`.
-   * - **`'all'` mode** — always `'outbound'`. Reflects the stored edge
+   * - **`'all'` mode** — always `'out'`. Reflects the stored edge
    *   topology (`sourceEntityId` → `targetEntityId`), not any particular
    *   walk; the deduped union has no walk context. Callers can derive
    *   walk-direction relative to any anchor using `sourceEntityId` /
    *   `targetEntityId`.
    * - **`'terminal'` mode** — relationships are not returned.
    */
-  direction: 'outbound' | 'inbound';
+  direction: 'out' | 'in';
   properties: Record<string, unknown>;
 }
 

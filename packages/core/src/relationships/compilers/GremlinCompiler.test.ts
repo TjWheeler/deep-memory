@@ -280,6 +280,48 @@ describe('GremlinCompiler', () => {
     expect(result.query).not.toContain("'embedding'");
   });
 
+  it("emits vertex branch before edge branch at each depth in 'all' mode union", () => {
+    // Ordering invariant: within each depth, the vertex branch must precede
+    // the edge branch in the union. The deduped+ranged stream is then closed
+    // under per-hop entity references — an edge in any .range() prefix is
+    // preceded by the vertex it newly introduced, so single-hop pagination
+    // returns a referentially self-contained slice for any limit.
+    const spec: TraversalSpec = {
+      start: { entityId: 'start' },
+      steps: [
+        { direction: 'out', relationshipTypes: ['R1'] },
+        { direction: 'out', relationshipTypes: ['R2'] },
+      ],
+      returnMode: 'all',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+
+    // Depth-1 vertex branch (outE.inV) must appear before depth-1 edge branch
+    // (outE alone) in the union string. Both end in their per-type project chain
+    // which is the disambiguator vs deeper-depth branches that share a prefix.
+    const depth1Vertex = result.query.search(
+      /__\.outE\(p\d+\)\.inV\(\)\.project\('__kind','id','entityType'/,
+    );
+    const depth1Edge = result.query.search(
+      /__\.outE\(p\d+\)\.project\('__kind','id','relationshipType'/,
+    );
+    expect(depth1Vertex).toBeGreaterThan(-1);
+    expect(depth1Edge).toBeGreaterThan(-1);
+    expect(depth1Vertex).toBeLessThan(depth1Edge);
+
+    // Depth-2 vertex branch (…outE.inV.outE.inV) must appear before depth-2
+    // edge branch (…outE.inV.outE). Both share the depth-1 prefix.
+    const depth2Vertex = result.query.search(
+      /__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)\.inV\(\)\.project\('__kind','id','entityType'/,
+    );
+    const depth2Edge = result.query.search(
+      /__\.outE\(p\d+\)\.inV\(\)\.outE\(p\d+\)\.project\('__kind','id','relationshipType'/,
+    );
+    expect(depth2Vertex).toBeGreaterThan(-1);
+    expect(depth2Edge).toBeGreaterThan(-1);
+    expect(depth2Vertex).toBeLessThan(depth2Edge);
+  });
+
   it("compiles 'all' mode with .dedup() even when spec.dedup is false", () => {
     const spec: TraversalSpec = {
       start: { entityId: 'e1' },

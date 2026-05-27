@@ -185,7 +185,7 @@ export class GraphTraversal {
           return {
             id: rid,
             type: r?.type ?? 'unknown',
-            direction: r?.sourceEntityId === currentEntityId ? 'outbound' : 'inbound',
+            direction: r?.sourceEntityId === currentEntityId ? 'out' : 'in',
             properties: r?.properties ?? {},
           };
         }),

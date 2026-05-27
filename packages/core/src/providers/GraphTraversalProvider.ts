@@ -84,7 +84,7 @@ export interface GraphTraversalCapabilities {
   supportsDedup: boolean;
 
   /**
-   * Whether the provider can return relationship summaries (outbound/inbound
+   * Whether the provider can return relationship summaries (out/in
    * counts by type) natively in a single traversal query.
    * When false, the library falls back to a batch fetch + local computation.
    */

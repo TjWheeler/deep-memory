@@ -559,16 +559,16 @@ describe('MemoryRepository', () => {
       await repo.createRelationships([{ relationshipType: 'knows', sourceEntityId: bob.id, targetEntityId: alice.id }]);
 
       const summary = await repo.getRelationshipSummary(alice.id);
-      expect(summary.outbound['WORKS_AT']).toBe(2);
-      // 'knows' is bidirectional so alice appears as target, counted as inbound
-      expect(summary.inbound['KNOWS']).toBe(1);
+      expect(summary.out['WORKS_AT']).toBe(2);
+      // 'knows' is bidirectional so alice appears as target, counted as in
+      expect(summary.in['KNOWS']).toBe(1);
     });
 
     it('returns empty summary for entity with no relationships', async () => {
       const [entity] = await repo.createEntities([{ entityType: 'person', label: 'Lonely' }]);
       const summary = await repo.getRelationshipSummary(entity.id);
-      expect(summary.outbound).toEqual({});
-      expect(summary.inbound).toEqual({});
+      expect(summary.out).toEqual({});
+      expect(summary.in).toEqual({});
     });
   });
 

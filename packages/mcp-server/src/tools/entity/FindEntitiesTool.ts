@@ -20,7 +20,7 @@ export class FindEntitiesTool extends BaseToolController {
         conversationId: { type: 'string', description: 'Filter to entities from this conversation' },
         actor: { type: 'string', description: 'Filter to entities created/modified by this actor' },
         dateRange: { type: 'object', properties: { from: { type: 'string' }, to: { type: 'string' } }, description: 'Filter by date range (ISO 8601)' },
-        includeRelationshipSummary: { type: 'boolean', description: 'Attach a relationship count summary (outbound/inbound by type) to each entity (default false)' },
+        includeRelationshipSummary: { type: 'boolean', description: 'Attach a relationship count summary (out/in by type) to each entity (default false)' },
       },
       required: ['repositoryId'],
     };

@@ -1,3 +1,7 @@
+// Note: this suite is the canonical coverage for the application-level traversal
+// path. Both the SQL Server provider (which lacks a native GraphTraversalProvider)
+// and the in-memory provider route through executeFallbackTraversal, so changes
+// here ripple to SQL Server's traversal behavior without separate test setup.
 import { describe, it, expect, beforeEach } from 'vitest';
 import { executeFallbackTraversal } from './FallbackTraversalExecutor.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
@@ -363,7 +367,7 @@ describe('FallbackTraversalExecutor', () => {
 
   it('path mode: inbound step reports direction=inbound', async () => {
     // Edge stored as comp-1 → REQUIRES_FLUID → fluid-1. Walking inbound from
-    // fluid-1 crosses the edge target → source, so direction must be 'inbound'.
+    // fluid-1 crosses the edge target → source, so direction must be 'in'.
     const spec: TraversalSpec = {
       start: { entityId: 'fluid-1' },
       steps: [{ direction: 'in', relationshipTypes: ['REQUIRES_FLUID'] }],
@@ -374,10 +378,10 @@ describe('FallbackTraversalExecutor', () => {
     expect(result.paths).toBeDefined();
     expect(result.paths!.length).toBe(1);
     expect(result.paths![0]!.relationships).toHaveLength(1);
-    expect(result.paths![0]!.relationships[0]!.direction).toBe('inbound');
+    expect(result.paths![0]!.relationships[0]!.direction).toBe('in');
     // Outer rels mirror walk direction (first-writer-wins).
     expect(result.relationships).toBeDefined();
-    expect(result.relationships![0]!.direction).toBe('inbound');
+    expect(result.relationships![0]!.direction).toBe('in');
   });
 
   it('path mode: both-direction step assigns direction per-walk', async () => {
@@ -394,17 +398,17 @@ describe('FallbackTraversalExecutor', () => {
     expect(result.paths).toBeDefined();
     expect(result.paths!.length).toBe(2);
 
-    const directionByTerminal = new Map<string, 'outbound' | 'inbound'>();
+    const directionByTerminal = new Map<string, 'out' | 'in'>();
     for (const p of result.paths!) {
       directionByTerminal.set(p.entities[1]!.id, p.relationships[0]!.direction);
     }
-    expect(directionByTerminal.get('fluid-1')).toBe('outbound');
-    expect(directionByTerminal.get('equip-1')).toBe('inbound');
+    expect(directionByTerminal.get('fluid-1')).toBe('out');
+    expect(directionByTerminal.get('equip-1')).toBe('in');
   });
 
-  it("all mode: every relationship has direction='outbound' regardless of walk direction", async () => {
+  it("all mode: every relationship has direction='out' regardless of walk direction", async () => {
     // Same both-direction fanout from comp-1; in 'all' mode direction
-    // reflects stored topology (always 'outbound'), not walk direction.
+    // reflects stored topology (always 'out'), not walk direction.
     const spec: TraversalSpec = {
       start: { entityId: 'comp-1' },
       steps: [{ direction: 'both' }],
@@ -415,7 +419,7 @@ describe('FallbackTraversalExecutor', () => {
     expect(result.relationships).toBeDefined();
     expect(result.relationships!.length).toBeGreaterThan(0);
     for (const rel of result.relationships!) {
-      expect(rel.direction).toBe('outbound');
+      expect(rel.direction).toBe('out');
     }
   });
 });
@@ -546,9 +550,10 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
   it('all mode paginates the entity+edge union together (page 1: start-frontier persons)', async () => {
     // Union layout for this scenario (6 Persons → WORKS_AT → 2 Orgs):
     //   positions 0-5  : 6 Person entities (depth-0 vertices)
-    //   positions 6-11 : 6 WORKS_AT edges (depth-1 edges)
-    //   positions 12-13: 2 Organization entities (depth-1 vertices)
-    // Total: 14 union elements.
+    //   positions 6-7  : 2 Organization entities (depth-1 vertices)
+    //   positions 8-13 : 6 WORKS_AT edges (depth-1 edges)
+    // Vertices precede edges at each depth so edges in any prefix have their
+    // endpoints present. Total: 14 union elements.
     const spec: TraversalSpec = {
       start: { entityType: 'Person' },
       steps: [{ direction: 'out', relationshipTypes: ['WORKS_AT'] }],
@@ -568,8 +573,12 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
     expect(result.entities.every((e) => (e as { entityType: string }).entityType === 'Person')).toBe(true);
   });
 
-  it('all mode pagination spans entities and edges across pages without overlap', async () => {
-    // Page through the same 14-element union in chunks of 10.
+  it('all mode pagination spans entities and edges across pages with greedy endpoint expansion', async () => {
+    // Page through the same 14-element union in chunks of 10. Page 2 holds
+    // only edges by union ordering; greedy-expand pulls their endpoint
+    // vertices into the page so it remains referentially self-contained.
+    // The pulled-in vertices are duplicates of page 1's entities (the
+    // documented soft-limit / cross-page-duplicate cost).
     const baseSpec: TraversalSpec = {
       start: { entityType: 'Person' },
       steps: [{ direction: 'out', relationshipTypes: ['WORKS_AT'] }],
@@ -580,29 +589,78 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
     const page1 = await executeFallbackTraversal(repoId, storage, { ...baseSpec, offset: 0 });
     const page2 = await executeFallbackTraversal(repoId, storage, { ...baseSpec, offset: 10 });
 
-    // Page 1: positions 0-9 — 6 Persons + 4 WORKS_AT edges.
-    expect(page1.entities.length).toBe(6);
-    expect(page1.relationships!.length).toBe(4);
+    // Page 1: positions 0-9 — 6 Persons + 2 Orgs + 2 WORKS_AT edges.
+    // No greedy-expand needed; every edge's endpoints already in the page.
+    expect(page1.entities.length).toBe(8);
+    expect(page1.relationships!.length).toBe(2);
     expect(page1.total).toBe(10);
     expect(page1.returned).toBe(10);
     expect(page1.hasMore).toBe(true);
 
-    // Page 2: positions 10-13 — 2 WORKS_AT edges + 2 Organizations.
-    expect(page2.entities.length).toBe(2);
-    expect(page2.relationships!.length).toBe(2);
-    expect(page2.total).toBe(4);
-    expect(page2.returned).toBe(4);
+    // Page 2: positions 10-13 — 4 WORKS_AT edges by union ordering.
+    // Greedy-expand pulls in each edge's endpoint vertices (already emitted
+    // in page 1, re-appearing here for self-contained referential integrity).
+    expect(page2.relationships!.length).toBe(4);
+    expect(page2.entities.length).toBeGreaterThan(0);
     expect(page2.hasMore).toBe(false);
-    expect(page2.entities.every((e) => (e as { entityType: string }).entityType === 'Organization')).toBe(true);
+    // Every relationship endpoint must be in the page's entities array.
+    const page2EntityIds = new Set(page2.entities.map((e) => e.id));
+    for (const rel of page2.relationships!) {
+      expect(page2EntityIds.has(rel.sourceEntityId)).toBe(true);
+      expect(page2EntityIds.has(rel.targetEntityId)).toBe(true);
+    }
 
-    // Across pages: no id overlap on either entities or relationships.
-    const allEntityIds = [...page1.entities, ...page2.entities].map((e) => e.id);
+    // Relationship ids do not overlap across pages.
     const allRelIds = [...page1.relationships!, ...page2.relationships!].map((r) => r.id);
-    expect(new Set(allEntityIds).size).toBe(allEntityIds.length);
     expect(new Set(allRelIds).size).toBe(allRelIds.length);
-
-    // And the combined pages reconstruct the full 14-element union (8 entities + 6 edges).
-    expect(allEntityIds.length).toBe(8);
     expect(allRelIds.length).toBe(6);
+
+    // Entity ids may overlap (greedy-expand re-includes endpoints). Combined
+    // unique set covers all 8 distinct entities.
+    const uniqueEntityIds = new Set([...page1.entities, ...page2.entities].map((e) => e.id));
+    expect(uniqueEntityIds.size).toBe(8);
+  });
+
+  // ─── Referential integrity at small limits — Council bug regression ──
+
+  it('all mode at limit=2 returns a referentially self-contained page (one provision → one structure)', async () => {
+    // Mirrors the Council bug repro: a single start vertex with multiple
+    // inbound edges, queried at limit=2. Pre-fix the response contained a
+    // relationship whose source entity sat past the slice and was dropped,
+    // breaking referential integrity. Post-fix the slice is closed.
+    const spec: TraversalSpec = {
+      start: { entityId: 'org-nexus' },
+      steps: [{ direction: 'in', relationshipTypes: ['WORKS_AT'] }],
+      returnMode: 'all',
+      limit: 2,
+      offset: 0,
+    };
+
+    const result = await executeFallbackTraversal(repoId, storage, spec);
+    const pageEntityIds = new Set(result.entities.map((e) => e.id));
+    for (const rel of result.relationships ?? []) {
+      expect(pageEntityIds.has(rel.sourceEntityId)).toBe(true);
+      expect(pageEntityIds.has(rel.targetEntityId)).toBe(true);
+    }
+  });
+
+  it('all mode referential integrity holds across the full limit-sweep', async () => {
+    // Run the same query at every limit from 1 through the full union size
+    // and assert that, on every page, every relationship's endpoints are
+    // present in the page's entities array.
+    const baseSpec: TraversalSpec = {
+      start: { entityType: 'Person' },
+      steps: [{ direction: 'out', relationshipTypes: ['WORKS_AT'] }],
+      returnMode: 'all',
+    };
+
+    for (const limit of [1, 2, 3, 5, 7, 8, 10, 14]) {
+      const result = await executeFallbackTraversal(repoId, storage, { ...baseSpec, limit });
+      const pageEntityIds = new Set(result.entities.map((e) => e.id));
+      for (const rel of result.relationships ?? []) {
+        expect(pageEntityIds.has(rel.sourceEntityId), `limit=${limit} sourceEntityId=${rel.sourceEntityId}`).toBe(true);
+        expect(pageEntityIds.has(rel.targetEntityId), `limit=${limit} targetEntityId=${rel.targetEntityId}`).toBe(true);
+      }
+    }
   });
 });

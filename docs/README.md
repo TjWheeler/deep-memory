@@ -81,6 +81,7 @@ Each provider's canonical documentation lives in its package README. The `docs/`
 - [Import & Export Guidance](import-export-guidance.md) — Workflows for building, shipping, and updating knowledge repositories in production.
 - [Troubleshooting](troubleshooting.md) — Cross-cutting issues across extraction, embeddings, and import. Symptoms, diagnoses, fixes.
 - [Publishing Guide](publishing-guide.md) — How to publish packages to npm under the `@utaba` organisation.
+- [Changeset Guide](changeset-guide.md) — **AI agents: load this before writing a changeset.** Self-contained reference for the changeset format, fixed-group versioning, bump-level rules, and anti-patterns. Replaces ad-hoc git-history mining.
 
 ## Coding Conventions
 

@@ -87,10 +87,10 @@ export async function getEntityRelationships(
   // Build edge traversal based on direction
   let edgeTraversal: string;
   switch (direction) {
-    case 'outbound':
+    case 'out':
       edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').outE()";
       break;
-    case 'inbound':
+    case 'in':
       edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').inE()";
       break;
     case 'both':
@@ -112,14 +112,14 @@ export async function getEntityRelationships(
   }
 
   // For bidirectional support in outbound/inbound:
-  // When direction is 'outbound', include inbound edges that are bidirectional
-  // When direction is 'inbound', include outbound edges that are bidirectional
+  // When direction is 'out', include inbound edges that are bidirectional
+  // When direction is 'in', include outbound edges that are bidirectional
   // This requires a union approach.
   let unionQuery: string | null = null;
-  if (direction === 'outbound') {
+  if (direction === 'out') {
     // outE + inE where bidirectional=true
     unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(outE()${typeFilter}, inE()${typeFilter}.has('bidirectional', true))`;
-  } else if (direction === 'inbound') {
+  } else if (direction === 'in') {
     unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(inE()${typeFilter}, outE()${typeFilter}.has('bidirectional', true))`;
   }
 

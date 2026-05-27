@@ -277,8 +277,9 @@ export const STORED_ENTITY_FIELDS = [
  * appends after `RETURN ` (or after `SET ... RETURN ` for projection-on-write).
  *
  * `embedding` is opt-in: pass `loadEmbeddings: true` to add `n.embedding AS
- * embedding` to the tail. Probe P6 confirmed that `RETURN n.<field> AS <field>`
- * after a `SET` returns the post-SET state in one round-trip — no re-MATCH.
+ * embedding` to the tail. `RETURN n.<field> AS <field>` after a `SET` ships
+ * the post-SET state in the same round-trip, so `updateEntity` reuses this
+ * projection for projection-on-write without a re-MATCH.
  *
  * `alias` defaults to `'n'`; the fulltext-index search branch uses `'node'`.
  */
@@ -295,20 +296,123 @@ export function buildEntityProjection(options?: {
 }
 
 /**
- * Build the parameter map for the fixed-shape `CREATE` entity template. Every
- * field gets a binding on every call so the planner reuses one cached plan
- * across all entity creates (D15 — plan-cache friendliness).
+ * Schema-managed property names on `:_Entity` nodes. User-supplied
+ * `entity.properties` keys cannot collide with these — colliding would clobber
+ * a schema-managed scalar via `SET n += $userProperties` and break round-trip.
  *
- * Optional fields bind as `null`. Neo4j drops null properties on write (probe
- * P6 Test 4 confirmed this) — symmetric with the read mapping where absent
- * properties round-trip as `undefined` via `optionalString`. The umbrella
- * `:_Entity` label is the only label written on the node — per probe P5,
- * per-type labels add ~12 ms cold compile + ~1.2 ms steady-state per call with
- * no offsetting benefit, since every provider read filters via the indexed
- * `n.entityType` property.
+ * Kept as a frozen `Set` for O(1) membership checks on the write hot path.
+ */
+export const RESERVED_ENTITY_PROPERTY_KEYS: ReadonlySet<string> = new Set([
+  'id',
+  'repositoryId',
+  'entityType',
+  'label',
+  'slug',
+  'summary',
+  'properties',
+  'data',
+  'dataFormat',
+  'embedding',
+  'createdBy',
+  'createdByType',
+  'createdAt',
+  'createdInConversation',
+  'createdFromMessage',
+  'modifiedBy',
+  'modifiedByType',
+  'modifiedAt',
+  'modifiedInConversation',
+  'modifiedFromMessage',
+]);
+
+/**
+ * User-supplied property keys are interpolated into the Cypher string at
+ * REMOVE-time (Cypher 25 cannot REMOVE a property whose key is bound at
+ * run-time) and used in the predicate slot of `findEntities`. Restrict them
+ * to the bare Cypher identifier shape so the interpolation cannot widen the
+ * injection surface — same guard `assertSafeRelationshipType` applies to the
+ * relationship-type slot.
+ */
+const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Validate a user-supplied entity property key. Throws `ProviderError` when
+ * the key is not a bare Cypher identifier or collides with a schema-managed
+ * field name. Both checks run on every write and every predicate emission —
+ * the cost is one regex test plus one set lookup per key per call.
+ */
+export function assertSafeUserPropertyKey(key: string): string {
+  if (!USER_PROPERTY_KEY_PATTERN.test(key)) {
+    throw new ProviderError(
+      `Entity property key "${key}" is not a valid Cypher identifier — must match ` +
+        `${USER_PROPERTY_KEY_PATTERN.source}. User-property keys are interpolated into ` +
+        `Cypher REMOVE / predicate slots (the key slot cannot be parameterised), so an ` +
+        `unsafe value would widen the injection surface.`,
+    );
+  }
+  if (RESERVED_ENTITY_PROPERTY_KEYS.has(key)) {
+    throw new ProviderError(
+      `Entity property key "${key}" collides with a schema-managed field. ` +
+        `Reserved names: ${Array.from(RESERVED_ENTITY_PROPERTY_KEYS).join(', ')}.`,
+    );
+  }
+  return key;
+}
+
+/**
+ * Decide whether a value can be stored as a native Neo4j scalar property.
+ * Native scalars are the predicate-queryable surface; non-storable values
+ * (nested objects, `null`, heterogeneous arrays, arrays of objects) live only
+ * inside the JSON-stringified `properties` blob and are NOT predicate-queryable.
  *
- * `embedding` is bound as the native `number[]` (driver maps directly per
- * probe P2 — no JSON-stringify step) or `null` when absent.
+ * The set covers what Cypher's literal property syntax accepts uniformly:
+ * `string`, finite `number`, `boolean`, and homogeneous arrays of those. The
+ * driver passes these through Bolt without wrapping; everything else either
+ * fails Bolt encoding or coerces to a shape Cypher cannot index.
+ */
+export function isNativeStorableValue(value: unknown): boolean {
+  if (typeof value === 'string') return true;
+  if (typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return true;
+    const first = value[0];
+    const t = typeof first;
+    if (t !== 'string' && t !== 'boolean' && (t !== 'number' || !Number.isFinite(first))) {
+      return false;
+    }
+    for (const v of value) {
+      if (typeof v !== t) return false;
+      if (t === 'number' && !Number.isFinite(v as number)) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Build the parameter map for the schema-managed slots of the fixed-shape
+ * entity `CREATE` template. Every schema field gets a binding on every call so
+ * the planner reuses one cached plan across all entity creates (D15 — plan
+ * cache friendliness).
+ *
+ * User-supplied `entity.properties` are NOT in this bag — they bind through
+ * the separate `entityUserPropertyParams` helper and feed the
+ * `SET n += $userProperties` clause that runs alongside the fixed CREATE. The
+ * split keeps the CREATE plan-cache-keyed on a single Cypher string while
+ * letting user-property keys live as native predicate-queryable scalars on
+ * the node in addition to the JSON blob.
+ *
+ * Optional fields bind as `null`. Neo4j drops null properties on write —
+ * symmetric with the read mapping where absent properties round-trip as
+ * `undefined` via `optionalString`. The umbrella `:_Entity` label is the only
+ * label written on the node; writing a per-type label as well would add
+ * cold-compile and steady-state overhead with no offsetting benefit, since
+ * every provider read filters via the indexed `n.entityType` property.
+ *
+ * `embedding` is bound as the native `number[]` — the Neo4j JS driver maps
+ * `LIST<FLOAT>` directly to a JS `Array` with no wrapping, so no
+ * JSON-stringify step — or `null` when absent.
  */
 export function entityToParams(entity: StoredEntity): Record<string, unknown> {
   const p = entity.provenance;
@@ -333,6 +437,138 @@ export function entityToParams(entity: StoredEntity): Record<string, unknown> {
     modifiedInConversation: p.modifiedInConversation ?? null,
     modifiedFromMessage: p.modifiedFromMessage ?? null,
   };
+}
+
+/**
+ * Project `entity.properties` to the native-scalar map fed to
+ * `SET n += $userProperties`. Validates every key (no reserved-name
+ * collision, identifier shape) and silently drops values that Neo4j cannot
+ * store natively — those live only inside the JSON blob. The blob remains
+ * authoritative for `entity.properties` round-trip via `entityFromProperties`,
+ * so dropping a value here loses only its predicate-queryable shape, not its
+ * read shape.
+ *
+ * The return is the bare map that binds to `$userProperties`; callers append
+ * `SET n += $userProperties` to the CREATE / UPDATE template and bind this
+ * value verbatim. An empty map is the no-op shape (`SET n += {}` is legal
+ * Cypher and resets nothing), so the caller can emit the SET unconditionally.
+ */
+export function entityUserPropertyParams(
+  properties: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(properties)) {
+    assertSafeUserPropertyKey(key);
+    if (isNativeStorableValue(value)) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Field list projected by relationship read paths. Mirror of
+ * `STORED_ENTITY_FIELDS` for `StoredRelationship` — `repositoryId` is the
+ * scope discriminator, not a public field, so it is intentionally excluded
+ * from the projection.
+ *
+ * Keeping this list in lockstep with `relationshipFromProperties` is enforced
+ * by the co-located mapping tests — adding a new field requires updating both.
+ */
+export const STORED_RELATIONSHIP_FIELDS = [
+  'id',
+  'relationshipType',
+  'sourceEntityId',
+  'targetEntityId',
+  'properties',
+  'bidirectional',
+  'createdBy',
+  'createdByType',
+  'createdAt',
+  'createdInConversation',
+  'createdFromMessage',
+  'modifiedBy',
+  'modifiedByType',
+  'modifiedAt',
+  'modifiedInConversation',
+  'modifiedFromMessage',
+] as const;
+
+/**
+ * Build a `RETURN` projection chain for a relationship read. The result is a
+ * comma-separated list of `r.<field> AS <field>` clauses; the caller appends
+ * after `RETURN ` (or after UNION ALL branches that all project the same
+ * shape).
+ *
+ * `alias` defaults to `'r'`. Each UNION branch must use the same alias and
+ * the same field-name aliases to keep the union column-compatible.
+ */
+export function buildRelationshipProjection(options?: { alias?: string }): string {
+  const alias = options?.alias ?? 'r';
+  return STORED_RELATIONSHIP_FIELDS.map((field) => `${alias}.${field} AS ${field}`).join(', ');
+}
+
+/**
+ * Build the parameter map for the fixed-shape relationship `CREATE` template.
+ * Every field gets a binding on every call so the planner reuses one cached
+ * plan per relationship type (D15) — the type slot is interpolated into the
+ * Cypher string at compile time (the type slot cannot be parameterised in
+ * Cypher 25), so the plan cache holds one entry per distinct vocabulary type.
+ *
+ * Optional fields bind as `null`. Neo4j drops null properties on write, so
+ * absent fields are symmetric with their read-side `undefined`.
+ *
+ * `properties` is JSON-stringified into a single Neo4j property — relationship
+ * properties are not indexed and are not predicate-queried server-side
+ * (per O1/D6: indexed scalars live on entities only), so the blob round-trip
+ * is sufficient.
+ */
+export function relationshipToParams(rel: StoredRelationship): Record<string, unknown> {
+  const p = rel.provenance;
+  return {
+    id: rel.id,
+    relationshipType: rel.relationshipType,
+    sourceEntityId: rel.sourceEntityId,
+    targetEntityId: rel.targetEntityId,
+    properties: JSON.stringify(rel.properties ?? {}),
+    bidirectional: rel.bidirectional,
+    createdBy: p.createdBy,
+    createdByType: p.createdByType,
+    createdAt: p.createdAt,
+    createdInConversation: p.createdInConversation ?? null,
+    createdFromMessage: p.createdFromMessage ?? null,
+    modifiedBy: p.modifiedBy,
+    modifiedByType: p.modifiedByType,
+    modifiedAt: p.modifiedAt,
+    modifiedInConversation: p.modifiedInConversation ?? null,
+    modifiedFromMessage: p.modifiedFromMessage ?? null,
+  };
+}
+
+/**
+ * Cypher 25 forbids parameterising the relationship-type slot (Cypher
+ * identifier, not a value), so the type slug is concatenated directly into
+ * the query string at compile time. This guard pins the value to the bare
+ * identifier shape Cypher accepts unquoted, which is also the shape vocabulary
+ * slugs already emit (UPPER_SNAKE_CASE per D5).
+ *
+ * Anything failing the guard is a programming error in the caller — either a
+ * vocabulary value that bypassed slug normalisation, or a value handed in
+ * directly without going through the relationship-create surface. Surfacing
+ * it as `ProviderError` catches injection-shaped values at the chokepoint.
+ */
+const RELATIONSHIP_TYPE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function assertSafeRelationshipType(value: string): string {
+  if (!RELATIONSHIP_TYPE_PATTERN.test(value)) {
+    throw new ProviderError(
+      `Relationship type "${value}" is not a valid Cypher identifier — must match ` +
+        `${RELATIONSHIP_TYPE_PATTERN.source}. Cypher 25 does not allow parameterising ` +
+        `the relationship-type slot, so the value is interpolated directly into the ` +
+        `query string and an unsafe value would otherwise widen the injection surface.`,
+    );
+  }
+  return value;
 }
 
 /**

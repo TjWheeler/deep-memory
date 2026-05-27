@@ -4,12 +4,12 @@
 //   System labels:   _Entity, _Repository, _Vocabulary, _VocabularyChangeLog, _Meta
 //   Entity nodes:    :_Entity (umbrella) only. The entity-type discriminator
 //                    lives in `n.entityType` and is indexed by
-//                    `dm_entity_type_lookup`. Probe P5
-//                    (local-tests/baseline/neo4j-phase6-probes-results.md) ruled
-//                    out the per-type-label-as-well shape: it adds ~12 ms cold
-//                    compile per distinct type plus ~1.2 ms steady-state per
-//                    call with no benefit, because every provider read filters
-//                    by `n.entityType` regardless.
+//                    `dm_entity_type_lookup`. Writing a per-type label as well
+//                    adds measurable cold-compile overhead per distinct type
+//                    plus a steady-state per-call cost (the label slot cannot
+//                    be parameterised, so each distinct type produces its own
+//                    plan-cache entry) with no offsetting benefit — every
+//                    provider read filters by `n.entityType` regardless.
 //   Multi-tenancy:   every node and relationship carries a `repositoryId` property;
 //                    every composite constraint / index leads with `repositoryId`.
 //

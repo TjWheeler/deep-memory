@@ -1,11 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import { ProviderError } from '@utaba/deep-memory';
+import type { StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
 import {
+  assertSafeRelationshipType,
+  assertSafeUserPropertyKey,
   bigintToSafeNumber,
+  buildRelationshipProjection,
   entityFromProperties,
   entityFromRecord,
+  entityToParams,
+  entityUserPropertyParams,
+  isNativeStorableValue,
   relationshipFromProperties,
   relationshipFromRecord,
+  relationshipToParams,
+  RESERVED_ENTITY_PROPERTY_KEYS,
+  STORED_RELATIONSHIP_FIELDS,
   type DriverRecord,
 } from './mapping.js';
 
@@ -278,5 +288,241 @@ describe('relationshipFromRecord', () => {
   it('reads from an explicit projection', () => {
     const record = recordFromProjection(FULL_REL_PROPS);
     expect(relationshipFromRecord(record).id).toBe('rel-1');
+  });
+});
+
+// ─── relationshipToParams ───────────────────────────────────────────
+
+describe('relationshipToParams', () => {
+  const fullRel: StoredRelationship = {
+    id: 'rel-1',
+    relationshipType: 'WORKS_AT',
+    sourceEntityId: 'ent-alice',
+    targetEntityId: 'ent-acme',
+    properties: { role: 'senior engineer' },
+    bidirectional: false,
+    provenance: {
+      createdBy: 'tester',
+      createdByType: 'agent',
+      createdAt: '2026-05-27T00:00:00.000Z',
+      createdInConversation: 'conv-1',
+      createdFromMessage: 'msg-1',
+      modifiedBy: 'tester',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-27T01:00:00.000Z',
+      modifiedInConversation: 'conv-2',
+      modifiedFromMessage: 'msg-2',
+    },
+  };
+
+  it('emits a binding per relationship field, JSON-stringifying properties', () => {
+    expect(relationshipToParams(fullRel)).toEqual({
+      id: 'rel-1',
+      relationshipType: 'WORKS_AT',
+      sourceEntityId: 'ent-alice',
+      targetEntityId: 'ent-acme',
+      properties: JSON.stringify({ role: 'senior engineer' }),
+      bidirectional: false,
+      createdBy: 'tester',
+      createdByType: 'agent',
+      createdAt: '2026-05-27T00:00:00.000Z',
+      createdInConversation: 'conv-1',
+      createdFromMessage: 'msg-1',
+      modifiedBy: 'tester',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-27T01:00:00.000Z',
+      modifiedInConversation: 'conv-2',
+      modifiedFromMessage: 'msg-2',
+    });
+  });
+
+  it('binds absent optional provenance fields as null (Neo4j drops null on write)', () => {
+    const minimal: StoredRelationship = {
+      id: 'rel-min',
+      relationshipType: 'CONNECTS',
+      sourceEntityId: 'a',
+      targetEntityId: 'b',
+      properties: {},
+      bidirectional: true,
+      provenance: {
+        createdBy: 't',
+        createdByType: 'user',
+        createdAt: '2026-05-27T00:00:00.000Z',
+        modifiedBy: 't',
+        modifiedByType: 'user',
+        modifiedAt: '2026-05-27T00:00:00.000Z',
+      },
+    };
+    const params = relationshipToParams(minimal);
+    expect(params.createdInConversation).toBeNull();
+    expect(params.createdFromMessage).toBeNull();
+    expect(params.modifiedInConversation).toBeNull();
+    expect(params.modifiedFromMessage).toBeNull();
+    expect(params.bidirectional).toBe(true);
+    expect(params.properties).toBe('{}');
+  });
+});
+
+// ─── buildRelationshipProjection ────────────────────────────────────
+
+describe('buildRelationshipProjection', () => {
+  it('emits one `r.<field> AS <field>` per stored relationship field', () => {
+    const projection = buildRelationshipProjection();
+    for (const field of STORED_RELATIONSHIP_FIELDS) {
+      expect(projection).toContain(`r.${field} AS ${field}`);
+    }
+  });
+
+  it('respects a custom alias for UNION branches', () => {
+    const projection = buildRelationshipProjection({ alias: 'rel' });
+    expect(projection.startsWith('rel.id AS id')).toBe(true);
+    expect(projection).not.toContain('r.id');
+  });
+});
+
+// ─── User-property write split ──────────────────────────────────────
+
+describe('assertSafeUserPropertyKey', () => {
+  it('accepts bare Cypher identifiers that do not collide with reserved schema fields', () => {
+    expect(assertSafeUserPropertyKey('city')).toBe('city');
+    expect(assertSafeUserPropertyKey('age')).toBe('age');
+    expect(assertSafeUserPropertyKey('_private')).toBe('_private');
+    expect(assertSafeUserPropertyKey('field42')).toBe('field42');
+  });
+
+  it('rejects keys that are not bare Cypher identifiers', () => {
+    expect(() => assertSafeUserPropertyKey('has-dash')).toThrowError(ProviderError);
+    expect(() => assertSafeUserPropertyKey('has space')).toThrowError(ProviderError);
+    expect(() => assertSafeUserPropertyKey('1leading-digit')).toThrowError(ProviderError);
+    expect(() => assertSafeUserPropertyKey('')).toThrowError(ProviderError);
+    expect(() => assertSafeUserPropertyKey('a.b')).toThrowError(ProviderError);
+  });
+
+  it('rejects keys that collide with reserved schema field names', () => {
+    for (const reserved of RESERVED_ENTITY_PROPERTY_KEYS) {
+      expect(() => assertSafeUserPropertyKey(reserved)).toThrowError(ProviderError);
+    }
+  });
+});
+
+describe('isNativeStorableValue', () => {
+  it('accepts scalars Neo4j can store as native properties', () => {
+    expect(isNativeStorableValue('hello')).toBe(true);
+    expect(isNativeStorableValue('')).toBe(true);
+    expect(isNativeStorableValue(0)).toBe(true);
+    expect(isNativeStorableValue(42)).toBe(true);
+    expect(isNativeStorableValue(-3.14)).toBe(true);
+    expect(isNativeStorableValue(true)).toBe(true);
+    expect(isNativeStorableValue(false)).toBe(true);
+  });
+
+  it('accepts homogeneous arrays of scalars', () => {
+    expect(isNativeStorableValue([])).toBe(true);
+    expect(isNativeStorableValue(['a', 'b'])).toBe(true);
+    expect(isNativeStorableValue([1, 2, 3])).toBe(true);
+    expect(isNativeStorableValue([true, false])).toBe(true);
+  });
+
+  it('rejects nulls, NaN/Infinity, nested objects, and heterogeneous arrays', () => {
+    expect(isNativeStorableValue(null)).toBe(false);
+    expect(isNativeStorableValue(undefined)).toBe(false);
+    expect(isNativeStorableValue(NaN)).toBe(false);
+    expect(isNativeStorableValue(Infinity)).toBe(false);
+    expect(isNativeStorableValue({ foo: 'bar' })).toBe(false);
+    expect(isNativeStorableValue([1, 'a'])).toBe(false);
+    expect(isNativeStorableValue([{ x: 1 }])).toBe(false);
+    expect(isNativeStorableValue([null])).toBe(false);
+  });
+});
+
+describe('entityUserPropertyParams', () => {
+  it('projects native-storable scalar properties verbatim into the userProperties map', () => {
+    expect(
+      entityUserPropertyParams({
+        city: 'Berlin',
+        age: 30,
+        active: true,
+        tags: ['x', 'y'],
+      }),
+    ).toEqual({
+      city: 'Berlin',
+      age: 30,
+      active: true,
+      tags: ['x', 'y'],
+    });
+  });
+
+  it('drops values Neo4j cannot store as native scalars — those round-trip only via the JSON blob', () => {
+    expect(
+      entityUserPropertyParams({
+        scalar: 'kept',
+        nested: { foo: 'bar' },
+        empty: null,
+        mixed: [1, 'two'],
+      }),
+    ).toEqual({ scalar: 'kept' });
+  });
+
+  it('throws ProviderError on a reserved-key collision (no silent overwrite of a schema field)', () => {
+    expect(() => entityUserPropertyParams({ entityType: 'forced' })).toThrowError(ProviderError);
+    expect(() => entityUserPropertyParams({ slug: 'forced' })).toThrowError(ProviderError);
+    expect(() => entityUserPropertyParams({ createdBy: 'forced' })).toThrowError(ProviderError);
+  });
+
+  it('throws ProviderError on a malformed key (defence in depth at the write seam)', () => {
+    expect(() => entityUserPropertyParams({ 'bad-key': 'x' })).toThrowError(ProviderError);
+  });
+});
+
+describe('entityToParams', () => {
+  const baseEntity: StoredEntity = {
+    id: 'ent-1',
+    slug: 'person:alice',
+    entityType: 'Person',
+    label: 'Alice',
+    properties: { city: 'Berlin', nested: { foo: 'bar' } },
+    provenance: {
+      createdBy: 'verify',
+      createdByType: 'agent',
+      createdAt: '2026-05-27T00:00:00.000Z',
+      modifiedBy: 'verify',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-27T00:00:00.000Z',
+    },
+  };
+
+  it('binds the JSON blob with the full user-properties shape', () => {
+    const params = entityToParams(baseEntity);
+    expect(params.properties).toBe(
+      JSON.stringify({ city: 'Berlin', nested: { foo: 'bar' } }),
+    );
+  });
+
+  it('does not embed the user-properties map (that is a separate binding via entityUserPropertyParams)', () => {
+    const params = entityToParams(baseEntity);
+    expect(params).not.toHaveProperty('userProperties');
+    // No user keys leak into the schema-field bag either.
+    expect(params).not.toHaveProperty('city');
+    expect(params).not.toHaveProperty('nested');
+  });
+});
+
+// ─── assertSafeRelationshipType ─────────────────────────────────────
+
+describe('assertSafeRelationshipType', () => {
+  it('accepts vocabulary-shaped UPPER_SNAKE_CASE identifiers', () => {
+    expect(assertSafeRelationshipType('WORKS_AT')).toBe('WORKS_AT');
+    expect(assertSafeRelationshipType('KNOWS')).toBe('KNOWS');
+    expect(assertSafeRelationshipType('_PRIVATE')).toBe('_PRIVATE');
+    expect(assertSafeRelationshipType('A123')).toBe('A123');
+  });
+
+  it('rejects values containing characters Cypher would interpret as syntax', () => {
+    expect(() => assertSafeRelationshipType('WORKS AT')).toThrowError(ProviderError);
+    expect(() => assertSafeRelationshipType('WORKS-AT')).toThrowError(ProviderError);
+    expect(() => assertSafeRelationshipType('1KNOWS')).toThrowError(ProviderError);
+    expect(() => assertSafeRelationshipType('KNOWS`')).toThrowError(ProviderError);
+    expect(() => assertSafeRelationshipType('a]->(b)')).toThrowError(ProviderError);
+    expect(() => assertSafeRelationshipType('')).toThrowError(ProviderError);
   });
 });

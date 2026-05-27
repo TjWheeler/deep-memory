@@ -8,11 +8,14 @@ import type {
   MemoryVocabulary,
   PaginatedResult,
   PaginationOptions,
+  RelationshipQueryOptions,
   RepositoryFilter,
   RepositoryUpdate,
+  StorageFindQuery,
   StorageRepositoryConfig,
   StoredEntity,
   StoredEntityUpdate,
+  StoredRelationship,
   StoredRepository,
   StoredRepositorySummary,
   UsageSink,
@@ -32,6 +35,7 @@ import {
   repositorySummaryFromRecord,
 } from './mapping.js';
 import * as entityQueries from './queries/entity.js';
+import * as relationshipQueries from './queries/relationship.js';
 import * as vocabQueries from './queries/vocabulary.js';
 import { getSchemaCypher, SCHEMA_VERSION } from './schema.js';
 import {
@@ -87,6 +91,13 @@ const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> =
   deleteEntity: (args) => args[0] as string,
   deleteEntities: (args) => args[0] as string,
   deleteEntitiesByType: (args) => args[0] as string,
+  findEntities: (args) => args[0] as string,
+  createRelationship: (args) => args[0] as string,
+  getRelationship: (args) => args[0] as string,
+  getEntityRelationships: (args) => args[0] as string,
+  deleteRelationship: (args) => args[0] as string,
+  deleteRelationships: (args) => args[0] as string,
+  deleteRelationshipsByType: (args) => args[0] as string,
 };
 
 /** Configuration for `Neo4jStorageProvider`. */
@@ -670,10 +681,11 @@ export class Neo4jStorageProvider {
   // ─── Entities ──────────────────────────────────────────────────────
 
   /**
-   * Create a new entity. Strategy A (`CREATE` + catch constraint violation)
-   * per probe P4 — `MERGE`-with-discriminator is marginally faster on the
-   * happy path but mutates the existing node on collisions, polluting the
-   * durable graph with a discriminator property.
+   * Create a new entity via fixed-shape `CREATE` + catch on the uniqueness
+   * constraint. A `MERGE`-with-discriminator alternative is marginally faster
+   * on the happy path but mutates the existing node on collisions, writing
+   * a discriminator property onto durable graph state the caller never
+   * requested — correctness wins over the marginal perf delta.
    */
   public async createEntity(
     repositoryId: string,
@@ -757,5 +769,100 @@ export class Neo4jStorageProvider {
     entityType: string,
   ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
     return entityQueries.deleteEntitiesByType(this.connection, repositoryId, entityType);
+  }
+
+  /**
+   * Page entities matching a `StorageFindQuery`. Parallel data + count Cypher
+   * pair; `total` is always exact because every filter (entity-type, property
+   * equality, search term, provenance) is server-side via either a typed
+   * predicate or the `dm_entity_text` fulltext index. Search-term queries
+   * order by Lucene score descending; non-search queries order by `n.id` to
+   * pin pagination determinism across slices.
+   */
+  public async findEntities(
+    repositoryId: string,
+    query: StorageFindQuery,
+    options?: EntityReadOptions,
+  ): Promise<PaginatedResult<StoredEntity>> {
+    return entityQueries.findEntities(this.connection, repositoryId, query, options);
+  }
+
+  // ─── Relationships ─────────────────────────────────────────────────
+
+  /**
+   * Create a relationship. Both endpoint entities are matched under the
+   * repository scope before the edge is created, so cross-repository edges
+   * are structurally impossible to write (D3b layer 3). A missing endpoint
+   * surfaces as `EntityNotFoundError` carrying the absent id.
+   */
+  public async createRelationship(
+    repositoryId: string,
+    relationship: StoredRelationship,
+  ): Promise<StoredRelationship> {
+    return relationshipQueries.createRelationship(this.connection, repositoryId, relationship);
+  }
+
+  /** Read a single relationship by id; `null` when not found. */
+  public async getRelationship(
+    repositoryId: string,
+    relationshipId: string,
+  ): Promise<StoredRelationship | null> {
+    return relationshipQueries.getRelationship(this.connection, repositoryId, relationshipId);
+  }
+
+  /**
+   * Page an entity's incident relationships. `direction: 'out' | 'in'`
+   * additionally surfaces edges flagged `bidirectional: true` from the
+   * opposite endpoint, mirroring the Cosmos read-time duplication of bidir
+   * edges. `propertyFilters` is applied client-side and reports
+   * `total: undefined` in that branch — same trade-off as the Cosmos
+   * provider, because relationship `properties` is a JSON blob with no
+   * per-key index.
+   */
+  public async getEntityRelationships(
+    repositoryId: string,
+    entityId: string,
+    options?: RelationshipQueryOptions,
+  ): Promise<PaginatedResult<StoredRelationship>> {
+    return relationshipQueries.getEntityRelationships(
+      this.connection,
+      repositoryId,
+      entityId,
+      options,
+    );
+  }
+
+  /** Drop a single relationship by id. No-op when the id does not match. */
+  public async deleteRelationship(
+    repositoryId: string,
+    relationshipId: string,
+  ): Promise<void> {
+    return relationshipQueries.deleteRelationship(this.connection, repositoryId, relationshipId);
+  }
+
+  /**
+   * Bulk drop by ids — single round-trip. Returns the ids actually deleted;
+   * missing ids land in `notFound`.
+   */
+  public async deleteRelationships(
+    repositoryId: string,
+    ids: string[],
+  ): Promise<{ deleted: string[]; notFound: string[] }> {
+    return relationshipQueries.deleteRelationships(this.connection, repositoryId, ids);
+  }
+
+  /**
+   * Drop every relationship of a type in the repository. Returns an exact
+   * delete count in a single round-trip.
+   */
+  public async deleteRelationshipsByType(
+    repositoryId: string,
+    relationshipType: string,
+  ): Promise<{ deletedRelationships: number }> {
+    return relationshipQueries.deleteRelationshipsByType(
+      this.connection,
+      repositoryId,
+      relationshipType,
+    );
   }
 }

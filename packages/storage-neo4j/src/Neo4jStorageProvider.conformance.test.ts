@@ -4,10 +4,12 @@
 // lands once the CRUD surface is complete. Until then, this file covers the
 // pieces that already exist:
 //
-//   - ensureSchema (Phase 2/3 — idempotent DDL + _Meta version handshake).
-//   - Repository CRUD (Phase 4 — create / get / list / update / delete /
+//   - ensureSchema (idempotent DDL + _Meta version handshake).
+//   - Repository CRUD (create / get / list / update / delete /
 //     deleteAllContents, with the dm_repository_unique constraint mapped to
 //     DuplicateRepositoryError and the chunked-wipe progress callback).
+//   - Vocabulary CRUD (getVocabulary with 60 s cache, saveVocabulary upsert
+//     via MERGE, getVocabularyChangeLog with parallel data + count).
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run.
 // Example:
@@ -22,6 +24,7 @@ import {
   expect,
   it,
 } from 'vitest';
+import type { OperationUsage } from '@utaba/deep-memory/types';
 import {
   DuplicateRepositoryError,
   RepositoryNotFoundError,
@@ -276,6 +279,147 @@ if (NEO4J_URI) {
           progress.push({ entitiesDeleted: p.entitiesDeleted, relationshipsDeleted: p.relationshipsDeleted });
         }),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('Neo4jStorageProvider — vocabulary CRUD (live)', () => {
+    let provider: Neo4jStorageProvider;
+    let sinkRecords: OperationUsage[];
+    const seeded: string[] = [];
+
+    beforeAll(async () => {
+      sinkRecords = [];
+      provider = new Neo4jStorageProvider({
+        uri: NEO4J_URI,
+        username: NEO4J_USER,
+        password: NEO4J_PASSWORD,
+        database: NEO4J_DATABASE,
+        reportUsage: (usage) => {
+          sinkRecords.push(usage);
+        },
+      });
+      await provider.initialize();
+      await provider.ensureSchema();
+    });
+
+    afterAll(async () => {
+      for (const id of seeded) {
+        try {
+          await provider.deleteRepository(id);
+        } catch {
+          // Already deleted or never created — ignore.
+        }
+      }
+      await provider.dispose();
+    });
+
+    let rid: string;
+
+    beforeEach(async () => {
+      rid = makeRid('vocab');
+      seeded.push(rid);
+      await provider.createRepository({
+        repositoryId: rid,
+        label: 'vocab conformance',
+        governanceConfig: { mode: 'open' },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+      sinkRecords.length = 0;
+    });
+
+    afterEach(async () => {
+      try {
+        await provider.deleteRepository(rid);
+      } catch {
+        // Test may have already deleted it.
+      }
+    });
+
+    function lastRecordFor(op: string): OperationUsage | undefined {
+      for (let i = sinkRecords.length - 1; i >= 0; i -= 1) {
+        const record = sinkRecords[i];
+        if (record?.operation === op) return record;
+      }
+      return undefined;
+    }
+
+    it('getVocabulary returns an empty vocabulary when no _Vocabulary node exists', async () => {
+      const vocab = await provider.getVocabulary(rid);
+      expect(vocab.version).toBe('0.0.0');
+      expect(vocab.entityTypes).toEqual([]);
+      expect(vocab.relationshipTypes).toEqual([]);
+
+      const record = lastRecordFor('getVocabulary');
+      expect(record).toBeDefined();
+      // First read against an empty repo is a cache miss — one round-trip.
+      expect((record?.details as { calls?: number } | undefined)?.calls).toBe(1);
+    });
+
+    it('getVocabulary cache hit emits zero round-trips on the sink record', async () => {
+      await provider.getVocabulary(rid); // populate cache
+      const beforeIndex = sinkRecords.length;
+      await provider.getVocabulary(rid); // cache hit
+      const hits = sinkRecords.slice(beforeIndex).filter((r) => r.operation === 'getVocabulary');
+      expect(hits).toHaveLength(1);
+      expect((hits[0]?.details as { calls?: number } | undefined)?.calls).toBe(0);
+      expect(hits[0]?.value).toBe(0);
+    });
+
+    it('saveVocabulary persists across cache invalidation', async () => {
+      await provider.getVocabulary(rid); // warm cache with the empty default
+      await provider.saveVocabulary(rid, {
+        version: '0.1.0',
+        lastModified: '2026-05-27T01:00:00Z',
+        modifiedBy: 'conformance',
+        entityTypes: [
+          {
+            type: 'Person',
+            description: 'A human',
+            version: '0.1.0',
+            properties: [],
+            createdAt: '2026-05-27T01:00:00Z',
+            createdBy: 'conformance',
+            modifiedAt: '2026-05-27T01:00:00Z',
+            modifiedBy: 'conformance',
+          },
+        ],
+        relationshipTypes: [],
+      });
+
+      const refetched = await provider.getVocabulary(rid);
+      expect(refetched.version).toBe('0.1.0');
+      expect(refetched.entityTypes[0]?.type).toBe('Person');
+
+      const record = lastRecordFor('getVocabulary');
+      // Save invalidated the cache, so this read is a miss again.
+      expect((record?.details as { calls?: number } | undefined)?.calls).toBe(1);
+    });
+
+    it('saveVocabulary is idempotent — second write hits MERGE on the existing node', async () => {
+      const base = {
+        version: '0.1.0',
+        lastModified: '2026-05-27T01:00:00Z',
+        modifiedBy: 'conformance',
+        entityTypes: [],
+        relationshipTypes: [],
+      };
+      await provider.saveVocabulary(rid, base);
+      await provider.saveVocabulary(rid, { ...base, version: '0.2.0' });
+
+      const after = await provider.getVocabulary(rid);
+      expect(after.version).toBe('0.2.0');
+    });
+
+    it('getVocabularyChangeLog returns an empty page when no entries exist', async () => {
+      const log = await provider.getVocabularyChangeLog(rid);
+      expect(log.total).toBe(0);
+      expect(log.items).toEqual([]);
+      expect(log.hasMore).toBe(false);
+
+      const record = lastRecordFor('getVocabularyChangeLog');
+      // Parallel data + count = two round-trips per call.
+      expect((record?.details as { calls?: number } | undefined)?.calls).toBe(2);
     });
   });
 } else {

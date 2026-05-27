@@ -5,13 +5,16 @@
 import type { EnsureSchemaResult } from '@utaba/deep-memory/providers';
 import type {
   DeleteProgressCallback,
+  MemoryVocabulary,
   PaginatedResult,
+  PaginationOptions,
   RepositoryFilter,
   RepositoryUpdate,
   StorageRepositoryConfig,
   StoredRepository,
   StoredRepositorySummary,
   UsageSink,
+  VocabularyChangeRecord,
 } from '@utaba/deep-memory/types';
 import {
   ProviderError,
@@ -26,6 +29,7 @@ import {
   repositoryFromRecord,
   repositorySummaryFromRecord,
 } from './mapping.js';
+import * as vocabQueries from './queries/vocabulary.js';
 import { getSchemaCypher, SCHEMA_VERSION } from './schema.js';
 import {
   buildUsageDetails,
@@ -35,6 +39,16 @@ import {
 
 const PROVIDER_NAME = 'neo4j';
 const DELETE_BATCH_SIZE = 500;
+
+/**
+ * Lifetime of an entry in the per-process vocabulary cache. The vocabulary is
+ * compile-time context for traversal — it changes on the order of once per
+ * session, but a naïve read pays one round-trip per call on the hot path.
+ * 60 s bounds cross-process staleness; writes inside this process invalidate
+ * immediately via `invalidateVocabularyCache`. Direct port of the Cosmos
+ * `VOCABULARY_CACHE_TTL_MS` constant.
+ */
+const VOCABULARY_CACHE_TTL_MS = 60_000;
 
 /**
  * Public methods that emit a usage record per call. The value extracts the
@@ -59,6 +73,9 @@ const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> =
   updateRepository: (args) => args[0] as string,
   deleteRepository: (args) => args[0] as string,
   deleteAllContents: (args) => args[0] as string,
+  getVocabulary: (args) => args[0] as string,
+  saveVocabulary: (args) => args[0] as string,
+  getVocabularyChangeLog: (args) => args[0] as string,
 };
 
 /** Configuration for `Neo4jStorageProvider`. */
@@ -85,6 +102,15 @@ const META_KEY = 'schema';
 export class Neo4jStorageProvider {
   private readonly connection: Neo4jConnection;
   private initialized = false;
+  /**
+   * In-process vocabulary cache. Reads hit this map first; writes inside this
+   * process invalidate the entry so cache hits stay coherent with the local
+   * write. Cross-process staleness is bounded by `VOCABULARY_CACHE_TTL_MS`.
+   */
+  private readonly vocabularyCache = new Map<
+    string,
+    { vocab: MemoryVocabulary; expiresAt: number }
+  >();
 
   constructor(config: Neo4jStorageProviderConfig) {
     this.connection = new Neo4jConnection(config);
@@ -559,5 +585,74 @@ export class Neo4jStorageProvider {
     const totalEntities = bigintToSafeNumber(entitiesResult.records[0]?.get('total') ?? 0);
     const totalRelationships = bigintToSafeNumber(relationshipsResult.records[0]?.get('total') ?? 0);
     return { totalEntities, totalRelationships };
+  }
+
+  // ─── Vocabulary ────────────────────────────────────────────────────
+
+  /**
+   * Read the vocabulary for a repository. Cache-aware: cache hits return
+   * synchronously with zero Bolt round-trips. The TRACKED_METHODS proxy still
+   * fires for every call — the sink record on a cache hit carries
+   * `details.calls === 0` and `value === 0`, which is the contract the sink
+   * expects to express "this operation ran but did no server work".
+   */
+  public async getVocabulary(repositoryId: string): Promise<MemoryVocabulary> {
+    return this.getVocabularyCached(repositoryId);
+  }
+
+  /**
+   * Cached vocabulary read used by `getVocabulary` and (in later phases) by
+   * traversal compilation. The vocabulary is compile-time context for the
+   * Cypher compiler — it changes on the order of once per session, but the
+   * traversal hot path would otherwise pay one round-trip per call. The cache
+   * flips that to one round-trip per TTL window.
+   *
+   * Reads inside an active usage scope still record a round-trip when a fetch
+   * actually happens (cache miss); cache hits emit no round-trip and therefore
+   * contribute nothing to the scope.
+   */
+  private async getVocabularyCached(repositoryId: string): Promise<MemoryVocabulary> {
+    const now = Date.now();
+    const cached = this.vocabularyCache.get(repositoryId);
+    if (cached && cached.expiresAt > now) {
+      return cached.vocab;
+    }
+    const vocab = await vocabQueries.getVocabulary(this.connection, repositoryId);
+    this.vocabularyCache.set(repositoryId, {
+      vocab,
+      expiresAt: now + VOCABULARY_CACHE_TTL_MS,
+    });
+    return vocab;
+  }
+
+  /** Drop the cache entry for a repository — call after every vocabulary write. */
+  private invalidateVocabularyCache(repositoryId: string): void {
+    this.vocabularyCache.delete(repositoryId);
+  }
+
+  /**
+   * Upsert the vocabulary for a repository. Invalidates the in-process cache
+   * on success so subsequent reads observe the new state immediately within
+   * this process (cross-process staleness is bounded by the 60 s TTL).
+   */
+  public async saveVocabulary(
+    repositoryId: string,
+    vocabulary: MemoryVocabulary,
+  ): Promise<void> {
+    await vocabQueries.saveVocabulary(this.connection, repositoryId, vocabulary);
+    this.invalidateVocabularyCache(repositoryId);
+  }
+
+  /**
+   * Page the vocabulary change-log newest first. Writes land in
+   * `proposeVocabularyExtension` (out of scope here) — this method only reads
+   * the `_VocabularyChangeLog` nodes back, ordered by `proposedAt` to match
+   * the audit semantic on `VocabularyChangeRecord`.
+   */
+  public async getVocabularyChangeLog(
+    repositoryId: string,
+    options?: PaginationOptions,
+  ): Promise<PaginatedResult<VocabularyChangeRecord>> {
+    return vocabQueries.getVocabularyChangeLog(this.connection, repositoryId, options);
   }
 }

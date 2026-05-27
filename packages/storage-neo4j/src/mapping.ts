@@ -27,6 +27,7 @@ import type {
   StoredRepository,
   StoredRepositorySummary,
 } from '@utaba/deep-memory/types';
+import type { VocabularyChangeRecord } from '@utaba/deep-memory/types';
 
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
@@ -198,6 +199,45 @@ export function repositorySummaryFromProperties(
 }
 
 /**
+ * Map a driver record to a `VocabularyChangeRecord`. Accepts both
+ * `RETURN e` (alias resolves to a `Node` with `.properties`) and explicit
+ * projection forms; `alias` defaults to `'e'` to match the change-log query.
+ *
+ * The four optional traceability fields (`previousVersion`, `approvedBy`,
+ * `approvedAt`, plus the user-supplied `reason`) round-trip via the same
+ * `optionalString` / `requireString` helpers used elsewhere. The provenance
+ * fields are intentionally NOT flattened into the surrounding provenance bag —
+ * proposed/approved are a separate audit semantic from createdBy/modifiedBy.
+ */
+export function changeRecordFromRecord(
+  record: DriverRecord,
+  alias = 'e',
+): VocabularyChangeRecord {
+  return changeRecordFromProperties(extractPropertyBag(record, alias));
+}
+
+export function changeRecordFromProperties(
+  props: Record<string, unknown>,
+): VocabularyChangeRecord {
+  const previousVersion = optionalString(props, 'previousVersion');
+  const approvedBy = optionalString(props, 'approvedBy');
+  const approvedAt = optionalString(props, 'approvedAt');
+  const record: VocabularyChangeRecord = {
+    changeId: requireString(props, 'changeId'),
+    changeType: requireChangeType(props, 'changeType'),
+    typeName: requireString(props, 'typeName'),
+    newVersion: requireString(props, 'newVersion'),
+    proposedBy: requireString(props, 'proposedBy'),
+    proposedAt: requireString(props, 'proposedAt'),
+    reason: requireString(props, 'reason'),
+  };
+  if (previousVersion !== undefined) record.previousVersion = previousVersion;
+  if (approvedBy !== undefined) record.approvedBy = approvedBy;
+  if (approvedAt !== undefined) record.approvedAt = approvedAt;
+  return record;
+}
+
+/**
  * Build the parameter map for `createRepository`'s fixed-shape `CREATE` Cypher.
  * Optional fields become `null` (Neo4j drops null properties on write, so the
  * resulting node has no property by that name — symmetric with read where
@@ -297,6 +337,29 @@ function requireActorType(props: Record<string, unknown>, key: string): 'user' |
     );
   }
   return value;
+}
+
+const CHANGE_TYPES = [
+  'entity_type_added',
+  'relationship_type_added',
+  'entity_type_modified',
+  'relationship_type_modified',
+  'entity_type_removed',
+  'relationship_type_removed',
+] as const satisfies ReadonlyArray<VocabularyChangeRecord['changeType']>;
+
+function requireChangeType(
+  props: Record<string, unknown>,
+  key: string,
+): VocabularyChangeRecord['changeType'] {
+  const value = requireString(props, key);
+  if (!(CHANGE_TYPES as readonly string[]).includes(value)) {
+    throw new ProviderError(
+      `Neo4j record field "${key}" must be one of the VocabularyChangeRecord change types ` +
+        `(got ${JSON.stringify(value)}).`,
+    );
+  }
+  return value as VocabularyChangeRecord['changeType'];
 }
 
 function requireBoolean(props: Record<string, unknown>, key: string): boolean {

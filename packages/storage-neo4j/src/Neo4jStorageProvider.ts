@@ -8,7 +8,11 @@ import type {
   GraphTraversalCapabilities,
 } from '@utaba/deep-memory/providers';
 import type {
+  BulkImportOptions,
+  BulkImportResult,
   DeleteProgressCallback,
+  ExportChunk,
+  ImportChunk,
   MemoryVocabulary,
   PaginatedResult,
   PaginationOptions,
@@ -55,6 +59,7 @@ import {
   repositoryFromRecord,
   repositorySummaryFromRecord,
 } from './mapping.js';
+import * as bulkQueries from './queries/bulk.js';
 import * as entityQueries from './queries/entity.js';
 import * as relationshipQueries from './queries/relationship.js';
 import * as repositoryQueries from './queries/repository.js';
@@ -126,6 +131,13 @@ const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> =
   findPaths: (args) => args[0] as string,
   getTimeline: (args) => args[0] as string,
   getRepositoryStats: (args) => args[0] as string,
+  importBulk: (args) => args[0] as string,
+  // `exportAll` is intentionally omitted from this map. The Proxy emits one
+  // sink record at promise resolution; an `AsyncIterable` returns
+  // synchronously and is consumed across an arbitrary number of awaits, so
+  // a single emit at method-return would fire BEFORE any chunk had streamed
+  // and the sink would carry zero round-trips. `exportAll` opens its own
+  // usage scope via `trackIterable` and emits when the iterator drains.
 };
 
 /** Configuration for `Neo4jStorageProvider`. */
@@ -171,6 +183,13 @@ export class Neo4jStorageProvider {
     string,
     { vocab: MemoryVocabulary; expiresAt: number }
   >();
+  /**
+   * Captured at construction so `exportAll`'s `trackIterable` can emit
+   * outside the Proxy's promise-resolution path. The Proxy itself relies on
+   * the same `safeSink` captured by closure; this field exists for the
+   * streaming-iterator case only.
+   */
+  private readonly reportUsage: UsageSink | undefined;
 
   constructor(config: Neo4jStorageProviderConfig) {
     this.connection = new Neo4jConnection(config);
@@ -179,6 +198,7 @@ export class Neo4jStorageProvider {
     });
 
     const safeSink = createSafeSink(config.reportUsage);
+    this.reportUsage = safeSink;
     if (safeSink) {
       // Wrap the instance in a Proxy that opens a per-operation `UsageScope`
       // before invoking each tracked method, then emits one `OperationUsage`
@@ -1328,6 +1348,115 @@ export class Neo4jStorageProvider {
     options: StorageTimelineOptions,
   ): Promise<StorageTimelineResult> {
     return timelineQueries.getTimeline(this.connection, repositoryId, entityId, options);
+  }
+
+  // ─── Bulk Operations ───────────────────────────────────────────────
+
+  /**
+   * Stream every entity and every relationship in the repository as
+   * cursor-paginated chunks. Entities come first, then relationships; each
+   * chunk carries a monotonic `sequence` and an `isLast` flag.
+   *
+   * The Proxy-based tracking flow does not apply here. Tracked methods emit
+   * one sink record at promise resolution; an `AsyncIterable` returns
+   * synchronously, before any chunk has streamed. Instead, `trackIterable`
+   * wraps the underlying generator in its own `UsageScope` that opens at
+   * iterator creation, records each round-trip as the consumer pulls the
+   * next chunk, and emits one sink record when the iterator drains — so the
+   * resulting record aggregates server time across every chunk fetch.
+   */
+  public exportAll(repositoryId: string): AsyncIterable<ExportChunk> {
+    return this.trackIterable(
+      'exportAll',
+      repositoryId,
+      bulkQueries.exportAll(this.connection, repositoryId),
+    );
+  }
+
+  /**
+   * Run a bulk import: every entity then every relationship from the input
+   * chunks lands in the repository. `skipExistenceCheck: true` uses CREATE
+   * for the absolute peak throughput; `false` (default) uses MERGE for
+   * idempotent re-imports.
+   *
+   * Returns a single aggregate `BulkImportResult` spanning every chunk.
+   * Per-row failures land in `result.errors`; surviving rows still count
+   * toward `entitiesImported` / `relationshipsImported`.
+   */
+  public async importBulk(
+    repositoryId: string,
+    data: ImportChunk[],
+    options?: BulkImportOptions,
+  ): Promise<BulkImportResult> {
+    return bulkQueries.importBulk(this.connection, repositoryId, data, options);
+  }
+
+  /**
+   * Wrap an `AsyncIterable` so every chunk it produces is generated inside a
+   * single shared `UsageScope`. The scope aggregates `summary.resultConsumedAfter`
+   * across every round-trip the iterator performs; one sink record fires when
+   * the iterator drains (or is closed / thrown into).
+   *
+   * Implementation mirrors the Cosmos `trackIterable` precedent: each
+   * `iter.next()` call re-enters the scope via `runInUsageScope`. The
+   * `AsyncLocalStorage` chain links async work performed inside the
+   * generator body to the scope for the duration of that step. Between
+   * `next()` calls the scope is dormant — the consumer's awaits do not
+   * accumulate into it, which is exactly the desired semantics.
+   *
+   * When the sink is absent the wrap degenerates to a pass-through; the
+   * Proxy's `createSafeSink` short-circuit covers the no-sink case at
+   * construction time, so this method is only reached when `reportUsage` is
+   * present.
+   */
+  private trackIterable<T>(
+    operation: string,
+    repositoryId: string,
+    source: AsyncIterable<T>,
+  ): AsyncIterable<T> {
+    // The sink may be undefined when the provider was constructed without
+    // `reportUsage`; the Proxy is then absent and this method is reached
+    // directly. Pass-through in that case so the streaming consumer pays no
+    // wrapper overhead.
+    const sink = this.reportUsage;
+    if (sink === undefined) return source;
+    return {
+      [Symbol.asyncIterator]: (): AsyncIterator<T> => {
+        const iter = source[Symbol.asyncIterator]();
+        const scope = createUsageScope();
+        let emitted = false;
+        const emit = (): void => {
+          if (emitted) return;
+          emitted = true;
+          sink({
+            provider: PROVIDER_NAME,
+            operation,
+            unit: 'server_ms',
+            value: scope.serverMs,
+            repositoryId,
+            timestamp: new Date(),
+            details: buildUsageDetails(scope),
+          });
+        };
+        return {
+          async next(): Promise<IteratorResult<T>> {
+            const step = await runInUsageScope(scope, () => iter.next());
+            if (step.done) emit();
+            return step;
+          },
+          async return(value?: T): Promise<IteratorResult<T>> {
+            emit();
+            if (iter.return) return iter.return(value);
+            return { done: true, value: value as T };
+          },
+          async throw(err?: unknown): Promise<IteratorResult<T>> {
+            emit();
+            if (iter.throw) return iter.throw(err);
+            throw err;
+          },
+        };
+      },
+    };
   }
 
   // ─── Stats ─────────────────────────────────────────────────────────

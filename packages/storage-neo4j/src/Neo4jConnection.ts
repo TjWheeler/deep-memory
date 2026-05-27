@@ -15,6 +15,7 @@ import type {
   ServerInfo,
 } from 'neo4j-driver';
 import { ProviderError } from '@utaba/deep-memory';
+import { recordRoundTrip } from './usageScope.js';
 
 /**
  * Cypher parameters are arbitrary Bolt-encodable values keyed by name.
@@ -78,8 +79,8 @@ export class Neo4jConnection {
       neo4j.auth.basic(config.username, config.password),
       {
         // BigInt for INTEGER avoids silent precision loss on counts that may
-        // exceed Number.MAX_SAFE_INTEGER — see D6b. The mapping layer in
-        // Phase 3 narrows BigInt → Number at the public-API boundary.
+        // exceed Number.MAX_SAFE_INTEGER — see D6b. The mapping layer
+        // narrows BigInt → Number at the public-API boundary.
         useBigInt: true,
         userAgent: config.userAgent ?? DEFAULT_USER_AGENT,
         ...(config.maxTransactionRetryTime !== undefined
@@ -126,6 +127,7 @@ export class Neo4jConnection {
         ...(options.routing !== undefined ? { routing: options.routing } : {}),
       },
     );
+    recordRoundTrip(result.summary, result.records.length);
     this.surfaceNotifications(cypher, result.summary);
     return result;
   }
@@ -181,6 +183,7 @@ export class Neo4jConnection {
       database: this.database,
       ...(options.routing !== undefined ? { routing: options.routing } : {}),
     });
+    recordRoundTrip(result.summary, result.records.length);
     this.surfaceNotifications(cypher, result.summary);
     return result;
   }
@@ -195,6 +198,7 @@ export class Neo4jConnection {
     const session = this.driver.session({ database: this.database });
     try {
       const result = await session.run(cypher);
+      recordRoundTrip(result.summary, result.records.length);
       this.surfaceNotifications(cypher, result.summary);
       return result.summary;
     } finally {
@@ -278,34 +282,90 @@ export class ScopedTransaction {
           'Multi-statement writes still flow through the isolation chokepoint.',
       );
     }
-    const result = await this.tx.run<T>(cypher, { ...params, rid: this.repositoryId });
-    const records = await result.records;
-    const summary = await result.summary;
+    const queryResult = await this.tx.run<T>(cypher, { ...params, rid: this.repositoryId });
+    const records = queryResult.records;
+    const summary = queryResult.summary;
+    recordRoundTrip(summary, records.length);
     this.notify(cypher, summary);
     return { records, summary };
   }
 }
 
-function collectNonInformationNotifications(summary: ResultSummary): Array<{
+interface CollectedNotification {
   severity: string;
+  category: string;
+  code: string;
   title: string;
   description: string;
-}> {
-  type GqlLike = { severity?: string; title?: string; description?: string };
-  const out: Array<{ severity: string; title: string; description: string }> = [];
+}
+
+/**
+ * Surface real warnings from a `ResultSummary` without drowning callers in
+ * the always-present "successful completion" sentinels.
+ *
+ * Per probe P15 (local-tests/baseline/neo4j-phase3-probes-results.md):
+ *
+ * - `summary.notifications` is the legacy server-side filtered surface; if it
+ *   is non-empty the server already decided the entries are worth flagging
+ *   (`UNRECOGNIZED`, `PERFORMANCE`, `DEPRECATION`, etc.). Prefer it.
+ * - `summary.gqlStatusObjects` always includes a `severity=UNKNOWN
+ *   classification=UNKNOWN` "successful completion" entry, plus tags many
+ *   PERFORMANCE warnings (e.g. cartesian product) as `severity=INFORMATION`
+ *   which a naive filter on `severity !== 'INFORMATION'` would silently drop.
+ *
+ * Strategy: dedup the legacy `notifications` first; supplement with
+ * `gqlStatusObjects` entries whose severity is `WARNING` or `ERROR` (the
+ * post-Cypher-25 GQL severities worth raising).
+ */
+function collectNonInformationNotifications(summary: ResultSummary): CollectedNotification[] {
+  type LegacyLike = {
+    severity?: string;
+    category?: string;
+    code?: string;
+    title?: string;
+    description?: string;
+  };
+  type GqlLike = {
+    severity?: string;
+    classification?: string;
+    gqlStatus?: string;
+    title?: string;
+    description?: string;
+    statusDescription?: string;
+  };
   const summaryLike = summary as unknown as {
     gqlStatusObjects?: GqlLike[];
-    notifications?: GqlLike[];
+    notifications?: LegacyLike[];
   };
-  const source = summaryLike.gqlStatusObjects ?? summaryLike.notifications ?? [];
-  for (const item of source) {
-    const severity = item.severity ?? '';
-    if (severity === 'INFORMATION' || severity === '') continue;
-    out.push({
-      severity,
+  const out: CollectedNotification[] = [];
+  const seen = new Set<string>();
+  for (const item of summaryLike.notifications ?? []) {
+    const entry: CollectedNotification = {
+      severity: item.severity ?? '',
+      category: item.category ?? '',
+      code: item.code ?? '',
       title: item.title ?? '',
       description: item.description ?? '',
-    });
+    };
+    const key = entry.code || entry.title;
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(entry);
+  }
+  for (const item of summaryLike.gqlStatusObjects ?? []) {
+    const severity = item.severity ?? '';
+    if (severity !== 'WARNING' && severity !== 'ERROR') continue;
+    const entry: CollectedNotification = {
+      severity,
+      category: item.classification ?? '',
+      code: item.gqlStatus ?? '',
+      title: item.title ?? '',
+      description: item.description ?? item.statusDescription ?? '',
+    };
+    const key = entry.code || entry.title || entry.description;
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(entry);
   }
   return out;
 }

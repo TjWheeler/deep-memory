@@ -1,8 +1,8 @@
-// Conformance harness skeleton for Neo4jStorageProvider — Phase 2 scope.
+// Conformance harness for Neo4jStorageProvider.
 //
 // Currently asserts only the EnsureSchemaResult shape against a live Neo4j.
 // Full StorageProvider conformance (via runStorageProviderConformanceTests
-// from @utaba/deep-memory/testing) lands in Phase 13 once CRUD is in place.
+// from @utaba/deep-memory/testing) lands once CRUD methods are in place.
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run.
 // Example:

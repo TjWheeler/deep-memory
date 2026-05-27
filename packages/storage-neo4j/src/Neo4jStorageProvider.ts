@@ -1,18 +1,48 @@
 // Neo4jStorageProvider — Neo4j implementation of @utaba/deep-memory's
-// StorageProvider. Phase 2 scope: constructor / lifecycle / ensureSchema.
-// CRUD methods land in Phases 4–7 and the `implements StorageProvider`
-// declaration is added once the surface is complete.
+// StorageProvider. CRUD methods are added incrementally; the `implements
+// StorageProvider` declaration is added once the surface is complete.
 
 import type { EnsureSchemaResult } from '@utaba/deep-memory/providers';
-import { ProviderError } from '@utaba/deep-memory';
+import type { UsageSink } from '@utaba/deep-memory/types';
+import { ProviderError, createSafeSink } from '@utaba/deep-memory';
 import { Neo4jConnection, type Neo4jConnectionConfig } from './Neo4jConnection.js';
 import { getSchemaCypher, SCHEMA_VERSION } from './schema.js';
+import {
+  buildUsageDetails,
+  createUsageScope,
+  runInUsageScope,
+} from './usageScope.js';
+
+const PROVIDER_NAME = 'neo4j';
+
+/**
+ * Public methods that emit a usage record per call. The value extracts the
+ * `repositoryId` from the method's argument list — `undefined` when the
+ * operation is not scoped to a single repository (e.g. `ensureSchema`,
+ * `listRepositories`).
+ *
+ * The map mirrors the SQL Server precedent: methods on `StorageProvider`
+ * mostly take the `repositoryId` as their first positional argument, so the
+ * canonical extractor is `(args) => args[0] as string`. Methods that operate
+ * across repositories (e.g. `ensureSchema`, `listRepositories`) return
+ * `undefined` so the sink record omits `repositoryId`.
+ */
+const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> = {
+  ensureSchema: () => undefined,
+};
 
 /** Configuration for `Neo4jStorageProvider`. */
 export interface Neo4jStorageProviderConfig extends Neo4jConnectionConfig {
-  // Reserved for Phase 3 — `reportUsage?: UsageSink` lands once the
-  // server_ms sink wiring is in place. Intentionally not added here so the
-  // public config stays minimal until that contract is built.
+  /**
+   * Optional usage sink. When provided, the provider emits one
+   * `OperationUsage` record per public method call. The record's `value` is
+   * the aggregated `summary.resultConsumedAfter` (server-side ms) across
+   * every Bolt round-trip the operation produced; `unit` is `'server_ms'`.
+   *
+   * The sink is **never** plumbed through to AI-agent-facing surfaces — MCP
+   * tools must not expose RU / server-time figures to model responses.
+   */
+  reportUsage?: UsageSink;
 }
 
 /**
@@ -28,6 +58,67 @@ export class Neo4jStorageProvider {
 
   constructor(config: Neo4jStorageProviderConfig) {
     this.connection = new Neo4jConnection(config);
+
+    const safeSink = createSafeSink(config.reportUsage);
+    if (safeSink) {
+      // Wrap the instance in a Proxy that opens a per-operation `UsageScope`
+      // before invoking each tracked method, then emits one `OperationUsage`
+      // record at completion. The chokepoint (`Neo4jConnection`) writes into
+      // the active scope on every round-trip — the Proxy is the only place
+      // sink records are constructed.
+      //
+      // Mirror of the SQL Server precedent, but with the recorded `value`
+      // sourced from aggregated `summary.resultConsumedAfter` (`unit:
+      // 'server_ms'`) rather than wall-clock `Date.now()`.
+      // eslint-disable-next-line no-constructor-return
+      return new Proxy(this, {
+        get(target, prop, receiver): unknown {
+          const value = Reflect.get(target, prop, receiver);
+          if (typeof prop !== 'string' || typeof value !== 'function') return value;
+          const extractRepoId = TRACKED_METHODS[prop];
+          if (!extractRepoId) return value;
+          const method = value as (...a: unknown[]) => unknown;
+          return (...args: unknown[]): unknown => {
+            const scope = createUsageScope();
+            const repositoryId = extractRepoId(args);
+            const emit = (): void => {
+              safeSink({
+                provider: PROVIDER_NAME,
+                operation: prop,
+                unit: 'server_ms',
+                value: scope.serverMs,
+                ...(repositoryId !== undefined ? { repositoryId } : {}),
+                timestamp: new Date(),
+                details: buildUsageDetails(scope),
+              });
+            };
+            return runInUsageScope(scope, () => {
+              let result: unknown;
+              try {
+                result = method.apply(target, args);
+              } catch (err) {
+                emit();
+                throw err;
+              }
+              if (result && typeof (result as { then?: unknown }).then === 'function') {
+                return (result as Promise<unknown>).then(
+                  (v) => {
+                    emit();
+                    return v;
+                  },
+                  (err) => {
+                    emit();
+                    throw err;
+                  },
+                );
+              }
+              emit();
+              return result;
+            });
+          };
+        },
+      });
+    }
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────

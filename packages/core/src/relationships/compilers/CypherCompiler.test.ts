@@ -106,7 +106,58 @@ describe('CypherCompiler', () => {
     expect(result.query).toContain('*1..5');
   });
 
-  it('compiles path return mode with all nodes and rels', () => {
+  it('compiles all return mode with single-hop nodes and relationship', () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out', relationshipTypes: ['KNOWS'] }],
+      returnMode: 'all',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    // 'all' mode must emit both endpoints AND the relationship — the provider's
+    // executeTraversal discriminates Node vs Relationship objects per column to
+    // populate the entities and relationships arrays in TraversalResult.
+    expect(result.query).toContain('RETURN DISTINCT n0, n1, r0');
+  });
+
+  it('compiles all return mode with two-hop nodes and relationships', () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [
+        { direction: 'out', relationshipTypes: ['HAS_COMPONENT'] },
+        { direction: 'out', relationshipTypes: ['REQUIRES_FLUID'] },
+      ],
+      returnMode: 'all',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    expect(result.query).toContain('RETURN DISTINCT n0, n1, n2, r0, r1');
+  });
+
+  it('compiles all return mode with repeat step', () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out', relationshipTypes: ['CONTAINS'], repeat: { maxDepth: 3 } }],
+      returnMode: 'all',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    // One step → one relationship alias, regardless of repeat maxDepth. The
+    // variable-length pattern collapses into r0 even at maxDepth > 1.
+    expect(result.query).toContain('*1..3');
+    expect(result.query).toContain('RETURN DISTINCT n0, n1, r0');
+  });
+
+  it('omits DISTINCT in all return mode when dedup is false', () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'out', relationshipTypes: ['KNOWS'] }],
+      returnMode: 'all',
+      dedup: false,
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    expect(result.query).toContain('RETURN n0, n1, r0');
+    expect(result.query).not.toContain('DISTINCT');
+  });
+
+  it('compiles path return mode with path binding', () => {
     const spec: TraversalSpec = {
       start: { entityId: 'e1' },
       steps: [
@@ -116,7 +167,21 @@ describe('CypherCompiler', () => {
       returnMode: 'path',
     };
     const result = compiler.compile(spec, emptyVocab);
-    expect(result.query).toContain('RETURN n0, n1, n2, r0, r1');
+    expect(result.query).toContain('MATCH p = (n0)');
+    expect(result.query).toContain('RETURN nodes(p) AS pathNodes, relationships(p) AS pathRels, length(p) AS pathLength');
+  });
+
+  it('compiles path mode with repeat step capturing intermediates via nodes(p)', () => {
+    const spec: TraversalSpec = {
+      start: { entityId: 'e1' },
+      steps: [{ direction: 'both', repeat: { maxDepth: 5, emitIntermediates: true } }],
+      returnMode: 'path',
+    };
+    const result = compiler.compile(spec, emptyVocab);
+    // Variable-length patterns compress every intermediate node into one hop
+    // alias; the path binding lets nodes(p) / relationships(p) recover them.
+    expect(result.query).toContain('MATCH p = (n0)-[r0*1..5]-(n1)');
+    expect(result.query).toContain('RETURN nodes(p) AS pathNodes, relationships(p) AS pathRels, length(p) AS pathLength');
   });
 
   it('includes SKIP when offset > 0', () => {

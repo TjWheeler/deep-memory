@@ -111,7 +111,15 @@ export class CypherCompiler implements TraversalCompiler {
 
     // ─── Build query ────────────────────────────────────────────
 
-    const matchClause = `MATCH ${matchParts[0]}${matchParts.slice(1).join('')}`;
+    // Path mode binds the whole walk to `p` so the parser can recover ordered
+    // intermediate nodes via `nodes(p)` / `relationships(p)`. Variable-length
+    // patterns (`-[r*1..N]-`) compress every intermediate node into a single
+    // hop alias, so without the path binding the round-trip would lose every
+    // node between source and terminal — fatal for `findPaths`. Multi-alias
+    // `RETURN n0, n1, …` works only for fully unrolled fixed-step chains.
+    const bindPath = spec.returnMode === 'path';
+    const pathBinding = bindPath ? 'p = ' : '';
+    const matchClause = `MATCH ${pathBinding}${matchParts[0]}${matchParts.slice(1).join('')}`;
     const whereClause = whereClauses.length > 0
       ? `\nWHERE ${whereClauses.join(' AND ')}`
       : '';
@@ -119,16 +127,22 @@ export class CypherCompiler implements TraversalCompiler {
     // Return clause
     let returnClause: string;
     if (spec.returnMode === 'path') {
-      // Return full paths
+      // Ordered node + relationship lists from the path binding. The parser
+      // walks segments to recover per-edge walk direction.
+      returnClause = 'RETURN nodes(p) AS pathNodes, relationships(p) AS pathRels, length(p) AS pathLength';
+    } else if (spec.returnMode === 'all') {
+      // Return every node AND every relationship from the step chain. The
+      // sibling GremlinCompiler emits the same vertex+edge union shape (with a
+      // synthetic `__kind` discriminator); the provider-side `executeTraversal`
+      // depends on both backends agreeing on the discriminated-emission contract.
+      // Cypher discriminates structurally — the driver returns typed Node /
+      // Relationship objects per column, so no `__kind` field is needed.
       const allNodes = Array.from({ length: nodeIndex }, (_, i) => `n${i}`);
       const allRels = steps.map((_, i) => `r${i}`);
-      returnClause = `RETURN ${[...allNodes, ...allRels].join(', ')}`;
-    } else if (spec.returnMode === 'all') {
-      // Return all nodes
-      const allNodes = Array.from({ length: nodeIndex }, (_, i) => `n${i}`);
+      const projection = [...allNodes, ...allRels].join(', ');
       returnClause = spec.dedup !== false
-        ? `RETURN DISTINCT ${allNodes.join(', ')}`
-        : `RETURN ${allNodes.join(', ')}`;
+        ? `RETURN DISTINCT ${projection}`
+        : `RETURN ${projection}`;
     } else {
       // Terminal — return only the last node
       returnClause = spec.dedup !== false

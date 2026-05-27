@@ -2,22 +2,36 @@
 // StorageProvider. CRUD methods are added incrementally; the `implements
 // StorageProvider` declaration is added once the surface is complete.
 
-import type { EnsureSchemaResult, EntityReadOptions } from '@utaba/deep-memory/providers';
+import type {
+  EnsureSchemaResult,
+  EntityReadOptions,
+  GraphTraversalCapabilities,
+} from '@utaba/deep-memory/providers';
 import type {
   DeleteProgressCallback,
   MemoryVocabulary,
   PaginatedResult,
   PaginationOptions,
+  QueryMetadata,
   RelationshipQueryOptions,
   RepositoryFilter,
   RepositoryUpdate,
+  StorageExploreOptions,
   StorageFindQuery,
+  StorageNeighborhood,
+  StorageNeighborhoodLayer,
+  StoragePath,
+  StoragePathOptions,
+  StoragePathResult,
   StorageRepositoryConfig,
   StoredEntity,
   StoredEntityUpdate,
   StoredRelationship,
   StoredRepository,
   StoredRepositorySummary,
+  TraversalResult,
+  TraversalSpec,
+  TraversalStep,
   UsageSink,
   VocabularyChangeRecord,
 } from '@utaba/deep-memory/types';
@@ -25,7 +39,11 @@ import {
   ProviderError,
   RepositoryNotFoundError,
   createSafeSink,
+  matchesPropertyFilters,
+  projectEntity,
 } from '@utaba/deep-memory';
+import { Neo4jTraversalExecutor } from './Neo4jTraversalExecutor.js';
+import type { RawTraversalResult } from './Neo4jTraversalExecutor.js';
 import { Neo4jConnection, type Neo4jConnectionConfig } from './Neo4jConnection.js';
 import { mapDriverError } from './errors.js';
 import {
@@ -98,6 +116,9 @@ const TRACKED_METHODS: Record<string, (args: unknown[]) => string | undefined> =
   deleteRelationship: (args) => args[0] as string,
   deleteRelationships: (args) => args[0] as string,
   deleteRelationshipsByType: (args) => args[0] as string,
+  traverse: (args) => args[0] as string,
+  exploreNeighborhood: (args) => args[0] as string,
+  findPaths: (args) => args[0] as string,
 };
 
 /** Configuration for `Neo4jStorageProvider`. */
@@ -112,6 +133,15 @@ export interface Neo4jStorageProviderConfig extends Neo4jConnectionConfig {
    * tools must not expose RU / server-time figures to model responses.
    */
   reportUsage?: UsageSink;
+  /**
+   * When `true`, prepend `PROFILE` to every compiled traversal query and
+   * surface the resulting plan summary under `details.profile` on the sink
+   * record. Defaults to `false` — `PROFILE` more than doubles wall-clock on
+   * short traversals (see plan §D14 and the Phase 9 probe results), so the
+   * cost is worth paying only when an operator is actively investigating
+   * planner behaviour.
+   */
+  profileTraversals?: boolean;
 }
 
 /**
@@ -123,6 +153,7 @@ const META_KEY = 'schema';
 
 export class Neo4jStorageProvider {
   private readonly connection: Neo4jConnection;
+  private readonly traversalExecutor: Neo4jTraversalExecutor;
   private initialized = false;
   /**
    * In-process vocabulary cache. Reads hit this map first; writes inside this
@@ -136,6 +167,9 @@ export class Neo4jStorageProvider {
 
   constructor(config: Neo4jStorageProviderConfig) {
     this.connection = new Neo4jConnection(config);
+    this.traversalExecutor = new Neo4jTraversalExecutor(this.connection, {
+      profileTraversals: config.profileTraversals === true,
+    });
 
     const safeSink = createSafeSink(config.reportUsage);
     if (safeSink) {
@@ -865,4 +899,431 @@ export class Neo4jStorageProvider {
       relationshipType,
     );
   }
+
+  // ─── Graph Traversal ───────────────────────────────────────────────
+
+  /**
+   * Capabilities surface used by the dispatcher to decide whether a given
+   * `TraversalSpec` shape is supported natively. Strict improvement over the
+   * Cosmos provider in two cells: `supportsAggregation` is `true` (Cypher's
+   * native aggregation makes `count` / per-key projection a one-statement
+   * shape) and the runtime supports every other traversal lever.
+   */
+  public getCapabilities(): GraphTraversalCapabilities {
+    return {
+      supportsNativeQuery: true,
+      nativeQueryLanguage: 'cypher',
+      maxTraversalDepth: 10,
+      supportsRelationshipPropertyFilters: true,
+      supportsEntityPropertyFilters: true,
+      supportsAggregation: true,
+      supportsRepeat: true,
+      supportsDedup: true,
+      supportsRelationshipSummary: false,
+    };
+  }
+
+  /**
+   * Execute a `TraversalSpec` against this repository's subgraph. The
+   * provider owns Cypher compilation; the spec stays language-agnostic.
+   * `track('traverse')` opens the per-operation usage scope so every
+   * `executeQuery` round-trip the executor performs aggregates into a single
+   * `OperationUsage` record.
+   */
+  public async traverse(
+    repositoryId: string,
+    spec: TraversalSpec,
+  ): Promise<TraversalResult> {
+    return this.traverseInternal(repositoryId, spec);
+  }
+
+  /**
+   * Internal compile → submit → project pipeline. Shared by the public
+   * `traverse` method and by the compiler-model rewrites of
+   * `exploreNeighborhood` / `findPaths`, which both consume the raw stored
+   * shape to rebuild their storage-level outputs.
+   */
+  private async traverseInternal(
+    repositoryId: string,
+    spec: TraversalSpec,
+  ): Promise<TraversalResult> {
+    const raw = await this.executeRawTraversal(repositoryId, spec);
+
+    const detailLevel = spec.detailLevel ?? 'summary';
+    type ProjectedEntity = TraversalResult['entities'][number];
+    type ProjectedRelationship = NonNullable<TraversalResult['relationships']>[number];
+
+    const projectStoredEntity = (stored: StoredEntity): ProjectedEntity => {
+      const projected = projectEntity(stored, detailLevel) as ProjectedEntity;
+      if (!spec.includeProvenance) {
+        delete (projected as unknown as Record<string, unknown>)['provenance'];
+      }
+      return projected;
+    };
+
+    // Walk direction stamping is mode-specific:
+    //   'all'  — relationships have no walk context (the row tuple has no
+    //            anchor), so the stored topology direction is reported as
+    //            `'out'` and callers derive walk direction relative to any
+    //            anchor via sourceEntityId / targetEntityId.
+    //   'path' — per-segment, computed inside the executor.
+    const projectStoredRelationship = (
+      rel: StoredRelationship,
+      direction: 'out' | 'in' = 'out',
+    ): ProjectedRelationship => ({
+      id: rel.id,
+      type: rel.relationshipType,
+      sourceEntityId: rel.sourceEntityId,
+      targetEntityId: rel.targetEntityId,
+      direction,
+      properties: rel.properties,
+    });
+
+    let entities: ProjectedEntity[] = [];
+    let relationships: ProjectedRelationship[] | undefined;
+    let paths: NonNullable<TraversalResult['paths']> | undefined;
+
+    if (spec.returnMode === 'terminal') {
+      entities = raw.terminalEntities.map(projectStoredEntity);
+      relationships = undefined;
+    } else if (spec.returnMode === 'all') {
+      // Greedy-expand is unnecessary on Cypher: each row of the 'all' emission
+      // is a (n0, ..., nD, r0, ..., r(D-1)) tuple binding every relationship
+      // to its endpoint nodes at MATCH time. A `LIMIT` slices whole rows; it
+      // cannot orphan a relationship's endpoint within a row. The Cosmos
+      // provider needs the back-fill because Gremlin's union-of-vertices-and-
+      // edges stream can drop an edge's endpoint via `.range()`.
+      entities = raw.allEntities.map(projectStoredEntity);
+      relationships = raw.allRelationships.map((r) => projectStoredRelationship(r));
+    } else {
+      paths = raw.pathRows.map((row) => ({
+        length: Math.max(row.entityIds.length - 1, 0),
+        entities: row.entityIds.map((id) => {
+          const stored = raw.entityMap.get(id);
+          if (!stored) {
+            throw new ProviderError(
+              'Unpacking Cypher path: entity referenced by path is missing from the result.',
+              'Inspect compiledQuery — this indicates a path emission shape mismatch.',
+            );
+          }
+          return projectStoredEntity(stored);
+        }),
+        relationships: row.relationshipIds.map((id, i) => {
+          const stored = raw.relationshipMap.get(id);
+          if (!stored) {
+            throw new ProviderError(
+              'Unpacking Cypher path: relationship referenced by path is missing from the result.',
+              'Inspect compiledQuery — this indicates a path emission shape mismatch.',
+            );
+          }
+          return projectStoredRelationship(stored, row.relationshipDirections[i] ?? 'out');
+        }),
+      }));
+      relationships = Array.from(raw.relationshipMap.values()).map((rel) =>
+        projectStoredRelationship(rel, raw.pathRelFirstDirection.get(rel.id) ?? 'out'),
+      );
+    }
+
+    const limit = spec.limit ?? 50;
+    let total: number;
+    if (spec.returnMode === 'path') {
+      total = paths?.length ?? 0;
+    } else if (spec.returnMode === 'all') {
+      // 'all' mode returns an interleaved entity+edge union — total counts both
+      // arrays so callers see the true page size.
+      total = entities.length + (relationships?.length ?? 0);
+    } else {
+      total = entities.length;
+    }
+
+    const truncated = total >= limit;
+
+    const queryMetadata: QueryMetadata = {
+      executionTimeMs: raw.executionTimeMs,
+      resourceCost: { units: 'server_ms', value: raw.serverMs },
+      compiledQuery: raw.compiledQuery,
+      compiledQueryLanguage: 'cypher',
+      appliedLimits: {
+        maxResults: limit,
+        ...(spec.steps !== undefined ? { maxDepth: spec.steps.length } : {}),
+      },
+      truncated,
+      ...(truncated ? { truncationReason: 'result_limit' as const } : {}),
+    };
+
+    return {
+      entities,
+      ...(relationships !== undefined ? { relationships } : {}),
+      ...(paths !== undefined ? { paths } : {}),
+      total,
+      returned: total,
+      hasMore: truncated,
+      queryMetadata,
+    };
+  }
+
+  /**
+   * Lower-level compile + submit + parse helper. Fetches the cached
+   * vocabulary once (D16) and hands it to the executor; the executor handles
+   * the repositoryId-scope rewrite, optional PROFILE prefix, and Path-object
+   * parsing.
+   */
+  private async executeRawTraversal(
+    repositoryId: string,
+    spec: TraversalSpec,
+  ): Promise<RawTraversalResult> {
+    const vocabulary = await this.getVocabularyCached(repositoryId);
+    return this.traversalExecutor.execute(repositoryId, spec, vocabulary);
+  }
+
+  /**
+   * BFS-like neighbourhood exploration. For each depth `d` from 1 to
+   * `options.depth`, compile a cumulative `'all'`-mode spec with `d` discrete
+   * `'both'`-direction steps, run it through the executor, and walk one BFS
+   * layer client-side from the previous frontier using the returned edges.
+   *
+   * Round-trips per call: `options.depth`. Server-side step direction is
+   * fixed to `'both'` (catches every edge in either direction); the
+   * directional + bidirectional filter and entity-type filter run client-side
+   * during layer reconstruction — both to preserve the observable contract
+   * shared with the Cosmos provider and because the compiler's prefix walk at
+   * each depth is intentionally unfiltered so deeper layers stay reachable
+   * through any intermediate.
+   */
+  public async exploreNeighborhood(
+    repositoryId: string,
+    entityId: string,
+    options: StorageExploreOptions,
+  ): Promise<StorageNeighborhood> {
+    const layers: StorageNeighborhoodLayer[] = [];
+    const visited = new Set<string>([entityId]);
+    let frontier = new Set<string>([entityId]);
+
+    for (let d = 1; d <= options.depth; d++) {
+      if (frontier.size === 0) break;
+
+      const spec: TraversalSpec = {
+        start: { entityId },
+        steps: buildExploreSteps(d, options),
+        returnMode: 'all',
+        // The cumulative-d query fetches every node and edge reachable in ≤d
+        // hops in either direction. Size the limit generously so a single
+        // round-trip can hold the layer's full graph regardless of fan-out.
+        limit: 10_000,
+        detailLevel: 'full',
+        includeProvenance: true,
+      };
+      const raw = await this.executeRawTraversal(repositoryId, spec);
+
+      const edgesByVertex = new Map<string, StoredRelationship[]>();
+      for (const rel of raw.allRelationships) {
+        const a = edgesByVertex.get(rel.sourceEntityId);
+        if (a) a.push(rel);
+        else edgesByVertex.set(rel.sourceEntityId, [rel]);
+        const b = edgesByVertex.get(rel.targetEntityId);
+        if (b) b.push(rel);
+        else edgesByVertex.set(rel.targetEntityId, [rel]);
+      }
+
+      const layer: StorageNeighborhoodLayer = {};
+      const nextFrontier = new Set<string>();
+      // Dedup the (vertex-pair, edge) within a single layer — the cumulative
+      // 'all' response can include the same edge under multiple rows when
+      // both endpoints sit on the frontier.
+      const layerEdgeSeen = new Set<string>();
+
+      for (const fv of frontier) {
+        const incident = edgesByVertex.get(fv) ?? [];
+        for (const rel of incident) {
+          const isSource = rel.sourceEntityId === fv;
+          const isTarget = rel.targetEntityId === fv;
+          let matchesDirection = false;
+          let connectedId: string | undefined;
+
+          if (isSource && (options.direction === 'out' || options.direction === 'both')) {
+            matchesDirection = true;
+            connectedId = rel.targetEntityId;
+          } else if (isTarget && (options.direction === 'in' || options.direction === 'both')) {
+            matchesDirection = true;
+            connectedId = rel.sourceEntityId;
+          } else if (rel.bidirectional) {
+            // bidirectional flag exposes the edge in the opposite direction
+            // without doubling the stored topology.
+            if (isSource && options.direction === 'in') {
+              matchesDirection = true;
+              connectedId = rel.targetEntityId;
+            } else if (isTarget && options.direction === 'out') {
+              matchesDirection = true;
+              connectedId = rel.sourceEntityId;
+            }
+          }
+          if (!matchesDirection || !connectedId) continue;
+          if (visited.has(connectedId)) continue;
+
+          if (
+            options.relationshipPropertyFilters &&
+            options.relationshipPropertyFilters.length > 0
+          ) {
+            if (!matchesPropertyFilters(rel.properties, options.relationshipPropertyFilters))
+              continue;
+          }
+
+          const connectedEntity = raw.entityMap.get(connectedId);
+          if (!connectedEntity) continue;
+
+          if (
+            options.entityTypes &&
+            options.entityTypes.length > 0 &&
+            !options.entityTypes.includes(connectedEntity.entityType)
+          ) {
+            continue;
+          }
+
+          const edgeKey = `${rel.id}|${fv}->${connectedId}`;
+          if (layerEdgeSeen.has(edgeKey)) continue;
+          layerEdgeSeen.add(edgeKey);
+
+          const relType = rel.relationshipType;
+          if (!layer[relType]) {
+            layer[relType] = { total: 0, entities: [], relationships: [] };
+          }
+          layer[relType]!.entities.push(connectedEntity);
+          layer[relType]!.relationships.push(rel);
+          layer[relType]!.total = layer[relType]!.entities.length;
+          nextFrontier.add(connectedId);
+        }
+      }
+
+      // Per-type pagination — `total` reflects the full pre-slice count so
+      // callers can page later without re-issuing the traversal.
+      for (const relType of Object.keys(layer)) {
+        const group = layer[relType]!;
+        const start = options.offsetPerType;
+        const end = start + options.limitPerType;
+        group.entities = group.entities.slice(start, end);
+        group.relationships = group.relationships.slice(start, end);
+      }
+
+      if (Object.keys(layer).length > 0) {
+        layers.push(layer);
+      }
+
+      // Promote the next frontier into `visited` only after the whole layer is
+      // processed — keeps a single entity available under multiple relationship
+      // types within the same layer (same semantic as the Cosmos provider).
+      for (const id of nextFrontier) visited.add(id);
+      frontier = nextFrontier;
+    }
+
+    return { centerId: entityId, layers };
+  }
+
+  /**
+   * Path finding between two entities. Single round-trip via a variable-length
+   * `MATCH p = (s)-[*1..N]-(t)` pattern; the compiler's path-binding emission
+   * lets the executor recover ordered nodes and relationships via `nodes(p)`
+   * / `relationships(p)`. The default `DIFFERENT RELATIONSHIPS` match mode in
+   * Cypher 25 prevents edge reuse within a single path — no explicit dedup
+   * filter is needed.
+   *
+   * The traversal walks the graph topologically regardless of relationship
+   * directionality (a path is defined by reachability, not semantic
+   * direction); entity-type and relationship-property filters apply during
+   * compilation, target filtering happens post-fetch.
+   */
+  public async findPaths(
+    repositoryId: string,
+    sourceId: string,
+    targetId: string,
+    options: StoragePathOptions,
+  ): Promise<StoragePathResult> {
+    if (sourceId === targetId) {
+      return { paths: [{ entityIds: [sourceId], relationshipIds: [] }], totalPaths: 1 };
+    }
+
+    const step: TraversalStep = {
+      direction: 'both',
+      repeat: { maxDepth: options.maxDepth, emitIntermediates: true },
+    };
+    if (options.relationshipTypes && options.relationshipTypes.length > 0) {
+      step.relationshipTypes = options.relationshipTypes;
+    }
+    if (options.relationshipPropertyFilters && options.relationshipPropertyFilters.length > 0) {
+      step.relationshipFilter = options.relationshipPropertyFilters;
+    }
+
+    const spec: TraversalSpec = {
+      start: { entityId: sourceId },
+      steps: [step],
+      returnMode: 'path',
+      // Pull a generous candidate pool so the post-fetch filter (paths ending
+      // at targetId) has enough rows to paginate from. The variable-length
+      // pattern returns every walk of length ≤ maxDepth in one round-trip.
+      limit: Math.max(options.limit + options.offset, options.limit) * 10,
+      detailLevel: 'full',
+      includeProvenance: true,
+    };
+
+    const raw = await this.executeRawTraversal(repositoryId, spec);
+
+    const matchingPaths: StoragePath[] = [];
+    for (const row of raw.pathRows) {
+      const last = row.entityIds[row.entityIds.length - 1];
+      if (last !== targetId) continue;
+      if (options.entityTypes && options.entityTypes.length > 0) {
+        // Entity-type filter applies only to intermediate vertices — source
+        // and target are always allowed regardless of the filter, mirroring
+        // the Cosmos contract.
+        let rejected = false;
+        for (let i = 1; i < row.entityIds.length - 1; i++) {
+          const intermediate = raw.entityMap.get(row.entityIds[i]!);
+          if (!intermediate) {
+            rejected = true;
+            break;
+          }
+          if (!options.entityTypes.includes(intermediate.entityType)) {
+            rejected = true;
+            break;
+          }
+        }
+        if (rejected) continue;
+      }
+      matchingPaths.push({
+        entityIds: [...row.entityIds],
+        relationshipIds: [...row.relationshipIds],
+      });
+    }
+
+    const paginated = matchingPaths.slice(options.offset, options.offset + options.limit);
+
+    return {
+      paths: paginated,
+      totalPaths: matchingPaths.length,
+    };
+  }
+}
+
+/**
+ * Build the per-step `TraversalSpec` steps for `exploreNeighborhood` at a
+ * given cumulative depth. Server-side step direction is fixed to `'both'`;
+ * the directional + bidirectional filter and entity-type filter are applied
+ * client-side during layer reconstruction to preserve the observable
+ * contract (deeper layers stay reachable through any intermediate).
+ *
+ * `relationshipTypes` is pushed to the server — the compiler emits it as
+ * `-[r:TYPE1|TYPE2]-` which IS part of the prefix walk at every depth.
+ */
+function buildExploreSteps(
+  depth: number,
+  options: StorageExploreOptions,
+): TraversalStep[] {
+  const base: TraversalStep = { direction: 'both' };
+  if (options.relationshipTypes && options.relationshipTypes.length > 0) {
+    base.relationshipTypes = options.relationshipTypes;
+  }
+  const steps: TraversalStep[] = [];
+  for (let i = 0; i < depth; i++) {
+    steps.push({ ...base });
+  }
+  return steps;
 }

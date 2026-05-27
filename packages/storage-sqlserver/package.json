@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-storage-sqlserver",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "SQL Server storage provider for @utaba/deep-memory",
   "type": "module",
   "main": "./dist/index.cjs",

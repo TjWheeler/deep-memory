@@ -412,4 +412,157 @@ describe('GremlinCompiler', () => {
     };
     expect(compiler.compile(allSpec, emptyVocab).query).not.toContain('.simplePath()');
   });
+
+  // ─── Server-side projection — group/dedup/values terminals ──
+
+  describe('projection', () => {
+    it('emits group/count/unfold when mode is count', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Organization' },
+        returnMode: 'terminal',
+        projection: { properties: ['orgType'], mode: 'count' },
+        limit: 200,
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain(
+        `.group().by(values('orgType')).by(count()).unfold()`,
+      );
+      // The vertex project chain that normally terminates a terminal-mode
+      // query is suppressed — projection owns the row shape.
+      expect(result.query).not.toContain("'__kind'");
+      expect(result.query).not.toContain('valueMap(true)');
+    });
+
+    it('emits .dedup() when distinct is true and mode is values', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Equipment' },
+        returnMode: 'terminal',
+        projection: { properties: ['equipmentType'], distinct: true },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain(`.values('equipmentType').dedup()`);
+      expect(result.query).not.toContain('count()');
+    });
+
+    it('emits one row per match in plain values mode (no dedup, no count)', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Fluid' },
+        returnMode: 'terminal',
+        projection: { properties: ['fluidType'] },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain(`.values('fluidType')`);
+      expect(result.query).not.toContain('.dedup()');
+      expect(result.query).not.toContain('count()');
+    });
+
+    it('projects multiple properties as separate .by(values(...)) modulators', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Equipment' },
+        returnMode: 'terminal',
+        projection: { properties: ['equipmentType', 'tier'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain(
+        `.group().by(project('equipmentType','tier').by(values('equipmentType')).by(values('tier'))).by(count()).unfold()`,
+      );
+    });
+
+    it('uses the single-property shortcut (no project wrapper) for count and distinct', () => {
+      // Single-property emissions skip the project('p').by(values('p')) wrapper
+      // and use the bare values('p') terminal — smaller emission and one less
+      // Map layer for the parser to walk.
+      const countSpec: TraversalSpec = {
+        start: { entityType: 'Organization' },
+        returnMode: 'terminal',
+        projection: { properties: ['orgType'], mode: 'count' },
+      };
+      const countResult = compiler.compile(countSpec, emptyVocab);
+      expect(countResult.query).toContain(
+        `.group().by(values('orgType')).by(count()).unfold()`,
+      );
+      expect(countResult.query).not.toContain(`project('orgType')`);
+
+      const distinctSpec: TraversalSpec = {
+        start: { entityType: 'Equipment' },
+        returnMode: 'terminal',
+        projection: { properties: ['equipmentType'], distinct: true },
+      };
+      const distinctResult = compiler.compile(distinctSpec, emptyVocab);
+      expect(distinctResult.query).toContain(`.values('equipmentType').dedup()`);
+      expect(distinctResult.query).not.toContain(`project('equipmentType')`);
+    });
+
+    it('projects the terminal anchor after multi-hop steps', () => {
+      // In Gremlin the terminal anchor is positional — projection is appended
+      // after the final hop's vertex emission. Verify both hops AND the
+      // projection terminal appear in order.
+      const spec: TraversalSpec = {
+        start: { entityId: 'Equipment:pc7000' },
+        steps: [
+          { direction: 'out', relationshipTypes: ['HAS_COMPONENT'] },
+          { direction: 'out', relationshipTypes: ['REQUIRES_FLUID'] },
+        ],
+        returnMode: 'terminal',
+        projection: { properties: ['fluidType'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+
+      const outCount = (result.query.match(/\.out\(/g) ?? []).length;
+      expect(outCount).toBe(2);
+      expect(result.query).toContain(
+        `.group().by(values('fluidType')).by(count()).unfold()`,
+      );
+
+      const firstOut = result.query.indexOf('.out(');
+      const lastOut = result.query.lastIndexOf('.out(');
+      const projection = result.query.indexOf('.group()');
+      expect(firstOut).toBeLessThan(lastOut);
+      expect(lastOut).toBeLessThan(projection);
+    });
+
+    it('rejects unsafe projection property names', () => {
+      // Identifier-position values like values('p') can't be parameterised in
+      // Gremlin — anything other than the documented identifier shape must
+      // throw before reaching emission.
+      const spec: TraversalSpec = {
+        start: { entityType: 'Organization' },
+        returnMode: 'terminal',
+        projection: { properties: [`orgType').values('embedding`], mode: 'count' },
+      };
+      expect(() => compiler.compile(spec, emptyVocab)).toThrow(
+        /Unsafe projection property name/,
+      );
+    });
+
+    it('drops projection silently when returnMode is path', () => {
+      const spec: TraversalSpec = {
+        start: { entityId: 'a' },
+        steps: [{ direction: 'both', repeat: { maxDepth: 3 } }],
+        returnMode: 'path',
+        projection: { properties: ['anything'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      // The path emission shape is unchanged — no projection terminal slipped
+      // in. `count()` and the projected property name are absent.
+      expect(result.query).toContain('.path()');
+      expect(result.query).not.toContain('count()');
+      expect(result.query).not.toContain(`values('anything')`);
+    });
+
+    it('drops projection silently when returnMode is all', () => {
+      const spec: TraversalSpec = {
+        start: { entityId: 'a' },
+        steps: [{ direction: 'out', relationshipTypes: ['KNOWS'] }],
+        returnMode: 'all',
+        projection: { properties: ['anything'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      // 'all' emits the union+dedup branch shape regardless of projection.
+      expect(result.query).toContain('.union(');
+      expect(result.query).toContain(`.dedup().by(select('id'))`);
+      expect(result.query).not.toContain('count()');
+      expect(result.query).not.toContain(`values('anything')`);
+    });
+  });
 });

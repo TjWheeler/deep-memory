@@ -30,6 +30,7 @@ import type {
   TraversalSpec,
   TraversalStep,
   TraversalResult,
+  TraversalAggregation,
   QueryMetadata,
   UsageSink,
 } from '@utaba/deep-memory/types';
@@ -124,6 +125,15 @@ interface RawTraversalResult {
     relationshipIds: string[];
     relationshipDirections: Array<'out' | 'in'>;
   }>;
+  /**
+   * Populated when the spec carries `projection` and the compiler emitted a
+   * projection-aware terminal (`.group()` / `.dedup()` / `.project()` shape).
+   * The rows are aggregated server-side; the provider returns this verbatim
+   * on `TraversalResult.aggregations`. Mutually exclusive with
+   * `terminalEntities` / `allEntities` / `pathRows` — the compiler picks one
+   * emission shape per query. Symmetric with the Neo4j executor's contract.
+   */
+  aggregations?: TraversalAggregation[];
   /**
    * Lookup table — populated for `'all'` and `'path'` modes. Includes every
    * entity that appears in any returned row.
@@ -1130,6 +1140,18 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     let relationships: ProjectedRelationship[] | undefined;
     let paths: NonNullable<TraversalResult['paths']> | undefined;
 
+    // The compiler emits projection-aware terminal only when returnMode is
+    // 'terminal'. On that path the raw result carries `aggregations` and no
+    // entity rows — bypass the entity/relationship/path mapping entirely.
+    //
+    // `projection.includeEntities: true` is not supported alongside server-side
+    // projection: a single grouped/distinct terminal cannot also stream the
+    // un-aggregated vertex payload. Callers needing both must issue two
+    // queries (one with projection, one without). Same decision as the Neo4j
+    // executor — keeps semantics symmetric across native-graph backends.
+    const aggregations = raw.aggregations;
+    const projectionEmitted = aggregations !== undefined;
+
     // Server-side row count BEFORE greedy-expand. The compiler's union emits
     // vertices before edges at each depth so the deduped stream is closed
     // under per-hop entity references; this preserved count is what hasMore /
@@ -1139,7 +1161,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         ? raw.allEntities.length + raw.allRelationships.length
         : 0;
 
-    if (spec.returnMode === 'terminal') {
+    if (projectionEmitted) {
+      // entities / relationships / paths stay empty/undefined — projection
+      // owns the response. `total` is computed from aggregations below.
+    } else if (spec.returnMode === 'terminal') {
       entities = raw.terminalEntities.map(projectStoredEntity);
       relationships = undefined;
     } else if (spec.returnMode === 'all') {
@@ -1205,9 +1230,12 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     const limit = spec.limit ?? 50;
     // 'all' mode returns an interleaved entity+edge union — total must count
     // both so callers see the true page size (including any greedy-expanded
-    // endpoint vertices).
+    // endpoint vertices). Projection rows are the visible page (one row per
+    // group / distinct value), so total reflects the aggregation count.
     let total: number;
-    if (spec.returnMode === 'path') {
+    if (projectionEmitted) {
+      total = aggregations!.length;
+    } else if (spec.returnMode === 'path') {
       total = paths?.length ?? 0;
     } else if (spec.returnMode === 'all') {
       total = entities.length + (relationships?.length ?? 0);
@@ -1219,7 +1247,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     // post-expand visible page size. 'all' mode uses the pre-expand row count
     // from the server-side .range() — greedy-expand can only inflate the page
     // and would otherwise spuriously trip the >= limit heuristic when the
-    // server-side slice was actually short of `limit`.
+    // server-side slice was actually short of `limit`. Projection mode uses
+    // the aggregation count directly: server-side .range() paginates the
+    // group / distinct stream, so the visible page is exactly what the
+    // request asked for.
     const paginationSignal =
       spec.returnMode === 'all' ? rangeRowCount : total;
     const truncated = paginationSignal >= limit;
@@ -1243,6 +1274,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       entities,
       relationships,
       paths,
+      ...(aggregations !== undefined ? { aggregations } : {}),
       total,
       returned: total,
       hasMore: truncated,
@@ -1315,7 +1347,24 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       compiledQuery: scopedQuery,
     };
 
-    if (spec.returnMode === 'terminal') {
+    // Projection rows have a different shape (group/dedup/values emissions
+    // produce scalars or projected Maps, not vertex property maps) so they
+    // bypass the entity parsers entirely. The compiler only emits the
+    // projection terminal when returnMode is 'terminal'; mirror that gate
+    // here so 'all' / 'path' projections fall through to the existing paths
+    // (where the projection block is silently dropped, per plan §2.2).
+    const emitsProjection =
+      spec.projection !== undefined &&
+      spec.returnMode !== 'all' &&
+      spec.returnMode !== 'path';
+
+    if (emitsProjection) {
+      raw.aggregations = parseProjectionRows(
+        result.items,
+        spec.projection!.properties,
+        spec.projection!.mode ?? 'values',
+      );
+    } else if (spec.returnMode === 'terminal') {
       // Flat projected vertex rows — one per row.
       for (const item of result.items) {
         const stored = entityFromGremlin(item as Record<string, unknown>);
@@ -1431,6 +1480,154 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 function unwrapGremlinValue(val: unknown): unknown {
   if (Array.isArray(val) && val.length > 0) return val[0];
   return val;
+}
+
+/**
+ * Parse the server-aggregated projection rows from a Gremlin response.
+ *
+ * The compiler emits one of three terminal shapes — `.group().by(K).by(count()).unfold()`,
+ * `.<keyExpr>.dedup()`, or plain `.<keyExpr>` — picked from `mode` + `distinct`.
+ * Per-row shape:
+ *
+ *   - count mode: a Map.Entry-like row carrying the projected key and the
+ *     count. Cosmos serialises this as a plain object `{ key, value }` or as a
+ *     JS `Map`; we accept either via `readEntry`.
+ *   - values modes: single-property shortcut emits the scalar directly;
+ *     multi-property emits a projected Map / object.
+ *
+ * Counts arrive as either Number, BigInt, or a Cosmos Long-shape (string).
+ * Coerced to Number so the JSON wire shape stays portable.
+ */
+function parseProjectionRows(
+  items: ReadonlyArray<unknown>,
+  properties: ReadonlyArray<string>,
+  mode: 'values' | 'count',
+): TraversalAggregation[] {
+  const singleProperty = properties.length === 1;
+  const aggregations: TraversalAggregation[] = [];
+
+  if (mode === 'count') {
+    for (const item of items) {
+      const entry = readEntry(item);
+      if (entry === undefined) continue;
+      const values = singleProperty
+        ? { [properties[0]!]: normaliseProjectionScalar(entry.key) }
+        : readProjectedMap(entry.key, properties);
+      aggregations.push({ values, count: coerceCount(entry.value) });
+    }
+    return aggregations;
+  }
+
+  // values / distinct-values modes: one row per matching vertex (or per
+  // distinct projected combination when the compiler appended .dedup()).
+  for (const item of items) {
+    const values = singleProperty
+      ? { [properties[0]!]: normaliseProjectionScalar(item) }
+      : readProjectedMap(item, properties);
+    aggregations.push({ values });
+  }
+  return aggregations;
+}
+
+/**
+ * Read a Map.Entry-like row into `{ key, value }`. Cosmos's Gremlin server
+ * has been observed to serialise `g:Map` as a plain JS object (see the
+ * `getRepositoryStats` group-by parser), so we accept both:
+ *
+ *   - plain object `{ key: K, value: V }`
+ *   - JS `Map` (via gremlin-javascript's MapSerializer)
+ *   - single-key object `{ <K>: V }` when Cosmos collapses a unfolded Map.Entry
+ *
+ * Returns `undefined` for unrecognised shapes — the row is skipped defensively
+ * rather than throwing, matching the existing `'all'` / `'path'` parsers'
+ * defensive-skip behaviour for rows without the expected discriminator.
+ */
+function readEntry(item: unknown): { key: unknown; value: unknown } | undefined {
+  if (item instanceof Map) {
+    if (item.has('key') && item.has('value')) {
+      return { key: item.get('key'), value: item.get('value') };
+    }
+    // Single-entry Map collapsed from a Map.Entry — take the first pair.
+    const first = item.entries().next();
+    if (!first.done) {
+      const [key, value] = first.value;
+      return { key, value };
+    }
+    return undefined;
+  }
+  if (typeof item !== 'object' || item === null) return undefined;
+  const obj = item as Record<string, unknown>;
+  if ('key' in obj && 'value' in obj) {
+    return { key: obj['key'], value: obj['value'] };
+  }
+  // Single-key object representation: `{ <projectedKey>: <count> }`.
+  const keys = Object.keys(obj);
+  if (keys.length === 1) {
+    const k = keys[0]!;
+    return { key: k, value: obj[k] };
+  }
+  return undefined;
+}
+
+/**
+ * Read a projected key (multi-property mode) into a positional `Record<string, unknown>`
+ * keyed by the projected property names. Accepts either a JS `Map` or a plain
+ * object — Cosmos has been observed to emit projected Maps as plain JS objects.
+ *
+ * Properties absent from the row are filled with `undefined` to keep the
+ * `values` shape stable across rows — agents can rely on every aggregation
+ * carrying every requested property name.
+ */
+function readProjectedMap(
+  row: unknown,
+  properties: ReadonlyArray<string>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (row instanceof Map) {
+    for (const prop of properties) {
+      out[prop] = normaliseProjectionScalar(row.get(prop));
+    }
+    return out;
+  }
+  if (typeof row === 'object' && row !== null) {
+    const obj = row as Record<string, unknown>;
+    for (const prop of properties) {
+      out[prop] = normaliseProjectionScalar(obj[prop]);
+    }
+    return out;
+  }
+  // Unrecognised — fill with undefined so callers see all requested keys.
+  for (const prop of properties) {
+    out[prop] = undefined;
+  }
+  return out;
+}
+
+/**
+ * Normalise a server-side projected scalar to a JSON-wire shape. Cosmos's
+ * Gremlin driver may return integers as `BigInt` (driver-configurable) or
+ * as Long-shape strings; coerce numeric forms to `Number` so projection
+ * values survive `JSON.stringify`. Other scalars / strings / booleans / null
+ * pass through.
+ */
+function normaliseProjectionScalar(value: unknown): unknown {
+  if (typeof value === 'bigint') return Number(value);
+  return value;
+}
+
+/**
+ * Coerce a Gremlin count cell to Number. Cosmos has been observed to return
+ * counts as Number, BigInt, or (rarely) a Long-shape numeric string; all three
+ * coerce safely through `Number(...)`. Non-numeric or missing → 0.
+ */
+function coerceCount(value: unknown): number {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value === 'string') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
 }
 
 /**

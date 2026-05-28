@@ -10,6 +10,8 @@ import {
   entityFromDocument,
   entityFromGremlin,
   entityToLadderBindings,
+  entityUserPropertyParams,
+  existingEntityScalarUserKeys,
   STORED_ENTITY_FIELDS,
 } from '../mapping.js';
 import {
@@ -25,14 +27,22 @@ import {
 // translate into the typed error — single round-trip either way.
 const DUPLICATE_SENTINEL = '__duplicate';
 
-// Fixed-shape property ladder — same Gremlin string for every entity create
-// regardless of which optional fields are populated, so the Cosmos plan cache
-// reuses one compiled plan. Computed once at module load.
-const ENTITY_CREATE_QUERY =
+// Prefix shared by every entity-create query: existence-check coalesce wrapper
+// + schema-managed property ladder. Per-call user-property scalars append after
+// the ladder (between the prefix and the closing `)` of the coalesce). When
+// the caller has no native-storable user properties, the empty suffix collapses
+// the emitted string to the canonical `ENTITY_CREATE_QUERY` value below — same
+// Gremlin string the provider has always issued for that case, so the plan
+// cache keeps its single warm entry for the dominant shape.
+const ENTITY_CREATE_PREFIX =
   `g.V().has('repositoryId', rid).hasId(vid).fold().coalesce(` +
   `unfold().constant('${DUPLICATE_SENTINEL}'),` +
-  `addV(vertexLabel).property('id', vid).property('repositoryId', rid)${buildEntityPropertyLadder()}` +
-  `)`;
+  `addV(vertexLabel).property('id', vid).property('repositoryId', rid)${buildEntityPropertyLadder()}`;
+
+// Canonical empty-user-properties form. Exported so the unit test can pin the
+// zero-regression invariant (this string is byte-identical to the historical
+// fixed-shape query).
+export const ENTITY_CREATE_QUERY = `${ENTITY_CREATE_PREFIX})`;
 
 export async function createEntity(
   conn: CosmosDbConnection,
@@ -46,7 +56,26 @@ export async function createEntity(
     ...entityToLadderBindings(entity),
   };
 
-  const result = await conn.submit(ENTITY_CREATE_QUERY, bindings);
+  // Dual-write: the JSON blob lives in the `properties` ladder slot above
+  // (round-trip authoritative); native-storable scalars also project to per-
+  // key vertex properties so server-side predicates and aggregations can
+  // reach them. Validation runs before any round-trip — reserved-key
+  // collisions and unsafe identifiers raise ProviderError synchronously.
+  const userProps = entityUserPropertyParams(entity.properties ?? {});
+  let query: string;
+  if (userProps.length === 0) {
+    query = ENTITY_CREATE_QUERY;
+  } else {
+    let suffix = '';
+    for (let i = 0; i < userProps.length; i++) {
+      const { key, value } = userProps[i]!;
+      suffix += `.property('${key}', p_user_${i})`;
+      bindings[`p_user_${i}`] = value;
+    }
+    query = `${ENTITY_CREATE_PREFIX}${suffix})`;
+  }
+
+  const result = await conn.submit(query, bindings);
 
   if (result.items[0] === DUPLICATE_SENTINEL) {
     throw new DuplicateEntityError(entity.id);
@@ -126,6 +155,38 @@ export async function getEntities(
 // plans/performance-issues.md), not partial-update calls. If the reembed loop
 // ever profiles as plan-parse-bound, revisit by introducing a two-sentinel
 // ladder shape — until then variable is fine.
+//
+// User-property dual-write on update is a 2-round-trip operation when the
+// caller replaces the properties blob: one pre-read of the existing blob (so
+// the drop set for scalars that left the new shape can be computed), then
+// one write. Read-then-write is not transactional — the documented contract
+// is last-writer-wins with the blob as the read-side source of truth. When
+// the caller does not touch properties, the pre-read is skipped and the
+// shape is unchanged from the historical single-round-trip path.
+
+async function readExistingEntityPropertiesBlob(
+  conn: CosmosDbConnection,
+  repositoryId: string,
+  entityId: string,
+): Promise<{ found: true; blob: Record<string, unknown> } | { found: false }> {
+  const result = await conn.submit(
+    "g.V().has('repositoryId', rid).hasId(eid).has('entityType').values('properties').limit(1)",
+    { rid: repositoryId, eid: entityId },
+  );
+  if (result.items.length === 0) return { found: false };
+  const raw = result.items[0];
+  const json = typeof raw === 'string' ? raw : String(raw ?? '');
+  if (!json) return { found: true, blob: {} };
+  try {
+    const parsed = JSON.parse(json);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { found: true, blob: parsed as Record<string, unknown> };
+    }
+  } catch {
+    // Malformed blob — treat as empty for drop-set purposes.
+  }
+  return { found: true, blob: {} };
+}
 
 export async function updateEntity(
   conn: CosmosDbConnection,
@@ -133,6 +194,26 @@ export async function updateEntity(
   entityId: string,
   updates: StoredEntityUpdate,
 ): Promise<StoredEntity> {
+  // Validate the new user-property shape BEFORE any round-trip — a reserved-
+  // name collision or unsafe identifier raises ProviderError synchronously,
+  // so we never burn a pre-read on a payload we cannot persist.
+  const userProps =
+    updates.properties !== undefined
+      ? entityUserPropertyParams(updates.properties)
+      : null;
+
+  let droppedUserKeys: string[] = [];
+  if (updates.properties !== undefined) {
+    const existing = await readExistingEntityPropertiesBlob(conn, repositoryId, entityId);
+    if (!existing.found) {
+      // Short-circuit before the write: no entity to update.
+      throw new EntityNotFoundError(entityId);
+    }
+    const existingKeys = existingEntityScalarUserKeys(existing.blob);
+    const newKeySet = new Set(userProps!.map((p) => p.key));
+    droppedUserKeys = existingKeys.filter((k) => !newKeySet.has(k));
+  }
+
   const bindings: Record<string, unknown> = { rid: repositoryId, eid: entityId };
   const propParts: string[] = [];
   let idx = 0;
@@ -160,7 +241,26 @@ export async function updateEntity(
   if (updates.slug !== undefined) addProp('slug', updates.slug);
   if (updates.summary === null) dropProp('summary');
   else if (updates.summary !== undefined) addProp('summary', updates.summary);
-  if (updates.properties !== undefined) addProp('properties', JSON.stringify(updates.properties));
+
+  // User-property dual-write block. Order within the block: write the
+  // canonical blob first (the read-side source of truth), then drop scalars
+  // that left the new shape, then re-emit a .property for every native-
+  // storable key in the new shape. Keys whose value did not change still
+  // get re-emitted — the cost is one idempotent .property step per key and
+  // it keeps the emitted shape stable per-shape for plan-cache reuse.
+  if (updates.properties !== undefined && userProps !== null) {
+    addProp('properties', JSON.stringify(updates.properties));
+    for (const dropKey of droppedUserKeys) {
+      dropProp(dropKey);
+    }
+    for (let i = 0; i < userProps.length; i++) {
+      const { key, value } = userProps[i]!;
+      const paramName = `p_user_${i}`;
+      bindings[paramName] = value;
+      propParts.push(`.property('${key}', ${paramName})`);
+    }
+  }
+
   if (updates.data === null) dropProp('data');
   else if (updates.data !== undefined) addProp('data', updates.data);
   if (updates.dataFormat === null) dropProp('dataFormat');

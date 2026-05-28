@@ -20,7 +20,9 @@ import {
   DuplicateEntityError,
   DuplicateRelationshipError,
   EntityNotFoundError,
+  ProviderError,
 } from '@utaba/deep-memory';
+import { ENTITY_CREATE_QUERY } from './queries/entity.js';
 import type { CosmosQueryParameter, CosmosQueryResult } from './CosmosDocumentClient.js';
 
 const TEST_REPO = '40000000-0000-4000-a000-000000000099';
@@ -422,6 +424,496 @@ describe('single-round-trip create / update', () => {
     await expect(
       provider.updateEntity(TEST_REPO, '40000000-0000-4000-a000-000000006006', updates),
     ).rejects.toBeInstanceOf(EntityNotFoundError);
+  });
+});
+
+// ─── createEntity user-property scalars (dual-write) ─────────────────
+//
+// Native-storable user-property values dual-write as per-key vertex properties
+// alongside the canonical JSON blob, so server-side predicates (values('orgType'))
+// and aggregations can reach them. The blob remains authoritative for round-
+// trip. Contract pins:
+//   1. Empty user-properties → the emitted Gremlin string is byte-identical
+//      to the canonical ENTITY_CREATE_QUERY (zero plan-cache regression for
+//      the dominant shape).
+//   2. Native-storable values → one `.property('<key>', p_user_<i>)` per key,
+//      emitted in insertion order, with values bound through the p_user_*
+//      slots (only keys are inline).
+//   3. Unsafe identifiers and reserved-set collisions → ProviderError thrown
+//      synchronously, no round-trip.
+//   4. Non-storable values → silently dropped from the suffix; the canonical
+//      blob still carries them via the ladder `properties` slot.
+//   5. The duplicate-detection sentinel path is unaffected — the suffix sits
+//      inside the addV branch of the coalesce.
+
+function captureCreateQuery(): {
+  provider: CosmosDbProvider;
+  stub: SubmitStub;
+  getCreateCall: () => SubmitCall;
+} {
+  const { provider, stub } = makeProvider();
+  stub.submit = async (query, params) => {
+    stub.calls.push({ query, params });
+    if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+      return { items: [{ id: 'created-vertex' }] };
+    }
+    return { items: [] };
+  };
+  return {
+    provider,
+    stub,
+    getCreateCall: () => {
+      const call = stub.calls.find((c) =>
+        c.query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce('),
+      );
+      if (!call) throw new Error('no create call captured');
+      return call;
+    },
+  };
+}
+
+describe('createEntity user-property scalars', () => {
+  it('empty user-properties emits the canonical ENTITY_CREATE_QUERY string byte-for-byte', async () => {
+    const { provider, getCreateCall } = captureCreateQuery();
+    const entity: StoredEntity = {
+      ...makeEntity('40000000-0000-4000-a000-000000008001'),
+      properties: {},
+    };
+
+    await provider.createEntity(TEST_REPO, entity);
+
+    expect(getCreateCall().query).toBe(ENTITY_CREATE_QUERY);
+  });
+
+  it('all-non-storable user-properties collapse to the canonical query — blob still carries them', async () => {
+    const { provider, getCreateCall } = captureCreateQuery();
+    const entity: StoredEntity = {
+      ...makeEntity('40000000-0000-4000-a000-000000008002'),
+      properties: { nested: { a: 1 }, mixed: ['a', 1] },
+    };
+
+    await provider.createEntity(TEST_REPO, entity);
+
+    const call = getCreateCall();
+    expect(call.query).toBe(ENTITY_CREATE_QUERY);
+    // The canonical `properties` ladder binding (p3 in the entity ladder) still
+    // serialises the full input blob — non-storable values round-trip via JSON.
+    const propertiesBlob = (call.params as Record<string, unknown>)['p3'];
+    expect(propertiesBlob).toBe(JSON.stringify({ nested: { a: 1 }, mixed: ['a', 1] }));
+  });
+
+  it('appends one .property suffix per native-storable user key in insertion order', async () => {
+    const { provider, getCreateCall } = captureCreateQuery();
+    const entity: StoredEntity = {
+      ...makeEntity('40000000-0000-4000-a000-000000008003'),
+      properties: { orgType: 'company', tier: 'premium', headcount: 42 },
+    };
+
+    await provider.createEntity(TEST_REPO, entity);
+
+    const call = getCreateCall();
+    expect(call.query).toContain(".property('orgType', p_user_0)");
+    expect(call.query).toContain(".property('tier', p_user_1)");
+    expect(call.query).toContain(".property('headcount', p_user_2)");
+    // Order is part of the cache key — verify literal substring order.
+    const orgIdx = call.query.indexOf(".property('orgType', p_user_0)");
+    const tierIdx = call.query.indexOf(".property('tier', p_user_1)");
+    const hcIdx = call.query.indexOf(".property('headcount', p_user_2)");
+    expect(orgIdx).toBeGreaterThan(-1);
+    expect(tierIdx).toBeGreaterThan(orgIdx);
+    expect(hcIdx).toBeGreaterThan(tierIdx);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('premium');
+    expect(params['p_user_2']).toBe(42);
+  });
+
+  it('drops non-storable values from the suffix; storable siblings still appear', async () => {
+    const { provider, getCreateCall } = captureCreateQuery();
+    const entity: StoredEntity = {
+      ...makeEntity('40000000-0000-4000-a000-000000008004'),
+      properties: {
+        orgType: 'company',
+        nested: { a: 1 },
+        mixed: ['a', 1],
+        tier: 'premium',
+      },
+    };
+
+    await provider.createEntity(TEST_REPO, entity);
+
+    const call = getCreateCall();
+    expect(call.query).toContain(".property('orgType', p_user_0)");
+    expect(call.query).toContain(".property('tier', p_user_1)");
+    expect(call.query).not.toContain(".property('nested'");
+    expect(call.query).not.toContain(".property('mixed'");
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('premium');
+    expect(params['p_user_2']).toBeUndefined();
+  });
+
+  it('throws ProviderError on a reserved-key collision before any round-trip', async () => {
+    const { provider, stub } = captureCreateQuery();
+    const entity: StoredEntity = {
+      ...makeEntity('40000000-0000-4000-a000-000000008005'),
+      properties: { entityLabel: 'X' },
+    };
+
+    const before = stub.calls.length;
+    await expect(provider.createEntity(TEST_REPO, entity)).rejects.toBeInstanceOf(ProviderError);
+    const after = stub.calls.length;
+
+    // Validation runs synchronously — no submit issued. Vocabulary read is
+    // also skipped because createEntity hits validation first (the public
+    // CosmosDbProvider.createEntity calls vocabulary first; assert no CREATE
+    // query was issued specifically).
+    const createCalls = stub.calls
+      .slice(before, after)
+      .filter((c) =>
+        c.query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce('),
+      );
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it('throws ProviderError on an unsafe identifier (rejects before round-trip)', async () => {
+    const { provider, stub } = captureCreateQuery();
+    const entity: StoredEntity = {
+      ...makeEntity('40000000-0000-4000-a000-000000008006'),
+      properties: { 'has-dash': 'X' },
+    };
+
+    const before = stub.calls.length;
+    await expect(provider.createEntity(TEST_REPO, entity)).rejects.toThrow(
+      /not a valid Gremlin identifier/,
+    );
+    const after = stub.calls.length;
+    const createCalls = stub.calls
+      .slice(before, after)
+      .filter((c) =>
+        c.query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce('),
+      );
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it('duplicate-detection sentinel path still fires when scalars are present', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+        return { items: ['__duplicate'] };
+      }
+      return { items: [] };
+    };
+
+    const entity: StoredEntity = {
+      ...makeEntity('40000000-0000-4000-a000-000000008007'),
+      properties: { orgType: 'company' },
+    };
+
+    await expect(provider.createEntity(TEST_REPO, entity)).rejects.toBeInstanceOf(
+      DuplicateEntityError,
+    );
+    const lastCall = stub.calls[stub.calls.length - 1]!;
+    // Suffix is present in the duplicate-path query too — the addV branch
+    // carries the scalars whether or not it fires at runtime.
+    expect(lastCall.query).toContain(".property('orgType', p_user_0)");
+  });
+});
+
+// ─── updateEntity user-property scalars (dual-write) ─────────────────
+//
+// When the caller replaces `updates.properties`, the update path runs two
+// round-trips: one pre-read of the existing blob (so the drop set for
+// scalars that left the new shape can be computed client-side) and one
+// write. Cosmos Gremlin cannot enumerate user-property keys in-step, so the
+// drop set has to be derived externally. The contract pinned by these
+// tests:
+//   1. updates.properties === undefined → NO pre-read, NO user-property
+//      steps in the emitted query (preserves the historical 1-round-trip
+//      shape for the dominant partial-update case).
+//   2. updates.properties defined → pre-read fires, drop steps emit for
+//      scalars present in the old blob and absent in the new payload,
+//      and .property steps emit for every native-storable key in the new
+//      payload (including keys whose value did not change — re-emit keeps
+//      the per-shape plan-cache entry stable).
+//   3. Reserved-name collision or unsafe identifier in the new payload
+//      throws ProviderError synchronously, BEFORE the pre-read.
+//   4. Pre-read miss (entity not found) short-circuits to
+//      EntityNotFoundError without burning the write round-trip.
+
+function projectedVertexFixture(
+  id: string,
+  propertiesBlob: string,
+): Record<string, unknown> {
+  // Shape that entityFromGremlin consumes — every projected field as a
+  // bare scalar (no [{ _value }] wrapper; that wrapper is the Document-
+  // endpoint shape, not the Gremlin projection shape).
+  return {
+    id,
+    entityType: 'Person',
+    entityLabel: 'Updated Label',
+    slug: 'updated-slug',
+    summary: '',
+    properties: propertiesBlob,
+    data: '',
+    dataFormat: '',
+    createdBy: 'test',
+    createdByType: 'agent',
+    createdAt: '2026-05-25T00:00:00.000Z',
+    createdInConversation: '',
+    createdFromMessage: '',
+    modifiedBy: 'test',
+    modifiedByType: 'agent',
+    modifiedAt: '2026-05-25T00:00:01.000Z',
+    modifiedInConversation: '',
+    modifiedFromMessage: '',
+  };
+}
+
+interface UpdateStubOptions {
+  vertexId: string;
+  preReadBlob: Record<string, unknown> | 'missing';
+  writeResultBlob: Record<string, unknown>;
+}
+
+function setupUpdateStub(stub: SubmitStub, options: UpdateStubOptions): void {
+  stub.submit = async (query, params) => {
+    stub.calls.push({ query, params });
+    if (query.includes(".values('properties').limit(1)")) {
+      if (options.preReadBlob === 'missing') return { items: [] };
+      return { items: [JSON.stringify(options.preReadBlob)] };
+    }
+    if (query.includes('.project(')) {
+      return {
+        items: [projectedVertexFixture(options.vertexId, JSON.stringify(options.writeResultBlob))],
+      };
+    }
+    return { items: [] };
+  };
+}
+
+function basicProvenanceUpdate() {
+  return {
+    createdBy: 'test',
+    createdByType: 'agent' as const,
+    createdAt: '2026-05-25T00:00:00.000Z',
+    modifiedBy: 'test',
+    modifiedByType: 'agent' as const,
+    modifiedAt: '2026-05-25T00:00:01.000Z',
+  };
+}
+
+describe('updateEntity user-property scalars', () => {
+  const VERTEX = '40000000-0000-4000-a000-000000009001';
+
+  function findCalls(stub: SubmitStub) {
+    const preRead = stub.calls.filter((c) =>
+      c.query.includes(".values('properties').limit(1)"),
+    );
+    const write = stub.calls.filter((c) => c.query.includes('.project('));
+    return { preRead, write };
+  }
+
+  it('updates.properties === undefined → no pre-read, no user-property steps', async () => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: { irrelevant: 'never-read' },
+      writeResultBlob: {},
+    });
+
+    const before = stub.calls.length;
+    await provider.updateEntity(TEST_REPO, VERTEX, {
+      label: 'Updated Label',
+      provenance: basicProvenanceUpdate(),
+    });
+
+    const { preRead, write } = findCalls(stub);
+    expect(preRead).toHaveLength(0);
+    expect(write).toHaveLength(1);
+    expect(stub.calls.length - before).toBe(1);
+
+    const writeQuery = write[0]!.query;
+    expect(writeQuery).not.toContain('p_user_');
+    expect(writeQuery).not.toMatch(/\.sideEffect\(properties\('[^']+'\)\.drop\(\)\)/);
+    // The schema-managed `properties` ladder slot is also untouched.
+    expect(writeQuery).not.toContain(".property('properties',");
+  });
+
+  it('add-only: existing has no scalars, new payload sets two scalars', async () => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: {},
+      writeResultBlob: { orgType: 'company', tier: 'premium' },
+    });
+
+    await provider.updateEntity(TEST_REPO, VERTEX, {
+      properties: { orgType: 'company', tier: 'premium' },
+      provenance: basicProvenanceUpdate(),
+    });
+
+    const { preRead, write } = findCalls(stub);
+    expect(preRead).toHaveLength(1);
+    expect(write).toHaveLength(1);
+
+    const q = write[0]!.query;
+    expect(q).toContain(".property('orgType', p_user_0)");
+    expect(q).toContain(".property('tier', p_user_1)");
+    expect(q).not.toMatch(/\.sideEffect\(properties\('[^']+'\)\.drop\(\)\)/);
+    const params = write[0]!.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('premium');
+  });
+
+  it('drop-only: existing has two scalars, new payload is {} → drops both, no sets', async () => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: { orgType: 'company', tier: 'premium' },
+      writeResultBlob: {},
+    });
+
+    await provider.updateEntity(TEST_REPO, VERTEX, {
+      properties: {},
+      provenance: basicProvenanceUpdate(),
+    });
+
+    const { write } = findCalls(stub);
+    const q = write[0]!.query;
+    expect(q).toContain(".sideEffect(properties('orgType').drop())");
+    expect(q).toContain(".sideEffect(properties('tier').drop())");
+    expect(q).not.toContain('p_user_');
+    const params = write[0]!.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBeUndefined();
+  });
+
+  it('mixed: keeps shared keys, drops removed keys, sets added keys', async () => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: { orgType: 'company', tier: 'premium' },
+      writeResultBlob: { orgType: 'company', region: 'EMEA' },
+    });
+
+    await provider.updateEntity(TEST_REPO, VERTEX, {
+      properties: { orgType: 'company', region: 'EMEA' },
+      provenance: basicProvenanceUpdate(),
+    });
+
+    const { write } = findCalls(stub);
+    const q = write[0]!.query;
+    // tier is dropped (was a scalar, no longer in the new payload).
+    expect(q).toContain(".sideEffect(properties('tier').drop())");
+    // orgType is re-emitted even though the value did not change — keeps
+    // the per-shape plan-cache entry stable.
+    expect(q).toContain(".property('orgType', p_user_0)");
+    expect(q).toContain(".property('region', p_user_1)");
+    // No drop emitted for orgType (still in the new payload).
+    expect(q).not.toContain(".sideEffect(properties('orgType').drop())");
+    const params = write[0]!.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('EMEA');
+  });
+
+  it('non-storable values in the new payload are dropped from scalars but still round-trip via the blob', async () => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: {},
+      writeResultBlob: { orgType: 'company', nested: { a: 1 } },
+    });
+
+    await provider.updateEntity(TEST_REPO, VERTEX, {
+      properties: { orgType: 'company', nested: { a: 1 } },
+      provenance: basicProvenanceUpdate(),
+    });
+
+    const { write } = findCalls(stub);
+    const q = write[0]!.query;
+    expect(q).toContain(".property('orgType', p_user_0)");
+    expect(q).not.toContain(".property('nested'");
+    // The schema-managed properties ladder slot still carries the full
+    // input blob — the non-storable nested value round-trips through JSON.
+    const params = write[0]!.params as Record<string, unknown>;
+    const propsBindingEntry = Object.entries(params).find(
+      ([, v]) => typeof v === 'string' && v === JSON.stringify({ orgType: 'company', nested: { a: 1 } }),
+    );
+    expect(propsBindingEntry).toBeDefined();
+  });
+
+  it('no-op: two updates with the same properties emit byte-identical query strings', async () => {
+    const { provider: providerA, stub: stubA } = makeProvider();
+    setupUpdateStub(stubA, {
+      vertexId: VERTEX,
+      preReadBlob: { orgType: 'company', tier: 'premium' },
+      writeResultBlob: { orgType: 'company', tier: 'premium' },
+    });
+    await providerA.updateEntity(TEST_REPO, VERTEX, {
+      properties: { orgType: 'company', tier: 'premium' },
+      provenance: basicProvenanceUpdate(),
+    });
+
+    const { provider: providerB, stub: stubB } = makeProvider();
+    setupUpdateStub(stubB, {
+      vertexId: VERTEX,
+      preReadBlob: { orgType: 'company', tier: 'premium' },
+      writeResultBlob: { orgType: 'company', tier: 'premium' },
+    });
+    await providerB.updateEntity(TEST_REPO, VERTEX, {
+      properties: { orgType: 'company', tier: 'premium' },
+      provenance: basicProvenanceUpdate(),
+    });
+
+    const writeA = stubA.calls.find((c) => c.query.includes('.project('))!;
+    const writeB = stubB.calls.find((c) => c.query.includes('.project('))!;
+    expect(writeA.query).toBe(writeB.query);
+  });
+
+  it('reserved-key collision throws ProviderError synchronously — no pre-read, no write', async () => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: {},
+      writeResultBlob: {},
+    });
+
+    const before = stub.calls.length;
+    await expect(
+      provider.updateEntity(TEST_REPO, VERTEX, {
+        properties: { entityLabel: 'X' },
+        provenance: basicProvenanceUpdate(),
+      }),
+    ).rejects.toBeInstanceOf(ProviderError);
+    const after = stub.calls.length;
+
+    // Validation runs before either round-trip — no calls issued at all.
+    expect(after - before).toBe(0);
+  });
+
+  it('pre-read miss short-circuits to EntityNotFoundError without burning the write', async () => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: 'missing',
+      writeResultBlob: {},
+    });
+
+    const before = stub.calls.length;
+    await expect(
+      provider.updateEntity(TEST_REPO, VERTEX, {
+        properties: { orgType: 'company' },
+        provenance: basicProvenanceUpdate(),
+      }),
+    ).rejects.toBeInstanceOf(EntityNotFoundError);
+    const after = stub.calls.length;
+
+    // One round-trip — the pre-read — and no write.
+    expect(after - before).toBe(1);
+    const { write } = findCalls(stub);
+    expect(write).toHaveLength(0);
   });
 });
 

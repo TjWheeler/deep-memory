@@ -6,6 +6,7 @@ import type { Provenance } from '@utaba/deep-memory/types';
 import type { StoredRepository, StoredRepositorySummary } from '@utaba/deep-memory/types';
 import type { GovernanceConfig } from '@utaba/deep-memory/types';
 import type { VocabularyChangeRecord } from '@utaba/deep-memory/types';
+import { ProviderError } from '@utaba/deep-memory';
 
 // ─── Projection field lists ───────────────────────────────────────
 //
@@ -333,7 +334,7 @@ export const ABSENT_STRING_SENTINEL = '';
 /** Binding name in the emitted query referencing the absent-sentinel value. */
 const SENTINEL_BINDING = 'absentSentinel';
 
-const ENTITY_REQUIRED_SLOTS = [
+export const ENTITY_REQUIRED_SLOTS = [
   'entityType',
   'entityLabel',
   'slug',
@@ -346,7 +347,7 @@ const ENTITY_REQUIRED_SLOTS = [
   'modifiedAt',
 ] as const;
 
-const ENTITY_OPTIONAL_SLOTS = [
+export const ENTITY_OPTIONAL_SLOTS = [
   'summary',
   'data',
   'dataFormat',
@@ -357,7 +358,7 @@ const ENTITY_OPTIONAL_SLOTS = [
   'modifiedFromMessage',
 ] as const;
 
-const RELATIONSHIP_REQUIRED_SLOTS = [
+export const RELATIONSHIP_REQUIRED_SLOTS = [
   'relationshipType',
   'sourceEntityId',
   'targetEntityId',
@@ -371,7 +372,7 @@ const RELATIONSHIP_REQUIRED_SLOTS = [
   'modifiedAt',
 ] as const;
 
-const RELATIONSHIP_OPTIONAL_SLOTS = [
+export const RELATIONSHIP_OPTIONAL_SLOTS = [
   'createdInConversation',
   'createdFromMessage',
   'modifiedInConversation',
@@ -551,4 +552,203 @@ export function repositoryConfigToLadderBindings(
   );
   bindings[SENTINEL_BINDING] = ABSENT_STRING_SENTINEL;
   return bindings;
+}
+
+// ─── User-property scalars (dual-write) ───────────────────────────
+//
+// Cosmos historically stored user-supplied `entity.properties` /
+// `relationship.properties` only as a JSON-stringified blob on the
+// `properties` vertex/edge property. That shape blocks server-side Gremlin
+// predicates and aggregations over user keys — `values('orgType')` cannot
+// reach into a JSON string. Mirror the Neo4j contract: dual-write storable
+// scalars alongside the canonical blob. The blob stays authoritative for
+// round-trip; the scalars exist purely to support server-side predicates.
+//
+// Reserved-key collision guard, identifier shape, and storable-value subset
+// are byte-identical to the Neo4j side (see packages/storage-neo4j/src/mapping.ts).
+// The shapes that round-trip through Bolt also round-trip through a Cosmos
+// Gremlin `.property(key, value)` binding: string, finite number, boolean,
+// homogeneous arrays of those. Nested objects, null, heterogeneous arrays,
+// and arrays of objects live only in the blob and are not predicate-queryable.
+
+/**
+ * Schema-managed property names on an entity vertex. User-supplied
+ * `entity.properties` keys cannot collide with these — a collision would
+ * clobber a schema scalar via the dual-write (e.g. user-property `entityLabel`
+ * would overwrite the ladder-written one and break round-trip).
+ *
+ * Derived from the entity ladder slot arrays plus `id` and `repositoryId`
+ * (both written outside the ladder). Kept as a frozen `Set` for O(1)
+ * membership checks on the write hot path. The Phase 1 drift test asserts
+ * every slot-array entry is present in this set, so adding a slot in the
+ * future fails loudly if the reserved set is forgotten.
+ */
+export const RESERVED_ENTITY_PROPERTY_KEYS: ReadonlySet<string> = new Set<string>([
+  'id',
+  'repositoryId',
+  ...ENTITY_REQUIRED_SLOTS,
+  ...ENTITY_OPTIONAL_SLOTS,
+]);
+
+/**
+ * Schema-managed property names on a relationship edge. Includes the Gremlin
+ * `'label'` token — Cosmos Gremlin uses it as the edge label and a user
+ * property of the same name would collide at write time.
+ */
+export const RESERVED_RELATIONSHIP_PROPERTY_KEYS: ReadonlySet<string> = new Set<string>([
+  'id',
+  'repositoryId',
+  'label',
+  ...RELATIONSHIP_REQUIRED_SLOTS,
+  ...RELATIONSHIP_OPTIONAL_SLOTS,
+]);
+
+/**
+ * Cosmos Gremlin property-name positions (`.property('key', val)`,
+ * `.properties('key').drop()`, `values('key')`) are not parameterisable —
+ * the key is baked into the query string. Restrict user keys to the bare
+ * Gremlin-identifier shape so the interpolation cannot widen the injection
+ * surface, matching the regex Neo4j uses on its Cypher equivalent.
+ */
+const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function assertSafeUserPropertyKey(
+  key: string,
+  reserved: ReadonlySet<string>,
+  scope: 'Entity' | 'Relationship',
+): string {
+  if (!USER_PROPERTY_KEY_PATTERN.test(key)) {
+    throw new ProviderError(
+      `${scope} property key "${key}" is not a valid Gremlin identifier — must match ` +
+        `${USER_PROPERTY_KEY_PATTERN.source}. User-property keys are interpolated into ` +
+        `Gremlin .property(...) / values(...) / .drop() slots (the key slot cannot be ` +
+        `parameterised), so an unsafe value would widen the injection surface.`,
+    );
+  }
+  if (reserved.has(key)) {
+    throw new ProviderError(
+      `${scope} property key "${key}" collides with a schema-managed field. ` +
+        `Reserved names: ${Array.from(reserved).join(', ')}.`,
+    );
+  }
+  return key;
+}
+
+/**
+ * Validate a user-supplied entity property key. Throws `ProviderError` when
+ * the key is not a bare Gremlin identifier or collides with a schema-managed
+ * field name. Returns the key on success so the call can chain.
+ */
+export function assertSafeEntityUserPropertyKey(key: string): string {
+  return assertSafeUserPropertyKey(key, RESERVED_ENTITY_PROPERTY_KEYS, 'Entity');
+}
+
+/** Relationship counterpart — uses the relationship reserved set. */
+export function assertSafeRelationshipUserPropertyKey(key: string): string {
+  return assertSafeUserPropertyKey(key, RESERVED_RELATIONSHIP_PROPERTY_KEYS, 'Relationship');
+}
+
+/**
+ * Decide whether a value can be stored as a native Cosmos Gremlin scalar
+ * property. The set covers what `.property(key, value)` accepts uniformly:
+ * `string`, finite `number`, `boolean`, and homogeneous arrays of those.
+ * Nested objects, `null`, heterogeneous arrays, and arrays of objects fail —
+ * those live only inside the JSON-stringified `properties` blob and are NOT
+ * predicate-queryable.
+ *
+ * Behaviour byte-identical to Neo4j's `isNativeStorableValue` so the
+ * cross-provider observable contract stays in lockstep.
+ */
+export function isNativeStorableValue(value: unknown): boolean {
+  if (typeof value === 'string') return true;
+  if (typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return true;
+    const first = value[0];
+    const t = typeof first;
+    if (t !== 'string' && t !== 'boolean' && (t !== 'number' || !Number.isFinite(first))) {
+      return false;
+    }
+    for (const v of value) {
+      if (typeof v !== t) return false;
+      if (t === 'number' && !Number.isFinite(v as number)) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Project `entity.properties` to the ordered list of `{ key, value }` entries
+ * that feed the dual-write user-property suffix on the entity Gremlin string.
+ * Validates every key (identifier shape + reserved-set collision) and silently
+ * drops values that Cosmos cannot store as a native scalar — those live only
+ * in the JSON blob.
+ *
+ * Returns an ordered `Array`, not an object: per-key emission happens inline
+ * in the Gremlin string, so insertion order is part of the cache key. Two
+ * callers passing the same shape in the same order produce the same Gremlin
+ * string and reuse the same compiled plan.
+ *
+ * The blob remains authoritative for `entity.properties` round-trip via
+ * `entityFromGremlin`; dropping a value here loses only its predicate-
+ * queryable shape, not its read shape.
+ */
+export function entityUserPropertyParams(
+  properties: Record<string, unknown>,
+): Array<{ key: string; value: unknown }> {
+  const out: Array<{ key: string; value: unknown }> = [];
+  for (const [key, value] of Object.entries(properties)) {
+    assertSafeEntityUserPropertyKey(key);
+    if (isNativeStorableValue(value)) {
+      out.push({ key, value });
+    }
+  }
+  return out;
+}
+
+/**
+ * Relationship counterpart — uses the relationship reserved set. Same ordered-
+ * list semantic as `entityUserPropertyParams` for the same plan-cache reason:
+ * per-key emission is inline, so the array order is part of the Gremlin string.
+ */
+export function relationshipUserPropertyParams(
+  properties: Record<string, unknown>,
+): Array<{ key: string; value: unknown }> {
+  const out: Array<{ key: string; value: unknown }> = [];
+  for (const [key, value] of Object.entries(properties)) {
+    assertSafeRelationshipUserPropertyKey(key);
+    if (isNativeStorableValue(value)) {
+      out.push({ key, value });
+    }
+  }
+  return out;
+}
+
+/**
+ * Project an entity's existing `properties` blob (parsed from the canonical
+ * JSON-stringified vertex property) to the list of keys that would have been
+ * written as native scalars by a prior create/update. The update path needs
+ * this to compute which scalars to drop when the new payload omits them —
+ * Cosmos Gremlin has no in-step way to enumerate user keys on a vertex, so
+ * the drop set is computed client-side from the read blob.
+ *
+ * Unsafe identifiers, reserved-name collisions, and non-storable values are
+ * silently skipped (not thrown). The blob may carry pre-validation or pre-
+ * migration keys that never had a scalar written for them; failing the
+ * update on those would defeat the lazy-migration contract (§2.7).
+ */
+export function existingEntityScalarUserKeys(
+  blob: Record<string, unknown> | null | undefined,
+): string[] {
+  if (blob == null) return [];
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(blob)) {
+    if (!USER_PROPERTY_KEY_PATTERN.test(key)) continue;
+    if (RESERVED_ENTITY_PROPERTY_KEYS.has(key)) continue;
+    if (!isNativeStorableValue(value)) continue;
+    out.push(key);
+  }
+  return out;
 }

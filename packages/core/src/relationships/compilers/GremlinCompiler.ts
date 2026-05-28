@@ -1,7 +1,7 @@
 // GremlinCompiler — compiles TraversalSpec to Gremlin query strings
 // Zero runtime dependencies — pure string construction with parameterized bindings.
 
-import type { TraversalSpec, TraversalStep } from '../../types/traversal.js';
+import type { TraversalProjection, TraversalSpec, TraversalStep } from '../../types/traversal.js';
 import type { MemoryVocabulary } from '../../types/vocabulary.js';
 import type { PropertyFilter } from '../../types/queries.js';
 import type { TraversalCompiler, CompiledQuery } from './TraversalCompiler.js';
@@ -285,10 +285,20 @@ export class GremlinCompiler implements TraversalCompiler {
         }
       }
 
+      // Server-side projection replaces the vertex-projected terminal with a
+      // group/dedup/values shape. Only emitted for terminal-mode queries — the
+      // anchor (the last hop's target) is unambiguous there. For 'path' mode
+      // projection is dropped silently (the same decision Cypher makes); 'all'
+      // is handled by the branch above and never reaches this point.
+      const emitProjection = spec.projection !== undefined && returnMode === 'terminal';
+
       // Dedup: 'terminal' honours spec.dedup. 'path' never dedups — paths are
       // distinct walks by definition; collapsing them by terminal id throws
-      // away the answer.
-      if (returnMode === 'terminal' && spec.dedup !== false) {
+      // away the answer. Skipped when emitProjection is set — projection owns
+      // its own row semantics (count groups, distinct on projected Maps), and
+      // a vertex-level dedup ahead of it would conflate "count rows" with
+      // "count distinct vertices" against the Cypher contract.
+      if (returnMode === 'terminal' && !emitProjection && spec.dedup !== false) {
         parts.push('.dedup()');
       }
 
@@ -305,6 +315,15 @@ export class GremlinCompiler implements TraversalCompiler {
         parts.push('.simplePath()');
       }
 
+      // Projection terminal — emitted BEFORE .range() so pagination slices
+      // group rows / distinct rows, not the un-aggregated vertex stream.
+      // .group() and .dedup() are barrier steps; .range() applied after them
+      // operates on the post-aggregation stream, matching the Cypher
+      // `SKIP / LIMIT` semantic over `RETURN n.p, count(*)`.
+      if (emitProjection) {
+        parts.push(emitProjectionTerminal(spec.projection!));
+      }
+
       // ─── Pagination ───────────────────────────────────────────
       const limit = spec.limit ?? 50;
       const offset = spec.offset ?? 0;
@@ -314,14 +333,18 @@ export class GremlinCompiler implements TraversalCompiler {
       params['_limit'] = limit;
       params['_offset'] = offset;
 
-      // 'terminal': flat vertex-projected rows.
-      // 'path': path objects with each vertex+edge projected. A single
-      // `.path().by(project(...))` across mixed objects crashes whenever an
-      // edge lacks a vertex-only key, so we use the two-by round-robin form:
-      // by-1 applies to vertices in path order, by-2 to edges.
-      if (returnMode === 'terminal') {
+      // Projection already emitted its own terminal — skip the vertex/path
+      // emission below.
+      if (emitProjection) {
+        // no-op
+      } else if (returnMode === 'terminal') {
+        // 'terminal': flat vertex-projected rows.
         parts.push(`.${VERTEX_PROJECT_EXPR}`);
       } else {
+        // 'path': path objects with each vertex+edge projected. A single
+        // `.path().by(project(...))` across mixed objects crashes whenever an
+        // edge lacks a vertex-only key, so we use the two-by round-robin form:
+        // by-1 applies to vertices in path order, by-2 to edges.
         parts.push(`.path().by(${VERTEX_PROJECT_EXPR}).by(${EDGE_PROJECT_EXPR})`);
       }
     }
@@ -467,6 +490,72 @@ function compileRepeatStep(
   }
 
   return parts.join('');
+}
+
+const SAFE_PROJECTION_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Guard against Gremlin injection through projection property names.
+ * Property names land inline in `values('p')` / `project('p')` steps —
+ * Gremlin does not parameterise identifier positions — so they must look
+ * like ordinary identifiers (letters, digits, underscores, leading non-digit).
+ * Same rule and error shape the sibling CypherCompiler enforces for symmetry.
+ */
+function assertSafeProjectionKey(key: string): void {
+  if (!SAFE_PROJECTION_KEY_RE.test(key)) {
+    throw new Error(
+      `Unsafe projection property name: "${key}". Property names must match ${SAFE_PROJECTION_KEY_RE.source}.`,
+    );
+  }
+}
+
+/**
+ * Build the projection terminal — a single chain that replaces the
+ * `.${VERTEX_PROJECT_EXPR}` emission for terminal-mode queries.
+ *
+ * Three shapes, mapped from `TraversalProjection.mode` + `.distinct`:
+ *
+ *   count           →  .group().by(<keyExpr>).by(count()).unfold()
+ *   values+distinct →  .<keyExpr>.dedup()
+ *   values (plain)  →  .<keyExpr>
+ *
+ * Single-property shortcut: when only one property is projected, `<keyExpr>`
+ * is `values('p')` (a scalar per traverser). For two or more, `<keyExpr>` is
+ * `project('p1','p2').by(values('p1')).by(values('p2'))` so each row is a
+ * Map keyed by property name — the parser walks the same Map shape in either
+ * mode and a single property still wraps to `{ p: scalar }` downstream.
+ *
+ * Property names are validated with `assertSafeProjectionKey` because they
+ * cannot be parameterised in Gremlin.
+ */
+function emitProjectionTerminal(projection: TraversalProjection): string {
+  const properties = projection.properties;
+  const mode = projection.mode ?? 'values';
+  const distinct = projection.distinct ?? false;
+
+  for (const prop of properties) {
+    assertSafeProjectionKey(prop);
+  }
+
+  const singleProperty = properties.length === 1;
+  // keyExpr has no leading dot — used inside `.by(...)` (count mode) and as
+  // the terminal step itself (distinct / values modes, with a leading dot).
+  const keyExpr = singleProperty
+    ? `values('${properties[0]}')`
+    : `project(${properties.map((p) => `'${p}'`).join(',')})${properties.map((p) => `.by(values('${p}'))`).join('')}`;
+
+  if (mode === 'count') {
+    // .group() collects into a single Map keyed by the projected combination;
+    // .by(count()) aggregates per key; .unfold() expands the Map into one
+    // traverser per entry so .range() pagination slices group rows.
+    return `.group().by(${keyExpr}).by(count()).unfold()`;
+  }
+  if (distinct) {
+    // .dedup() on projected Maps relies on value-equality dedup on the
+    // current traverser — the documented Gremlin semantic.
+    return `.${keyExpr}.dedup()`;
+  }
+  return `.${keyExpr}`;
 }
 
 /** Compile a single property filter to a Gremlin .has() predicate. */

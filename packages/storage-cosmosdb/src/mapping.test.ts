@@ -2,21 +2,34 @@ import { describe, it, expect } from 'vitest';
 import {
   GREMLIN_VERTEX_PROJECTION_FIELDS,
   GREMLIN_EDGE_PROJECTION_FIELDS,
+  ProviderError,
   buildVertexProjectChain,
   buildEdgeProjectChain,
 } from '@utaba/deep-memory';
 import {
   ABSENT_STRING_SENTINEL,
+  ENTITY_OPTIONAL_SLOTS,
+  ENTITY_REQUIRED_SLOTS,
+  RELATIONSHIP_OPTIONAL_SLOTS,
+  RELATIONSHIP_REQUIRED_SLOTS,
+  RESERVED_ENTITY_PROPERTY_KEYS,
+  RESERVED_RELATIONSHIP_PROPERTY_KEYS,
   STORED_ENTITY_FIELDS,
   STORED_RELATIONSHIP_FIELDS,
   STORED_REPOSITORY_FIELDS,
+  assertSafeEntityUserPropertyKey,
+  assertSafeRelationshipUserPropertyKey,
   buildEntityPropertyLadder,
   buildRelationshipPropertyLadder,
   buildRepositoryProjectChain,
   buildRepositoryPropertyLadder,
   entityFromDocument,
   entityToLadderBindings,
+  entityUserPropertyParams,
+  existingEntityScalarUserKeys,
+  isNativeStorableValue,
   relationshipToLadderBindings,
+  relationshipUserPropertyParams,
   repositoryConfigToLadderBindings,
 } from './mapping.js';
 import type { StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
@@ -394,5 +407,258 @@ describe('repository property ladder', () => {
     expect(bindings['p6']).toBe(ABSENT_STRING_SENTINEL);
     expect(bindings['p7']).toBe(ABSENT_STRING_SENTINEL);
     expect(bindings['p8']).toBe(ABSENT_STRING_SENTINEL);
+  });
+});
+
+// ─── User-property scalars (dual-write primitives) ────────────────
+//
+// Pure mapping helpers — no Gremlin emission, no callers wired yet. The
+// contract these tests pin: identifier-shape guard, reserved-set collision
+// guard, native-storable subset, and ordered projection of `properties`
+// into the array form per-key emission consumes (order is part of the
+// emitted Gremlin string, so order is part of the cache key).
+
+describe('assertSafeEntityUserPropertyKey', () => {
+  it('accepts a bare Gremlin identifier and returns it for chaining', () => {
+    expect(assertSafeEntityUserPropertyKey('orgType')).toBe('orgType');
+    expect(assertSafeEntityUserPropertyKey('_internal')).toBe('_internal');
+    expect(assertSafeEntityUserPropertyKey('tier_v2')).toBe('tier_v2');
+    expect(assertSafeEntityUserPropertyKey('A')).toBe('A');
+  });
+
+  it('rejects keys that violate the identifier shape', () => {
+    for (const bad of [' orgType', 'orgType ', '1key', 'org-type', 'org.type', '', 'has space']) {
+      expect(() => assertSafeEntityUserPropertyKey(bad)).toThrow(ProviderError);
+      expect(() => assertSafeEntityUserPropertyKey(bad)).toThrow(/not a valid Gremlin identifier/);
+    }
+  });
+
+  it('rejects every name in the entity reserved set', () => {
+    for (const reserved of RESERVED_ENTITY_PROPERTY_KEYS) {
+      expect(() => assertSafeEntityUserPropertyKey(reserved)).toThrow(ProviderError);
+      expect(() => assertSafeEntityUserPropertyKey(reserved)).toThrow(/collides with a schema-managed field/);
+    }
+  });
+});
+
+describe('assertSafeRelationshipUserPropertyKey', () => {
+  it('accepts a bare Gremlin identifier', () => {
+    expect(assertSafeRelationshipUserPropertyKey('weight')).toBe('weight');
+  });
+
+  it('rejects every name in the relationship reserved set', () => {
+    for (const reserved of RESERVED_RELATIONSHIP_PROPERTY_KEYS) {
+      expect(() => assertSafeRelationshipUserPropertyKey(reserved)).toThrow(ProviderError);
+    }
+  });
+
+  it("rejects the Gremlin 'label' token specifically — it is the edge-label slot", () => {
+    expect(() => assertSafeRelationshipUserPropertyKey('label')).toThrow(/collides/);
+  });
+});
+
+describe('RESERVED_*_PROPERTY_KEYS drift guards', () => {
+  // The reserved sets MUST contain every name in the corresponding ladder slot
+  // array — adding a slot without updating the reserved set would let a user
+  // property silently overwrite a schema scalar at write time. The reserved
+  // sets are derived via spread, so drift is structurally impossible, but
+  // these assertions document the contract and lock it against a future
+  // refactor that switches to a hand-list.
+
+  it('entity reserved set contains every entity slot name plus id and repositoryId', () => {
+    for (const slot of ENTITY_REQUIRED_SLOTS) {
+      expect(RESERVED_ENTITY_PROPERTY_KEYS.has(slot)).toBe(true);
+    }
+    for (const slot of ENTITY_OPTIONAL_SLOTS) {
+      expect(RESERVED_ENTITY_PROPERTY_KEYS.has(slot)).toBe(true);
+    }
+    expect(RESERVED_ENTITY_PROPERTY_KEYS.has('id')).toBe(true);
+    expect(RESERVED_ENTITY_PROPERTY_KEYS.has('repositoryId')).toBe(true);
+  });
+
+  it('entity reserved set includes embedding (the slot exists; collision would clobber it)', () => {
+    expect(RESERVED_ENTITY_PROPERTY_KEYS.has('embedding')).toBe(true);
+  });
+
+  it('relationship reserved set contains every relationship slot name plus id, repositoryId, and label', () => {
+    for (const slot of RELATIONSHIP_REQUIRED_SLOTS) {
+      expect(RESERVED_RELATIONSHIP_PROPERTY_KEYS.has(slot)).toBe(true);
+    }
+    for (const slot of RELATIONSHIP_OPTIONAL_SLOTS) {
+      expect(RESERVED_RELATIONSHIP_PROPERTY_KEYS.has(slot)).toBe(true);
+    }
+    expect(RESERVED_RELATIONSHIP_PROPERTY_KEYS.has('id')).toBe(true);
+    expect(RESERVED_RELATIONSHIP_PROPERTY_KEYS.has('repositoryId')).toBe(true);
+    expect(RESERVED_RELATIONSHIP_PROPERTY_KEYS.has('label')).toBe(true);
+  });
+});
+
+describe('isNativeStorableValue', () => {
+  it('accepts the four native scalar shapes', () => {
+    expect(isNativeStorableValue('a string')).toBe(true);
+    expect(isNativeStorableValue('')).toBe(true);
+    expect(isNativeStorableValue(0)).toBe(true);
+    expect(isNativeStorableValue(42)).toBe(true);
+    expect(isNativeStorableValue(-1.5)).toBe(true);
+    expect(isNativeStorableValue(true)).toBe(true);
+    expect(isNativeStorableValue(false)).toBe(true);
+  });
+
+  it('accepts homogeneous arrays of native scalars (including empty)', () => {
+    expect(isNativeStorableValue([])).toBe(true);
+    expect(isNativeStorableValue(['a', 'b', 'c'])).toBe(true);
+    expect(isNativeStorableValue([1, 2, 3])).toBe(true);
+    expect(isNativeStorableValue([true, false, true])).toBe(true);
+  });
+
+  it('rejects nested objects, null, undefined, and arrays of objects', () => {
+    expect(isNativeStorableValue(null)).toBe(false);
+    expect(isNativeStorableValue(undefined)).toBe(false);
+    expect(isNativeStorableValue({ nested: 1 })).toBe(false);
+    expect(isNativeStorableValue([{ a: 1 }])).toBe(false);
+  });
+
+  it('rejects heterogeneous arrays', () => {
+    expect(isNativeStorableValue(['a', 1])).toBe(false);
+    expect(isNativeStorableValue([1, true])).toBe(false);
+    expect(isNativeStorableValue(['x', null])).toBe(false);
+  });
+
+  it('rejects non-finite numbers (and arrays containing them)', () => {
+    expect(isNativeStorableValue(Number.NaN)).toBe(false);
+    expect(isNativeStorableValue(Number.POSITIVE_INFINITY)).toBe(false);
+    expect(isNativeStorableValue(Number.NEGATIVE_INFINITY)).toBe(false);
+    expect(isNativeStorableValue([1, Number.NaN])).toBe(false);
+    expect(isNativeStorableValue([1, Number.POSITIVE_INFINITY])).toBe(false);
+  });
+});
+
+describe('entityUserPropertyParams', () => {
+  it('returns an empty array for empty input', () => {
+    expect(entityUserPropertyParams({})).toEqual([]);
+  });
+
+  it('keeps every native-storable value and preserves insertion order', () => {
+    const result = entityUserPropertyParams({
+      orgType: 'company',
+      tier: 'premium',
+      headcount: 42,
+      active: true,
+      tags: ['a', 'b'],
+    });
+    expect(result).toEqual([
+      { key: 'orgType', value: 'company' },
+      { key: 'tier', value: 'premium' },
+      { key: 'headcount', value: 42 },
+      { key: 'active', value: true },
+      { key: 'tags', value: ['a', 'b'] },
+    ]);
+  });
+
+  it('silently drops non-storable values; storable ones survive', () => {
+    const result = entityUserPropertyParams({
+      orgType: 'company',
+      metadata: { nested: 1 },     // dropped — nested object
+      mixed: ['a', 1],             // dropped — heterogeneous
+      missing: null,               // dropped — null
+      nan: Number.NaN,             // dropped — non-finite
+      tier: 'premium',
+    });
+    expect(result).toEqual([
+      { key: 'orgType', value: 'company' },
+      { key: 'tier', value: 'premium' },
+    ]);
+  });
+
+  it('throws ProviderError on an unsafe identifier — no scalars survive the validation pass', () => {
+    expect(() =>
+      entityUserPropertyParams({ 'has-dash': 'x' }),
+    ).toThrow(ProviderError);
+  });
+
+  it('throws ProviderError on a reserved-name collision', () => {
+    expect(() =>
+      entityUserPropertyParams({ entityLabel: 'X' }),
+    ).toThrow(/collides with a schema-managed field/);
+  });
+});
+
+describe('relationshipUserPropertyParams', () => {
+  it('keeps storable values, drops the rest, preserves insertion order', () => {
+    const result = relationshipUserPropertyParams({
+      weight: 0.8,
+      since: '2026-01-01',
+      meta: { source: 'inferred' }, // dropped
+    });
+    expect(result).toEqual([
+      { key: 'weight', value: 0.8 },
+      { key: 'since', value: '2026-01-01' },
+    ]);
+  });
+
+  it("throws on a 'label' collision (Gremlin edge-label slot)", () => {
+    expect(() =>
+      relationshipUserPropertyParams({ label: 'X' }),
+    ).toThrow(/collides/);
+  });
+});
+
+describe('existingEntityScalarUserKeys', () => {
+  // The update path uses this to compute which existing scalars must be
+  // dropped when the new properties payload omits them. Unsafe / reserved /
+  // non-storable keys are skipped (silently — no throw) because the blob
+  // may carry pre-validation or pre-migration data that never had a scalar
+  // written for it, and failing the update on those would defeat the
+  // lazy-migration contract (plans/cosmosdb-user-property-scalars.md §2.7).
+
+  it('returns an empty list for null / undefined / empty input', () => {
+    expect(existingEntityScalarUserKeys(null)).toEqual([]);
+    expect(existingEntityScalarUserKeys(undefined)).toEqual([]);
+    expect(existingEntityScalarUserKeys({})).toEqual([]);
+  });
+
+  it('returns every native-storable key in insertion order', () => {
+    expect(
+      existingEntityScalarUserKeys({
+        orgType: 'company',
+        tier: 'premium',
+        headcount: 42,
+        active: true,
+        tags: ['a', 'b'],
+      }),
+    ).toEqual(['orgType', 'tier', 'headcount', 'active', 'tags']);
+  });
+
+  it('skips non-storable values (objects, nulls, heterogeneous arrays, NaN)', () => {
+    expect(
+      existingEntityScalarUserKeys({
+        orgType: 'company',
+        nested: { a: 1 },
+        empty: null,
+        mixed: ['a', 1],
+        nan: Number.NaN,
+        tier: 'premium',
+      }),
+    ).toEqual(['orgType', 'tier']);
+  });
+
+  it('silently skips reserved keys that may appear in pre-validation blobs', () => {
+    expect(
+      existingEntityScalarUserKeys({
+        orgType: 'company',
+        entityLabel: 'X',     // reserved — skipped, never had a scalar
+        repositoryId: 'rid',  // reserved — skipped
+      }),
+    ).toEqual(['orgType']);
+  });
+
+  it('silently skips keys that fail the identifier shape', () => {
+    expect(
+      existingEntityScalarUserKeys({
+        'has-dash': 'X',
+        '1starts-with-digit': 'Y',
+        orgType: 'company',
+      }),
+    ).toEqual(['orgType']);
   });
 });

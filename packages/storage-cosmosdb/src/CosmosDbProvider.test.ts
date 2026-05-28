@@ -1733,6 +1733,325 @@ describe('importBulk user-property scalars', () => {
   });
 });
 
+// ─── importBulk(skipExistenceCheck: true) user-property scalars ────────
+//
+// The skip-existence-check bulk path emits the fixed `INSERT_*_QUERY`
+// strings via `insertEntity` / `insertRelationship`. Before this contract
+// landed, those queries ended at the ladder chain and produced blob-only
+// rows — `createEntity` and `upsertEntity` dual-wrote scalars while the
+// insert path did not, so the same container could hold two structurally
+// different storage shapes depending on which write path produced the row.
+// The insert path now appends the same per-key user-property suffix the
+// upsert paths use so every dual-write entry point honours the contract.
+//
+// The findInsertEntityCall / findInsertRelationshipCall helpers
+// discriminate against the upsert query shape by excluding `.fold().
+// coalesce(` — the insert path does not branch.
+
+function findInsertEntityCall(stub: SubmitStub): SubmitCall {
+  const call = stub.calls.find(
+    (c) => c.query.startsWith('g.addV(vertexLabel)') && !c.query.includes('.fold().coalesce('),
+  );
+  if (!call) throw new Error('no insertEntity call captured');
+  return call;
+}
+
+function findInsertRelationshipCall(stub: SubmitStub): SubmitCall {
+  const call = stub.calls.find(
+    (c) =>
+      c.query.includes('.addE(edgeLabel)') &&
+      !c.query.includes('.fold().coalesce(') &&
+      c.query.startsWith("g.V().has('repositoryId', rid).hasId(srcId)"),
+  );
+  if (!call) throw new Error('no insertRelationship call captured');
+  return call;
+}
+
+describe('importBulk(skipExistenceCheck) user-property scalars', () => {
+  // Entities ─────────────────────────────────────────────────────────────
+
+  it('insertEntity emits the byte-identical fixed query when no native-storable properties are present', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000c001';
+
+    await provider.importBulk(
+      TEST_REPO,
+      [{ entities: [makeStoredBulkEntity(ENTITY_ID, {})] }],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertEntityCall(stub);
+    // Locks the zero-plan-cache-regression invariant — no per-key suffix
+    // appended, so the canonical INSERT_ENTITY_QUERY string is what hit
+    // the wire.
+    expect(call.query).not.toContain('p_user_');
+    expect(call.query.endsWith(')')).toBe(true);
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBeUndefined();
+  });
+
+  it('insertEntity appends a single-key scalar suffix after the ladder with the value bound', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000c002';
+
+    await provider.importBulk(
+      TEST_REPO,
+      [{ entities: [makeStoredBulkEntity(ENTITY_ID, { orgType: 'company' })] }],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertEntityCall(stub);
+    expect(call.query).toContain(".property('orgType', p_user_0)");
+    // Suffix is appended at the tail of the ladder — no intervening
+    // ladder slot can come after it.
+    expect(call.query.endsWith(".property('orgType', p_user_0)")).toBe(true);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+  });
+
+  it('insertEntity emits multi-key scalars in deterministic insertion order with sequential bindings', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000c003';
+
+    await provider.importBulk(
+      TEST_REPO,
+      [
+        {
+          entities: [
+            makeStoredBulkEntity(ENTITY_ID, {
+              orgType: 'company',
+              tier: 'premium',
+              headcount: 42,
+            }),
+          ],
+        },
+      ],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertEntityCall(stub);
+    expect(call.query).toContain(".property('orgType', p_user_0)");
+    expect(call.query).toContain(".property('tier', p_user_1)");
+    expect(call.query).toContain(".property('headcount', p_user_2)");
+    const orgIdx = call.query.indexOf(".property('orgType', p_user_0)");
+    const tierIdx = call.query.indexOf(".property('tier', p_user_1)");
+    const hcIdx = call.query.indexOf(".property('headcount', p_user_2)");
+    expect(orgIdx).toBeGreaterThan(-1);
+    expect(tierIdx).toBeGreaterThan(orgIdx);
+    expect(hcIdx).toBeGreaterThan(tierIdx);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('premium');
+    expect(params['p_user_2']).toBe(42);
+  });
+
+  it('insertEntity throws ProviderError on a reserved-key collision before any submit', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000c004';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(
+      TEST_REPO,
+      [{ entities: [makeStoredBulkEntity(ENTITY_ID, { entityType: 'X' })] }],
+      { skipExistenceCheck: true },
+    );
+    const after = stub.calls.length;
+
+    const insertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.startsWith('g.addV(vertexLabel)'));
+    expect(insertCalls).toHaveLength(0);
+    expect(result.entitiesImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`entity:${ENTITY_ID}`);
+    expect(result.errors[0]!.error).toMatch(/collides/);
+  });
+
+  it('insertEntity drops non-storable values from the suffix; the blob ladder slot still carries them via JSON', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000c005';
+    const inputProperties = {
+      orgType: 'company',
+      nested: { a: 1 },
+      mixed: ['a', 1],
+      tier: 'premium',
+    };
+
+    await provider.importBulk(
+      TEST_REPO,
+      [{ entities: [makeStoredBulkEntity(ENTITY_ID, inputProperties)] }],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertEntityCall(stub);
+    expect(call.query).toContain(".property('orgType', p_user_0)");
+    expect(call.query).toContain(".property('tier', p_user_1)");
+    expect(call.query).not.toContain(".property('nested'");
+    expect(call.query).not.toContain(".property('mixed'");
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('premium');
+    expect(params['p_user_2']).toBeUndefined();
+    // p3 in the entity ladder is the canonical `properties` JSON blob —
+    // non-storable values round-trip through the blob even though they
+    // are excluded from the scalar suffix.
+    expect(params['p3']).toBe(JSON.stringify(inputProperties));
+  });
+
+  // Relationships ────────────────────────────────────────────────────────
+
+  it('insertRelationship emits the byte-identical fixed query when no native-storable properties are present', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000c101';
+
+    await provider.importBulk(
+      TEST_REPO,
+      [{ relationships: [makeStoredBulkRelationship(REL_ID, {})] }],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertRelationshipCall(stub);
+    expect(call.query).not.toContain('p_user_');
+    expect(call.query.endsWith(')')).toBe(true);
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBeUndefined();
+  });
+
+  it('insertRelationship appends a single-key scalar suffix after the ladder with the value bound', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000c102';
+
+    await provider.importBulk(
+      TEST_REPO,
+      [{ relationships: [makeStoredBulkRelationship(REL_ID, { weight: 0.8 })] }],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertRelationshipCall(stub);
+    expect(call.query).toContain(".property('weight', p_user_0)");
+    expect(call.query.endsWith(".property('weight', p_user_0)")).toBe(true);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe(0.8);
+  });
+
+  it('insertRelationship emits multi-key scalars in deterministic insertion order with sequential bindings', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000c103';
+
+    await provider.importBulk(
+      TEST_REPO,
+      [
+        {
+          relationships: [
+            makeStoredBulkRelationship(REL_ID, {
+              weight: 0.8,
+              since: '2026-01-01',
+              active: true,
+            }),
+          ],
+        },
+      ],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertRelationshipCall(stub);
+    expect(call.query).toContain(".property('weight', p_user_0)");
+    expect(call.query).toContain(".property('since', p_user_1)");
+    expect(call.query).toContain(".property('active', p_user_2)");
+    const weightIdx = call.query.indexOf(".property('weight', p_user_0)");
+    const sinceIdx = call.query.indexOf(".property('since', p_user_1)");
+    const activeIdx = call.query.indexOf(".property('active', p_user_2)");
+    expect(weightIdx).toBeGreaterThan(-1);
+    expect(sinceIdx).toBeGreaterThan(weightIdx);
+    expect(activeIdx).toBeGreaterThan(sinceIdx);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe(0.8);
+    expect(params['p_user_1']).toBe('2026-01-01');
+    expect(params['p_user_2']).toBe(true);
+  });
+
+  it('insertRelationship throws ProviderError on a reserved-key collision before any submit', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000c104';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(
+      TEST_REPO,
+      [{ relationships: [makeStoredBulkRelationship(REL_ID, { relationshipType: 'X' })] }],
+      { skipExistenceCheck: true },
+    );
+    const after = stub.calls.length;
+
+    const insertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.includes('.addE(edgeLabel)'));
+    expect(insertCalls).toHaveLength(0);
+    expect(result.relationshipsImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
+    expect(result.errors[0]!.error).toMatch(/collides/);
+  });
+
+  it("insertRelationship throws ProviderError on the Gremlin 'label' token collision (edge-label slot)", async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000c105';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(
+      TEST_REPO,
+      [{ relationships: [makeStoredBulkRelationship(REL_ID, { label: 'X' })] }],
+      { skipExistenceCheck: true },
+    );
+    const after = stub.calls.length;
+
+    const insertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.includes('.addE(edgeLabel)'));
+    expect(insertCalls).toHaveLength(0);
+    expect(result.relationshipsImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
+    expect(result.errors[0]!.error).toMatch(/collides/);
+  });
+
+  it('insertRelationship drops non-storable values from the suffix; the blob ladder slot still carries them via JSON', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000c106';
+    const inputProperties = {
+      weight: 0.8,
+      nested: { a: 1 },
+      mixed: ['a', 1],
+      since: '2026-01-01',
+    };
+
+    await provider.importBulk(
+      TEST_REPO,
+      [{ relationships: [makeStoredBulkRelationship(REL_ID, inputProperties)] }],
+      { skipExistenceCheck: true },
+    );
+
+    const call = findInsertRelationshipCall(stub);
+    expect(call.query).toContain(".property('weight', p_user_0)");
+    expect(call.query).toContain(".property('since', p_user_1)");
+    expect(call.query).not.toContain(".property('nested'");
+    expect(call.query).not.toContain(".property('mixed'");
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe(0.8);
+    expect(params['p_user_1']).toBe('2026-01-01');
+    expect(params['p_user_2']).toBeUndefined();
+    // p4 in the relationship ladder is the canonical `properties` JSON
+    // blob — relationshipType/sourceEntityId/targetEntityId/bidirectional
+    // precede it (p0..p3).
+    expect(params['p4']).toBe(JSON.stringify(inputProperties));
+  });
+});
+
 // ─── Step D — findEntities routes through the Document (SQL) endpoint ─
 //
 // The Gremlin JS-filter fan-out is gone. All findEntities calls — with or

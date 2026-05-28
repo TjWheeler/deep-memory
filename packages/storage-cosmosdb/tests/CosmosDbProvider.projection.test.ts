@@ -274,5 +274,89 @@ const skipIfNoEmulator = !ENDPOINT || !KEY;
       // emitted a unique string.
       expect(distinct.size).toBeLessThan(captured.length);
     }, 120_000);
+
+    // The skip-existence-check bulk path now dual-writes the same
+    // user-property scalars as `createEntity` / `upsertEntity`. End-to-end
+    // proof: seed an isolated entity-type bucket via `importBulk(..., {
+    // skipExistenceCheck: true })` and observe that both the server-side
+    // count projection and the exact-eq `findEntities` SQL prefilter
+    // resolve `orgType` against the new vertex scalar — same shape the
+    // `createEntity`-seeded test above returns. Without the dual-write
+    // here, the projection raises `GraphRuntimeException` and the SQL
+    // prefilter has no scalar column to match against.
+    //
+    // Reuses the shared `RID` and scopes by a distinct entityType
+    // (`OrganizationBulk`) instead of provisioning a second repository.
+    // The `_repository_index` sentinel write inside `createRepository`
+    // contends with the parallel conformance suite running against the
+    // same container; staying inside one repo keeps that contention out
+    // of this test.
+    it('participates in projection + exact-path findEntities when seeded via importBulk(skipExistenceCheck)', async () => {
+      const orgs: Array<[string, string]> = [
+        ['bulk-c1', 'company'],    ['bulk-c2', 'company'],    ['bulk-c3', 'company'],
+        ['bulk-c4', 'company'],    ['bulk-c5', 'company'],    ['bulk-u1', 'university'],
+        ['bulk-u2', 'university'], ['bulk-u3', 'university'], ['bulk-u4', 'university'],
+        ['bulk-n1', 'non-profit'],
+      ];
+      const now = new Date().toISOString();
+      const result = await provider.importBulk(
+        RID,
+        [
+          {
+            entities: orgs.map(([id, orgType]) => ({
+              id,
+              slug: `OrganizationBulk:${id}`,
+              entityType: 'OrganizationBulk',
+              label: id,
+              summary: '',
+              properties: { orgType },
+              provenance: {
+                createdBy: 'projection-test',
+                createdByType: 'agent' as const,
+                createdAt: now,
+                modifiedBy: 'projection-test',
+                modifiedByType: 'agent' as const,
+                modifiedAt: now,
+              },
+            })),
+          },
+        ],
+        { skipExistenceCheck: true },
+      );
+      expect(result.errors).toEqual([]);
+      expect(result.entitiesImported).toBe(orgs.length);
+
+      // 1) Server-side projection resolves `values('orgType')` against
+      // the dual-written scalar. Scoped to `OrganizationBulk` so the
+      // grouping only sees this test's bulk-seeded rows, not the
+      // `Organization` rows the earlier tests populate.
+      const projection = await provider.traverse(RID, {
+        start: { entityType: 'OrganizationBulk' },
+        returnMode: 'terminal',
+        projection: { properties: ['orgType'], mode: 'count' },
+        limit: 200,
+      });
+      expect(projection.entities).toEqual([]);
+      expect(projection.aggregations).toBeDefined();
+      expect(projection.aggregations).toHaveLength(3);
+      const byType = new Map(
+        projection.aggregations!.map((a) => [a.values['orgType'], a.count]),
+      );
+      expect(byType.get('company')).toBe(5);
+      expect(byType.get('university')).toBe(4);
+      expect(byType.get('non-profit')).toBe(1);
+
+      // 2) Exact-path findEntities — the SQL prefilter now finds the
+      // `orgType` scalar column, so `total` is a precise number.
+      const companies = await provider.findEntities(RID, {
+        entityTypes: ['OrganizationBulk'],
+        properties: { orgType: 'company' },
+        limit: 100,
+        offset: 0,
+      });
+      expect(companies.total).toBe(5);
+      expect(companies.items).toHaveLength(5);
+      expect(companies.items.every((e) => e.properties['orgType'] === 'company')).toBe(true);
+    }, 120_000);
   },
 );

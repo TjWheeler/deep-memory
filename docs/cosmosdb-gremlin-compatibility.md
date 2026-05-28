@@ -226,6 +226,70 @@ This is the resolved form of [Performance issue #20](../plans/performance-issues
 
 ---
 
+## Properties model
+
+How user-supplied entity / relationship properties are stored, and how that storage shape determines which server-side predicates and aggregations are possible.
+
+### Schema slots vs. user properties
+
+Every vertex and edge carries two distinct property classes:
+
+| Class | Examples | Storage shape | Source of truth |
+|---|---|---|---|
+| Schema slots | `entityType`, `entityLabel`, `slug`, `summary`, `createdAt`, … | Individual native vertex/edge properties via the fixed ladder ([packages/storage-cosmosdb/src/mapping.ts](../packages/storage-cosmosdb/src/mapping.ts) — `ENTITY_REQUIRED_SLOTS`, `ENTITY_OPTIONAL_SLOTS`, `RELATIONSHIP_REQUIRED_SLOTS`, `RELATIONSHIP_OPTIONAL_SLOTS`). | The slot itself. |
+| User properties | Anything inside `entity.properties` / `relationship.properties` (`orgType`, `tier`, `equipmentType`, …). | **Dual-written:** the full object lives JSON-stringified in the `properties` schema slot AND every native-storable key/value is mirrored as a per-key native vertex/edge scalar. | The JSON blob — `entityFromGremlin` / `relationshipFromGremlin` round-trip from it. The native scalars exist solely to support server-side predicates and aggregation; they are not read back. |
+
+The native scalar mirror is what makes `g.V().has('orgType', 'company')`, `g.V().has('entityType','Organization').group().by(values('orgType')).by(count())`, and the exact-path `findEntities` SQL prefilter (next section) work — none of those reach inside the JSON-stringified blob, because the Cosmos Gremlin subset has no in-step JSON traversal.
+
+### Dual-write contract
+
+On every write that produces or replaces user properties — `createEntity`, `updateEntity`, `createRelationship`, both branches of bulk-import `upsertEntity` / `upsertRelationship`, and the `skipExistenceCheck: true` bulk path through `insertEntity` / `insertRelationship` — the provider:
+
+1. JSON-stringifies the entire `properties` payload (lossless for any shape JS supports) into the `properties` schema slot.
+2. For every key whose value passes [`isNativeStorableValue`](../packages/storage-cosmosdb/src/mapping.ts), emits an additional `.property('<key>', p_user_N)` step. The key is inline (Gremlin's key slot is not parameterisable — see [§Property-key interpolation](#property-key-interpolation-prevents-server-side-plan-caching)) and pre-validated by `assertSafeEntityUserPropertyKey` / `assertSafeRelationshipUserPropertyKey`; the value binds through `p_user_N`.
+
+`updateEntity` additionally pre-reads the existing blob via `existingEntityScalarUserKeys`, computes `dropped = old-storable-keys ∖ new-storable-keys`, and emits a `.sideEffect(properties('<key>').drop())` per dropped key alongside the new `.property(...)` chain — one round-trip after the pre-read. Concurrent updates can leave scalars and blob momentarily divergent (the read-then-write pair is not transactional); the blob is the read-side source of truth and the next consistent write converges. Matches the Neo4j semantic.
+
+Bulk import overwrites and adds, but does **not** drop stale scalars from a pre-existing vertex (no pre-read in the bulk path). Callers that need exact-shape semantics issue per-entity `updateEntity` calls instead — same asymmetry the bulk path already had on the JSON blob before this change.
+
+There is no `updateRelationship` on the storage surface, so the drop logic is entity-only on the per-entity side; `createRelationship` mirrors `createEntity` and bulk relationship upsert mirrors the entity bulk path with its same drop-stale caveat.
+
+### Native-storable subset
+
+`isNativeStorableValue` accepts exactly what Cosmos Gremlin can carry as a scalar property without serialisation surprises:
+
+- `string`
+- finite `number` (rejects `NaN` and `±Infinity`)
+- `boolean`
+- homogeneous arrays of any of the above (empty arrays included)
+
+Everything else — nested objects, `null`, mixed-type arrays, arrays of objects — survives via the JSON blob but is **not predicate-queryable**: no native scalar gets written for it, so server-side `has(key, value)` / `values(key)` / `c.<key>[0]._value = @v` cannot reach it. Same observable subset as Neo4j, kept byte-identical so the cross-provider contract stays in lockstep.
+
+Silent drop of non-storable values is by design; the blob is authoritative for round-trip and the scalars are an additive predicate channel. Callers who depend on querying nested shapes need to denormalise into top-level keys.
+
+### Reserved-key collision guard
+
+User keys cannot reuse a schema slot name — colliding would clobber a managed scalar via the dual-write. Both write paths and the `findEntities` exact-path SQL prefilter reject collisions synchronously:
+
+- Entity: `RESERVED_ENTITY_PROPERTY_KEYS` = `ENTITY_REQUIRED_SLOTS ∪ ENTITY_OPTIONAL_SLOTS ∪ {'id', 'repositoryId'}`.
+- Relationship: `RESERVED_RELATIONSHIP_PROPERTY_KEYS` = `RELATIONSHIP_REQUIRED_SLOTS ∪ RELATIONSHIP_OPTIONAL_SLOTS ∪ {'id', 'repositoryId', 'label'}` — `'label'` is the Gremlin edge-label token and a user property of that name would collide at write time.
+
+`assertSafeEntityUserPropertyKey` / `assertSafeRelationshipUserPropertyKey` apply both the identifier-shape regex (`/^[A-Za-z_][A-Za-z0-9_]*$/`) and the reserved-set check. A failure throws `ProviderError` before any round-trip. A drift test in `mapping.test.ts` asserts every entry in the slot arrays is present in the matching reserved set — adding a slot in the future fails loudly if the reserved set is forgotten.
+
+### Lazy migration
+
+No backfill ships with the dual-write change. Pre-existing entities and relationships written before it landed have the JSON blob but no native scalars; on next `createEntity` / `updateEntity` (or `createRelationship` / `upsertRelationship`) the dual-write fires for that record and the scalars appear. Records never touched again stay scalar-less — projections (`values('orgType')`) and the exact-path `findEntities` prefilter undercount them silently.
+
+Acceptable trade-off for a project in active development: seed scripts that produce real test data are easy to re-run, which migrates every record they touch. Production-scale repos that need exhaustive convergence can re-run their indexer / loader. There is no admin tool for forced migration and no `local-tests/` script for it.
+
+### Plan-cache implication
+
+The variable-shape user-property suffix means each unique `(write path, ordered user-key set)` pair produces a distinct Gremlin string. The fixed schema ladder up to the suffix is byte-identical across writes, so the cached plan still benefits from binding reuse on that portion; the marginal cost is per-shape.
+
+In a vocabulary-driven system the per-entity-type property shape is bounded (≤20 keys typical) and call-site population is dominated by "all required + a few optional" — plan-cache pressure scales with entity-type count, not unique-entity count. Emulator observation confirmed the prediction: 7 same-shape `createEntity` round-trips compiled to 1 distinct Gremlin string.
+
+---
+
 ## Performance-critical operator differences
 
 These are correctness-OK choices that have non-obvious RU/latency consequences.
@@ -369,18 +433,35 @@ The SQL rewrite (Step D of [plans/findentities-cosmos-fanout-2026-05-25.md](../p
 -- data
 SELECT <projection> FROM c
 WHERE c.repositoryId = @rid
+  AND IS_DEFINED(c.entityType)                                   -- excludes system vertices
   [AND c.entityType[0]._value IN (@etype0, @etype1, ...)]
   [AND (CONTAINS(c.entityLabel[0]._value, @term, true)
      OR CONTAINS(c.slug[0]._value,        @term, true)
      OR CONTAINS(c.summary[0]._value,     @term, true))]
-  [AND CONTAINS(c.properties[0]._value, @kv0, false) AND ...]
+  [-- propertyFilterMode='exact' — every filter value is isNativeStorableValue
+   AND c.<key0>[0]._value = @val0 AND c.<key1>[0]._value = @val1 ...]
+  [-- propertyFilterMode='approximate' — any filter value is non-storable
+   AND CONTAINS(c.properties[0]._value, @kv0, false) AND ...]
 ORDER BY c.id OFFSET @off LIMIT @lim
 
--- count (skipped when query.properties is non-empty)
+-- count
 SELECT VALUE COUNT(1) FROM c WHERE <same clause>
+-- skipped only when the property-filter mode is `approximate`
 ```
 
-The `count` is skipped on `properties` queries because the `CONTAINS` on the JSON-stringified blob is **approximate** — exact-match verification happens client-side after the page lands. Counting the approximate set would overstate `total`, so `PaginatedResult.total` is `undefined` for those queries by convention.
+### Property-filter prefilter modes (`PaginatedResult.total` exactness)
+
+`buildWhereClause` selects one of three modes per call based on `query.properties`:
+
+| Mode | Triggered by | Prefilter | COUNT branch | `PaginatedResult.total` |
+|---|---|---|---|---|
+| `none` | `query.properties` absent / empty | (no clause added) | runs | exact `number` |
+| `exact` | `query.properties` non-empty AND every value passes `isNativeStorableValue` | `c.<key>[0]._value = @valN` per clause against the dual-written native scalar column | runs | exact `number` |
+| `approximate` | `query.properties` non-empty AND any value fails `isNativeStorableValue` (nested object, mixed array, …) | `CONTAINS(c.properties[0]._value, @kvN, false)` substring match against the JSON-stringified blob | **skipped** | `undefined` |
+
+The `approximate` path is a defensive fallback for filter sets the dual-write cannot reach (the write path silently drops non-storable values from the scalar mirror — see [§Native-storable subset](#native-storable-subset)). Exact-match verification still happens client-side via `matchesPropertyFilters` after the page lands; the prefilter is a routing optimisation, not the source of truth. Counting the substring-matched set would over-report by the false-positive rate, so `total: undefined` is the only honest value for that mode.
+
+Reserved-key collisions in `query.properties` (`{ entityType: 'X' }`, `{ id: '…' }`, …) throw `ProviderError` synchronously on the `exact` path via `assertSafeEntityUserPropertyKey` — same identifier-shape + reserved-set guard the write path uses. Before this widening landed they substring-matched the JSON blob through the old `CONTAINS` prefilter and usually returned zero rows silently; the throw makes the bug visible at the caller.
 
 ### Path conventions (the `[0]._value` gotcha)
 

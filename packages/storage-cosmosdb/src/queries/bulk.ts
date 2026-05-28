@@ -251,7 +251,22 @@ const UPSERT_RELATIONSHIP_QUERY =
 
 // ─── Direct insert (no existence check) ─────────────────────────
 
-/** Insert an entity directly — assumes it does not exist. */
+/**
+ * Insert an entity directly — assumes it does not exist.
+ *
+ * User-property dual-write contract: native-storable values in
+ * `entity.properties` also project to per-key vertex properties so server-
+ * side predicates and aggregations can reach them. The suffix appends to
+ * the fixed `addV(...)` ladder with `p_user_<i>` bindings beside the
+ * existing ladder bindings. Validation (reserved-name collisions, unsafe
+ * identifiers) runs synchronously via `entityUserPropertyParams` before
+ * any round-trip — the contract matches the `createEntity` and
+ * `upsertEntity` write paths so every dual-write entry point produces the
+ * same scalar shape. When the caller's properties contain no native-
+ * storable values, the empty suffix collapses the query to the canonical
+ * fixed `INSERT_ENTITY_QUERY` string (byte-identical to the historical
+ * shape), keeping the dominant plan-cache entry warm.
+ */
 async function insertEntity(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -263,10 +278,35 @@ async function insertEntity(
     vertexLabel: entity.entityType,
     ...entityToLadderBindings(entity),
   };
-  await conn.submit(INSERT_ENTITY_QUERY, bindings);
+
+  const userProps = entityUserPropertyParams(entity.properties ?? {});
+  let query: string;
+  if (userProps.length === 0) {
+    query = INSERT_ENTITY_QUERY;
+  } else {
+    let suffix = '';
+    for (let i = 0; i < userProps.length; i++) {
+      const { key, value } = userProps[i]!;
+      suffix += `.property('${key}', p_user_${i})`;
+      bindings[`p_user_${i}`] = value;
+    }
+    query = `${INSERT_ENTITY_QUERY}${suffix}`;
+  }
+
+  await conn.submit(query, bindings);
 }
 
-/** Insert a relationship directly — assumes it does not exist. */
+/**
+ * Insert a relationship directly — assumes it does not exist.
+ *
+ * User-property dual-write contract: same shape as `insertEntity` above —
+ * native-storable values in `relationship.properties` project to per-key
+ * edge properties via a suffix appended to the fixed `addE(...)` ladder.
+ * The relationship reserved set additionally guards against the Gremlin
+ * `'label'` token, which would collide with the edge-label slot set at
+ * `addE(edgeLabel)`. Empty-properties insert hits the byte-identical
+ * fixed `INSERT_RELATIONSHIP_QUERY` string.
+ */
 async function insertRelationship(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -280,7 +320,22 @@ async function insertRelationship(
     edgeLabel: rel.relationshipType,
     ...relationshipToLadderBindings(rel),
   };
-  await conn.submit(INSERT_RELATIONSHIP_QUERY, bindings);
+
+  const userProps = relationshipUserPropertyParams(rel.properties ?? {});
+  let query: string;
+  if (userProps.length === 0) {
+    query = INSERT_RELATIONSHIP_QUERY;
+  } else {
+    let suffix = '';
+    for (let i = 0; i < userProps.length; i++) {
+      const { key, value } = userProps[i]!;
+      suffix += `.property('${key}', p_user_${i})`;
+      bindings[`p_user_${i}`] = value;
+    }
+    query = `${INSERT_RELATIONSHIP_QUERY}${suffix}`;
+  }
+
+  await conn.submit(query, bindings);
 }
 
 // ─── Atomic upsert (single query with coalesce) ─────────────────

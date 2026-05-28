@@ -88,35 +88,42 @@ All data is partitioned by `repositoryId` — every vertex and edge stores it. T
 
 ### Edge Types
 
-Edge labels are relationship types. Each edge stores `sourceEntityId`, `targetEntityId`, `bidirectional`, properties (as JSON), and provenance.
+Edge labels are relationship types. Each edge stores `sourceEntityId`, `targetEntityId`, `bidirectional`, user properties (dual-written — see [Property Storage](#property-storage)), and provenance.
 
 ### Property Storage
 
+User-supplied properties on entities and relationships are **dual-written**: the full payload is JSON-stringified into the `properties` slot (round-trip authoritative — every shape JS can serialise survives), and every key whose value is natively Cosmos-storable (`string`, finite `number`, `boolean`, homogeneous arrays of those) is mirrored as a per-key native vertex/edge scalar so it can be reached by server-side Gremlin predicates (`has('orgType', 'company')`, `values('orgType')`, `group().by(...)`) and the exact-path `findEntities` SQL prefilter. Nested objects, `null`, mixed arrays, and arrays of objects live only in the blob and are not predicate-queryable. Schema-slot collisions on user keys (`entityType`, `id`, `'label'` on edges, …) throw `ProviderError` synchronously on every write path AND on `findEntities` property filters. See the [Properties model section in the Gremlin compatibility doc](https://github.com/TjWheeler/deep-memory/blob/main/docs/cosmosdb-gremlin-compatibility.md#properties-model) for the full contract.
+
 | Data | Storage | Notes |
 |------|---------|-------|
-| Entity properties | JSON string in `properties` vertex property | Parsed on read |
+| Entity / relationship user properties | JSON blob in `properties` + per-key native vertex/edge scalars for native-storable values | Blob is authoritative on read. The scalars are a write-only mirror that powers server-side predicates and aggregation; the read path never consumes them. |
 | Embeddings | JSON string in `embedding` vertex property | Stored for export/import fidelity; not searchable via Gremlin |
 | Governance config | JSON string in `governanceConfig` vertex property | On `_repository` vertices |
 | Vocabulary | JSON string in `vocabulary` vertex property | On `_vocabulary` vertices |
 
 ## Capabilities
 
-`findEntities()` supports:
+`findEntities()` runs against the Cosmos NoSQL (Document) endpoint over the same backing container the Gremlin reads use — a separate code path because the Gremlin subset cannot express case-insensitive substring search server-side (`TextP.containing()` silently returns zero rows in the Cosmos Gremlin subset). The two paths share the container; `CosmosDocumentClient` issues raw HTTPS + HMAC requests with no SDK dependency. Supports:
 
-- **Type filter** — restrict to specific entity types
-- **Text search** — case-insensitive slug-based matching via `TextP.containing()`
-- **Pagination** — Gremlin `range()` with total count
+- **Type filter** — `c.entityType[0]._value IN (@etype0, …)`
+- **Text search** — case-insensitive substring via `CONTAINS(<field>, @term, true)` across `entityLabel` / `slug` / `summary`
+- **Property filter** — three modes set by the filter values:
+  - no filter → `PaginatedResult.total` is an exact `number`
+  - every value native-storable → exact prefilter (`c.<key>[0]._value = @val` per clause against the dual-written scalar column); `total` is an exact `number`
+  - any value non-storable → fallback `CONTAINS` substring on the JSON blob; `total: undefined` (the count branch is skipped because the substring prefilter over-reports)
+  - Reserved-key collisions in `query.properties` throw `ProviderError` synchronously
+- **Pagination** — SQL `ORDER BY c.id OFFSET @off LIMIT @lim`; data and count queries share one `WHERE` clause so `total` is consistent with the data page by construction
 
 `GraphTraversalProvider` capabilities:
 
 | Capability | Supported |
 |-----------|-----------|
 | Native Gremlin queries | Yes |
-| Relationship property filters | Yes |
-| Entity property filters | Yes |
+| Relationship property filters | Yes (server-side `has('<userKey>', value)` against the dual-written edge scalar) |
+| Entity property filters | Yes (server-side `has('<userKey>', value)` against the dual-written vertex scalar) |
 | Repeat/loop traversals | Yes |
 | Dedup | Yes |
-| Aggregation | Limited (CosmosDB Gremlin limitation) |
+| Server-side aggregation over user properties | Yes — `group().by(values('<userKey>')).by(count())` and `dedup().by(values('<userKey>'))` resolve through the dual-written scalars |
 | Relationship summaries | No |
 
 RU cost is reported in `QueryMetadata.resourceCost` for graph traversal operations.
@@ -125,11 +132,11 @@ RU cost is reported in `QueryMetadata.resourceCost` for graph traversal operatio
 
 | Limitation | Impact |
 |-----------|--------|
-| No full-text search | `findEntities()` text matching is slug-based only — pair with a separate `SearchProvider` for richer search |
+| No ranked / fuzzy / phrase text search | `findEntities()` text matching is substring `CONTAINS` over `entityLabel` / `slug` / `summary` only — pair with a separate `SearchProvider` for ranked, fuzzy, or multi-token search |
 | No vector similarity | Embeddings stored for portability but not searchable |
-| Limited aggregation | `count()`, `sum()`, `mean()` have limited support |
+| `group().by(values('<key>'))` cost scales with partition size | Server-side aggregation over user-property scalars works but touches every matching vertex in the partition — costly at millions of vertices. Mitigation options (write-side counter vertex, scheduled stats refresh) are deferred |
 | No lambda steps | Cannot use closures in Gremlin queries |
-| Arrays stored as JSON strings | Cannot filter on array elements server-side |
+| Nested-shape user properties are blob-only | Nested objects, `null`, mixed-type arrays, and arrays of objects survive via the JSON blob but get no native scalar mirror — so they are not server-side predicate-queryable. Homogeneous arrays of native-storable values *are* dual-written as multi-cardinality native properties. |
 
 ## Bulk Operations
 

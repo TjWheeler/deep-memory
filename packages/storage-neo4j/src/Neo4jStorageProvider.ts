@@ -653,6 +653,12 @@ export class Neo4jStorageProvider {
    * entity count uses the umbrella `:_Entity` label so system nodes
    * (`_Repository` / `_Vocabulary`) are excluded — that matches the
    * user-facing semantics of the progress callback.
+   *
+   * The relationship count uses the **directed** pattern `()-[r]->()`: every
+   * edge is written in its stored direction (D5), so the directed pattern
+   * binds each edge to exactly one row. An undirected `-` pattern would
+   * double-count every edge whose endpoints are distinct vertices, because
+   * Cypher enumerates the pattern from both directions.
    */
   private async countRepositoryContents(
     repositoryId: string,
@@ -664,7 +670,7 @@ export class Neo4jStorageProvider {
         { repositoryId, routing: 'READ' },
       ),
       this.connection.executeQuery(
-        'MATCH ()-[r {repositoryId: $rid}]-() RETURN count(r) AS total',
+        'MATCH ()-[r {repositoryId: $rid}]->() RETURN count(r) AS total',
         {},
         { repositoryId, routing: 'READ' },
       ),

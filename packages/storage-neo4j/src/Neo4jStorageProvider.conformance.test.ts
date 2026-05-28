@@ -1,15 +1,21 @@
 // Conformance harness for Neo4jStorageProvider.
 //
-// The full `runStorageProviderConformanceTests` from @utaba/deep-memory/testing
-// lands once the CRUD surface is complete. Until then, this file covers the
-// pieces that already exist:
+// Two layers:
 //
-//   - ensureSchema (idempotent DDL + _Meta version handshake).
-//   - Repository CRUD (create / get / list / update / delete /
-//     deleteAllContents, with the dm_repository_unique constraint mapped to
-//     DuplicateRepositoryError and the chunked-wipe progress callback).
-//   - Vocabulary CRUD (getVocabulary with 60 s cache, saveVocabulary upsert
-//     via MERGE, getVocabularyChangeLog with parallel data + count).
+//   1. Targeted Neo4j-specific tests in this file — cover ensureSchema's
+//      idempotent DDL + `_Meta` handshake, repository CRUD edge cases
+//      (DuplicateRepositoryError, chunked-wipe progress callback), and
+//      vocabulary CRUD with the 60 s cache (the `details.calls` round-trip
+//      contract is provider-specific so it stays alongside the live tests).
+//
+//   2. The cross-provider `runStorageProviderConformanceTests` harness from
+//      `@utaba/deep-memory/testing` — exercises the full `StorageProvider`
+//      contract against the running Neo4j instance. Every contract assertion
+//      is identical to the Cosmos and SQL Server runs, so any silent
+//      divergence in semantics surfaces here. The Neo4j build is expected to
+//      pass with zero skips and zero `total: undefined` paths (D22 —
+//      findEntities is strictly more precise than the Cosmos surface because
+//      every filter shape resolves to a server-side exact predicate).
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run.
 // Example:
@@ -29,8 +35,14 @@ import {
   DuplicateRepositoryError,
   RepositoryNotFoundError,
 } from '@utaba/deep-memory';
+import { runStorageProviderConformanceTests } from '@utaba/deep-memory/testing';
 import { Neo4jStorageProvider } from './Neo4jStorageProvider.js';
 import { SCHEMA_VERSION } from './schema.js';
+
+// The stable repository id baked into the cross-provider conformance harness.
+// Cleaning it up before each factory call lets the harness's per-test
+// `createRepository` succeed even when an earlier test was interrupted.
+const CONFORMANCE_REPO_ID = '40000000-0000-4000-a000-000000000001';
 
 const NEO4J_URI = process.env['NEO4J_URI'];
 const NEO4J_USER = process.env['NEO4J_USER'] ?? 'neo4j';
@@ -420,6 +432,48 @@ if (NEO4J_URI) {
       const record = lastRecordFor('getVocabularyChangeLog');
       // Parallel data + count = two round-trips per call.
       expect((record?.details as { calls?: number } | undefined)?.calls).toBe(2);
+    });
+  });
+
+  // ─── Cross-provider conformance suite ───────────────────────────────
+  //
+  // Shares a single driver across every harness test (one Neo4jStorageProvider
+  // built once in `beforeAll`). The factory deletes the harness's stable repo
+  // id before each test so the harness's own `createRepository` always lands
+  // against a clean slate, then returns the shared instance. `initialize()` is
+  // idempotent inside the harness's `setup`, so the shared provider passes
+  // through unchanged.
+
+  describe('Neo4jStorageProvider — cross-provider conformance (live)', () => {
+    let sharedProvider: Neo4jStorageProvider;
+
+    beforeAll(async () => {
+      sharedProvider = new Neo4jStorageProvider({
+        uri: NEO4J_URI,
+        username: NEO4J_USER,
+        password: NEO4J_PASSWORD,
+        database: NEO4J_DATABASE,
+      });
+      await sharedProvider.initialize();
+      await sharedProvider.ensureSchema();
+    });
+
+    afterAll(async () => {
+      try {
+        await sharedProvider.deleteRepository(CONFORMANCE_REPO_ID);
+      } catch {
+        // Already gone — fine.
+      }
+      await sharedProvider.dispose();
+    });
+
+    runStorageProviderConformanceTests(async () => {
+      try {
+        await sharedProvider.deleteRepository(CONFORMANCE_REPO_ID);
+      } catch {
+        // Not yet created — first test in the run, no cleanup needed.
+      }
+      return sharedProvider;
     });
   });
 } else {

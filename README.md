@@ -27,7 +27,7 @@ This repo has been designed to provide detailed documentation that AI can use.  
 - [quickstart-neo4j.md](quickstart-neo4j.md) — Neo4j graph database. Bundled Docker Compose, or AuraDB / self-hosted.
 - [quickstart-indexer.md](quickstart-indexer.md) — build your own knowledge graph from source documents via the indexing pipeline.
 
-**Not a developer? Using Claude Desktop instead of Claude Code?**
+**Not a developer? Using Claude Desktop instead of Claude Code or another MCP capable AI?**
 
 - [quickstart-claude-desktop.md](quickstart-claude-desktop.md) — no coding, no git, no build. Three installers + one config file. ~15 minutes.
 

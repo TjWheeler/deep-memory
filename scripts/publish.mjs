@@ -8,7 +8,8 @@
  *   2. @utaba/deep-memory-embeddings-openai
  *   3. @utaba/deep-memory-storage-cosmosdb
  *   4. @utaba/deep-memory-storage-sqlserver
- *   5. @utaba/deep-memory-local-mcp-server
+ *   5. @utaba/deep-memory-storage-neo4j
+ *   6. @utaba/deep-memory-local-mcp-server
  *
  * Indexer packages (indexer, indexer-llm-anthropic, indexer-mcp-server)
  * are intentionally excluded — they are marked "private": true and are
@@ -38,6 +39,7 @@ const packages = [
   { name: '@utaba/deep-memory-embeddings-openai', path: 'packages/embeddings-openai' },
   { name: '@utaba/deep-memory-storage-cosmosdb', path: 'packages/storage-cosmosdb' },
   { name: '@utaba/deep-memory-storage-sqlserver', path: 'packages/storage-sqlserver' },
+  { name: '@utaba/deep-memory-storage-neo4j', path: 'packages/storage-neo4j' },
   { name: '@utaba/deep-memory-local-mcp-server', path: 'packages/mcp-server' },
 ];
 

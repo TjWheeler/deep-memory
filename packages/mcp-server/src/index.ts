@@ -34,6 +34,7 @@ const logger = new ConsoleLogger();
 const storageSetting = process.env['DEEP_MEMORY_STORAGE'];
 const storageType = storageSetting === 'sqlserver' ? 'sqlserver' as const
   : storageSetting === 'cosmosdb' ? 'cosmosdb' as const
+  : storageSetting === 'neo4j' ? 'neo4j' as const
   : 'memory' as const;
 
 const server = new McpServer(
@@ -60,6 +61,10 @@ const server = new McpServer(
     cosmosDbDatabase: process.env['DEEP_MEMORY_COSMOSDB_DATABASE'],
     cosmosDbContainer: process.env['DEEP_MEMORY_COSMOSDB_CONTAINER'],
     cosmosDbRejectUnauthorized: process.env['DEEP_MEMORY_COSMOSDB_REJECT_UNAUTHORIZED'] !== 'false',
+    neo4jUri: process.env['DEEP_MEMORY_NEO4J_URI'],
+    neo4jUsername: process.env['DEEP_MEMORY_NEO4J_USERNAME'],
+    neo4jPassword: process.env['DEEP_MEMORY_NEO4J_PASSWORD'],
+    neo4jDatabase: process.env['DEEP_MEMORY_NEO4J_DATABASE'],
     exportDir: process.env['DEEP_MEMORY_EXPORT_DIR'] ?? './exports',
   },
   logger,

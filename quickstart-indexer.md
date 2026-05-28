@@ -53,7 +53,7 @@ This uses the in-memory storage for the resulting graph. If you'd rather import 
 
 ## 3. Restart Claude Code
 
-Restart Claude Code so it loads both servers. Confirm via `/mcp` that **deep-memory** (28 tools) and **deep-memory-indexer** (9 tools) both show connected.
+Restart Claude Code so it loads both servers. Confirm via `/mcp` that **deep-memory** (29 tools) and **deep-memory-indexer** (9 tools) both show connected.
 
 ## 4. Kick off the pipeline
 

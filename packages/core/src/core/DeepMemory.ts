@@ -414,6 +414,7 @@ export class DeepMemory {
     options: ImportOptions,
   ): Promise<ImportResult> {
     await this.ensureInitialized();
+    this.validateRepositoryId(options.target.repositoryId);
 
     await this.globalEventBus.emit('import:started', { repositoryId: options.target.repositoryId });
 
@@ -534,6 +535,7 @@ export class DeepMemory {
     options: ImportOptions,
   ): Promise<ImportResult> {
     await this.ensureInitialized();
+    this.validateRepositoryId(options.target.repositoryId);
 
     const importer = new RepositoryImporter({
       storage: this.storage,

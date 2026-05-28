@@ -141,6 +141,9 @@ importers:
       '@utaba/deep-memory-storage-cosmosdb':
         specifier: workspace:*
         version: link:../storage-cosmosdb
+      '@utaba/deep-memory-storage-neo4j':
+        specifier: workspace:*
+        version: link:../storage-neo4j
       '@utaba/deep-memory-storage-sqlserver':
         specifier: workspace:*
         version: link:../storage-sqlserver

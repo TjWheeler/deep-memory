@@ -10,6 +10,7 @@ A vocabulary-driven graph memory library for AI agents. Zero runtime dependencie
 | `@utaba/deep-memory-embeddings-openai` | `packages/embeddings-openai` | OpenAI-compatible embeddings provider — works with vLLM, OpenAI, Azure, Ollama, etc. |
 | `@utaba/deep-memory-storage-sqlserver` | `packages/storage-sqlserver` | SQL Server storage provider — persistent, multi-tenant graph storage. |
 | `@utaba/deep-memory-storage-cosmosdb` | `packages/storage-cosmosdb` | CosmosDB Gremlin storage provider — native graph database with dual StorageProvider + GraphTraversalProvider. |
+| `@utaba/deep-memory-storage-neo4j` | `packages/storage-neo4j` | Neo4j storage provider — native Cypher graph database with dual StorageProvider + GraphTraversalProvider, against Neo4j Community Edition over Bolt. |
 | `@utaba/deep-memory-indexer` | `packages/indexer` | Document indexing pipeline — LLM extraction, validation, consolidation, and import. |
 | `@utaba/deep-memory-indexer-llm-anthropic` | `packages/indexer-llm-anthropic` | Anthropic LLM provider for the indexer — native Messages API with prompt caching. |
 | `@utaba/deep-memory-local-mcp-server` | `packages/mcp-server` | Local MCP server exposing deep-memory memory tools for AI agents. |
@@ -49,6 +50,7 @@ Each provider's canonical documentation lives in its package README. The `docs/`
 - [CosmosDB Gremlin Storage Provider](../packages/storage-cosmosdb/README.md) — Native graph storage backed by Azure CosmosDB Gremlin API. Includes local emulator setup (Windows + WSL2) and Azure production deployment.
 - [CosmosDB Gremlin Compatibility & Performance Notes](cosmosdb-gremlin-compatibility.md) — What we've verified works (and doesn't) in CosmosDB's Gremlin subset, plus the performance-critical operator differences. **Required reading before changing emitted Gremlin** in the compiler or any storage-cosmosdb query module.
 - [CosmosDB Adaptive Import](storage-cosmosdb-adaptive-import.md) — How `importBulk` adapts concurrency to RU-constrained CosmosDB tiers: control loop, throttle detection via the connection's retry counter, circuit breaker, and operator visibility.
+- [Neo4j Storage Provider](../packages/storage-neo4j/README.md) — Native graph storage backed by Neo4j Community Edition over Bolt. Implements both StorageProvider and GraphTraversalProvider; ships with Docker Compose for local dev and AuraDB-compatible URIs for production.
 - [Embeddings Provider (OpenAI)](../packages/embeddings-openai/README.md) — Setup and usage for the OpenAI-compatible embeddings provider.
 - [Embeddings Quickstart](../quickstart-embeddings.md) — Wiring an embeddings provider into the MCP server (bundled vLLM, OpenAI, Ollama, Azure OpenAI) to enable semantic search.
 

@@ -8,7 +8,7 @@ Memory is only useful if it survives restarts. The recommended setup runs a loca
 
 **Full step-by-step (Windows / Mac / Linux):** [quickstart-claude-desktop.md](https://github.com/TjWheeler/deep-memory/blob/main/quickstart-claude-desktop.md) — three installers + one config file, around 15 minutes.
 
-The summary version: install Docker Desktop and Node.js, download the project ZIP, run `docker compose up sqlserver -d`, create the `deep-memory` database, then paste this into your MCP client's config:
+The summary version: install Docker Desktop and Node.js, download the project ZIP, run `docker compose -f docker-compose.sqlserver.yml up -d`, create the `deep-memory` database, then paste this into your MCP client's config:
 
 **Mac / Linux:**
 
@@ -67,9 +67,9 @@ The summary version: install Docker Desktop and Node.js, download the project ZI
 | Claude Desktop (Linux) | `~/.config/Claude/claude_desktop_config.json` |
 | Claude Code | `.mcp.json` at your project root, or `~/.mcp.json` for global |
 
-The password and port above match the bundled `docker-compose.yml` in the project repo — change them in both places if you customise the database setup. CosmosDB Gremlin is also supported; see the [project repository](https://github.com/TjWheeler/deep-memory) for that path.
+The password and port above match the bundled `docker-compose.sqlserver.yml` in the project repo — change them in both places if you customise the database setup. CosmosDB Gremlin is also supported; see the [project repository](https://github.com/TjWheeler/deep-memory) for that path.
 
-> **Security — change the default password.** `DeepMem@Dev1234` is a publicly known development default. Anyone who can reach your machine on port 1435 can read your entire memory with it. Before you put anything personal or sensitive into the database, change the `SA_PASSWORD` / `MSSQL_SA_PASSWORD` in `docker-compose.yml` (and the matching `DEEP_MEMORY_SQL_PASSWORD` in the MCP config above) to a strong, unique password. The default is only safe when the database is bound to `localhost` on a trusted machine.
+> **Security — change the default password.** `DeepMem@Dev1234` is a publicly known development default. Anyone who can reach your machine on port 1435 can read your entire memory with it. Before you put anything personal or sensitive into the database, change the `SA_PASSWORD` / `MSSQL_SA_PASSWORD` in `docker-compose.sqlserver.yml` (and the matching `DEEP_MEMORY_SQL_PASSWORD` in the MCP config above) to a strong, unique password. The default is only safe when the database is bound to `localhost` on a trusted machine.
 
 Quit and reopen the MCP client. The server should show as connected with around 28 memory tools.
 
@@ -104,14 +104,18 @@ Environment variables passed via the MCP client's `env` block:
 |----------|---------|-------------|
 | `DEEP_MEMORY_ACTOR_ID` | `mcp-agent` | Actor ID stamped on provenance |
 | `DEEP_MEMORY_ACTOR_TYPE` | `agent` | Actor type: `agent`, `human`, or `system` |
-| `DEEP_MEMORY_STORAGE` | `memory` | `memory` (test only — wiped on restart) or `sqlserver` (recommended) |
+| `DEEP_MEMORY_STORAGE` | `memory` | `memory` (test only — wiped on restart), `sqlserver` (recommended), `cosmosdb`, or `neo4j` |
 | `DEEP_MEMORY_SQL_HOST` | — | SQL Server hostname (when `DEEP_MEMORY_STORAGE=sqlserver`) |
-| `DEEP_MEMORY_SQL_PORT` | `1433` | SQL Server port. The bundled `docker-compose.yml` publishes the container on host port **1435** (to avoid clashing with any local SQL install on the default 1433); use `1435` for that path. For a different SQL Server instance, check the port that instance is listening on. |
+| `DEEP_MEMORY_SQL_PORT` | `1433` | SQL Server port. The bundled `docker-compose.sqlserver.yml` publishes the container on host port **1435** (to avoid clashing with any local SQL install on the default 1433); use `1435` for that path. For a different SQL Server instance, check the port that instance is listening on. |
 | `DEEP_MEMORY_SQL_DATABASE` | — | Database name |
 | `DEEP_MEMORY_SQL_USER` | — | SQL Server username |
 | `DEEP_MEMORY_SQL_PASSWORD` | — | SQL Server password |
 | `DEEP_MEMORY_SQL_SCHEMA` | `dbo` | SQL Server schema |
 | `DEEP_MEMORY_SQL_TRUST_CERT` | `false` | Trust self-signed certificates (set `true` for local Docker) |
+| `DEEP_MEMORY_NEO4J_URI` | — | Neo4j Bolt URI (when `DEEP_MEMORY_STORAGE=neo4j`), e.g. `bolt://localhost:7687` or `neo4j+s://<dbid>.databases.neo4j.io` |
+| `DEEP_MEMORY_NEO4J_USERNAME` | `neo4j` | Neo4j username |
+| `DEEP_MEMORY_NEO4J_PASSWORD` | — | Neo4j password |
+| `DEEP_MEMORY_NEO4J_DATABASE` | `neo4j` | Neo4j database name |
 | `DEEP_MEMORY_EMBEDDINGS_BASE_URL` | — | Embeddings API URL (enables semantic search). See [quickstart-embeddings.md](https://github.com/TjWheeler/deep-memory/blob/main/quickstart-embeddings.md) for provider-specific recipes. |
 | `DEEP_MEMORY_EMBEDDINGS_MODEL` | — | Embeddings model identifier |
 | `DEEP_MEMORY_EMBEDDINGS_DIMENSIONS` | auto-detected | Embedding vector dimensionality. Set only when the model supports configurable dimensions (e.g. OpenAI `text-embedding-3-*`). |
@@ -129,14 +133,15 @@ The package exports the same entry point its `bin` invokes — see the [project 
 
 ## Tools (28)
 
-### Repository lifecycle (8)
+### Repository lifecycle (9)
 
 | Tool | Description |
 |------|-------------|
 | `memory_create_repository` | Create a new repository with optional vocabulary and governance mode |
 | `memory_open_repository` | Open a repository by ID or label — call first before entity/relationship operations |
-| `memory_list_repositories` | List all available repositories |
-| `memory_update_repository` | Update repository metadata — label, description, governance mode, similarity threshold |
+| `memory_list_repositories` | List all available repositories (summary only) |
+| `memory_get_repository` | Get the full record for one repository — legal, owner, metadata (embedding model/dimensions), governance, creation provenance |
+| `memory_update_repository` | Update repository metadata — label, description, legal, owner, governance, similarity threshold, embedding metadata |
 | `memory_delete_repository` | Delete a repository (or only its contents, keeping vocabulary) |
 | `memory_ensure_schema` | Ensure storage provider schema exists; no-op for in-memory, creates tables/indexes for persistent providers |
 | `memory_validate_entities` | Audit entities against the vocabulary; returns issues fixable with `memory_update_entity` |

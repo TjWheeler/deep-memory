@@ -65,7 +65,7 @@ cd ~/deep-memory           # Mac / Linux
 Start the database:
 
 ```bash
-docker compose up sqlserver -d
+docker compose -f docker-compose.sqlserver.yml up -d
 ```
 
 The first time this runs, Docker downloads and builds the database image. It can take 5–10 minutes. Subsequent starts take seconds.
@@ -73,7 +73,7 @@ The first time this runs, Docker downloads and builds the database image. It can
 Check progress until you see `healthy`:
 
 ```bash
-docker compose ps sqlserver
+docker compose -f docker-compose.sqlserver.yml ps
 ```
 
 Repeat the command every minute. When the **STATUS** column shows `Up X minutes (healthy)`, you're ready.
@@ -86,7 +86,7 @@ docker exec deep-memory-sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U 
 
 You should see output ending with something like `Changed database context to 'master'.` That means it worked.
 
-> **Security note:** the default password `DeepMem@Dev1234` is fine for a local-only database that nothing outside your machine can reach. Don't expose this database to the internet without changing the password in `docker-compose.yml` first.
+> **Security note:** the default password `DeepMem@Dev1234` is fine for a local-only database that nothing outside your machine can reach. Don't expose this database to the internet without changing the password in `docker-compose.sqlserver.yml` first.
 
 The database will now restart automatically every time Docker Desktop starts. You only need to do Step 3 once.
 
@@ -191,7 +191,7 @@ Save the file. If you already have other MCP servers configured, merge the `deep
 
 Fully **quit** Claude Desktop (don't just close the window — use the menu **Claude → Quit** on Mac, or right-click the tray icon → Quit on Windows). Open it again.
 
-The first time, `npx` will spend ~30 seconds downloading the connector. The Claude Desktop window may show a brief "starting tools" indicator. After that, you should see a small tools icon (a hammer or slider, depending on the version) near the message input. Click it and confirm `deep-memory` is listed with around 28 tools.
+The first time, `npx` will spend ~30 seconds downloading the connector. The Claude Desktop window may show a brief "starting tools" indicator. After that, you should see a small tools icon (a hammer or slider, depending on the version) near the message input. Click it and confirm `deep-memory` is listed with around 29 tools.
 
 ---
 
@@ -243,7 +243,7 @@ Docker Desktop isn't running. Open it from your Start menu / Applications folder
 
 **`Login failed for user 'sa'`** when running the `CREATE DATABASE` command.
 
-The database container needs a minute on first run. Run `docker compose ps sqlserver` and wait for `(healthy)` before retrying.
+The database container needs a minute on first run. Run `docker compose -f docker-compose.sqlserver.yml ps` and wait for `(healthy)` before retrying.
 
 **The tools show up but the first memory operation fails.**
 
@@ -255,7 +255,7 @@ Most often the database wasn't created. Re-run the `docker exec ... CREATE DATAB
 
 **Port 1435 is already in use.**
 
-Another program on your machine is using port 1435. Open `docker-compose.yml` from the folder you extracted in Step 2, change `"1435:1433"` to (for example) `"1436:1433"`, save, then run `docker compose up sqlserver -d` again. Also update `DEEP_MEMORY_SQL_PORT` in your Claude Desktop config to the new number.
+Another program on your machine is using port 1435. Open `docker-compose.sqlserver.yml` from the folder you extracted in Step 2, change `"1435:1433"` to (for example) `"1436:1433"`, save, then run `docker compose -f docker-compose.sqlserver.yml up -d` again. Also update `DEEP_MEMORY_SQL_PORT` in your Claude Desktop config to the new number.
 
 **Where is my data stored?**
 

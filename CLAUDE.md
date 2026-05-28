@@ -20,7 +20,7 @@ If unclear, ask one short question. Do not load all three doc trees defensively.
 
 ## Mode 1 — Using deep-memory as a memory tool
 
-The MCP server exposes ~28 tools prefixed `memory_*`. The canonical reference is [packages/mcp-server/README.md](packages/mcp-server/README.md) — read it the first time you need a tool, then rely on the tool descriptions that the MCP server itself sends.
+The MCP server exposes ~29 tools prefixed `memory_*`. The canonical reference is [packages/mcp-server/README.md](packages/mcp-server/README.md) — read it the first time you need a tool, then rely on the tool descriptions that the MCP server itself sends.
 
 Core workflow:
 

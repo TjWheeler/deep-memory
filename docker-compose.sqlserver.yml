@@ -1,0 +1,29 @@
+name: deep-memory-sqlserver
+
+services:
+  sqlserver:
+    build:
+      context: ./database
+      dockerfile: Dockerfile.sqlserver
+    image: deep-memory-sqlserver-fts:latest
+    container_name: deep-memory-sqlserver
+    environment:
+      - ACCEPT_EULA=Y
+      - "SA_PASSWORD=DeepMem@Dev1234"
+      - "MSSQL_SA_PASSWORD=DeepMem@Dev1234"
+      - MSSQL_PID=Developer
+    ports:
+      - "1435:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P DeepMem@Dev1234 -Q 'SELECT 1' -C"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  sqlserver_data:
+    driver: local

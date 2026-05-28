@@ -116,7 +116,7 @@ Azure uses `wss://`, the default REST endpoint is derived from the Gremlin hostn
 
 ## 4. Restart Claude Code
 
-Restart Claude Code so it loads the new server. Confirm via `/mcp` that `deep-memory` shows connected with 28 tools.
+Restart Claude Code so it loads the new server. Confirm via `/mcp` that `deep-memory` shows connected with 29 tools.
 
 ## 5. Create the database and container
 
@@ -182,7 +182,8 @@ For Claude Desktop, you'll need the absolute path to `packages/mcp-server/dist/i
 ## What's next
 
 - **SQL Server instead.** [quickstart-sqlserver.md](quickstart-sqlserver.md) uses SQL Server with the bundled Docker compose — works on macOS/Linux/Windows.
+- **Neo4j instead.** [quickstart-neo4j.md](quickstart-neo4j.md) uses Neo4j Community Edition over Bolt — native Cypher graph storage with the bundled Docker compose, or AuraDB / self-hosted.
 - **Enable semantic search.** [quickstart-embeddings.md](quickstart-embeddings.md) wires up an embeddings provider (bundled vLLM, OpenAI, Ollama, or Azure) so `memory_search_by_concept` works.
 - **Build your own graph.** [quickstart-indexer.md](quickstart-indexer.md) runs the indexing pipeline over your source documents.
 - **Provider reference.** [packages/storage-cosmosdb/README.md](packages/storage-cosmosdb/README.md) covers the data model, Gremlin capabilities, RU cost considerations, and the adaptive bulk-import controller.
-- **MCP tools.** [packages/mcp-server/README.md](packages/mcp-server/README.md) lists all 28 tools.
+- **MCP tools.** [packages/mcp-server/README.md](packages/mcp-server/README.md) lists all 29 tools.

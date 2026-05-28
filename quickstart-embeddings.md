@@ -26,12 +26,12 @@ The deep-memory MCP server speaks the OpenAI Embeddings API, so any compatible s
 
 ## Path A — Bundled vLLM (local GPU)
 
-The repo's `docker-compose.yml` includes a ready-to-use vLLM service serving [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B) on port **8010**. It's gated behind the `embeddings` Compose profile so it doesn't auto-start unless asked.
+The repo's `docker-compose.indexer.yml` includes a ready-to-use vLLM service serving [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B) on port **8010**. It's gated behind the `embeddings` Compose profile so it doesn't auto-start unless asked.
 
 ### 1. Start the embeddings server
 
 ```bash
-docker compose up vllm-embeddings -d
+docker compose -f docker-compose.indexer.yml --profile embeddings up -d
 ```
 
 First run downloads ~15 GB of model weights into the `huggingface_cache` volume — expect 5–10 minutes on a typical connection. Subsequent starts are seconds.
@@ -39,7 +39,7 @@ First run downloads ~15 GB of model weights into the `huggingface_cache` volume 
 Check progress:
 
 ```bash
-docker compose logs -f vllm-embeddings
+docker compose -f docker-compose.indexer.yml logs -f vllm-embeddings
 ```
 
 Wait until you see `Application startup complete` and `Uvicorn running on http://0.0.0.0:8000`.

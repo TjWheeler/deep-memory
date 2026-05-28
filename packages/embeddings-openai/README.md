@@ -76,7 +76,7 @@ const embeddings = new OpenAIEmbeddingProvider({
 });
 ```
 
-See the repo's `docker-compose.yml` for a ready-to-use vLLM container serving Qwen3-Embedding-8B on port 8010.
+See the repo's `docker-compose.indexer.yml` for a ready-to-use vLLM container serving Qwen3-Embedding-8B on port 8010.
 
 ### OpenAI
 

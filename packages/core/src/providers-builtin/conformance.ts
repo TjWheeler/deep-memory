@@ -390,6 +390,23 @@ export function runStorageProviderConformanceTests(
         expect(result.layers).toHaveLength(1);
       });
 
+      it('dedupes connected entities per (layer, relationship-type) bucket', async () => {
+        // Two same-type edges connect the same pair (b ↔ c), modelling a
+        // logically-symmetric relationship as two directed half-edges. The
+        // bucket should still report c exactly once at depth 2 from a.
+        await provider.createRelationship(repoId, makeRelationship('r3', 'links', 'c', 'b'));
+        const result = await provider.exploreNeighborhood(repoId, 'a', {
+          depth: 2,
+          direction: 'both',
+          limitPerType: 10,
+          offsetPerType: 0,
+        });
+        const linksLayer2 = result.layers[1]?.['links'];
+        expect(linksLayer2).toBeDefined();
+        expect(linksLayer2!.total).toBe(1);
+        expect(linksLayer2!.entities.map((e) => e.id)).toEqual(['c']);
+      });
+
       it('finds paths between connected entities', async () => {
         const result = await provider.findPaths(repoId, 'a', 'c', {
           maxDepth: 3,
@@ -410,6 +427,29 @@ export function runStorageProviderConformanceTests(
           offset: 0,
         });
         expect(result.paths).toHaveLength(0);
+      });
+
+      it('returns only simple paths (no repeated vertices)', async () => {
+        // Set up a graph where a non-simple walk could otherwise emerge:
+        //   a — b — c (the target)
+        //         c — d via two distinct edges
+        // A walk of length 4 along (a)-(b)-(c)-(d)-(c) reuses neither edge
+        // but visits c twice. The contract requires findPaths to drop walks
+        // that visit any vertex more than once.
+        await provider.createEntity(repoId, makeEntity('d', 'node', 'D'));
+        await provider.createRelationship(repoId, makeRelationship('r3', 'links', 'c', 'd'));
+        await provider.createRelationship(repoId, makeRelationship('r4', 'links', 'c', 'd'));
+        const result = await provider.findPaths(repoId, 'a', 'c', {
+          maxDepth: 4,
+          limit: 50,
+          offset: 0,
+        });
+        for (const path of result.paths) {
+          expect(new Set(path.entityIds).size).toBe(path.entityIds.length);
+          expect(path.entityIds[path.entityIds.length - 1]).toBe('c');
+        }
+        // Exactly one simple path from a to c at depth ≤ 4: a-b-c.
+        expect(result.totalPaths).toBe(1);
       });
 
       it('finds paths through non-bidirectional inbound edges', async () => {

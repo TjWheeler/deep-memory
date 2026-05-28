@@ -24,6 +24,7 @@ This repo has been designed to provide detailed documentation that AI can use.  
 - [quickstart-inmemory.md](quickstart-inmemory.md) — zero setup; the graph lives in memory. Fastest 2-minute path.
 - [quickstart-sqlserver.md](quickstart-sqlserver.md) — persistent storage in SQL Server. Bundled Docker Compose for local use.
 - [quickstart-cosmosdb.md](quickstart-cosmosdb.md) — Azure CosmosDB Gremlin API (local emulator on Windows, or an Azure account).
+- [quickstart-neo4j.md](quickstart-neo4j.md) — Neo4j graph database. Bundled Docker Compose, or AuraDB / self-hosted.
 - [quickstart-indexer.md](quickstart-indexer.md) — build your own knowledge graph from source documents via the indexing pipeline.
 
 **Not a developer? Using Claude Desktop instead of Claude Code?**
@@ -38,6 +39,7 @@ This repo has been designed to provide detailed documentation that AI can use.  
 | `@utaba/deep-memory-embeddings-openai` | `packages/embeddings-openai` | OpenAI-compatible embeddings provider (vLLM, OpenAI, Azure, Ollama) |
 | `@utaba/deep-memory-storage-sqlserver` | `packages/storage-sqlserver` | SQL Server storage provider — persistent, multi-tenant graph storage |
 | `@utaba/deep-memory-storage-cosmosdb` | `packages/storage-cosmosdb` | CosmosDB Gremlin storage + graph traversal provider |
+| `@utaba/deep-memory-storage-neo4j` | `packages/storage-neo4j` | Neo4j storage + graph traversal provider (Cypher over Bolt, Community Edition) |
 | `@utaba/deep-memory-indexer` | `packages/indexer` | Document indexing pipeline — LLM extraction, validation, consolidation, import |
 | `@utaba/deep-memory-indexer-llm-anthropic` | `packages/indexer-llm-anthropic` | Anthropic LLM provider for indexer — prompt caching + native Messages API |
 | `@utaba/deep-memory-indexer-mcp-server` | `packages/indexer-mcp-server` | Indexer MCP server — 9 phase-aware tools for the indexing pipeline |
@@ -98,11 +100,19 @@ Starter kits are extensible. In `open` governance mode, the agent can propose ne
 
 ### 1. Start the Infrastructure
 
-The repository includes a `docker-compose.yml` that provisions the required services:
+The repository ships per-service Compose files so you only start what you need:
+
+| File | What it brings up |
+|------|-------------------|
+| `docker-compose.sqlserver.yml` | SQL Server (persistent storage) |
+| `docker-compose.neo4j.yml` | Neo4j (alternative graph storage) |
+| `docker-compose.indexer.yml` | vLLM embeddings + extraction workers (all gated behind Compose profiles) |
+
+Start SQL Server:
 
 ```bash
 # Start SQL Server (required for persistent storage)
-docker compose up sqlserver -d
+docker compose -f docker-compose.sqlserver.yml up -d
 ```
 
 This starts a SQL Server 2022 Developer Edition container on port **1435**. The database schema is created automatically when the MCP server connects for the first time.
@@ -110,8 +120,8 @@ This starts a SQL Server 2022 Developer Edition container on port **1435**. The 
 If you have an NVIDIA GPU and want semantic search (concept search, vocabulary deduplication via embeddings), also start the embeddings service:
 
 ```bash
-# Start both SQL Server and the vLLM embeddings server
-docker compose up -d
+# Start the vLLM embeddings server
+docker compose -f docker-compose.indexer.yml --profile embeddings up -d
 ```
 
 The vLLM service serves the [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B) model on port **8010**. This is optional — without it, deep-memory falls back to string similarity for vocabulary deduplication, and `memory_search_by_concept` is unavailable.
@@ -166,14 +176,18 @@ Security Note: Consider changing the SQL Password in the config and the docker s
 |----------|---------|-------------|
 | `DEEP_MEMORY_ACTOR_ID` | `mcp-agent` | Actor ID stamped on provenance metadata |
 | `DEEP_MEMORY_ACTOR_TYPE` | `agent` | Actor type: `agent`, `human`, or `system` |
-| `DEEP_MEMORY_STORAGE` | `memory` | Storage backend: `memory` (in-memory, data lost on restart) or `sqlserver` |
+| `DEEP_MEMORY_STORAGE` | `memory` | Storage backend: `memory` (in-memory, data lost on restart), `sqlserver`, `cosmosdb`, or `neo4j` |
 | `DEEP_MEMORY_SQL_HOST` | — | SQL Server hostname |
-| `DEEP_MEMORY_SQL_PORT` | `1433` | SQL Server port. The bundled `docker-compose.yml` publishes the container on host port **1435** (to avoid clashing with any local SQL install on the default 1433); use `1435` for that path. For a different SQL Server instance, check the port that instance is listening on. |
+| `DEEP_MEMORY_SQL_PORT` | `1433` | SQL Server port. The bundled `docker-compose.sqlserver.yml` publishes the container on host port **1435** (to avoid clashing with any local SQL install on the default 1433); use `1435` for that path. For a different SQL Server instance, check the port that instance is listening on. |
 | `DEEP_MEMORY_SQL_DATABASE` | — | Database name |
 | `DEEP_MEMORY_SQL_USER` | — | SQL Server username |
 | `DEEP_MEMORY_SQL_PASSWORD` | — | SQL Server password |
 | `DEEP_MEMORY_SQL_SCHEMA` | `dbo` | SQL Server schema |
 | `DEEP_MEMORY_SQL_TRUST_CERT` | `false` | Trust self-signed certificates (set `true` for local dev) |
+| `DEEP_MEMORY_NEO4J_URI` | — | Neo4j Bolt URI (when `DEEP_MEMORY_STORAGE=neo4j`). The bundled `docker-compose.neo4j.yml` exposes `bolt://localhost:7687`; AuraDB uses `neo4j+s://<dbid>.databases.neo4j.io`. |
+| `DEEP_MEMORY_NEO4J_USERNAME` | `neo4j` | Neo4j username |
+| `DEEP_MEMORY_NEO4J_PASSWORD` | — | Neo4j password — `DeepMem-Dev-1234` for the bundled `docker-compose.neo4j.yml`. |
+| `DEEP_MEMORY_NEO4J_DATABASE` | `neo4j` | Neo4j database name |
 | `DEEP_MEMORY_EMBEDDINGS_BASE_URL` | — | Embeddings API URL (enables semantic search). See [quickstart-embeddings.md](quickstart-embeddings.md) for provider-specific recipes (vLLM, OpenAI, Ollama, Azure). |
 | `DEEP_MEMORY_EMBEDDINGS_MODEL` | — | Embeddings model identifier |
 | `DEEP_MEMORY_EMBEDDINGS_DIMENSIONS` | auto-detected | Embedding vector dimensionality. Set only when the model supports configurable dimensions (e.g. OpenAI `text-embedding-3-*`). |
@@ -243,8 +257,9 @@ pnpm --filter @utaba/deep-memory-local-mcp-server build
 - [AI Requirements](docs/ai-requirements.md) — Design principles from the AI agent perspective
 - [SQL Server Storage Provider](packages/storage-sqlserver/README.md) — Persistent storage setup and configuration
 - [CosmosDB Storage Provider](packages/storage-cosmosdb/README.md) — Native graph storage backed by Azure CosmosDB (includes emulator + production deployment)
+- [Neo4j Storage Provider](packages/storage-neo4j/README.md) — Native graph storage backed by Neo4j Community Edition over Bolt (includes Docker Compose for local dev)
 - [Embeddings Provider (OpenAI)](packages/embeddings-openai/README.md) — OpenAI-compatible embeddings setup
-- [Local MCP Server](packages/mcp-server/README.md) — MCP server tool reference (28 tools)
+- [Local MCP Server](packages/mcp-server/README.md) — MCP server tool reference (29 tools)
 - [Import & Export](docs/import-export-guidance.md) — Repository portability workflows
 
 **Indexing Pipeline:**

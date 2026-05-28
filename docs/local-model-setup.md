@@ -151,7 +151,7 @@ vLLM runs in Docker containers and is better suited for Linux bare-metal or mult
 
 ### Available Workers
 
-The `docker-compose.yml` defines multiple worker profiles. Each exposes port 8020. **Only run one worker at a time** — they share the GPU.
+The `docker-compose.indexer.yml` defines multiple worker profiles. Each exposes port 8020. **Only run one worker at a time** — they share the GPU.
 
 | Profile | Model | Quantisation | VRAM | Context | Use Case |
 |---------|-------|-------------|------|---------|----------|
@@ -166,16 +166,16 @@ The `docker-compose.yml` defines multiple worker profiles. Each exposes port 802
 
 ```bash
 # Start SQL Server (always needed)
-docker compose up -d sqlserver
+docker compose -f docker-compose.sqlserver.yml up -d
 
 # Start a specific worker
-docker compose --profile worker-qwen3-14b up -d
+docker compose -f docker-compose.indexer.yml --profile worker-qwen3-14b up -d
 
 # Check if the model is loaded (returns model list when ready)
 curl http://localhost:8020/v1/models
 
 # Stop the worker before starting a different one
-docker compose --profile worker-qwen3-14b down
+docker compose -f docker-compose.indexer.yml --profile worker-qwen3-14b down
 ```
 
 Model loading takes 30 seconds to 5 minutes depending on whether weights are cached. First run downloads the model from HuggingFace — this can take 5-20 minutes depending on model size and network speed.
@@ -239,7 +239,7 @@ ValueError: Free memory on device cuda:0 (30.2/31.84 GiB) on startup is less tha
 desired GPU memory utilization (0.95, 30.25 GiB)
 ```
 
-This means something else is using GPU memory (display driver, another process). Lower the utilisation value in `docker-compose.yml` or stop other GPU processes.
+This means something else is using GPU memory (display driver, another process). Lower the utilisation value in `docker-compose.indexer.yml` or stop other GPU processes.
 
 **Only run one worker at a time.** The workers are configured as Docker Compose profiles so they cannot accidentally start together, but if you manually run multiple containers on port 8020 they will conflict.
 
@@ -257,7 +257,7 @@ docker logs deep-memory-worker-qwen3-14b --tail 20
 |-------|-------|-----|
 | `is not a valid model identifier listed on huggingface.co` | Model name is wrong or doesn't exist | Check the exact model ID on huggingface.co |
 | `Cannot access gated repo` | Gated model without authentication | Set `HF_TOKEN` in `.env` and accept the model licence on HuggingFace |
-| `does not support float16. Reason: Numerical instability` | Model requires bfloat16 | Change `--dtype` to `bfloat16` in docker-compose.yml |
+| `does not support float16. Reason: Numerical instability` | Model requires bfloat16 | Change `--dtype` to `bfloat16` in docker-compose.indexer.yml |
 | `Free memory on device cuda:0 ... is less than desired` | Not enough free VRAM | Lower `--gpu-memory-utilization` or stop other GPU processes |
 | `CUDA error: no kernel image is available` | vLLM image doesn't support your GPU architecture | Update to latest `vllm/vllm-openai` image |
 | `Unterminated string in JSON` (during extraction) | Model ran out of output tokens | Increase `maxOutputTokens` in indexer config |
@@ -286,7 +286,7 @@ Look for download progress bars. Once download completes, the model loads into G
 
 ### Adding a New Model (vLLM)
 
-To add a new model to the docker-compose:
+To add a new model to `docker-compose.indexer.yml`:
 
 1. **Find the model on HuggingFace.** Note the exact model ID (e.g., `Qwen/Qwen3-14B-AWQ`).
 
@@ -309,6 +309,6 @@ To add a new model to the docker-compose:
    - Larger KV cache = longer context window
    - Start with `--max-model-len 32768` and reduce if OOM
 
-6. **Add the service to docker-compose.yml** following the existing pattern. Use a unique profile name and the shared port 8020.
+6. **Add the service to docker-compose.indexer.yml** following the existing pattern. Use a unique profile name and the shared port 8020.
 
 7. **Test by starting the container** and checking `curl http://localhost:8020/v1/models`.

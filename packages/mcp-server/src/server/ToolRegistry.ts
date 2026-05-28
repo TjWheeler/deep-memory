@@ -6,6 +6,7 @@ import type { ToolContext } from '../tools/base/BaseToolController.js';
 import { CreateRepositoryTool } from '../tools/repository/CreateRepositoryTool.js';
 import { OpenRepositoryTool } from '../tools/repository/OpenRepositoryTool.js';
 import { ListRepositoriesTool } from '../tools/repository/ListRepositoriesTool.js';
+import { GetRepositoryTool } from '../tools/repository/GetRepositoryTool.js';
 import { UpdateRepositoryTool } from '../tools/repository/UpdateRepositoryTool.js';
 import { DeleteRepositoryTool } from '../tools/repository/DeleteRepositoryTool.js';
 import { EnsureSchemaTool } from '../tools/repository/EnsureSchemaTool.js';
@@ -67,6 +68,7 @@ export class ToolRegistry {
     this.register(new CreateRepositoryTool(this.context, this.logger));
     this.register(new OpenRepositoryTool(this.context, this.logger));
     this.register(new ListRepositoriesTool(this.context, this.logger));
+    this.register(new GetRepositoryTool(this.context, this.logger));
     this.register(new UpdateRepositoryTool(this.context, this.logger));
     this.register(new DeleteRepositoryTool(this.context, this.logger));
     this.register(new EnsureSchemaTool(this.context, this.logger));

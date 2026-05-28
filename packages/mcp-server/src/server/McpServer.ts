@@ -15,6 +15,7 @@ import {
 import { OpenAIEmbeddingProvider } from '@utaba/deep-memory-embeddings-openai';
 import { SqlServerStorageProvider } from '@utaba/deep-memory-storage-sqlserver';
 import { CosmosDbProvider } from '@utaba/deep-memory-storage-cosmosdb';
+import { Neo4jStorageProvider } from '@utaba/deep-memory-storage-neo4j';
 import type { ILogger } from '../interfaces/ILogger.js';
 import { ToolRegistry } from './ToolRegistry.js';
 import { McpHandler } from './McpHandler.js';
@@ -33,8 +34,8 @@ export interface McpServerConfig {
   embeddingsDimensions?: number;
   /** Embeddings API key (optional, not needed for local servers) */
   embeddingsApiKey?: string;
-  /** Storage type: 'memory' (default), 'sqlserver', or 'cosmosdb' */
-  storageType?: 'memory' | 'sqlserver' | 'cosmosdb';
+  /** Storage type: 'memory' (default), 'sqlserver', 'cosmosdb', or 'neo4j' */
+  storageType?: 'memory' | 'sqlserver' | 'cosmosdb' | 'neo4j';
   /** SQL Server host (required when storageType is 'sqlserver') */
   sqlServerHost?: string;
   /** SQL Server port (default: 1433) */
@@ -61,6 +62,14 @@ export interface McpServerConfig {
   cosmosDbContainer?: string;
   /** Reject unauthorized TLS certs — set false for emulator (default: true) */
   cosmosDbRejectUnauthorized?: boolean;
+  /** Neo4j Bolt URI (required when storageType is 'neo4j'), e.g. 'bolt://localhost:7687' or 'neo4j+s://aura-host' */
+  neo4jUri?: string;
+  /** Neo4j username (default: 'neo4j') */
+  neo4jUsername?: string;
+  /** Neo4j password (required when storageType is 'neo4j') */
+  neo4jPassword?: string;
+  /** Neo4j database name (default: 'neo4j') */
+  neo4jDatabase?: string;
   /** Directory where exported zip files are written (default: './exports') */
   exportDir?: string;
 }
@@ -103,6 +112,15 @@ export class McpServer {
       });
       storage = cosmos;
       graphTraversal = cosmos;
+    } else if (config.storageType === 'neo4j') {
+      const neo4j = new Neo4jStorageProvider({
+        uri: config.neo4jUri!,
+        username: config.neo4jUsername ?? 'neo4j',
+        password: config.neo4jPassword!,
+        database: config.neo4jDatabase ?? 'neo4j',
+      });
+      storage = neo4j;
+      graphTraversal = neo4j;
     } else {
       storage = new InMemoryStorageProvider();
     }

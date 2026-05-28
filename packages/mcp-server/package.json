@@ -58,6 +58,7 @@
     "@utaba/deep-memory-embeddings-openai": "workspace:*",
     "@utaba/deep-memory-storage-sqlserver": "workspace:*",
     "@utaba/deep-memory-storage-cosmosdb": "workspace:*",
+    "@utaba/deep-memory-storage-neo4j": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.28.0"
   },
   "devDependencies": {

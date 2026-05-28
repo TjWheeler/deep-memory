@@ -126,6 +126,30 @@ describe('Portability', () => {
       expect(alice!.label).toBe('Alice');
       expect(alice!.provenance.createdBy).toBe('test-agent');
     });
+
+    it('rejects non-UUID target repositoryId on import (create mode)', async () => {
+      const archive = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
+
+      await expect(
+        memory.importRepository(archive, {
+          target: {
+            mode: 'create',
+            repositoryId: 'person-test',
+            config: { label: 'Bad ID' },
+          },
+        }),
+      ).rejects.toThrow('not a valid UUID');
+    });
+
+    it('rejects non-UUID target repositoryId on import (merge mode)', async () => {
+      const archive = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
+
+      await expect(
+        memory.importRepository(archive, {
+          target: { mode: 'merge', repositoryId: 'person-test' },
+        }),
+      ).rejects.toThrow('not a valid UUID');
+    });
   });
 
   // ─── Merge Import ──────────────────────────────────────────

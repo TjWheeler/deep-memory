@@ -46,7 +46,7 @@ In-memory is the default — you don't need to set `DEEP_MEMORY_STORAGE`. To swi
 
 ## 3. Restart Claude Code
 
-After editing `.mcp.json`, restart Claude Code so it picks up the new server. Open the MCP panel (or run `/mcp` in chat) and confirm `deep-memory` shows as connected with 28 tools available.
+After editing `.mcp.json`, restart Claude Code so it picks up the new server. Open the MCP panel (or run `/mcp` in chat) and confirm `deep-memory` shows as connected with 29 tools available.
 
 ## 4. Load the sample graph
 
@@ -164,5 +164,5 @@ You'll need to download or build your own `.dkg` for this path — the sample li
 - **Make it persistent.** [`quickstart-sqlserver.md`](quickstart-sqlserver.md) walks you through wiring SQL Server (Docker or existing instance). [`quickstart-cosmosdb.md`](quickstart-cosmosdb.md) does the same for CosmosDB Gremlin.
 - **Enable semantic search.** [`quickstart-embeddings.md`](quickstart-embeddings.md) wires up an embeddings provider (bundled vLLM, OpenAI, Ollama, or Azure) so `memory_search_by_concept` works.
 - **Build your own graph.** [`quickstart-indexer.md`](quickstart-indexer.md) runs the indexing pipeline over your source documents to produce a `.dkg` like the sample.
-- **Browse the tools.** [`packages/mcp-server/README.md`](packages/mcp-server/README.md) is the full reference for the 28 MCP tools.
+- **Browse the tools.** [`packages/mcp-server/README.md`](packages/mcp-server/README.md) is the full reference for the 29 MCP tools.
 - **Browse the API.** [`packages/core/README.md`](packages/core/README.md) covers using Deep Memory as a library directly (no MCP layer).

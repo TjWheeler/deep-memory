@@ -1,6 +1,6 @@
 # Quickstart — SQL Server
 
-Same flow as the [in-memory quickstart](quickstart-inmemory.md), but the graph lives in SQL Server so it survives restarts. The repo ships a `docker-compose.yml` that brings up SQL Server with full-text search enabled — you can be querying a persistent graph in a few minutes.
+Same flow as the [in-memory quickstart](quickstart-inmemory.md), but the graph lives in SQL Server so it survives restarts. The repo ships a `docker-compose.sqlserver.yml` that brings up SQL Server with full-text search enabled — you can be querying a persistent graph in a few minutes.
 
 **You'll need:** Node.js 22 or 24 (the supported LTS pair), [Claude Code](https://claude.com/claude-code) or another AI, Docker Desktop (or an existing SQL Server 2016+ instance).
 
@@ -18,7 +18,7 @@ pnpm build
 ## 2. Start SQL Server
 
 ```bash
-docker compose up sqlserver -d
+docker compose -f docker-compose.sqlserver.yml up -d
 ```
 
 This builds the bundled image (Microsoft's SQL Server 2025 with full-text search) and exposes port **1435** on the host, mapped to 1433 in the container. The `sa` password is `DeepMem@Dev1234`.
@@ -28,7 +28,7 @@ This builds the bundled image (Microsoft's SQL Server 2025 with full-text search
 Wait for the health check to go green (about a minute on first run):
 
 ```bash
-docker compose ps sqlserver
+docker compose -f docker-compose.sqlserver.yml ps
 ```
 
 Once `health: starting` becomes `healthy`, create the `deep-memory` database:
@@ -79,7 +79,7 @@ For a non-Docker SQL Server, change `DEEP_MEMORY_SQL_HOST` / `DEEP_MEMORY_SQL_PO
 
 ## 4. Restart Claude Code
 
-Restart Claude Code so it loads the new server. Confirm via `/mcp` that `deep-memory` shows connected with 28 tools.
+Restart Claude Code so it loads the new server. Confirm via `/mcp` that `deep-memory` shows connected with 29 tools.
 
 ## 5. Create the tables
 
@@ -135,17 +135,18 @@ For Claude Desktop, you'll need the absolute path to `packages/mcp-server/dist/i
 
 ## Troubleshooting
 
-- **`Login failed for user 'sa'`** — the container needs a moment after `docker compose up` to finish initialising. Wait for `docker compose ps sqlserver` to show `healthy` before retrying.
+- **`Login failed for user 'sa'`** — the container needs a moment after `docker compose ... up` to finish initialising. Wait for `docker compose -f docker-compose.sqlserver.yml ps` to show `healthy` before retrying.
 - **`Cannot open database "deep-memory"`** — you missed the `CREATE DATABASE` step in section 2.
 - **TLS errors** — keep `DEEP_MEMORY_SQL_TRUST_CERT=true` for local Docker. Only set it to `false` when you have a real, verifiable certificate.
-- **Port 1435 already in use** — change the host-side port in `docker-compose.yml` (left side of `1435:1433`) and update `DEEP_MEMORY_SQL_PORT` to match.
+- **Port 1435 already in use** — change the host-side port in `docker-compose.sqlserver.yml` (left side of `1435:1433`) and update `DEEP_MEMORY_SQL_PORT` to match.
 
 ---
 
 ## What's next
 
 - **CosmosDB instead.** [quickstart-cosmosdb.md](quickstart-cosmosdb.md) uses the CosmosDB Gremlin API — native graph storage with the local emulator or Azure.
+- **Neo4j instead.** [quickstart-neo4j.md](quickstart-neo4j.md) uses Neo4j Community Edition over Bolt — native Cypher graph storage with the bundled Docker compose, or AuraDB / self-hosted.
 - **Enable semantic search.** [quickstart-embeddings.md](quickstart-embeddings.md) wires up an embeddings provider (bundled vLLM, OpenAI, Ollama, or Azure) so `memory_search_by_concept` works.
 - **Build your own graph.** [quickstart-indexer.md](quickstart-indexer.md) runs the indexing pipeline over your source documents.
 - **Provider reference.** [packages/storage-sqlserver/README.md](packages/storage-sqlserver/README.md) covers the full schema, multi-tenancy, ER diagram, and query capabilities.
-- **MCP tools.** [packages/mcp-server/README.md](packages/mcp-server/README.md) lists all 28 tools.
+- **MCP tools.** [packages/mcp-server/README.md](packages/mcp-server/README.md) lists all 29 tools.

@@ -127,6 +127,54 @@ describe('Portability', () => {
       expect(alice!.provenance.createdBy).toBe('test-agent');
     });
 
+    it('preserves repository legal, owner, and metadata fields through create round-trip', async () => {
+      const sourceId = '10000000-0000-4000-a000-0000000000e0';
+      await memory.createRepository({
+        repositoryId: sourceId,
+        label: 'Source With Metadata',
+        legal: 'Apache-2.0 — internal use only',
+        owner: 'platform-team',
+        metadata: {
+          embeddingModelId: 'Qwen/Qwen3-Embedding-8B',
+          embeddingDimensions: 4096,
+          customField: 'custom-value',
+        },
+        vocabulary,
+        governance: { mode: 'open' },
+      });
+
+      const archive = await memory.exportRepository(sourceId);
+
+      // The manifest itself should carry the fields
+      expect(archive.manifest.repository.legal).toBe('Apache-2.0 — internal use only');
+      expect(archive.manifest.repository.owner).toBe('platform-team');
+      expect(archive.manifest.repository.metadata?.embeddingModelId).toBe('Qwen/Qwen3-Embedding-8B');
+      expect(archive.manifest.repository.metadata?.embeddingDimensions).toBe(4096);
+      expect(archive.manifest.repository.metadata?.customField).toBe('custom-value');
+
+      const targetId = '10000000-0000-4000-a000-0000000000e1';
+      await memory.importRepository(archive, {
+        target: {
+          mode: 'create',
+          repositoryId: targetId,
+          config: {
+            repositoryId: targetId,
+            label: archive.manifest.repository.label,
+            legal: archive.manifest.repository.legal,
+            owner: archive.manifest.repository.owner,
+            metadata: archive.manifest.repository.metadata,
+          },
+        },
+      });
+
+      const imported = await memory.getRepository(targetId);
+      expect(imported.legal).toBe('Apache-2.0 — internal use only');
+      expect(imported.owner).toBe('platform-team');
+      expect(imported.metadata?.embeddingModelId).toBe('Qwen/Qwen3-Embedding-8B');
+      expect(imported.metadata?.embeddingDimensions).toBe(4096);
+      expect(imported.metadata?.customField).toBe('custom-value');
+    });
+
     it('rejects non-UUID target repositoryId on import (create mode)', async () => {
       const archive = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
 

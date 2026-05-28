@@ -1020,7 +1020,21 @@ export class Neo4jStorageProvider {
     let relationships: ProjectedRelationship[] | undefined;
     let paths: NonNullable<TraversalResult['paths']> | undefined;
 
-    if (spec.returnMode === 'terminal') {
+    // The compiler emits projection-aware RETURN only when returnMode is
+    // terminal (or default). On that path the raw result carries aggregations
+    // and no entity rows — bypass the entity/path mapping entirely.
+    //
+    // `projection.includeEntities: true` is not supported alongside server-side
+    // projection: a single grouped/distinct RETURN cannot also stream the
+    // un-aggregated Node objects. Callers that need both should issue two
+    // queries (one with projection, one without). The flag is documented as
+    // returning a lightweight aggregation-only response on this backend.
+    const aggregations = raw.aggregations;
+    const projectionEmitted = aggregations !== undefined;
+
+    if (projectionEmitted) {
+      // entities / relationships / paths stay empty/undefined
+    } else if (spec.returnMode === 'terminal') {
       entities = raw.terminalEntities.map(projectStoredEntity);
       relationships = undefined;
     } else if (spec.returnMode === 'all') {
@@ -1063,7 +1077,11 @@ export class Neo4jStorageProvider {
 
     const limit = spec.limit ?? 50;
     let total: number;
-    if (spec.returnMode === 'path') {
+    if (projectionEmitted) {
+      // Projection rows are the visible page — one row per group (count /
+      // distinct) or per matched entity (values, non-distinct).
+      total = aggregations!.length;
+    } else if (spec.returnMode === 'path') {
       total = paths?.length ?? 0;
     } else if (spec.returnMode === 'all') {
       // 'all' mode returns an interleaved entity+edge union — total counts both
@@ -1092,6 +1110,7 @@ export class Neo4jStorageProvider {
       entities,
       ...(relationships !== undefined ? { relationships } : {}),
       ...(paths !== undefined ? { paths } : {}),
+      ...(aggregations !== undefined ? { aggregations } : {}),
       total,
       returned: total,
       hasMore: truncated,
@@ -1164,10 +1183,11 @@ export class Neo4jStorageProvider {
 
       const layer: StorageNeighborhoodLayer = {};
       const nextFrontier = new Set<string>();
-      // Dedup the (vertex-pair, edge) within a single layer — the cumulative
-      // 'all' response can include the same edge under multiple rows when
-      // both endpoints sit on the frontier.
-      const layerEdgeSeen = new Set<string>();
+      // Dedup connected entities per (relationship-type) bucket within a single
+      // layer. The same entity can be reached via multiple stored edges of the
+      // same type (e.g. a logically-bidirectional relationship modelled as two
+      // directed half-edges) — count it once, not once per traversed edge.
+      const layerBucketSeen = new Map<string, Set<string>>();
 
       for (const fv of frontier) {
         const incident = edgesByVertex.get(fv) ?? [];
@@ -1216,11 +1236,15 @@ export class Neo4jStorageProvider {
             continue;
           }
 
-          const edgeKey = `${rel.id}|${fv}->${connectedId}`;
-          if (layerEdgeSeen.has(edgeKey)) continue;
-          layerEdgeSeen.add(edgeKey);
-
           const relType = rel.relationshipType;
+          let bucketSeen = layerBucketSeen.get(relType);
+          if (!bucketSeen) {
+            bucketSeen = new Set<string>();
+            layerBucketSeen.set(relType, bucketSeen);
+          }
+          if (bucketSeen.has(connectedId)) continue;
+          bucketSeen.add(connectedId);
+
           if (!layer[relType]) {
             layer[relType] = { total: 0, entities: [], relationships: [] };
           }
@@ -1307,6 +1331,14 @@ export class Neo4jStorageProvider {
     for (const row of raw.pathRows) {
       const last = row.entityIds[row.entityIds.length - 1];
       if (last !== targetId) continue;
+      // Enforce simple paths — no vertex appears twice. Cypher's variable-
+      // length pattern emits every walk of length ≤ maxDepth, and the default
+      // `DIFFERENT RELATIONSHIPS` match mode only prevents edge reuse; vertex
+      // reuse is still allowed. Without this filter the walk
+      //   source → … → target → other → target
+      // counts as a valid path to the caller and inflates `totalPaths` with
+      // detours that loop back through the destination.
+      if (new Set(row.entityIds).size !== row.entityIds.length) continue;
       if (options.entityTypes && options.entityTypes.length > 0) {
         // Entity-type filter applies only to intermediate vertices — source
         // and target are always allowed regardless of the filter, mirroring

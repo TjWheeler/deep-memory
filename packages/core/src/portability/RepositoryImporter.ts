@@ -165,7 +165,10 @@ export class RepositoryImporter {
         type: target.config.type,
         label: target.config.label,
         description: target.config.description,
+        legal: target.config.legal,
+        owner: target.config.owner,
         governanceConfig: target.config.governance ?? { mode: 'open' },
+        metadata: target.config.metadata,
         createdAt: now,
         createdBy: this.actorId,
       });

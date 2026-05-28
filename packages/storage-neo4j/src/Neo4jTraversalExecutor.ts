@@ -18,6 +18,7 @@ import type {
   MemoryVocabulary,
   StoredEntity,
   StoredRelationship,
+  TraversalAggregation,
   TraversalSpec,
 } from '@utaba/deep-memory/types';
 import { CypherCompiler, ProviderError } from '@utaba/deep-memory';
@@ -44,6 +45,14 @@ export interface RawTraversalResult {
     relationshipIds: string[];
     relationshipDirections: Array<'out' | 'in'>;
   }>;
+  /**
+   * Populated when the spec carries `projection` and the compiler emitted a
+   * projection-aware RETURN. The rows are aggregated server-side; the
+   * provider returns this verbatim on `TraversalResult.aggregations`.
+   * Mutually exclusive with `terminalEntities` / `allEntities` / `pathRows` —
+   * the compiler picks one emission shape per query.
+   */
+  aggregations?: TraversalAggregation[];
   /** Lookup table for every entity that appeared in any returned row. */
   entityMap: Map<string, StoredEntity>;
   /** Lookup table for every relationship that appeared in any returned row. */
@@ -173,7 +182,16 @@ export class Neo4jTraversalExecutor {
       raw.profile = summariseProfile(summary.profile);
     }
 
-    if (spec.returnMode === 'terminal') {
+    // Projection rows have a different shape (scalar columns, no Node objects)
+    // so they bypass the entity/relationship parsers entirely. The compiler
+    // only emits the projection RETURN when returnMode is terminal/default,
+    // mirroring that gate here.
+    const emitsProjection =
+      spec.projection !== undefined && spec.returnMode !== 'path' && spec.returnMode !== 'all';
+
+    if (emitsProjection) {
+      this.parseProjectionRows(result.records, raw, spec.projection!.properties, spec.projection!.mode ?? 'values');
+    } else if (spec.returnMode === 'terminal') {
       this.parseTerminalRows(result.records, raw);
     } else if (spec.returnMode === 'all') {
       this.parseAllRows(result.records, raw);
@@ -182,6 +200,38 @@ export class Neo4jTraversalExecutor {
     }
 
     return raw;
+  }
+
+  /**
+   * Parse the server-aggregated projection rows. Each row has one column per
+   * projected property and, when mode is 'count', an additional `count` column.
+   * Values arrive as native scalars / strings / BigInts; counts arrive as
+   * BigInt (per the driver's `useBigInt: true` configuration) and coerce to
+   * Number for the JSON wire shape.
+   */
+  private parseProjectionRows(
+    records: ReadonlyArray<{ keys: ReadonlyArray<PropertyKey>; get(key: string): unknown }>,
+    raw: RawTraversalResult,
+    propertyNames: ReadonlyArray<string>,
+    mode: 'values' | 'count',
+  ): void {
+    const aggregations: TraversalAggregation[] = [];
+    for (const record of records) {
+      const values: Record<string, unknown> = {};
+      for (const prop of propertyNames) {
+        values[prop] = normaliseScalar(record.get(prop));
+      }
+      if (mode === 'count') {
+        const rawCount = record.get('count');
+        const count = typeof rawCount === 'bigint' ? Number(rawCount)
+          : typeof rawCount === 'number' ? rawCount
+          : 0;
+        aggregations.push({ values, count });
+      } else {
+        aggregations.push({ values });
+      }
+    }
+    raw.aggregations = aggregations;
   }
 
   /**
@@ -376,6 +426,18 @@ function bigintLike(value: unknown): number {
   if (typeof value === 'bigint') return Number(value);
   if (typeof value === 'number') return value;
   return 0;
+}
+
+/**
+ * Normalise a server-projected scalar to a JSON-wire shape. Neo4j's driver
+ * returns INTEGER values as BigInt (config-wide `useBigInt: true` keeps every
+ * other integer round-trip exact); coerce those to Number so projection
+ * `values` survive `JSON.stringify`. Other scalars / strings / booleans /
+ * null pass through.
+ */
+function normaliseScalar(value: unknown): unknown {
+  if (typeof value === 'bigint') return Number(value);
+  return value;
 }
 
 const SKIP_LIMIT_PARAM_PATTERN = /\b(?:SKIP|LIMIT)\s+\$(\w+)/gi;

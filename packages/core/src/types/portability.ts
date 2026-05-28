@@ -5,7 +5,7 @@ import type { MemoryVocabulary } from './vocabulary.js';
 import type { StoredEntity } from './entities.js';
 import type { StoredRelationship } from './relationships.js';
 import type { ProvenanceContext } from './provenance.js';
-import type { RepositoryConfig } from './repositories.js';
+import type { RepositoryConfig, RepositoryMetadata } from './repositories.js';
 
 /** Manifest describing an exported repository archive */
 export interface ExportManifest {
@@ -22,6 +22,12 @@ export interface ExportManifest {
     type?: string;
     label: string;
     description?: string;
+    /** Free-form legal terms, licence, or compliance notes carried with the repository */
+    legal?: string;
+    /** Repository owner identifier */
+    owner?: string;
+    /** Extensible metadata bag (embeddingModelId, embeddingDimensions, custom fields) */
+    metadata?: RepositoryMetadata;
     vocabularyVersion: string;
     governanceMode: GovernanceMode;
   };

@@ -568,6 +568,11 @@ export class InMemoryStorageProvider implements StorageProvider {
     for (let depth = 0; depth < options.depth; depth++) {
       const layer: Record<string, { total: number; entities: StoredEntity[]; relationships: StoredRelationship[] }> = {};
       const nextFrontier = new Set<string>();
+      // Dedup connected entities per (relationship-type) bucket within a single
+      // layer. The same entity can be reached via multiple stored edges of the
+      // same type (e.g. a logically-bidirectional relationship modelled as two
+      // directed half-edges) — count it once, not once per traversed edge.
+      const layerBucketSeen = new Map<string, Set<string>>();
 
       for (const frontierEntityId of currentFrontier) {
         for (const rel of store.relationships.values()) {
@@ -618,6 +623,14 @@ export class InMemoryStorageProvider implements StorageProvider {
           }
 
           const relType = rel.relationshipType;
+          let bucketSeen = layerBucketSeen.get(relType);
+          if (!bucketSeen) {
+            bucketSeen = new Set<string>();
+            layerBucketSeen.set(relType, bucketSeen);
+          }
+          if (bucketSeen.has(connectedEntityId)) continue;
+          bucketSeen.add(connectedEntityId);
+
           if (!layer[relType]) {
             layer[relType] = { total: 0, entities: [], relationships: [] };
           }

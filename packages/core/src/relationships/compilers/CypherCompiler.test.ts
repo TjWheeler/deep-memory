@@ -221,4 +221,100 @@ describe('CypherCompiler', () => {
     expect(result.query).not.toContain('DROP TABLE');
     expect(Object.values(result.params)).toContain("'; DROP TABLE");
   });
+
+  describe('projection', () => {
+    it('emits count grouping when mode is count', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Organization' },
+        returnMode: 'terminal',
+        projection: { properties: ['orgType'], mode: 'count' },
+        limit: 200,
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain('RETURN n0.orgType AS orgType, count(*) AS count');
+      expect(result.query).not.toContain('RETURN DISTINCT n0\n');
+    });
+
+    it('emits DISTINCT when distinct is true and mode is values', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Equipment' },
+        returnMode: 'terminal',
+        projection: { properties: ['equipmentType'], distinct: true },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain('RETURN DISTINCT n0.equipmentType AS equipmentType');
+    });
+
+    it('emits one row per match in plain values mode (no DISTINCT, no count)', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Fluid' },
+        returnMode: 'terminal',
+        projection: { properties: ['fluidType'] },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain('RETURN n0.fluidType AS fluidType');
+      expect(result.query).not.toContain('DISTINCT');
+      expect(result.query).not.toContain('count(*)');
+    });
+
+    it('projects multiple properties as separate aliased columns', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Equipment' },
+        returnMode: 'terminal',
+        projection: { properties: ['equipmentType', 'tier'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain('n0.equipmentType AS equipmentType');
+      expect(result.query).toContain('n0.tier AS tier');
+      expect(result.query).toContain('count(*) AS count');
+    });
+
+    it('projects the terminal alias after multi-hop steps', () => {
+      const spec: TraversalSpec = {
+        start: { entityId: 'Equipment:pc7000' },
+        steps: [
+          { direction: 'out', relationshipTypes: ['HAS_COMPONENT'] },
+          { direction: 'out', relationshipTypes: ['REQUIRES_FLUID'] },
+        ],
+        returnMode: 'terminal',
+        projection: { properties: ['fluidType'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain('n2.fluidType AS fluidType');
+      expect(result.query).toContain('count(*) AS count');
+    });
+
+    it('rejects unsafe projection property names', () => {
+      const spec: TraversalSpec = {
+        start: { entityType: 'Organization' },
+        returnMode: 'terminal',
+        projection: { properties: ['orgType, count(*) // injection'], mode: 'count' },
+      };
+      expect(() => compiler.compile(spec, emptyVocab)).toThrow(/Unsafe projection property name/);
+    });
+
+    it('drops projection silently when returnMode is path', () => {
+      const spec: TraversalSpec = {
+        start: { entityId: 'a' },
+        steps: [{ direction: 'both', repeat: { maxDepth: 3 } }],
+        returnMode: 'path',
+        projection: { properties: ['anything'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).toContain('RETURN nodes(p) AS pathNodes');
+      expect(result.query).not.toContain('count(*)');
+    });
+
+    it('drops projection silently when returnMode is all', () => {
+      const spec: TraversalSpec = {
+        start: { entityId: 'a' },
+        steps: [{ direction: 'out' }],
+        returnMode: 'all',
+        projection: { properties: ['anything'], mode: 'count' },
+      };
+      const result = compiler.compile(spec, emptyVocab);
+      expect(result.query).not.toContain('count(*)');
+      expect(result.query).toMatch(/RETURN DISTINCT n0, n1, r0/);
+    });
+  });
 });

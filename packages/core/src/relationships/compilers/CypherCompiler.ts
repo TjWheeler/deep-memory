@@ -126,7 +126,37 @@ export class CypherCompiler implements TraversalCompiler {
 
     // Return clause
     let returnClause: string;
-    if (spec.returnMode === 'path') {
+    // Server-side projection is only emitted for terminal-mode queries — the
+    // anchor (lastNode) is unambiguous there. For 'all' / 'path' modes the
+    // emission stays vertex/edge-oriented and projection is dropped silently
+    // (the bug repro is terminal mode; multi-anchor projection over the
+    // walked set is a separate concern).
+    const emitProjection =
+      spec.projection !== undefined && spec.returnMode !== 'path' && spec.returnMode !== 'all';
+
+    if (emitProjection) {
+      const projection = spec.projection!;
+      const mode = projection.mode ?? 'values';
+      const distinct = projection.distinct ?? false;
+
+      // Each projected property becomes one column aliased to its own name so
+      // the executor can rebuild { [prop]: value } maps positionally. Property
+      // keys are validated against the same identifier rule used for filter
+      // emission upstream (compilePropertyFilterCypher); user-supplied data
+      // never reaches Cypher unparameterised.
+      const projectionColumns = projection.properties.map((prop) => {
+        assertSafeProjectionKey(prop);
+        return `${lastNode}.${prop} AS ${prop}`;
+      });
+
+      if (mode === 'count') {
+        returnClause = `RETURN ${projectionColumns.join(', ')}, count(*) AS count`;
+      } else if (distinct) {
+        returnClause = `RETURN DISTINCT ${projectionColumns.join(', ')}`;
+      } else {
+        returnClause = `RETURN ${projectionColumns.join(', ')}`;
+      }
+    } else if (spec.returnMode === 'path') {
       // Ordered node + relationship lists from the path binding. The parser
       // walks segments to recover per-edge walk direction.
       returnClause = 'RETURN nodes(p) AS pathNodes, relationships(p) AS pathRels, length(p) AS pathLength';
@@ -166,6 +196,23 @@ export class CypherCompiler implements TraversalCompiler {
       params,
       estimatedFanOut: Math.min(estimatedFanOut, 10000),
     };
+  }
+}
+
+const SAFE_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Guard against Cypher injection through projection property names. Projection
+ * keys are emitted inline (Cypher does not parameterise identifier positions),
+ * so they must look like ordinary identifiers — letters, digits, underscores,
+ * starting with a non-digit. The same rule is enforced upstream when a key
+ * lands on the wire via the storage layer's safe-key validator.
+ */
+function assertSafeProjectionKey(key: string): void {
+  if (!SAFE_KEY_RE.test(key)) {
+    throw new Error(
+      `Unsafe projection property name: "${key}". Property names must match ${SAFE_KEY_RE.source}.`,
+    );
   }
 }
 

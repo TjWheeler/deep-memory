@@ -476,6 +476,110 @@ if (NEO4J_URI) {
       return sharedProvider;
     });
   });
+
+  // ─── Server-side projection (live) ─────────────────────────────────
+  //
+  // Reproduces the bug #5 case: `memory_query_graph { projection: { mode:
+  // 'count' } }` was silently dropped, returning the full entity payload with
+  // no aggregations. The compiler now emits projection-aware RETURN and the
+  // executor parses the scalar rows into TraversalAggregation[].
+
+  describe('Neo4jStorageProvider — projection (live)', () => {
+    let provider: Neo4jStorageProvider;
+    const RID = `projection-${Date.now()}`;
+
+    beforeAll(async () => {
+      provider = new Neo4jStorageProvider({
+        uri: NEO4J_URI,
+        username: NEO4J_USER,
+        password: NEO4J_PASSWORD,
+        database: NEO4J_DATABASE,
+      });
+      await provider.initialize();
+      await provider.ensureSchema();
+      await provider.deleteRepository(RID).catch(() => undefined);
+      await provider.createRepository({
+        repositoryId: RID,
+        label: 'projection test',
+        governanceConfig: { mode: 'open' },
+        createdAt: new Date().toISOString(),
+        createdBy: 'projection-test',
+      });
+
+      // 5 companies, 4 universities, 1 non-profit — mirrors the bug repro
+      // shape so the count aggregation produces a recognisable result.
+      const orgs: Array<[string, string]> = [
+        ['c1', 'company'],   ['c2', 'company'],     ['c3', 'company'],
+        ['c4', 'company'],   ['c5', 'company'],     ['u1', 'university'],
+        ['u2', 'university'],['u3', 'university'],  ['u4', 'university'],
+        ['n1', 'non-profit'],
+      ];
+      for (const [id, orgType] of orgs) {
+        await provider.createEntity(RID, {
+          id,
+          slug: `Organization:${id}`,
+          entityType: 'Organization',
+          label: id,
+          summary: '',
+          properties: { orgType },
+          provenance: {
+            createdBy: 'projection-test',
+            createdByType: 'agent',
+            createdAt: new Date().toISOString(),
+            modifiedBy: 'projection-test',
+            modifiedByType: 'agent',
+            modifiedAt: new Date().toISOString(),
+          },
+        });
+      }
+    });
+
+    afterAll(async () => {
+      await provider.deleteRepository(RID).catch(() => undefined);
+      await provider.dispose();
+    });
+
+    it('emits server-side count aggregation', async () => {
+      const result = await provider.traverse(RID, {
+        start: { entityType: 'Organization' },
+        returnMode: 'terminal',
+        projection: { properties: ['orgType'], mode: 'count' },
+        limit: 200,
+      });
+
+      // Entities suppressed — projection-only response.
+      expect(result.entities).toEqual([]);
+
+      // Compiled Cypher carries the projection clause.
+      expect(result.queryMetadata.compiledQuery).toContain('n0.orgType AS orgType');
+      expect(result.queryMetadata.compiledQuery).toContain('count(*) AS count');
+
+      // Aggregations: one row per distinct orgType, sorted by count desc.
+      expect(result.aggregations).toBeDefined();
+      const byType = new Map(result.aggregations!.map((a) => [a.values['orgType'], a.count]));
+      expect(byType.get('company')).toBe(5);
+      expect(byType.get('university')).toBe(4);
+      expect(byType.get('non-profit')).toBe(1);
+    });
+
+    it('emits server-side DISTINCT for distinct values mode', async () => {
+      const result = await provider.traverse(RID, {
+        start: { entityType: 'Organization' },
+        returnMode: 'terminal',
+        projection: { properties: ['orgType'], distinct: true },
+        limit: 200,
+      });
+
+      expect(result.queryMetadata.compiledQuery).toContain('RETURN DISTINCT n0.orgType');
+      expect(result.entities).toEqual([]);
+      expect(result.aggregations).toBeDefined();
+      // 3 distinct orgType values, no count column.
+      expect(result.aggregations).toHaveLength(3);
+      for (const agg of result.aggregations!) {
+        expect(agg.count).toBeUndefined();
+      }
+    });
+  });
 } else {
   describe('Neo4jStorageProvider', () => {
     it('skipped — set NEO4J_URI to run conformance tests', () => {

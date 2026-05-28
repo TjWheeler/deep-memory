@@ -118,6 +118,19 @@ export class ImportRepositoryTool extends BaseToolController {
       );
     };
 
+    // Hydrate metadata from the manifest. Older archives stored embedding info
+    // only in the top-level manifest.embedding block; newer exports also carry
+    // it on manifest.repository.metadata. Prefer the repository-scoped value
+    // and fall back to manifest.embedding so legacy archives don't lose the
+    // model identifier on round-trip.
+    const importedMetadata = manifest.repository.metadata
+      ?? (manifest.embedding
+        ? {
+            embeddingModelId: manifest.embedding.modelId,
+            embeddingDimensions: manifest.embedding.dimensions,
+          }
+        : undefined);
+
     const importOptions = mode === 'create'
       ? {
           target: {
@@ -127,7 +140,10 @@ export class ImportRepositoryTool extends BaseToolController {
               label: manifest.repository.label,
               type: manifest.repository.type,
               description: manifest.repository.description,
+              legal: manifest.repository.legal,
+              owner: manifest.repository.owner,
               governance: { mode: manifest.repository.governanceMode },
+              metadata: importedMetadata,
             },
           },
           bulk: {

@@ -1862,27 +1862,14 @@ describe('Step D findEntities SQL shape', () => {
     expect(result.total).toBe(42);
   });
 
-  it('skips COUNT(1) and reports total: undefined when properties filter is present', async () => {
-    const { provider, doc } = makeProviderWithDocStub();
-    doc.respond = () => [];
-
-    const result = await provider.findEntities(TEST_REPO, {
-      properties: { role: 'engineer' },
-      limit: 10,
-      offset: 0,
-    });
-
-    expect(doc.calls).toHaveLength(1);
-    expect(doc.calls[0]!.sql).not.toContain('COUNT(1)');
-    expect(result.total).toBeUndefined();
-  });
-
-  it('emits a CONTAINS prefilter for each properties key and exact-matches client-side', async () => {
+  it('emits exact-eq prefilter against the dual-written scalar column when every filter value is natively storable', async () => {
+    // Dual-write makes `c.<key>[0]._value` the authoritative server-side
+    // column for storable values. The exact predicate is precise — no
+    // substring false positives — so COUNT runs alongside and returns the
+    // exact `total`.
     const { provider, doc } = makeProviderWithDocStub();
 
-    // Stored properties as a JSON-stringified blob, matching the Gremlin-managed
-    // [{_value, id}] document shape from the probe.
-    const truePositive = {
+    const stored = {
       id: 'e1',
       label: 'Person',
       repositoryId: TEST_REPO,
@@ -1890,6 +1877,7 @@ describe('Step D findEntities SQL shape', () => {
       entityLabel: [{ _value: 'Alice',  id: 'b' }],
       slug:        [{ _value: 'alice',  id: 'c' }],
       properties:  [{ _value: '{"role":"engineer","seniority":"staff"}', id: 'd' }],
+      role:        [{ _value: 'engineer', id: 'r' }],
       createdBy:        [{ _value: 'test',                       id: 'p1' }],
       createdByType:    [{ _value: 'agent',                      id: 'p2' }],
       createdAt:        [{ _value: '2026-05-26T00:00:00.000Z',   id: 'p3' }],
@@ -1897,16 +1885,7 @@ describe('Step D findEntities SQL shape', () => {
       modifiedByType:   [{ _value: 'agent',                      id: 'p5' }],
       modifiedAt:       [{ _value: '2026-05-26T00:00:00.000Z',   id: 'p6' }],
     };
-    // False positive: the substring `"role":"engineer"` appears literally
-    // *inside another property's value* (e.g. summary). Server-side CONTAINS
-    // accepts it; client-side matchesPropertyFilters must reject it because
-    // the actual `role` property is `manager`.
-    const falsePositive = {
-      ...truePositive,
-      id: 'e2',
-      properties:  [{ _value: '{"role":"manager","note":"\\"role\\":\\"engineer\\""}', id: 'd2' }],
-    };
-    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : [truePositive, falsePositive]);
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [3] : [stored]);
 
     const result = await provider.findEntities(TEST_REPO, {
       properties: { role: 'engineer' },
@@ -1914,13 +1893,121 @@ describe('Step D findEntities SQL shape', () => {
       offset: 0,
     });
 
-    const data = doc.calls[0]!;
-    expect(data.sql).toContain('CONTAINS(c.properties[0]._value, @kv0, false)');
-    expect(data.parameters).toContainEqual({ name: '@kv0', value: '"role":"engineer"' });
+    const data = doc.calls.find((c) => !c.sql.includes('COUNT(1)'))!;
+    expect(data.sql).toContain('c.role[0]._value = @val0');
+    expect(data.sql).not.toContain('CONTAINS(c.properties[0]._value');
+    expect(data.parameters).toContainEqual({ name: '@val0', value: 'engineer' });
 
-    // Only the true positive survives the client-side exact-match.
+    // COUNT runs over the same WHERE clause; the precise predicate means it
+    // matches the data page set exactly, so `total` is reported.
+    expect(doc.calls).toHaveLength(2);
+    expect(doc.calls.some((c) => c.sql.startsWith('SELECT VALUE COUNT(1)'))).toBe(true);
+    expect(result.total).toBe(3);
     expect(result.items).toHaveLength(1);
     expect(result.items[0]!.id).toBe('e1');
+  });
+
+  it('emits exact-eq prefilter per key when multiple natively storable filters are combined', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
+
+    await provider.findEntities(TEST_REPO, {
+      properties: { role: 'engineer', active: true, level: 5 },
+      limit: 10,
+      offset: 0,
+    });
+
+    const data = doc.calls.find((c) => !c.sql.includes('COUNT(1)'))!;
+    expect(data.sql).toContain('c.role[0]._value = @val0');
+    expect(data.sql).toContain('c.active[0]._value = @val1');
+    expect(data.sql).toContain('c.level[0]._value = @val2');
+    expect(data.sql).not.toContain('CONTAINS(c.properties[0]._value');
+    expect(data.parameters).toContainEqual({ name: '@val0', value: 'engineer' });
+    expect(data.parameters).toContainEqual({ name: '@val1', value: true });
+    expect(data.parameters).toContainEqual({ name: '@val2', value: 5 });
+  });
+
+  it('falls back to approximate CONTAINS and skips COUNT(1) when any filter value is not natively storable', async () => {
+    // A nested object cannot be dual-written as a Cosmos Gremlin scalar, so
+    // it lives only in the JSON blob. The whole filter set falls back to the
+    // substring path — substring matches over-count, so COUNT is skipped and
+    // `total` reports `undefined`. `matchesPropertyFilters` still refines
+    // client-side over the prefiltered rows.
+    const { provider, doc } = makeProviderWithDocStub();
+
+    const truePositive = {
+      id: 'e1',
+      label: 'Person',
+      repositoryId: TEST_REPO,
+      entityType:  [{ _value: 'Person', id: 'a' }],
+      entityLabel: [{ _value: 'Alice',  id: 'b' }],
+      slug:        [{ _value: 'alice',  id: 'c' }],
+      properties:  [{ _value: '{"meta":{"team":"core"},"role":"engineer"}', id: 'd' }],
+      createdBy:        [{ _value: 'test',                       id: 'p1' }],
+      createdByType:    [{ _value: 'agent',                      id: 'p2' }],
+      createdAt:        [{ _value: '2026-05-26T00:00:00.000Z',   id: 'p3' }],
+      modifiedBy:       [{ _value: 'test',                       id: 'p4' }],
+      modifiedByType:   [{ _value: 'agent',                      id: 'p5' }],
+      modifiedAt:       [{ _value: '2026-05-26T00:00:00.000Z',   id: 'p6' }],
+    };
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : [truePositive]);
+
+    const filterValue = { team: 'core' };
+    const result = await provider.findEntities(TEST_REPO, {
+      properties: { meta: filterValue },
+      limit: 10,
+      offset: 0,
+    });
+
+    expect(doc.calls).toHaveLength(1);
+    const data = doc.calls[0]!;
+    expect(data.sql).toContain('CONTAINS(c.properties[0]._value, @kv0, false)');
+    expect(data.sql).not.toContain('COUNT(1)');
+    expect(data.parameters).toContainEqual({ name: '@kv0', value: '"meta":{"team":"core"}' });
+    expect(result.total).toBeUndefined();
+    // Client-side refinement: nested-object equality is `===` reference, so
+    // the stored blob's `{ team: 'core' }` is not the same instance as the
+    // caller's filter literal and the row is rejected. Documents today's
+    // observable contract for non-storable filter values.
+    expect(result.items).toHaveLength(0);
+  });
+
+  it('falls back to approximate CONTAINS for mixed filter sets when at least one value is non-storable', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = () => [];
+
+    await provider.findEntities(TEST_REPO, {
+      // First value is storable; second is not. The whole set must fall
+      // back — the exact column for `extra` would be absent on the dual-
+      // written shape, so emitting `c.extra[0]._value = …` would silently
+      // return zero rows.
+      properties: { role: 'engineer', extra: { nested: 1 } },
+      limit: 10,
+      offset: 0,
+    });
+
+    const data = doc.calls[0]!;
+    expect(data.sql).toContain('CONTAINS(c.properties[0]._value, @kv0, false)');
+    expect(data.sql).toContain('CONTAINS(c.properties[0]._value, @kv1, false)');
+    expect(data.sql).not.toContain('c.role[0]._value =');
+    expect(data.sql).not.toContain('c.extra[0]._value =');
+    expect(data.sql).not.toContain('COUNT(1)');
+  });
+
+  it('throws on reserved-key collision when the filter set is otherwise eligible for the exact path', async () => {
+    // The user-property key is interpolated into the SQL identifier slot,
+    // so reserved-name collisions and unsafe identifiers must be rejected
+    // synchronously rather than silently mis-routed to a schema slot or
+    // widening the injection surface. Matches the create-path contract.
+    const { provider } = makeProviderWithDocStub();
+
+    await expect(
+      provider.findEntities(TEST_REPO, {
+        properties: { entityType: 'Person' },
+        limit: 10,
+        offset: 0,
+      }),
+    ).rejects.toThrow(/schema-managed field/);
   });
 
   it('pages with ORDER BY c.id + OFFSET + LIMIT for deterministic pagination', async () => {

@@ -158,6 +158,58 @@ const skipIfNoEmulator = !ENDPOINT || !KEY;
       expect(values).toEqual(new Set(['company', 'university', 'non-profit']));
     }, 60_000);
 
+    // Exact-eq findEntities — the user-property scalars dual-written by
+    // createEntity also unlock the SQL endpoint's exact prefilter path:
+    // `c.<key>[0]._value = @val` instead of substring `CONTAINS` over the
+    // JSON blob. The exact predicate lets the parallel COUNT query report
+    // a precise `total`, restoring the pagination shape that was forced to
+    // `undefined` while the prefilter was approximate.
+    //
+    // Runs before the plan-cache observation test below so the seed is the
+    // original 5 companies + 4 universities + 1 non-profit established in
+    // beforeAll.
+    it('returns exact total via the dual-written scalar column for eq-over-storable filters', async () => {
+      const companies = await provider.findEntities(RID, {
+        entityTypes: ['Organization'],
+        properties: { orgType: 'company' },
+        limit: 100,
+        offset: 0,
+      });
+      expect(companies.total).toBe(5);
+      expect(companies.items).toHaveLength(5);
+      expect(companies.items.every((e) => e.properties['orgType'] === 'company')).toBe(true);
+
+      const universities = await provider.findEntities(RID, {
+        entityTypes: ['Organization'],
+        properties: { orgType: 'university' },
+        limit: 100,
+        offset: 0,
+      });
+      expect(universities.total).toBe(4);
+      expect(universities.items).toHaveLength(4);
+
+      const nonprofits = await provider.findEntities(RID, {
+        entityTypes: ['Organization'],
+        properties: { orgType: 'non-profit' },
+        limit: 100,
+        offset: 0,
+      });
+      expect(nonprofits.total).toBe(1);
+      expect(nonprofits.items).toHaveLength(1);
+
+      // A filter value that no seeded entity carries — exact total of 0,
+      // not `undefined`. Documents the contract: `total` is precise on the
+      // exact path even when the result set is empty.
+      const missing = await provider.findEntities(RID, {
+        entityTypes: ['Organization'],
+        properties: { orgType: 'government' },
+        limit: 100,
+        offset: 0,
+      });
+      expect(missing.total).toBe(0);
+      expect(missing.items).toHaveLength(0);
+    }, 60_000);
+
     // Plan-cache observation. Not a hard assertion — the planning doc flags
     // this as informational. The expectation is vocabulary-bounded growth:
     // every Organization is written with the same `{ orgType }` shape, so

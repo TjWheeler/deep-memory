@@ -6,12 +6,14 @@ import type { StoredEntity, StoredEntityUpdate } from '@utaba/deep-memory/types'
 import type { StorageFindQuery, PaginatedResult, PropertyFilter } from '@utaba/deep-memory/types';
 import type { EntityReadOptions } from '@utaba/deep-memory/providers';
 import {
+  assertSafeEntityUserPropertyKey,
   buildEntityPropertyLadder,
   entityFromDocument,
   entityFromGremlin,
   entityToLadderBindings,
   entityUserPropertyParams,
   existingEntityScalarUserKeys,
+  isNativeStorableValue,
   STORED_ENTITY_FIELDS,
 } from '../mapping.js';
 import {
@@ -340,18 +342,36 @@ function sqlPath(key: string): string {
 }
 
 /**
+ * How the WHERE clause expressed the `properties` filter set, if one was
+ * present. `none` — no filter set was supplied; `exact` — every value passed
+ * `isNativeStorableValue`, so each clause was emitted as
+ * `c.<key>[0]._value = @valN` against the dual-written native scalar column
+ * (precise prefilter, COUNT can run alongside); `approximate` — at least one
+ * filter value was not natively storable (nested object, null, mixed array,
+ * etc.), so the whole set fell back to `CONTAINS(c.properties[0]._value, …)`
+ * against the JSON blob (substring match, false-positive prone, refined
+ * client-side; COUNT is skipped because it would over-report).
+ */
+type PropertyFilterMode = 'none' | 'exact' | 'approximate';
+
+/**
  * Build the `WHERE` clause + parameter array shared by the data query and the
  * `SELECT VALUE COUNT(1)` query, so the two are guaranteed to count the same
  * set by construction.
  *
- * Property filters are emitted as approximate `CONTAINS` on the JSON-stringified
- * `c.properties[0]._value` blob; the caller verifies exact-match client-side
- * (see `findEntities`).
+ * Property filters take one of two shapes depending on the filter values. When
+ * every value is a native Cosmos Gremlin scalar (`isNativeStorableValue`), the
+ * write path has already dual-written that value as `c.<key>[0]._value`, so
+ * each clause emits an exact equality against that column and the COUNT query
+ * over the same WHERE clause is precise. When any value is not natively
+ * storable, the whole set falls back to substring `CONTAINS` on the
+ * JSON-stringified blob — caller refines via `matchesPropertyFilters`, and the
+ * COUNT branch is skipped because the substring prefilter over-counts.
  */
 function buildWhereClause(
   query: StorageFindQuery,
   repositoryId: string,
-): { sqlWhere: string; params: CosmosQueryParameter[] } {
+): { sqlWhere: string; params: CosmosQueryParameter[]; propertyFilterMode: PropertyFilterMode } {
   const params: CosmosQueryParameter[] = [{ name: '@rid', value: repositoryId }];
   // `IS_DEFINED(c.entityType)` mirrors the old Gremlin `.has('entityType')`
   // presence check — it excludes the `_repository`, `_vocabulary`, and
@@ -381,23 +401,53 @@ function buildWhereClause(
     );
   }
 
-  if (query.properties != null) {
-    let i = 0;
-    for (const [key, value] of Object.entries(query.properties)) {
-      // JSON.stringify on a single-entry object produces `{"key":<json-value>}`;
-      // strip the outer braces to get the substring that must appear inside
-      // the stored blob. Works uniformly for strings, numbers, booleans, and
-      // nested arrays/objects. False positives are filtered client-side via
-      // `matchesPropertyFilters` after JSON-parsing each returned doc.
-      const fragment = JSON.stringify({ [key]: value }).slice(1, -1);
-      const name = `@kv${i++}`;
-      params.push({ name, value: fragment });
-      // ignoreCase=false: property keys/values are canonical, no case folding.
-      predicates.push(`CONTAINS(${sqlPath('properties')}, ${name}, false)`);
+  let propertyFilterMode: PropertyFilterMode = 'none';
+  if (query.properties != null && Object.keys(query.properties).length > 0) {
+    const entries = Object.entries(query.properties);
+    // Eligibility for the exact column path requires every value to be a
+    // native Cosmos Gremlin scalar — the write path only dual-writes those.
+    // A single non-storable value (nested object, mixed array, …) means the
+    // exact column would be missing for that key and the whole filter set
+    // must fall back to the JSON blob.
+    const allStorable = entries.every(([, value]) => isNativeStorableValue(value));
+
+    if (allStorable) {
+      // The user-property key is interpolated directly into the SQL
+      // identifier slot, so it must pass the same identifier guard the
+      // write path uses — an unsafe key here would widen the injection
+      // surface beyond what bound parameters can cover. Reserved-name
+      // collisions (e.g. `entityType` in `properties`) are a programming
+      // error rather than a query: throwing surfaces them rather than
+      // silently returning whatever the schema slot happens to hold.
+      for (const [key] of entries) {
+        assertSafeEntityUserPropertyKey(key);
+      }
+      let i = 0;
+      for (const [key, value] of entries) {
+        const name = `@val${i++}`;
+        params.push({ name, value });
+        predicates.push(`${sqlPath(key)} = ${name}`);
+      }
+      propertyFilterMode = 'exact';
+    } else {
+      let i = 0;
+      for (const [key, value] of entries) {
+        // JSON.stringify on a single-entry object produces `{"key":<json-value>}`;
+        // strip the outer braces to get the substring that must appear inside
+        // the stored blob. Works uniformly for strings, numbers, booleans, and
+        // nested arrays/objects. False positives are filtered client-side via
+        // `matchesPropertyFilters` after JSON-parsing each returned doc.
+        const fragment = JSON.stringify({ [key]: value }).slice(1, -1);
+        const name = `@kv${i++}`;
+        params.push({ name, value: fragment });
+        // ignoreCase=false: property keys/values are canonical, no case folding.
+        predicates.push(`CONTAINS(${sqlPath('properties')}, ${name}, false)`);
+      }
+      propertyFilterMode = 'approximate';
     }
   }
 
-  return { sqlWhere: `WHERE ${predicates.join(' AND ')}`, params };
+  return { sqlWhere: `WHERE ${predicates.join(' AND ')}`, params, propertyFilterMode };
 }
 
 /**
@@ -418,7 +468,7 @@ export async function findEntities(
   query: StorageFindQuery,
   options?: EntityReadOptions,
 ): Promise<PaginatedResult<StoredEntity>> {
-  const { sqlWhere, params } = buildWhereClause(query, repositoryId);
+  const { sqlWhere, params, propertyFilterMode } = buildWhereClause(query, repositoryId);
 
   const dataParams: CosmosQueryParameter[] = [
     ...params,
@@ -432,12 +482,13 @@ export async function findEntities(
   const dataSql = `${selectClause} FROM c ${sqlWhere} ORDER BY c.id OFFSET @off LIMIT @lim`;
   const countSql = `SELECT VALUE COUNT(1) FROM c ${sqlWhere}`;
 
-  // The properties prefilter is approximate (substring CONTAINS on the
-  // JSON-stringified blob), so COUNT(1) over the same WHERE clause would
+  // The approximate property prefilter is a substring CONTAINS on the
+  // JSON-stringified blob, so COUNT(1) over the same WHERE clause would
   // overcount by the false-positive rate. Report `total: undefined` and let
-  // callers paginate on `hasMore` instead.
-  const skipCount =
-    query.properties != null && Object.keys(query.properties).length > 0;
+  // callers paginate on `hasMore` instead. The exact path emits a direct
+  // equality against the dual-written native scalar column, so the COUNT is
+  // precise and runs alongside.
+  const skipCount = propertyFilterMode === 'approximate';
 
   const [dataResult, countResult] = await Promise.all([
     docClient.query<Record<string, unknown>>(dataSql, dataParams, {
@@ -450,6 +501,10 @@ export async function findEntities(
 
   let items = dataResult.documents.map(entityFromDocument);
 
+  // Client-side refinement stays as a belt-and-suspenders pass. On the exact
+  // path it matches every row by construction, but the cost is negligible and
+  // any prefilter regression (a missed equality emission, a stale blob from a
+  // pre-migration entity) still produces the correct observable result.
   if (query.properties != null && Object.keys(query.properties).length > 0) {
     const filters: PropertyFilter[] = Object.entries(query.properties).map(
       ([key, value]) => ({ key, operator: 'eq', value }),

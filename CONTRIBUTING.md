@@ -32,7 +32,7 @@ Versions are managed by [Changesets](https://github.com/changesets/changesets). 
 pnpm changeset
 ```
 
-You will be prompted to select affected packages and a bump level (`patch` / `minor` / `major`). The five published packages are in a fixed group, so selecting any one of them bumps the whole group together — pick the package whose change is most prominent.
+You will be prompted to select affected packages and a bump level (`patch` / `minor` / `major`). The six published packages are in a fixed group, so selecting any one of them bumps the whole group together — pick the package whose change is most prominent.
 
 Commit the generated `.changeset/*.md` file as part of your PR. The PR template's checklist has a reminder.
 

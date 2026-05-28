@@ -4,15 +4,16 @@ This folder holds version intent for `@utaba/deep-memory` releases. Each `.md` f
 
 ## Fixed group
 
-The five published packages are configured as a **fixed group** in `config.json`:
+The six published packages are configured as a **fixed group** in `config.json`:
 
 - `@utaba/deep-memory`
 - `@utaba/deep-memory-embeddings-openai`
 - `@utaba/deep-memory-storage-cosmosdb`
 - `@utaba/deep-memory-storage-sqlserver`
+- `@utaba/deep-memory-storage-neo4j`
 - `@utaba/deep-memory-local-mcp-server`
 
-Selecting any one of these in `pnpm changeset` will bump all five together. This preserves the "install any combination at the same version" guarantee.
+Selecting any one of these in `pnpm changeset` will bump all six together. This preserves the "install any combination at the same version" guarantee.
 
 ## Private packages
 
@@ -22,7 +23,7 @@ Three packages are `"private": true` and version **independently** of the fixed 
 - `@utaba/deep-memory-indexer-llm-anthropic`
 - `@utaba/deep-memory-indexer-mcp-server`
 
-Selecting one of these in `pnpm changeset` will bump only that package (or whichever subset of the three you select). It will not force a release of the published five.
+Selecting one of these in `pnpm changeset` will bump only that package (or whichever subset of the three you select). It will not force a release of the published six.
 
 ## Full workflow
 

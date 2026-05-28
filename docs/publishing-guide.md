@@ -8,7 +8,7 @@ Versioning is driven by [Changesets](https://github.com/changesets/changesets).
 
 ### Published to npm
 
-Five packages publish to the `@utaba` scope. They are configured as a **fixed group** in `.changeset/config.json`, so they always bump together to the same version. Users can install any combination at the same version and rely on compatibility.
+Six packages publish to the `@utaba` scope. They are configured as a **fixed group** in `.changeset/config.json`, so they always bump together to the same version. Users can install any combination at the same version and rely on compatibility.
 
 | Package directory | npm name |
 |-------------------|----------|
@@ -16,11 +16,12 @@ Five packages publish to the `@utaba` scope. They are configured as a **fixed gr
 | `packages/embeddings-openai` | `@utaba/deep-memory-embeddings-openai` |
 | `packages/storage-cosmosdb` | `@utaba/deep-memory-storage-cosmosdb` |
 | `packages/storage-sqlserver` | `@utaba/deep-memory-storage-sqlserver` |
+| `packages/storage-neo4j` | `@utaba/deep-memory-storage-neo4j` |
 | `packages/mcp-server` | `@utaba/deep-memory-local-mcp-server` |
 
 ### Private (not published)
 
-Three packages are marked `"private": true` in their `package.json`. They are intended to be run from a repo clone, not installed via npm. They version independently — bumping them does not force a release of the five published packages.
+Three packages are marked `"private": true` in their `package.json`. They are intended to be run from a repo clone, not installed via npm. They version independently — bumping them does not force a release of the six published packages.
 
 | Package directory | npm name |
 |-------------------|----------|
@@ -68,7 +69,7 @@ Interactive prompts will ask:
 
 This writes a markdown file under `.changeset/`. Commit it as part of your PR.
 
-**You don't have to pick every package in the fixed group manually** — selecting any one of the five forces the entire group to bump together. Pick the package whose change is most prominent for the description.
+**You don't have to pick every package in the fixed group manually** — selecting any one of the six forces the entire group to bump together. Pick the package whose change is most prominent for the description.
 
 **Picking the bump level:**
 
@@ -122,7 +123,7 @@ pnpm release              # actually publish
 2. Builds everything (`pnpm build`)
 3. Runs tests (`pnpm test`)
 4. Runs typecheck (`pnpm typecheck`)
-5. Publishes the five packages in dependency order
+5. Publishes the six packages in dependency order
 6. Skips any package whose local version already matches the registry
 
 npm prompts for MFA at publish time.
@@ -135,6 +136,7 @@ Check the registry:
 - https://www.npmjs.com/package/@utaba/deep-memory-embeddings-openai
 - https://www.npmjs.com/package/@utaba/deep-memory-storage-cosmosdb
 - https://www.npmjs.com/package/@utaba/deep-memory-storage-sqlserver
+- https://www.npmjs.com/package/@utaba/deep-memory-storage-neo4j
 - https://www.npmjs.com/package/@utaba/deep-memory-local-mcp-server
 
 ## Workspace References
@@ -158,7 +160,8 @@ pnpm rewrites these to real version numbers at publish time.
   ├── @utaba/deep-memory-embeddings-openai
   ├── @utaba/deep-memory-storage-cosmosdb
   ├── @utaba/deep-memory-storage-sqlserver
-  └── @utaba/deep-memory-local-mcp-server           (depends on core + embeddings-openai + both storage providers)
+  ├── @utaba/deep-memory-storage-neo4j
+  └── @utaba/deep-memory-local-mcp-server           (depends on core + embeddings-openai + all three storage providers)
 ```
 
 ## Deprecated: `scripts/version-bump.mjs`
@@ -174,4 +177,4 @@ For an urgent fix to an already-released version:
 3. Run `pnpm changeset` and pick `patch`.
 4. PR back into `main`. Merge the resulting Version PR. Publish locally.
 
-The fixed-group config means all five packages bump to the same patch version even if only one was touched. This is intentional and preserves the "install any combination at the same version" guarantee.
+The fixed-group config means all six packages bump to the same patch version even if only one was touched. This is intentional and preserves the "install any combination at the same version" guarantee.

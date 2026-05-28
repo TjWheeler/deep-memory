@@ -15,12 +15,13 @@ That's it. Two tool calls maximum (one `AskUserQuestion`, one `Write`). No `git 
 
 ## Fixed group (lockstep versioning)
 
-These five packages bump together. Declaring **any one** of them in the frontmatter bumps all five to the same new version. Pick the package with the broadest changes in this changeset:
+These six packages bump together. Declaring **any one** of them in the frontmatter bumps all six to the same new version. Pick the package with the broadest changes in this changeset:
 
 - `@utaba/deep-memory`
 - `@utaba/deep-memory-embeddings-openai`
 - `@utaba/deep-memory-storage-cosmosdb`
 - `@utaba/deep-memory-storage-sqlserver`
+- `@utaba/deep-memory-storage-neo4j`
 - `@utaba/deep-memory-local-mcp-server`
 
 Indexer packages (`@utaba/deep-memory-indexer`, `@utaba/deep-memory-indexer-llm-anthropic`, `@utaba/deep-memory-indexer-mcp-server`) are **not** in the fixed group — they version independently. Declare them separately if changed.
@@ -46,7 +47,7 @@ One-line summary of what changed and why it matters.
 
 Detail bullets describing the change, breaking surface, and any migration notes.
 Mention each affected package by name in the body so the per-package CHANGELOG
-entry remains meaningful (the fixed group propagates this same text to all five
+entry remains meaningful (the fixed group propagates this same text to all six
 package CHANGELOG.md files at version time).
 
 - API change: `OldName` → `NewName` (which interfaces it lives on, what consumers must update).

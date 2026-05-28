@@ -789,11 +789,13 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
       const layer: StorageNeighborhoodLayer = {};
       const nextFrontier = new Set<string>();
-      // Dedup edges within a layer: the cumulative-d response can include the
-      // same edge multiple times across the deduped union (server-side dedup
-      // is by row, not by edge-in-context). The visit set prevents the same
-      // (vertex, edge) pairing from contributing twice.
-      const layerEdgeSeen = new Set<string>();
+      // Dedup connected entities per (relationship-type) bucket within a
+      // single layer. The same entity can be reached via multiple stored
+      // edges of the same type (e.g. a logically-bidirectional relationship
+      // modelled as two directed half-edges) — count it once, not once per
+      // traversed edge. Symmetric with the Neo4j provider; the conformance
+      // suite locks this contract.
+      const layerBucketSeen = new Map<string, Set<string>>();
 
       for (const fv of frontier) {
         const incident = edgesByVertex.get(fv) ?? [];
@@ -839,12 +841,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
             continue;
           }
 
-          // Dedup the (vertex-pair, edge) within this layer.
-          const edgeKey = `${rel.id}|${fv}->${connectedId}`;
-          if (layerEdgeSeen.has(edgeKey)) continue;
-          layerEdgeSeen.add(edgeKey);
-
           const relType = rel.relationshipType;
+          let bucketSeen = layerBucketSeen.get(relType);
+          if (!bucketSeen) {
+            bucketSeen = new Set<string>();
+            layerBucketSeen.set(relType, bucketSeen);
+          }
+          if (bucketSeen.has(connectedId)) continue;
+          bucketSeen.add(connectedId);
+
           if (!layer[relType]) {
             layer[relType] = { total: 0, entities: [], relationships: [] };
           }

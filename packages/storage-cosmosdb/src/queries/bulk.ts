@@ -24,8 +24,10 @@ import {
   buildRelationshipPropertyLadder,
   entityFromGremlin,
   entityToLadderBindings,
+  entityUserPropertyParams,
   relationshipFromGremlin,
   relationshipToLadderBindings,
+  relationshipUserPropertyParams,
 } from '../mapping.js';
 import { resolveController, runAdaptive } from './adaptive-import.js';
 
@@ -218,17 +220,34 @@ const INSERT_RELATIONSHIP_QUERY =
   `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
   `.property('id', relId).property('repositoryId', rid)${RELATIONSHIP_LADDER_CHAIN}`;
 
-const UPSERT_ENTITY_QUERY =
+// Upsert query is split into the open / branch-separator / close fragments so
+// the per-call user-property suffix can append to BOTH branches of the
+// coalesce. When the caller has no native-storable user properties, the empty
+// suffix collapses each per-call query to the canonical fixed string below
+// (byte-identical to the historical shape), keeping the dominant plan-cache
+// entry warm.
+
+const UPSERT_ENTITY_OPEN =
   `g.V().has('repositoryId', rid).hasId(vid).has('entityType').fold().coalesce(` +
-  `unfold()${ENTITY_LADDER_CHAIN},` +
-  ` addV(vertexLabel).property('id', vid).property('repositoryId', rid)${ENTITY_LADDER_CHAIN})`;
+  `unfold()${ENTITY_LADDER_CHAIN}`;
+
+const UPSERT_ENTITY_CREATE_BRANCH =
+  `, addV(vertexLabel).property('id', vid).property('repositoryId', rid)${ENTITY_LADDER_CHAIN}`;
+
+const UPSERT_ENTITY_QUERY =
+  `${UPSERT_ENTITY_OPEN}${UPSERT_ENTITY_CREATE_BRANCH})`;
+
+const UPSERT_RELATIONSHIP_OPEN =
+  `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
+  `unfold()${RELATIONSHIP_LADDER_CHAIN}`;
+
+const UPSERT_RELATIONSHIP_CREATE_BRANCH =
+  `, g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)` +
+  `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+  `.property('id', relId).property('repositoryId', rid)${RELATIONSHIP_LADDER_CHAIN}`;
 
 const UPSERT_RELATIONSHIP_QUERY =
-  `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
-  `unfold()${RELATIONSHIP_LADDER_CHAIN},` +
-  ` g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)` +
-  `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
-  `.property('id', relId).property('repositoryId', rid)${RELATIONSHIP_LADDER_CHAIN})`;
+  `${UPSERT_RELATIONSHIP_OPEN}${UPSERT_RELATIONSHIP_CREATE_BRANCH})`;
 
 // ─── Direct insert (no existence check) ─────────────────────────
 
@@ -277,6 +296,23 @@ async function insertRelationship(
  * rejects `.property('repositoryId', ...)` after `unfold()` at parse time,
  * so excluding `repositoryId` from the ladder is required for correctness
  * as well as plan-cache shape.
+ *
+ * User-property dual-write contract: native-storable values in
+ * `entity.properties` also project to per-key vertex properties so server-
+ * side predicates and aggregations can reach them. The suffix appends to
+ * BOTH coalesce branches so a brand-new entity (create branch) and a pre-
+ * existing one (update branch) end up with the same scalar shape; the
+ * `p_user_<i>` bindings are shared across the two halves. Validation
+ * (reserved-name collisions, unsafe identifiers) runs synchronously via
+ * `entityUserPropertyParams` before any round-trip — the contract matches
+ * the per-entity `createEntity` write path. Bulk import does NOT pre-read
+ * the existing entity, so the update branch ADDS and OVERWRITES scalars
+ * but does NOT DROP stale ones: keys present on the pre-existing entity
+ * and absent from the new payload stay as orphan scalars. The canonical
+ * JSON `properties` blob (the ladder slot) stays the read-side source of
+ * truth, so round-trip is unaffected by that asymmetry. Callers needing
+ * exact drop-on-omit semantics from a bulk path should fall back to
+ * per-entity `updateEntity` instead.
  */
 async function upsertEntity(
   conn: CosmosDbConnection,
@@ -289,7 +325,22 @@ async function upsertEntity(
     vertexLabel: entity.entityType,
     ...entityToLadderBindings(entity),
   };
-  await conn.submit(UPSERT_ENTITY_QUERY, bindings);
+
+  const userProps = entityUserPropertyParams(entity.properties ?? {});
+  let query: string;
+  if (userProps.length === 0) {
+    query = UPSERT_ENTITY_QUERY;
+  } else {
+    let suffix = '';
+    for (let i = 0; i < userProps.length; i++) {
+      const { key, value } = userProps[i]!;
+      suffix += `.property('${key}', p_user_${i})`;
+      bindings[`p_user_${i}`] = value;
+    }
+    query = `${UPSERT_ENTITY_OPEN}${suffix}${UPSERT_ENTITY_CREATE_BRANCH}${suffix})`;
+  }
+
+  await conn.submit(query, bindings);
 }
 
 /**
@@ -298,6 +349,17 @@ async function upsertEntity(
  *
  * The E() lookup is scoped by repositoryId so an edge with the same id in a
  * different repo cannot be matched and silently overwritten.
+ *
+ * User-property dual-write contract: same shape as `upsertEntity` above —
+ * native-storable values in `relationship.properties` project to per-key
+ * edge properties via a suffix appended to BOTH coalesce branches, and the
+ * `p_user_<i>` bindings are shared across the two halves. The relationship
+ * reserved set additionally guards against the Gremlin `'label'` token,
+ * which would collide with the edge-label slot set at `addE(edgeLabel)`.
+ * Same add-and-overwrite asymmetry on the update branch — orphan scalars
+ * from a prior shape are not dropped, because bulk import skips the pre-
+ * read. The canonical JSON `properties` blob remains the read-side source
+ * of truth.
  */
 async function upsertRelationship(
   conn: CosmosDbConnection,
@@ -312,5 +374,20 @@ async function upsertRelationship(
     edgeLabel: rel.relationshipType,
     ...relationshipToLadderBindings(rel),
   };
-  await conn.submit(UPSERT_RELATIONSHIP_QUERY, bindings);
+
+  const userProps = relationshipUserPropertyParams(rel.properties ?? {});
+  let query: string;
+  if (userProps.length === 0) {
+    query = UPSERT_RELATIONSHIP_QUERY;
+  } else {
+    let suffix = '';
+    for (let i = 0; i < userProps.length; i++) {
+      const { key, value } = userProps[i]!;
+      suffix += `.property('${key}', p_user_${i})`;
+      bindings[`p_user_${i}`] = value;
+    }
+    query = `${UPSERT_RELATIONSHIP_OPEN}${suffix}${UPSERT_RELATIONSHIP_CREATE_BRANCH}${suffix})`;
+  }
+
+  await conn.submit(query, bindings);
 }

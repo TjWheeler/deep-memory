@@ -27,6 +27,7 @@ import {
   entityToLadderBindings,
   entityUserPropertyParams,
   existingEntityScalarUserKeys,
+  existingRelationshipScalarUserKeys,
   isNativeStorableValue,
   relationshipToLadderBindings,
   relationshipUserPropertyParams,
@@ -660,5 +661,66 @@ describe('existingEntityScalarUserKeys', () => {
         orgType: 'company',
       }),
     ).toEqual(['orgType']);
+  });
+});
+
+describe('existingRelationshipScalarUserKeys', () => {
+  // Mirror of existingEntityScalarUserKeys for the edge surface. Same lazy-
+  // migration tolerance — unsafe / reserved / non-storable keys are silently
+  // skipped rather than thrown. The relationship reserved set additionally
+  // includes the Gremlin 'label' token; a blob carrying 'label' must NOT
+  // produce a drop step (the edge-label slot is set at addE() and is never
+  // a writable user property).
+
+  it('returns an empty list for null / undefined / empty input', () => {
+    expect(existingRelationshipScalarUserKeys(null)).toEqual([]);
+    expect(existingRelationshipScalarUserKeys(undefined)).toEqual([]);
+    expect(existingRelationshipScalarUserKeys({})).toEqual([]);
+  });
+
+  it('returns every native-storable key in insertion order', () => {
+    expect(
+      existingRelationshipScalarUserKeys({
+        weight: 0.8,
+        since: '2026-01-01',
+        active: true,
+        tags: ['a', 'b'],
+      }),
+    ).toEqual(['weight', 'since', 'active', 'tags']);
+  });
+
+  it('skips non-storable values (objects, nulls, heterogeneous arrays, NaN)', () => {
+    expect(
+      existingRelationshipScalarUserKeys({
+        weight: 0.8,
+        nested: { a: 1 },
+        empty: null,
+        mixed: ['a', 1],
+        nan: Number.NaN,
+        since: '2026-01-01',
+      }),
+    ).toEqual(['weight', 'since']);
+  });
+
+  it("silently skips the Gremlin 'label' token and other reserved keys", () => {
+    expect(
+      existingRelationshipScalarUserKeys({
+        weight: 0.8,
+        label: 'STALE_TOKEN',  // reserved — edge-label slot, never a scalar
+        relationshipType: 'KNOWS', // reserved — schema-managed slot
+        repositoryId: 'rid',   // reserved
+        sourceEntityId: 'src', // reserved
+      }),
+    ).toEqual(['weight']);
+  });
+
+  it('silently skips keys that fail the identifier shape', () => {
+    expect(
+      existingRelationshipScalarUserKeys({
+        'has-dash': 'X',
+        '1starts-with-digit': 'Y',
+        weight: 0.8,
+      }),
+    ).toEqual(['weight']);
   });
 });

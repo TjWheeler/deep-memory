@@ -7,6 +7,7 @@ import {
   buildRelationshipPropertyLadder,
   relationshipFromGremlin,
   relationshipToLadderBindings,
+  relationshipUserPropertyParams,
 } from '../mapping.js';
 import { DuplicateRelationshipError, matchesPropertyFilters, buildEdgeProjectChain } from '@utaba/deep-memory';
 
@@ -14,17 +15,26 @@ import { DuplicateRelationshipError, matchesPropertyFilters, buildEdgeProjectCha
 // pattern. Mirrors entity.ts — single round-trip create.
 const DUPLICATE_SENTINEL = '__duplicate';
 
-// Fixed-shape property ladder — identical query string across every edge
-// create regardless of which optional fields are populated, so the Cosmos
-// plan cache reuses one compiled plan.
-const RELATIONSHIP_CREATE_QUERY =
+// Prefix shared by every relationship-create query: existence-check coalesce
+// wrapper + schema-managed edge property ladder. Per-call user-property scalars
+// append after the ladder (between the prefix and the closing `)` of the
+// coalesce). When the caller has no native-storable user properties, the empty
+// suffix collapses the emitted string to the canonical
+// `RELATIONSHIP_CREATE_QUERY` value below — same Gremlin string the provider
+// has always issued for that case, so the plan cache keeps its single warm
+// entry for the dominant shape.
+const RELATIONSHIP_CREATE_PREFIX =
   `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
   `unfold().constant('${DUPLICATE_SENTINEL}'),` +
   `g.V().has('repositoryId', rid).hasId(srcId).has('entityType')` +
   `.addE(edgeLabel)` +
   `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
-  `.property('id', relId).property('repositoryId', rid)${buildRelationshipPropertyLadder()}` +
-  `)`;
+  `.property('id', relId).property('repositoryId', rid)${buildRelationshipPropertyLadder()}`;
+
+// Canonical empty-user-properties form. Exported so the unit test can pin the
+// zero-regression invariant (this string is byte-identical to the historical
+// fixed-shape query).
+export const RELATIONSHIP_CREATE_QUERY = `${RELATIONSHIP_CREATE_PREFIX})`;
 
 export async function createRelationship(
   conn: CosmosDbConnection,
@@ -40,7 +50,27 @@ export async function createRelationship(
     ...relationshipToLadderBindings(relationship),
   };
 
-  const result = await conn.submit(RELATIONSHIP_CREATE_QUERY, bindings);
+  // Dual-write: the JSON blob lives in the `properties` ladder slot above
+  // (round-trip authoritative); native-storable scalars also project to per-
+  // key edge properties so server-side predicates and aggregations can reach
+  // them. Validation runs before any round-trip — reserved-key collisions
+  // (including the Gremlin 'label' token) and unsafe identifiers raise
+  // ProviderError synchronously.
+  const userProps = relationshipUserPropertyParams(relationship.properties ?? {});
+  let query: string;
+  if (userProps.length === 0) {
+    query = RELATIONSHIP_CREATE_QUERY;
+  } else {
+    let suffix = '';
+    for (let i = 0; i < userProps.length; i++) {
+      const { key, value } = userProps[i]!;
+      suffix += `.property('${key}', p_user_${i})`;
+      bindings[`p_user_${i}`] = value;
+    }
+    query = `${RELATIONSHIP_CREATE_PREFIX}${suffix})`;
+  }
+
+  const result = await conn.submit(query, bindings);
 
   if (result.items[0] === DUPLICATE_SENTINEL) {
     throw new DuplicateRelationshipError(relationship.id);

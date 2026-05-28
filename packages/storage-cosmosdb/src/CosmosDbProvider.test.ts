@@ -23,6 +23,7 @@ import {
   ProviderError,
 } from '@utaba/deep-memory';
 import { ENTITY_CREATE_QUERY } from './queries/entity.js';
+import { RELATIONSHIP_CREATE_QUERY } from './queries/relationship.js';
 import type { CosmosQueryParameter, CosmosQueryResult } from './CosmosDocumentClient.js';
 
 const TEST_REPO = '40000000-0000-4000-a000-000000000099';
@@ -917,6 +918,211 @@ describe('updateEntity user-property scalars', () => {
   });
 });
 
+// ─── createRelationship user-property scalars (dual-write) ───────────
+//
+// Edges follow the same dual-write contract as vertices: native-storable
+// user-property values project to per-key edge properties alongside the
+// canonical JSON blob, so server-side predicates and aggregations can reach
+// them. The contract pins mirror createEntity, with one addition — the
+// Gremlin `'label'` token is in the relationship reserved set (it is the
+// edge-label slot, set at `addE(edgeLabel)`, and a user property of the same
+// name would collide at write time).
+
+function captureRelationshipCreateQuery(): {
+  provider: CosmosDbProvider;
+  stub: SubmitStub;
+  getCreateCall: () => SubmitCall;
+} {
+  const { provider, stub } = makeProvider();
+  stub.submit = async (query, params) => {
+    stub.calls.push({ query, params });
+    if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+      return { items: [{ id: 'created-edge' }] };
+    }
+    return { items: [] };
+  };
+  return {
+    provider,
+    stub,
+    getCreateCall: () => {
+      const call = stub.calls.find((c) =>
+        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+      );
+      if (!call) throw new Error('no create call captured');
+      return call;
+    },
+  };
+}
+
+describe('createRelationship user-property scalars', () => {
+  const SRC = '40000000-0000-4000-a000-deadbeef0001';
+  const TGT = '40000000-0000-4000-a000-deadbeef0002';
+
+  it('empty user-properties emits the canonical RELATIONSHIP_CREATE_QUERY string byte-for-byte', async () => {
+    const { provider, getCreateCall } = captureRelationshipCreateQuery();
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a001', SRC, TGT),
+      properties: {},
+    };
+
+    await provider.createRelationship(TEST_REPO, rel);
+
+    expect(getCreateCall().query).toBe(RELATIONSHIP_CREATE_QUERY);
+  });
+
+  it('all-non-storable user-properties collapse to the canonical query — blob still carries them', async () => {
+    const { provider, getCreateCall } = captureRelationshipCreateQuery();
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a002', SRC, TGT),
+      properties: { nested: { a: 1 }, mixed: ['a', 1] },
+    };
+
+    await provider.createRelationship(TEST_REPO, rel);
+
+    const call = getCreateCall();
+    expect(call.query).toBe(RELATIONSHIP_CREATE_QUERY);
+    // The canonical `properties` ladder binding (p4 in the relationship ladder
+    // — relationshipType/sourceEntityId/targetEntityId/bidirectional precede
+    // it) still serialises the full input blob — non-storable values round-
+    // trip via JSON.
+    const propertiesBlob = (call.params as Record<string, unknown>)['p4'];
+    expect(propertiesBlob).toBe(JSON.stringify({ nested: { a: 1 }, mixed: ['a', 1] }));
+  });
+
+  it('appends one .property suffix per native-storable user key in insertion order', async () => {
+    const { provider, getCreateCall } = captureRelationshipCreateQuery();
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a003', SRC, TGT),
+      properties: { weight: 0.8, since: '2026-01-01', active: true },
+    };
+
+    await provider.createRelationship(TEST_REPO, rel);
+
+    const call = getCreateCall();
+    expect(call.query).toContain(".property('weight', p_user_0)");
+    expect(call.query).toContain(".property('since', p_user_1)");
+    expect(call.query).toContain(".property('active', p_user_2)");
+    // Order is part of the cache key — verify literal substring order.
+    const weightIdx = call.query.indexOf(".property('weight', p_user_0)");
+    const sinceIdx = call.query.indexOf(".property('since', p_user_1)");
+    const activeIdx = call.query.indexOf(".property('active', p_user_2)");
+    expect(weightIdx).toBeGreaterThan(-1);
+    expect(sinceIdx).toBeGreaterThan(weightIdx);
+    expect(activeIdx).toBeGreaterThan(sinceIdx);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe(0.8);
+    expect(params['p_user_1']).toBe('2026-01-01');
+    expect(params['p_user_2']).toBe(true);
+  });
+
+  it('drops non-storable values from the suffix; storable siblings still appear', async () => {
+    const { provider, getCreateCall } = captureRelationshipCreateQuery();
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a004', SRC, TGT),
+      properties: {
+        weight: 0.8,
+        nested: { a: 1 },
+        mixed: ['a', 1],
+        since: '2026-01-01',
+      },
+    };
+
+    await provider.createRelationship(TEST_REPO, rel);
+
+    const call = getCreateCall();
+    expect(call.query).toContain(".property('weight', p_user_0)");
+    expect(call.query).toContain(".property('since', p_user_1)");
+    expect(call.query).not.toContain(".property('nested'");
+    expect(call.query).not.toContain(".property('mixed'");
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe(0.8);
+    expect(params['p_user_1']).toBe('2026-01-01');
+    expect(params['p_user_2']).toBeUndefined();
+  });
+
+  it('throws ProviderError on a reserved-key collision before any round-trip', async () => {
+    const { provider, stub } = captureRelationshipCreateQuery();
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a005', SRC, TGT),
+      properties: { relationshipType: 'X' },
+    };
+
+    const before = stub.calls.length;
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(ProviderError);
+    const after = stub.calls.length;
+
+    const createCalls = stub.calls
+      .slice(before, after)
+      .filter((c) =>
+        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+      );
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it("throws ProviderError on the Gremlin 'label' token collision (edge-label slot)", async () => {
+    const { provider, stub } = captureRelationshipCreateQuery();
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a006', SRC, TGT),
+      properties: { label: 'X' },
+    };
+
+    const before = stub.calls.length;
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toThrow(/collides/);
+    const after = stub.calls.length;
+    const createCalls = stub.calls
+      .slice(before, after)
+      .filter((c) =>
+        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+      );
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it('throws ProviderError on an unsafe identifier (rejects before round-trip)', async () => {
+    const { provider, stub } = captureRelationshipCreateQuery();
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a007', SRC, TGT),
+      properties: { 'has-dash': 'X' },
+    };
+
+    const before = stub.calls.length;
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toThrow(
+      /not a valid Gremlin identifier/,
+    );
+    const after = stub.calls.length;
+    const createCalls = stub.calls
+      .slice(before, after)
+      .filter((c) =>
+        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+      );
+    expect(createCalls).toHaveLength(0);
+  });
+
+  it('duplicate-detection sentinel path still fires when scalars are present', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+        return { items: ['__duplicate'] };
+      }
+      return { items: [] };
+    };
+
+    const rel: StoredRelationship = {
+      ...makeRelationship('40000000-0000-4000-a000-00000000a008', SRC, TGT),
+      properties: { weight: 0.8 },
+    };
+
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(
+      DuplicateRelationshipError,
+    );
+    const lastCall = stub.calls[stub.calls.length - 1]!;
+    // Suffix is present in the duplicate-path query too — the addE branch
+    // carries the scalars whether or not it fires at runtime.
+    expect(lastCall.query).toContain(".property('weight', p_user_0)");
+  });
+});
+
 // ─── Single round-trip delete paths ──────────────────────────────────
 //
 // The aggregate('found').by('id').drop().cap('found') pattern collapses the
@@ -925,6 +1131,66 @@ describe('updateEntity user-property scalars', () => {
 // notFound = requestedIds - foundIds client-side.
 //
 // Shape verified live against the Cosmos emulator 2026-05-25.
+
+// Shared bulk-test helpers used by the partition-key shape test and by the
+// `importBulk user-property scalars` block further down. The same fixtures and
+// the same coalesce-branch splitter feed both — keeping them in one place
+// avoids drift between the two test surfaces that inspect the upsert query.
+
+function makeStoredBulkEntity(id: string, properties: Record<string, unknown> = { key: 'value' }): StoredEntity {
+  const now = new Date().toISOString();
+  return {
+    id,
+    slug: 'test-type:' + id,
+    entityType: 'test-type',
+    label: id,
+    summary: 'S',
+    properties,
+    provenance: {
+      createdBy: 'x', createdByType: 'agent', createdAt: now,
+      modifiedBy: 'x', modifiedByType: 'agent', modifiedAt: now,
+    },
+  };
+}
+
+function makeStoredBulkRelationship(id: string, properties: Record<string, unknown> = {}): StoredRelationship {
+  const now = new Date().toISOString();
+  return {
+    id,
+    relationshipType: 'LINKS',
+    sourceEntityId: 'src',
+    targetEntityId: 'tgt',
+    properties,
+    bidirectional: false,
+    provenance: {
+      createdBy: 'x', createdByType: 'agent', createdAt: now,
+      modifiedBy: 'x', modifiedByType: 'agent', modifiedAt: now,
+    },
+  };
+}
+
+// Split an upsert coalesce(update, create) query into the two branches.
+// Branches are separated by `, ` at the depth of the unfold/addV terminal;
+// the ladder's optional-slot `choose(__.constant(...).is(neq(...)),
+// __.property(...), __.identity())` blocks introduce their own `, ` at deeper
+// paren levels, so a naive first-`, ` scan splits inside the ladder rather
+// than at the branch boundary. Track paren depth and pick the comma at
+// depth 0 of the tail (which corresponds to depth 1 of the outer coalesce).
+function splitCoalesceBranches(query: string): { update: string; create: string } {
+  const idx = query.indexOf('unfold()');
+  expect(idx).toBeGreaterThan(-1);
+  const tail = query.slice(idx);
+  let depth = 0;
+  for (let i = 0; i < tail.length - 1; i++) {
+    const ch = tail[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    else if (depth === 0 && ch === ',' && tail[i + 1] === ' ') {
+      return { update: tail.slice(0, i), create: tail.slice(i + 2) };
+    }
+  }
+  throw new Error('coalesce branch separator not found');
+}
 
 describe('single-round-trip delete paths', () => {
   const ENTITY_A = '40000000-0000-4000-a000-000000007001';
@@ -1063,56 +1329,12 @@ describe('single-round-trip delete paths', () => {
   // entities. The fix splits propParts into update vs create; this test
   // locks the SQL shape so the bug doesn't come back.
 
-  function makeStoredEntity(id: string): StoredEntity {
-    const now = new Date().toISOString();
-    return {
-      id,
-      slug: 'test-type:' + id,
-      entityType: 'test-type',
-      label: id,
-      summary: 'S',
-      properties: { key: 'value' },
-      provenance: {
-        createdBy: 'x', createdByType: 'agent', createdAt: now,
-        modifiedBy: 'x', modifiedByType: 'agent', modifiedAt: now,
-      },
-    };
-  }
-
-  function makeStoredRelationship(id: string): StoredRelationship {
-    const now = new Date().toISOString();
-    return {
-      id,
-      relationshipType: 'LINKS',
-      sourceEntityId: 'src',
-      targetEntityId: 'tgt',
-      properties: {},
-      bidirectional: false,
-      provenance: {
-        createdBy: 'x', createdByType: 'agent', createdAt: now,
-        modifiedBy: 'x', modifiedByType: 'agent', modifiedAt: now,
-      },
-    };
-  }
-
-  function splitCoalesceBranches(query: string): { update: string; create: string } {
-    const idx = query.indexOf('unfold()');
-    expect(idx).toBeGreaterThan(-1);
-    const tail = query.slice(idx);
-    // Branches are separated by `, ` at the top level of coalesce(...).
-    // For these single-shot queries, the only `, ` outside a binding param
-    // list is the one separating unfold from addV/addE.
-    const splitIdx = tail.indexOf(', ');
-    expect(splitIdx).toBeGreaterThan(-1);
-    return { update: tail.slice(0, splitIdx), create: tail.slice(splitIdx + 2) };
-  }
-
   it("upsertEntity omits .property('repositoryId', ...) on the unfold branch but keeps it on addV", async () => {
     const { provider, stub } = makeProvider();
     const ENTITY_ID = '40000000-0000-4000-a000-000000007100';
 
     await provider.importBulk(TEST_REPO, [
-      { entities: [makeStoredEntity(ENTITY_ID)] },
+      { entities: [makeStoredBulkEntity(ENTITY_ID)] },
     ]);
 
     const upsert = stub.calls.find((c) => c.query.includes('addV(vertexLabel)'));
@@ -1127,7 +1349,7 @@ describe('single-round-trip delete paths', () => {
     const REL_ID = '40000000-0000-4000-a000-000000007101';
 
     await provider.importBulk(TEST_REPO, [
-      { relationships: [makeStoredRelationship(REL_ID)] },
+      { relationships: [makeStoredBulkRelationship(REL_ID)] },
     ]);
 
     const upsert = stub.calls.find((c) => c.query.includes('addE(edgeLabel)'));
@@ -1135,6 +1357,379 @@ describe('single-round-trip delete paths', () => {
     const { update, create } = splitCoalesceBranches(upsert!.query);
     expect(update).not.toMatch(/\.property\('repositoryId',/);
     expect(create).toMatch(/\.property\('repositoryId',/);
+  });
+});
+
+// ─── importBulk user-property scalars (dual-write) ─────────────────────
+//
+// Bulk upsert mirrors the per-entity create dual-write contract on BOTH
+// halves of the coalesce(update-branch, create-branch). The emitted suffix
+// is the same `.property('<key>', p_user_<i>)` chain on each branch with
+// shared `p_user_*` bindings, so whichever branch fires at runtime ends up
+// with the same scalar shape on the vertex/edge. The contract pins:
+//   1. Native-storable values append one .property step per key in
+//      insertion order on both branches.
+//   2. Non-storable values stay only in the canonical JSON `properties`
+//      blob (the ladder slot) — they round-trip via the read path but are
+//      not predicate-queryable.
+//   3. Reserved-name collisions and unsafe identifiers raise ProviderError
+//      synchronously, before any submit (same contract as `createEntity` /
+//      `createRelationship`).
+//   4. The update branch is ADD/OVERWRITE only — no drop steps emit for
+//      stale keys, because bulk import skips the per-entity pre-read.
+//      Callers needing exact drop-on-omit semantics use the per-entity
+//      update path instead.
+
+function findUpsertEntityCall(stub: SubmitStub): SubmitCall {
+  const call = stub.calls.find((c) => c.query.includes('addV(vertexLabel)'));
+  if (!call) throw new Error('no upsertEntity call captured');
+  return call;
+}
+
+function findUpsertRelationshipCall(stub: SubmitStub): SubmitCall {
+  const call = stub.calls.find((c) => c.query.includes('addE(edgeLabel)'));
+  if (!call) throw new Error('no upsertRelationship call captured');
+  return call;
+}
+
+describe('importBulk user-property scalars', () => {
+  // Entities ─────────────────────────────────────────────────────────────
+
+  it('upsertEntity emits the scalar suffix on the create branch in insertion order with values bound', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000b001';
+
+    await provider.importBulk(TEST_REPO, [
+      {
+        entities: [
+          makeStoredBulkEntity(ENTITY_ID, { orgType: 'company', tier: 'premium', headcount: 42 }),
+        ],
+      },
+    ]);
+
+    const call = findUpsertEntityCall(stub);
+    const { create } = splitCoalesceBranches(call.query);
+    expect(create).toContain(".property('orgType', p_user_0)");
+    expect(create).toContain(".property('tier', p_user_1)");
+    expect(create).toContain(".property('headcount', p_user_2)");
+    const orgIdx = create.indexOf(".property('orgType', p_user_0)");
+    const tierIdx = create.indexOf(".property('tier', p_user_1)");
+    const hcIdx = create.indexOf(".property('headcount', p_user_2)");
+    expect(orgIdx).toBeGreaterThan(-1);
+    expect(tierIdx).toBeGreaterThan(orgIdx);
+    expect(hcIdx).toBeGreaterThan(tierIdx);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('premium');
+    expect(params['p_user_2']).toBe(42);
+  });
+
+  it('upsertEntity emits the same scalar suffix on the update branch with no drop steps', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000b002';
+
+    await provider.importBulk(TEST_REPO, [
+      {
+        entities: [
+          makeStoredBulkEntity(ENTITY_ID, { orgType: 'company', tier: 'premium' }),
+        ],
+      },
+    ]);
+
+    const call = findUpsertEntityCall(stub);
+    const { update } = splitCoalesceBranches(call.query);
+    expect(update).toContain(".property('orgType', p_user_0)");
+    expect(update).toContain(".property('tier', p_user_1)");
+    const orgIdx = update.indexOf(".property('orgType', p_user_0)");
+    const tierIdx = update.indexOf(".property('tier', p_user_1)");
+    expect(orgIdx).toBeGreaterThan(-1);
+    expect(tierIdx).toBeGreaterThan(orgIdx);
+
+    // Bulk path is ADD/OVERWRITE only — no drop steps emit. Callers needing
+    // exact drop-on-omit semantics fall back to per-entity updateEntity.
+    expect(update).not.toMatch(/\.sideEffect\(properties\('[^']+'\)\.drop\(\)\)/);
+  });
+
+  it('upsertEntity emits the same scalar suffix on BOTH branches of the coalesce', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000b003';
+
+    await provider.importBulk(TEST_REPO, [
+      {
+        entities: [
+          makeStoredBulkEntity(ENTITY_ID, { orgType: 'company', tier: 'premium' }),
+        ],
+      },
+    ]);
+
+    const call = findUpsertEntityCall(stub);
+    const { update, create } = splitCoalesceBranches(call.query);
+    const expectedSuffix = `.property('orgType', p_user_0).property('tier', p_user_1)`;
+    expect(update).toContain(expectedSuffix);
+    expect(create).toContain(expectedSuffix);
+  });
+
+  it('upsertEntity drops non-storable values from the suffix; the blob ladder slot still carries them via JSON', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000b004';
+    const inputProperties = {
+      orgType: 'company',
+      nested: { a: 1 },
+      mixed: ['a', 1],
+      tier: 'premium',
+    };
+
+    await provider.importBulk(TEST_REPO, [
+      { entities: [makeStoredBulkEntity(ENTITY_ID, inputProperties)] },
+    ]);
+
+    const call = findUpsertEntityCall(stub);
+    const { update, create } = splitCoalesceBranches(call.query);
+    for (const branch of [update, create]) {
+      expect(branch).toContain(".property('orgType', p_user_0)");
+      expect(branch).toContain(".property('tier', p_user_1)");
+      expect(branch).not.toContain(".property('nested'");
+      expect(branch).not.toContain(".property('mixed'");
+    }
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe('company');
+    expect(params['p_user_1']).toBe('premium');
+    expect(params['p_user_2']).toBeUndefined();
+    // The canonical `properties` ladder binding (p3 in the entity ladder) still
+    // serialises the full input blob — non-storable values round-trip via JSON.
+    expect(params['p3']).toBe(JSON.stringify(inputProperties));
+  });
+
+  it('upsertEntity throws ProviderError on a reserved-key collision before any submit', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000b005';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(TEST_REPO, [
+      {
+        entities: [
+          makeStoredBulkEntity(ENTITY_ID, { entityLabel: 'X' }),
+        ],
+      },
+    ]);
+    const after = stub.calls.length;
+
+    // Validation fails synchronously inside the bulk worker — the import
+    // surfaces the error per item, no upsert query is issued.
+    const upsertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.includes('addV(vertexLabel)'));
+    expect(upsertCalls).toHaveLength(0);
+    expect(result.entitiesImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`entity:${ENTITY_ID}`);
+    expect(result.errors[0]!.error).toMatch(/collides/);
+  });
+
+  it('upsertEntity throws ProviderError on an unsafe identifier before any submit', async () => {
+    const { provider, stub } = makeProvider();
+    const ENTITY_ID = '40000000-0000-4000-a000-00000000b006';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(TEST_REPO, [
+      {
+        entities: [
+          makeStoredBulkEntity(ENTITY_ID, { 'has-dash': 'X' }),
+        ],
+      },
+    ]);
+    const after = stub.calls.length;
+
+    const upsertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.includes('addV(vertexLabel)'));
+    expect(upsertCalls).toHaveLength(0);
+    expect(result.entitiesImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`entity:${ENTITY_ID}`);
+    expect(result.errors[0]!.error).toMatch(/not a valid Gremlin identifier/);
+  });
+
+  // Relationships ────────────────────────────────────────────────────────
+
+  it('upsertRelationship emits the scalar suffix on the create branch in insertion order with values bound', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000b101';
+
+    await provider.importBulk(TEST_REPO, [
+      {
+        relationships: [
+          makeStoredBulkRelationship(REL_ID, { weight: 0.8, since: '2026-01-01', active: true }),
+        ],
+      },
+    ]);
+
+    const call = findUpsertRelationshipCall(stub);
+    const { create } = splitCoalesceBranches(call.query);
+    expect(create).toContain(".property('weight', p_user_0)");
+    expect(create).toContain(".property('since', p_user_1)");
+    expect(create).toContain(".property('active', p_user_2)");
+    const weightIdx = create.indexOf(".property('weight', p_user_0)");
+    const sinceIdx = create.indexOf(".property('since', p_user_1)");
+    const activeIdx = create.indexOf(".property('active', p_user_2)");
+    expect(weightIdx).toBeGreaterThan(-1);
+    expect(sinceIdx).toBeGreaterThan(weightIdx);
+    expect(activeIdx).toBeGreaterThan(sinceIdx);
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe(0.8);
+    expect(params['p_user_1']).toBe('2026-01-01');
+    expect(params['p_user_2']).toBe(true);
+  });
+
+  it('upsertRelationship emits the same scalar suffix on the update branch with no drop steps', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000b102';
+
+    await provider.importBulk(TEST_REPO, [
+      {
+        relationships: [
+          makeStoredBulkRelationship(REL_ID, { weight: 0.8, since: '2026-01-01' }),
+        ],
+      },
+    ]);
+
+    const call = findUpsertRelationshipCall(stub);
+    const { update } = splitCoalesceBranches(call.query);
+    expect(update).toContain(".property('weight', p_user_0)");
+    expect(update).toContain(".property('since', p_user_1)");
+    const weightIdx = update.indexOf(".property('weight', p_user_0)");
+    const sinceIdx = update.indexOf(".property('since', p_user_1)");
+    expect(weightIdx).toBeGreaterThan(-1);
+    expect(sinceIdx).toBeGreaterThan(weightIdx);
+
+    expect(update).not.toMatch(/\.sideEffect\(properties\('[^']+'\)\.drop\(\)\)/);
+  });
+
+  it('upsertRelationship emits the same scalar suffix on BOTH branches of the coalesce', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000b103';
+
+    await provider.importBulk(TEST_REPO, [
+      {
+        relationships: [
+          makeStoredBulkRelationship(REL_ID, { weight: 0.8, since: '2026-01-01' }),
+        ],
+      },
+    ]);
+
+    const call = findUpsertRelationshipCall(stub);
+    const { update, create } = splitCoalesceBranches(call.query);
+    const expectedSuffix = `.property('weight', p_user_0).property('since', p_user_1)`;
+    expect(update).toContain(expectedSuffix);
+    expect(create).toContain(expectedSuffix);
+  });
+
+  it('upsertRelationship drops non-storable values from the suffix; the blob ladder slot still carries them via JSON', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000b104';
+    const inputProperties = {
+      weight: 0.8,
+      nested: { a: 1 },
+      mixed: ['a', 1],
+      since: '2026-01-01',
+    };
+
+    await provider.importBulk(TEST_REPO, [
+      { relationships: [makeStoredBulkRelationship(REL_ID, inputProperties)] },
+    ]);
+
+    const call = findUpsertRelationshipCall(stub);
+    const { update, create } = splitCoalesceBranches(call.query);
+    for (const branch of [update, create]) {
+      expect(branch).toContain(".property('weight', p_user_0)");
+      expect(branch).toContain(".property('since', p_user_1)");
+      expect(branch).not.toContain(".property('nested'");
+      expect(branch).not.toContain(".property('mixed'");
+    }
+
+    const params = call.params as Record<string, unknown>;
+    expect(params['p_user_0']).toBe(0.8);
+    expect(params['p_user_1']).toBe('2026-01-01');
+    expect(params['p_user_2']).toBeUndefined();
+    // The canonical `properties` ladder binding (p4 in the relationship ladder
+    // — relationshipType/sourceEntityId/targetEntityId/bidirectional precede
+    // it) still serialises the full input blob.
+    expect(params['p4']).toBe(JSON.stringify(inputProperties));
+  });
+
+  it('upsertRelationship throws ProviderError on a reserved-key collision before any submit', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000b105';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(TEST_REPO, [
+      {
+        relationships: [
+          makeStoredBulkRelationship(REL_ID, { relationshipType: 'X' }),
+        ],
+      },
+    ]);
+    const after = stub.calls.length;
+
+    const upsertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.includes('addE(edgeLabel)'));
+    expect(upsertCalls).toHaveLength(0);
+    expect(result.relationshipsImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
+    expect(result.errors[0]!.error).toMatch(/collides/);
+  });
+
+  it("upsertRelationship throws ProviderError on the Gremlin 'label' token collision (edge-label slot)", async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000b106';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(TEST_REPO, [
+      {
+        relationships: [
+          makeStoredBulkRelationship(REL_ID, { label: 'X' }),
+        ],
+      },
+    ]);
+    const after = stub.calls.length;
+
+    const upsertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.includes('addE(edgeLabel)'));
+    expect(upsertCalls).toHaveLength(0);
+    expect(result.relationshipsImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
+    expect(result.errors[0]!.error).toMatch(/collides/);
+  });
+
+  it('upsertRelationship throws ProviderError on an unsafe identifier before any submit', async () => {
+    const { provider, stub } = makeProvider();
+    const REL_ID = '40000000-0000-4000-a000-00000000b107';
+
+    const before = stub.calls.length;
+    const result = await provider.importBulk(TEST_REPO, [
+      {
+        relationships: [
+          makeStoredBulkRelationship(REL_ID, { 'has-dash': 'X' }),
+        ],
+      },
+    ]);
+    const after = stub.calls.length;
+
+    const upsertCalls = stub.calls
+      .slice(before, after)
+      .filter((c) => c.query.includes('addE(edgeLabel)'));
+    expect(upsertCalls).toHaveLength(0);
+    expect(result.relationshipsImported).toBe(0);
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
+    expect(result.errors[0]!.error).toMatch(/not a valid Gremlin identifier/);
   });
 });
 

@@ -752,3 +752,23 @@ export function existingEntityScalarUserKeys(
   }
   return out;
 }
+
+/**
+ * Relationship counterpart — silently skips the Gremlin `'label'` token if it
+ * appears in an old blob (the edge-label slot is set at `addE()` and is never
+ * a writable user property; a blob carrying it predates the reserved guard or
+ * was authored against a different provider's contract).
+ */
+export function existingRelationshipScalarUserKeys(
+  blob: Record<string, unknown> | null | undefined,
+): string[] {
+  if (blob == null) return [];
+  const out: string[] = [];
+  for (const [key, value] of Object.entries(blob)) {
+    if (!USER_PROPERTY_KEY_PATTERN.test(key)) continue;
+    if (RESERVED_RELATIONSHIP_PROPERTY_KEYS.has(key)) continue;
+    if (!isNativeStorableValue(value)) continue;
+    out.push(key);
+  }
+  return out;
+}

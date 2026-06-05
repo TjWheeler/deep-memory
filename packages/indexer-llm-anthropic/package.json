@@ -60,15 +60,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.100.1"
-  },
-  "peerDependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
     "@utaba/deep-memory": "workspace:^",
     "@utaba/deep-memory-indexer": "workspace:^"
   },
   "devDependencies": {
-    "@utaba/deep-memory": "workspace:*",
-    "@utaba/deep-memory-indexer": "workspace:*",
     "@types/node": "^22.0.0",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",

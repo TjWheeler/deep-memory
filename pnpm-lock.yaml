@@ -36,7 +36,7 @@ importers:
   packages/embeddings-openai:
     dependencies:
       '@utaba/deep-memory':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
     devDependencies:
       '@types/node':
@@ -76,16 +76,16 @@ importers:
       '@anthropic-ai/sdk':
         specifier: ^0.100.1
         version: 0.100.1(zod@4.4.3)
+      '@utaba/deep-memory':
+        specifier: workspace:^
+        version: link:../core
+      '@utaba/deep-memory-indexer':
+        specifier: workspace:^
+        version: link:../indexer
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
         version: 22.19.19
-      '@utaba/deep-memory':
-        specifier: workspace:*
-        version: link:../core
-      '@utaba/deep-memory-indexer':
-        specifier: workspace:*
-        version: link:../indexer
       tsup:
         specifier: ^8.5.1
         version: 8.5.1(postcss@8.5.15)(typescript@6.0.3)
@@ -167,7 +167,7 @@ importers:
   packages/storage-cosmosdb:
     dependencies:
       '@utaba/deep-memory':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
       bufferutil:
         specifier: ^4.0.8
@@ -192,7 +192,7 @@ importers:
   packages/storage-neo4j:
     dependencies:
       '@utaba/deep-memory':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
       neo4j-driver:
         specifier: ^6.0.1
@@ -214,7 +214,7 @@ importers:
   packages/storage-sqlserver:
     dependencies:
       '@utaba/deep-memory':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
       mssql:
         specifier: ^12.5.5

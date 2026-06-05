@@ -8,6 +8,7 @@
       "@utaba/deep-memory-embeddings-openai",
       "@utaba/deep-memory-storage-cosmosdb",
       "@utaba/deep-memory-storage-sqlserver",
+      "@utaba/deep-memory-storage-neo4j",
       "@utaba/deep-memory-local-mcp-server"
     ]
   ],

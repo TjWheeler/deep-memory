@@ -1,15 +1,9 @@
-# @utaba/deep-memory-indexer
+# @utaba/deep-memory-storage-neo4j
 
-## 0.19.1
+## 0.20.0
 
 ### Patch Changes
 
 - Updated dependencies [58be448]
 - Updated dependencies [e4d470f]
   - @utaba/deep-memory@0.20.0
-
-## 0.16.1
-
-### Patch Changes
-
-- @utaba/deep-memory@1.0.0

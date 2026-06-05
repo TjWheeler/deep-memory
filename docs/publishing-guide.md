@@ -97,20 +97,31 @@ List any one of the five fixed-group packages in the frontmatter — the others 
 
 ### 2. Merge to `main`
 
-After merge, the `release.yml` GitHub Actions workflow runs and either:
+Land the PR into `main` normally. **There is no release automation** — versioning and publishing both happen locally from `main`.
 
-- **Opens (or updates) a "Version PR"** titled `chore: version packages`, which applies all pending changesets — bumping `package.json` versions and writing entries to each affected package's `CHANGELOG.md`.
-- **Does nothing**, if there are no pending changesets.
+> **No GitHub Action runs the version step.** A `release.yml` workflow existed previously but was removed: the Changesets action repeatedly forced the fixed group from `0.x` to `1.0.0`, because pre-1.0 the action treats accumulated `minor`s as a major-cut signal. Until the project is genuinely ready for `1.0`, the version step is run by hand. Do not reintroduce the action without a documented fix for that behaviour.
 
-This Version PR is the staging point for the next release. Review the diff to confirm the version bumps and changelog text look right.
+### 3. Apply pending changesets locally
 
-### 3. Merge the Version PR
+On a clean checkout of `main`:
 
-Once you're happy, merge the Version PR into `main`. The changesets are consumed (deleted) and the new versions are committed.
+```bash
+pnpm changeset version
+```
 
-### 4. Publish locally
+This applies every `.changeset/*.md` file: bumps `package.json` versions across the fixed group, writes entries into each affected package's `CHANGELOG.md`, and deletes the consumed `.md` files. Run `pnpm install` afterwards if `pnpm-lock.yaml` did not auto-update.
 
-From the repo root, on a clean checkout of `main` at the merged Version PR:
+Review the diff to confirm the version bumps and changelog text look right, then commit:
+
+```bash
+git add -A
+git commit -m "chore: version packages <new-version>"
+git push origin master
+```
+
+### 4. Publish
+
+From the repo root, still on `main` at the version-bump commit:
 
 ```bash
 pnpm release --dry-run    # preview what would be published
@@ -175,6 +186,6 @@ For an urgent fix to an already-released version:
 1. Branch from the tag of the affected release (not `development`).
 2. Apply the fix.
 3. Run `pnpm changeset` and pick `patch`.
-4. PR back into `main`. Merge the resulting Version PR. Publish locally.
+4. PR back into `main`. After merge, run `pnpm changeset version` locally, commit the bump, then `pnpm release`.
 
 The fixed-group config means all six packages bump to the same patch version even if only one was touched. This is intentional and preserves the "install any combination at the same version" guarantee.

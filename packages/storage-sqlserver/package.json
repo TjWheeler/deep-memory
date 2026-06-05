@@ -58,14 +58,14 @@
   },
   "dependencies": {
     "@utaba/deep-memory": "workspace:*",
-    "mssql": "^12.5.4"
+    "mssql": "^12.5.5"
   },
   "devDependencies": {
     "@types/mssql": "^12.3.0",
     "@types/node": "^22.0.0",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.2"
+    "vitest": "^4.1.8"
   },
   "peerDependencies": {
     "@utaba/deep-memory": "workspace:^"

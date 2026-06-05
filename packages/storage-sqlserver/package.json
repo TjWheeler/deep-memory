@@ -57,7 +57,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@utaba/deep-memory": "workspace:*",
+    "@utaba/deep-memory": "workspace:^",
     "mssql": "^12.5.5"
   },
   "devDependencies": {
@@ -66,8 +66,5 @@
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
     "vitest": "^4.1.8"
-  },
-  "peerDependencies": {
-    "@utaba/deep-memory": "workspace:^"
   }
 }

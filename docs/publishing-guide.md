@@ -99,7 +99,7 @@ List any one of the five fixed-group packages in the frontmatter — the others 
 
 Land the PR into `main` normally. **There is no release automation** — versioning and publishing both happen locally from `main`.
 
-> **No GitHub Action runs the version step.** A `release.yml` workflow existed previously but was removed: the Changesets action repeatedly forced the fixed group from `0.x` to `1.0.0`, because pre-1.0 the action treats accumulated `minor`s as a major-cut signal. Until the project is genuinely ready for `1.0`, the version step is run by hand. Do not reintroduce the action without a documented fix for that behaviour.
+> **No GitHub Action runs the version step.** A `release.yml` workflow existed previously but was removed because it repeatedly opened Version PRs that jumped the fixed group from `0.x` to `1.0.0`. Root cause: every storage / embeddings / indexer package declared `@utaba/deep-memory` as a `peerDependency` with `workspace:^`. A `minor` bump of core moved the published peer-dep range out of `^0.X.0`, which Changesets [Decision 4](https://github.com/changesets/changesets/blob/main/docs/decisions.md) treats as a breaking change for the package holding the peer dep — escalating it to **major**. Major in any fixed-group member propagates to the whole group → `1.0.0`. **The peer-deps have since been converted to regular `dependencies`**, so the escalation no longer fires. The action could be reintroduced now, but the manual flow is preserved for the per-release review checkpoint. **Never reintroduce a workspace-internal `peerDependencies` entry** — it will silently bring back the 1.0.0 bug.
 
 ### 3. Apply pending changesets locally
 

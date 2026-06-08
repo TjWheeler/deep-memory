@@ -59,10 +59,10 @@
   },
   "dependencies": {
     "@utaba/deep-memory": "workspace:^",
-    "neo4j-driver": "^6.0.1"
+    "neo4j-driver": "^6.1.0"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^22.19.20",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
     "vitest": "^4.1.8"

@@ -87,7 +87,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^22.19.20",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
     "vitest": "^4.1.8"

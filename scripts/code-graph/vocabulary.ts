@@ -62,6 +62,7 @@ export const REL_IMPORTS = 'IMPORTS'; // Module -> Module|Package (import/export
 export const REL_DESCRIBES = 'DESCRIBES'; // Doc -> Package (a package README documents its package)
 export const REL_EXTENDS = 'EXTENDS'; // ErrorType -> ErrorType (subclass -> superclass)
 export const REL_THROWS = 'THROWS'; // Module -> ErrorType (a file constructs/throws that error)
+export const REL_DEFINES = 'DEFINES'; // Module -> ProviderContract|ProviderImpl|McpServer|McpTool|ErrorType (the file that declares the construct)
 
 export const vocabulary: VocabularyInput = {
   entityTypes: [
@@ -139,12 +140,13 @@ export const vocabulary: VocabularyInput = {
     {
       type: ENTITY_MODULE,
       description:
-        'A non-test source file under packages/*/src (the file-level dependency layer beneath the package graph). The label is the repo-relative path. It IMPORTS other Modules (intra-repo, resolved file-to-file) and Packages (bare workspace/external imports), so "if I change this file, which files import it?" and "which files use neo4j-driver?" are one-hop queries — finer than DEPENDS_ON_PACKAGE. It THROWS the modelled ErrorTypes it constructs. `package` is the owning npm package (a property, not a CONTAINS edge — 186 modules would drown the package neighborhood). `throwsRawError` flags a file that throws an error not in the modelled typed hierarchy (the JS builtin Error, a private error) — a lead for the typed-errors convention.',
+        'A non-test source file under packages/*/src (the file-level dependency layer beneath the package graph). The label is the repo-relative path. It IMPORTS other Modules (intra-repo, resolved file-to-file) and Packages (bare workspace/external imports), so "if I change this file, which files import it?" and "which files use neo4j-driver?" are one-hop queries — finer than DEPENDS_ON_PACKAGE. It DEFINES the architectural constructs declared in it (provider contracts/impls, the MCP server, MCP tools, error types) — the bridge from the file tier to the architectural tier (construct ←DEFINES— Module —IMPORTS→ importers). It THROWS the modelled ErrorTypes it constructs. `package` is the owning npm package (a property, not a CONTAINS edge — 186 modules would drown the package neighborhood). `throwsRawError` flags a file that throws an error not in the modelled typed hierarchy (the JS builtin Error, a private error) — a lead for the typed-errors convention. `inImportCycle` flags a file caught in a circular import (an SCC of size > 1 in the Module→Module graph) — a real defect, since the project forbids circular deps.',
       properties: [
         { name: 'filePath', type: 'string', required: true, description: 'Source file path relative to the repo root.' },
         { name: 'package', type: 'string', required: false, description: 'Owning npm package name, derived from the path.' },
         { name: 'isBarrel', type: 'boolean', required: false, description: 'True for an index.ts barrel (mostly re-exports rather than definitions).' },
         { name: 'throwsRawError', type: 'boolean', required: false, description: 'True if the file throws an error constructor that is not a modelled ErrorType (e.g. the builtin Error) — a typed-error-convention lead.' },
+        { name: 'inImportCycle', type: 'boolean', required: false, description: 'True if the file participates in a circular import (a strongly-connected component of size > 1 over Module→Module IMPORTS) — a defect, as the project forbids circular deps.' },
         { name: 'fingerprint', type: 'string', required: false, description: 'Internal content hash used for delta reconciliation.' },
       ],
     },
@@ -197,24 +199,24 @@ export const vocabulary: VocabularyInput = {
     },
     {
       type: REL_DOCUMENTS,
-      description: 'A doc documents a code construct via an explicit markdown link to its source file (strong, precise).',
+      description: 'A doc documents a code construct via an explicit markdown link to its source file (strong, precise). A link to a provider contract/impl, the MCP server, or a tool file resolves to that specific construct; a link to any other modelled `.ts` source file resolves to its Module node — so DOCUMENTS reaches the whole file tier, not just the handful of provider/tool files.',
       allowedSourceTypes: [ENTITY_DOC],
-      allowedTargetTypes: [ENTITY_PROVIDER_CONTRACT, ENTITY_PROVIDER_IMPL, ENTITY_MCP_SERVER, ENTITY_MCP_TOOL],
+      allowedTargetTypes: [ENTITY_PROVIDER_CONTRACT, ENTITY_PROVIDER_IMPL, ENTITY_MCP_SERVER, ENTITY_MCP_TOOL, ENTITY_MODULE],
     },
     {
       type: REL_MENTIONS,
-      description: 'A doc mentions a provider contract or implementation by symbol name in prose, without an explicit source link (soft, broader). Suppressed where a stronger DOCUMENTS edge to the same target already exists from that doc.',
+      description: 'A doc mentions a provider contract/implementation or an error type by symbol name in prose, without an explicit source link (soft, broader). Suppressed where a stronger DOCUMENTS edge to the same target already exists from that doc.',
       allowedSourceTypes: [ENTITY_DOC],
-      allowedTargetTypes: [ENTITY_PROVIDER_CONTRACT, ENTITY_PROVIDER_IMPL],
+      allowedTargetTypes: [ENTITY_PROVIDER_CONTRACT, ENTITY_PROVIDER_IMPL, ENTITY_ERROR_TYPE],
     },
     {
       type: REL_COVERS,
       description:
-        'A test file covers a provider implementation/contract or an MCP tool — it imports the modelled symbol (the impl/contract interface by name, or the tool by its implementing class name, e.g. FindEntitiesTool → memory_find_entities). Imports-primary: resolution is by import declaration, so non-modelled imports (vitest, helpers, types) are dropped. The `role` property separates the test\'s subject (the symbol matching the test filename, e.g. CosmosDbProvider.test.ts → CosmosDbProvider) from a fixture (a symbol merely imported as scaffolding, e.g. InMemoryStorageProvider in a tool test) — so "tests that actually target X" filters on role=subject, cutting the universal-fixture noise. A static code fact, not proof of assertion depth; the value is also in the ABSENCE of an in-edge (e.g. an McpTool no test covers).',
+        'A test file covers a provider implementation/contract, an MCP tool, or a source Module. The provider/tool edges come from the imported symbol (the impl/contract interface by name, or the tool by its implementing class name, e.g. FindEntitiesTool → memory_find_entities); the Module edge comes from resolving the test\'s relative import specifiers to their target source file — so "which of the 186 source files has no test importing it" is queryable across the whole repo, not just providers/tools. Imports-primary: resolution is by import declaration, so non-modelled symbols (vitest, types) are dropped. The `role` property separates the test\'s subject (the symbol/module whose name matches the test filename, e.g. CosmosDbProvider.test.ts → CosmosDbProvider) from a fixture (imported as scaffolding, e.g. InMemoryStorageProvider in a tool test) — so "tests that actually target X" filters on role=subject, cutting the universal-fixture noise. A static code fact, not proof of assertion depth; the value is also in the ABSENCE of an in-edge (an McpTool or Module no test covers).',
       allowedSourceTypes: [ENTITY_TEST],
-      allowedTargetTypes: [ENTITY_PROVIDER_IMPL, ENTITY_PROVIDER_CONTRACT, ENTITY_MCP_TOOL],
+      allowedTargetTypes: [ENTITY_PROVIDER_IMPL, ENTITY_PROVIDER_CONTRACT, ENTITY_MCP_TOOL, ENTITY_MODULE],
       properties: [
-        { name: 'role', type: 'string', required: false, description: 'subject (the symbol matches the test filename — the unit under test) | fixture (imported as scaffolding).' },
+        { name: 'role', type: 'string', required: false, description: 'subject (the symbol/module name matches the test filename — the unit under test) | fixture (imported as scaffolding).' },
         { name: 'disc', type: 'string', required: false, description: 'Internal discriminator (sorted property digest) for delta reconciliation.' },
       ],
     },
@@ -242,6 +244,13 @@ export const vocabulary: VocabularyInput = {
       description: 'A source file constructs and throws an error type (Module → ErrorType, from a `throw new XError(...)` site). Answers "which files throw this error?" / "what can this file throw?". Throws of an unmodelled error (the builtin Error, a private error) are not edges — they set the source Module\'s `throwsRawError` flag instead.',
       allowedSourceTypes: [ENTITY_MODULE],
       allowedTargetTypes: [ENTITY_ERROR_TYPE],
+    },
+    {
+      type: REL_DEFINES,
+      description:
+        'The source file that declares an architectural construct (Module → ProviderContract | ProviderImpl | McpServer | McpTool | ErrorType). The bridge from the file tier to the architectural tier: a construct has exactly one defining Module, and that Module\'s IMPORTS in-edges are the construct\'s file-level blast radius (construct ←DEFINES— Module —IMPORTS→ importers). One file can define many constructs (errors.ts defines all 24 ErrorTypes), so a Module may have many DEFINES out-edges. The inverse of CONTAINS-at-the-file-level, but precise: CONTAINS anchors a construct to its package, DEFINES to its exact file.',
+      allowedSourceTypes: [ENTITY_MODULE],
+      allowedTargetTypes: [ENTITY_PROVIDER_CONTRACT, ENTITY_PROVIDER_IMPL, ENTITY_MCP_SERVER, ENTITY_MCP_TOOL, ENTITY_ERROR_TYPE],
     },
   ],
 };

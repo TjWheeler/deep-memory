@@ -20,7 +20,7 @@ Minimal reference for **querying** the optional deep-memory code graph. For what
 | `McpServer` | `kind`, `toolPrefix` |
 | `McpTool` | `domain`, `mutates` |
 | `Doc` / `Test` | `filePath` |
-| `Module` | `filePath`, `package`, `isBarrel`, `throwsRawError` |
+| `Module` | `filePath`, `package`, `isBarrel`, `throwsRawError`, `inImportCycle` |
 | `ErrorType` | `filePath`, `package`, `extendsBuiltin` |
 
 ```
@@ -28,14 +28,17 @@ Package      ─DEPENDS_ON_PACKAGE→ Package        (edge prop depType: depende
 ProviderImpl ─IMPLEMENTS→         ProviderContract (edge prop detection: nominal|structural)
 Package      ─CONTAINS→           ProviderContract | ProviderImpl | McpServer | ErrorType
 McpServer    ─ADVERTISES→         McpTool
-Doc          ─DOCUMENTS→          ProviderContract | ProviderImpl | McpServer | McpTool
-Doc          ─MENTIONS→           ProviderContract | ProviderImpl
+Module       ─DEFINES→            ProviderContract | ProviderImpl | McpServer | McpTool | ErrorType  (the file declaring the construct)
+Doc          ─DOCUMENTS→          ProviderContract | ProviderImpl | McpServer | McpTool | Module  (link to a provider/tool file → construct; any other .ts → Module)
+Doc          ─MENTIONS→           ProviderContract | ProviderImpl | ErrorType
 Doc          ─DESCRIBES→          Package          (package README → its package)
-Test         ─COVERS→             ProviderImpl | ProviderContract | McpTool   (edge prop role: subject|fixture)
+Test         ─COVERS→             ProviderImpl | ProviderContract | McpTool | Module  (edge prop role: subject|fixture; Module from a resolved relative import)
 Module       ─IMPORTS→            Module | Package  (file-level: imports another file, or a package)
 Module       ─THROWS→             ErrorType        (a `throw new XError()` site)
 ErrorType    ─EXTENDS→            ErrorType        (subclass → superclass; catchability chain)
 ```
+
+`Module.inImportCycle = true` ⟺ the file is in a circular import (SCC of size > 1 over `IMPORTS`) — a defect; the project forbids circular deps.
 
 ## Recipes (question → call)
 
@@ -49,6 +52,11 @@ ErrorType    ─EXTENDS→            ErrorType        (subclass → superclass;
 | List everything of a type | `memory_query_graph({ start: { entityType: "McpTool" }, limit: 50 })` |
 | Distinct values of a property | `memory_query_graph({ start: { entityType: "McpTool" }, projection: { properties: ["domain"], distinct: true }, limit: 200 })` |
 | Filter by a node property (native) | `memory_query_graph({ start: { entityType: "McpTool", filter: [{ key: "mutates", operator: "eq", value: true }] }, limit: 50 })` |
+| Which file defines a construct | `memory_explore_neighborhood({ entityId: "ProviderContract:storageprovider", direction: "in", relationshipTypes: ["DEFINES"] })` (one Module) |
+| What does a file define | `memory_explore_neighborhood({ entityId: "Module:packages-core-src-core-errors-ts", direction: "out", relationshipTypes: ["DEFINES"] })` (errors.ts → all 24 ErrorTypes) |
+| Construct's file-level blast radius (who imports its defining file) | `memory_query_graph({ start: { entityId: "ProviderContract:storageprovider" }, steps: [{ direction: "in", relationshipTypes: ["DEFINES"] }, { direction: "in", relationshipTypes: ["IMPORTS"] }] })` |
+| Files in an import cycle (a defect) | `memory_query_graph({ start: { entityType: "Module", filter: [{ key: "inImportCycle", operator: "eq", value: true }] }, limit: 50 })` |
+| Source files with no covering test | see the untested-modules Cypher below (a `NOT (m)<-[:COVERS]-(:Test)` scan) |
 | File blast radius: who imports this file | `memory_explore_neighborhood({ entityId: "Module:packages-core-src-providers-storageprovider-ts", direction: "in", relationshipTypes: ["IMPORTS"] })` |
 | Which files import a package (incl. external) | `memory_explore_neighborhood({ entityId: "Package:neo4j-driver", direction: "in", relationshipTypes: ["IMPORTS"] })` |
 | What can this file throw | `memory_explore_neighborhood({ entityId: "Module:…", direction: "out", relationshipTypes: ["THROWS"] })` |
@@ -81,4 +89,15 @@ WHERE NOT (t)<-[:COVERS]-() RETURN t.label ORDER BY t.label;
 // file blast radius — most-imported source files
 MATCH (m:_Entity {repositoryId:$rid, entityType:'Module'})<-[:IMPORTS]-(d:_Entity {entityType:'Module'})
 RETURN m.label, count(DISTINCT d) AS importers ORDER BY importers DESC LIMIT 10;
+
+// import cycles — every file flagged by Tarjan's SCC (expect 0 rows; a defect if any)
+MATCH (m:_Entity {repositoryId:$rid, entityType:'Module', inImportCycle:true}) RETURN m.label;
+
+// whole-repo test-coverage gap — source files no test imports (Test→Module COVERS in-edge absent)
+MATCH (m:_Entity {repositoryId:$rid, entityType:'Module'})
+WHERE NOT (m)<-[:COVERS]-(:_Entity {entityType:'Test'}) RETURN m.label ORDER BY m.label;
+
+// DEFINES bridge — every construct's defining file (file tier ↔ architectural tier)
+MATCH (m:_Entity {repositoryId:$rid, entityType:'Module'})-[:DEFINES]->(c:_Entity)
+RETURN c.entityType, c.label, m.label ORDER BY c.entityType, c.label;
 ```

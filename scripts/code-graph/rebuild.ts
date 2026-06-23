@@ -5,11 +5,19 @@
  * deterministically (no LLM, NO embeddings — zero API cost) and writes:
  *     (Package)-[:DEPENDS_ON_PACKAGE]->(Package)       from each package.json
  *     (ProviderImpl)-[:IMPLEMENTS]->(ProviderContract)  from `implements *Provider` clauses
- *     (Package)-[:CONTAINS]->(ProviderContract|ProviderImpl|McpServer)
+ *     (Package)-[:CONTAINS]->(ProviderContract|ProviderImpl|McpServer|ErrorType)
  *     (McpServer)-[:ADVERTISES]->(McpTool)              from each tool's `get name()` literal
- *     (Doc)-[:DOCUMENTS]->(code)                        markdown links to source files
- *     (Doc)-[:MENTIONS]->(ProviderContract|ProviderImpl) symbol names in prose
- *     (Test)-[:COVERS]->(ProviderImpl|ProviderContract) co-located test imports
+ *     (Module)-[:DEFINES]->(construct)                  the file that declares each construct
+ *     (Module)-[:IMPORTS]->(Module|Package)             per-file import/export specifiers
+ *     (Module)-[:THROWS]->(ErrorType)                   `throw new XError()` sites
+ *     (ErrorType)-[:EXTENDS]->(ErrorType)               the catchability chain
+ *     (Doc)-[:DOCUMENTS]->(construct|Module)            markdown links to source files
+ *     (Doc)-[:MENTIONS]->(ProviderContract|ProviderImpl|ErrorType) symbol names in prose
+ *     (Doc)-[:DESCRIBES]->(Package)                     a package README → its package
+ *     (Test)-[:COVERS]->(ProviderImpl|ProviderContract|McpTool|Module) test imports
+ *
+ * Import cycles are detected by Tarjan's SCC over the Module→Module graph (Module.inImportCycle);
+ * the project forbids circular deps, so any cycle is a real defect.
  *
  * Delta-write via desired-state reconciliation (NOT git-diff): re-extract the full desired
  * graph, read current state from Neo4j, diff (create/update/delete/skip), apply only the
@@ -47,6 +55,7 @@ import { extractDocs } from './extract-docs';
 import { extractTests } from './extract-tests';
 import { extractModules } from './extract-modules';
 import { extractErrors } from './extract-errors';
+import { stronglyConnectedComponents } from './scc';
 import {
   REPOSITORY_ID,
   REPOSITORY_LABEL,
@@ -73,6 +82,7 @@ import {
   REL_DESCRIBES,
   REL_EXTENDS,
   REL_THROWS,
+  REL_DEFINES,
 } from './vocabulary';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -398,11 +408,34 @@ async function main(): Promise<void> {
     if (owner) addEdge(REL_CONTAINS, owner, id);
   }
 
-  // Repo-relative source path -> entity id, for Doc DOCUMENTS links (any modelled file-backed node).
+  // Repo-relative source path -> entity id, for Doc DOCUMENTS links. Single-valued: the most
+  // specific construct backing a file (a provider/server/tool file). Module nodes are added as a
+  // fallback later (so a link to any other .ts source file still resolves — de-sparsifies DOCUMENTS).
   const sourceEntityIdByFilePath = new Map<string, string>();
-  for (const c of contracts) sourceEntityIdByFilePath.set(c.filePath, contractIdByName.get(c.name)!);
-  for (const im of impls) sourceEntityIdByFilePath.set(im.filePath, implIdByClassName.get(im.className)!);
-  for (const s of MCP_SERVERS) sourceEntityIdByFilePath.set(s.filePath, serverIdByKind.get(s.kind)!);
+  // Repo-relative source path -> ALL architectural constructs declared in that file (multi-valued:
+  // errors.ts declares all 24 ErrorTypes, so a single-valued map would bridge only one). Drives the
+  // Module ─DEFINES→ construct edges — the file tier → architectural tier bridge.
+  const definesTargetsByFilePath = new Map<string, string[]>();
+  const addDefinesTarget = (filePath: string, id: string): void => {
+    const list = definesTargetsByFilePath.get(filePath);
+    if (list) list.push(id);
+    else definesTargetsByFilePath.set(filePath, [id]);
+  };
+  for (const c of contracts) {
+    const id = contractIdByName.get(c.name)!;
+    sourceEntityIdByFilePath.set(c.filePath, id);
+    addDefinesTarget(c.filePath, id);
+  }
+  for (const im of impls) {
+    const id = implIdByClassName.get(im.className)!;
+    sourceEntityIdByFilePath.set(im.filePath, id);
+    addDefinesTarget(im.filePath, id);
+  }
+  for (const s of MCP_SERVERS) {
+    const id = serverIdByKind.get(s.kind)!;
+    sourceEntityIdByFilePath.set(s.filePath, id);
+    addDefinesTarget(s.filePath, id);
+  }
 
   // Tool implementing-class name -> tool id, for Test COVERS (a tool test imports the tool class).
   const toolIdByClassName = new Map<string, string>();
@@ -413,6 +446,7 @@ async function main(): Promise<void> {
       [ENTITY_MCP_TOOL, t.wireName, t.domain, String(t.mutates), t.className, t.filePath].join(''),
     );
     sourceEntityIdByFilePath.set(t.filePath, toolId);
+    addDefinesTarget(t.filePath, toolId);
     if (t.className) toolIdByClassName.set(t.className, toolId);
     const serverId = serverIdByKind.get(t.server);
     if (serverId) addEdge(REL_ADVERTISES, serverId, toolId);
@@ -430,53 +464,9 @@ async function main(): Promise<void> {
     if (id) packageIdByReadme.set(`${p.dir}${path.sep}README.md`, id);
   }
 
-  // ── Docs ─────────────────────────────────────────────────────────────────
-  for (const d of docs) {
-    const docId = ensureEntity(
-      `doc:${d.filePath}`,
-      () => ({ entityType: ENTITY_DOC, label: d.title, properties: { filePath: d.filePath } }),
-      [ENTITY_DOC, d.title, d.filePath].join(''),
-    );
-    // A package README describes its package — the strong doc↔package link DOCUMENTS can't give.
-    const describedPackageId = packageIdByReadme.get(d.filePath) ?? packageIdByReadme.get(d.filePath.split('/').join(path.sep));
-    if (describedPackageId) addEdge(REL_DESCRIBES, docId, describedPackageId);
-    const documentedTargets = new Set<string>();
-    for (const linked of d.linkedPaths) {
-      const targetId = sourceEntityIdByFilePath.get(linked);
-      if (!targetId) continue; // links to non-modelled files are dropped
-      addEdge(REL_DOCUMENTS, docId, targetId);
-      documentedTargets.add(targetId);
-    }
-    for (const sym of d.mentionedSymbols) {
-      const targetId = contractOrImplIdByLabel.get(sym);
-      if (!targetId || documentedTargets.has(targetId)) continue; // suppressed where DOCUMENTS already links
-      addEdge(REL_MENTIONS, docId, targetId);
-    }
-  }
-
-  // ── Tests ──────────────────────────────────────────────────────────────────
-  const uncoveredTests: string[] = [];
-  for (const t of tests) {
-    const testId = ensureEntity(
-      `test:${t.filePath}`,
-      () => ({ entityType: ENTITY_TEST, label: t.filePath, properties: { filePath: t.filePath } }),
-      [ENTITY_TEST, t.filePath].join(''),
-    );
-    // The symbol matching the filename is the unit under test (subject); the rest are fixtures.
-    const subject = path.basename(t.filePath).replace(/\.(test|spec)\.ts$/, '');
-    let covered = 0;
-    for (const sym of t.importedSymbols) {
-      // A test covers a provider contract/impl (imported by interface/class name) or an MCP tool
-      // (imported by its implementing class name, e.g. FindEntitiesTool → memory_find_entities).
-      const targetId = contractOrImplIdByLabel.get(sym) ?? toolIdByClassName.get(sym);
-      if (!targetId) continue; // non-modelled import — dropped, like DOCUMENTS
-      addEdge(REL_COVERS, testId, targetId, { role: sym === subject ? 'subject' : 'fixture' });
-      covered++;
-    }
-    if (covered === 0) uncoveredTests.push(t.filePath);
-  }
-
   // ── Error types + the catchability hierarchy ─────────────────────────────────
+  // (Before modules + docs/tests: errors must exist so a module can DEFINE one, a doc can MENTION
+  //  one by name, and a module's throw can resolve to one or set throwsRawError.)
   const errorIdByClassName = new Map<string, string>();
   for (const e of errorTypes) {
     const pkg = ownerPackageName(e.filePath);
@@ -486,6 +476,7 @@ async function main(): Promise<void> {
       [ENTITY_ERROR_TYPE, e.className, e.filePath, pkg ?? '', String(e.extendsBuiltin)].join(''),
     );
     errorIdByClassName.set(e.className, id);
+    addDefinesTarget(e.filePath, id);
     const owner = ownerPackageId(e.filePath);
     if (owner) addEdge(REL_CONTAINS, owner, id);
   }
@@ -497,19 +488,37 @@ async function main(): Promise<void> {
   }
 
   // ── Modules + the file-level import graph ────────────────────────────────────
-  // Pass 1: create every module node (and its THROWS edges); collect ids for intra-repo resolution.
+  // Import cycles: strongly-connected components over the resolved Module→Module import graph. The
+  // project forbids circular deps, so any SCC of size > 1 is a real defect; flag every module in one
+  // (inImportCycle) and report the cycles below. Computed before node creation so the flag — which
+  // feeds the fingerprint — is known when each Module node is built.
+  const knownModulePaths = new Set(modules.map((m) => m.filePath));
+  const moduleImportAdjacency = new Map<string, string[]>();
+  for (const m of modules) {
+    moduleImportAdjacency.set(m.filePath, m.importsModules.filter((target) => knownModulePaths.has(target)));
+  }
+  const importComponents = stronglyConnectedComponents([...knownModulePaths].sort(), moduleImportAdjacency);
+  const importCycles = importComponents.filter((component) => component.length > 1);
+  const cyclicModulePaths = new Set(importCycles.flat());
+
+  // Pass 1: create every module node (THROWS + DEFINES edges); collect ids for intra-repo resolution.
   const moduleIdByFilePath = new Map<string, string>();
   const rawErrorModules: string[] = [];
   for (const m of modules) {
     const pkg = ownerPackageName(m.filePath);
     const throwsRawError = m.throwsErrorCtors.some((ctor) => !errorIdByClassName.has(ctor));
+    const inImportCycle = cyclicModulePaths.has(m.filePath);
     const id = ensureEntity(
       `module:${m.filePath}`,
-      () => ({ entityType: ENTITY_MODULE, label: m.filePath, properties: { filePath: m.filePath, ...(pkg ? { package: pkg } : {}), isBarrel: m.isBarrel, throwsRawError } }),
-      [ENTITY_MODULE, m.filePath, pkg ?? '', String(m.isBarrel), String(throwsRawError)].join(''),
+      () => ({ entityType: ENTITY_MODULE, label: m.filePath, properties: { filePath: m.filePath, ...(pkg ? { package: pkg } : {}), isBarrel: m.isBarrel, throwsRawError, inImportCycle } }),
+      [ENTITY_MODULE, m.filePath, pkg ?? '', String(m.isBarrel), String(throwsRawError), String(inImportCycle)].join(''),
     );
     moduleIdByFilePath.set(m.filePath, id);
     if (throwsRawError) rawErrorModules.push(m.filePath);
+    // File tier → architectural tier bridge: this Module DEFINES every construct declared in it.
+    for (const targetId of definesTargetsByFilePath.get(m.filePath) ?? []) addEdge(REL_DEFINES, id, targetId);
+    // De-sparsify DOCUMENTS: a doc link to a .ts file with no more-specific construct resolves here.
+    if (!sourceEntityIdByFilePath.has(m.filePath)) sourceEntityIdByFilePath.set(m.filePath, id);
     for (const ctor of m.throwsErrorCtors) {
       const errorId = errorIdByClassName.get(ctor);
       if (errorId) addEdge(REL_THROWS, id, errorId);
@@ -528,6 +537,65 @@ async function main(): Promise<void> {
     }
   }
 
+  // ── Docs ─────────────────────────────────────────────────────────────────
+  // (After modules: a doc link to any .ts source file can now resolve to its Module node, and a
+  //  prose mention can resolve to an error class — not just the handful of provider/tool files.)
+  for (const d of docs) {
+    const docId = ensureEntity(
+      `doc:${d.filePath}`,
+      () => ({ entityType: ENTITY_DOC, label: d.title, properties: { filePath: d.filePath } }),
+      [ENTITY_DOC, d.title, d.filePath].join(''),
+    );
+    // A package README describes its package — the strong doc↔package link DOCUMENTS can't give.
+    const describedPackageId = packageIdByReadme.get(d.filePath) ?? packageIdByReadme.get(d.filePath.split('/').join(path.sep));
+    if (describedPackageId) addEdge(REL_DESCRIBES, docId, describedPackageId);
+    const documentedTargets = new Set<string>();
+    for (const linked of d.linkedPaths) {
+      const targetId = sourceEntityIdByFilePath.get(linked);
+      if (!targetId) continue; // links to non-modelled files are dropped
+      addEdge(REL_DOCUMENTS, docId, targetId);
+      documentedTargets.add(targetId);
+    }
+    for (const sym of d.mentionedSymbols) {
+      // A symbol in prose resolves to a provider contract/impl, or an error class by name.
+      const targetId = contractOrImplIdByLabel.get(sym) ?? errorIdByClassName.get(sym);
+      if (!targetId || documentedTargets.has(targetId)) continue; // suppressed where DOCUMENTS already links
+      addEdge(REL_MENTIONS, docId, targetId);
+    }
+  }
+
+  // ── Tests ──────────────────────────────────────────────────────────────────
+  // (After modules: a test's resolved relative imports become Test → Module COVERS edges, so the
+  //  coverage-gap query reaches every source file, not just providers/tools.)
+  const uncoveredTests: string[] = [];
+  for (const t of tests) {
+    const testId = ensureEntity(
+      `test:${t.filePath}`,
+      () => ({ entityType: ENTITY_TEST, label: t.filePath, properties: { filePath: t.filePath } }),
+      [ENTITY_TEST, t.filePath].join(''),
+    );
+    // The symbol/module matching the filename is the unit under test (subject); the rest are fixtures.
+    const subject = path.basename(t.filePath).replace(/\.(test|spec)\.ts$/, '');
+    let covered = 0;
+    for (const sym of t.importedSymbols) {
+      // A test covers a provider contract/impl (imported by interface/class name) or an MCP tool
+      // (imported by its implementing class name, e.g. FindEntitiesTool → memory_find_entities).
+      const targetId = contractOrImplIdByLabel.get(sym) ?? toolIdByClassName.get(sym);
+      if (!targetId) continue; // non-modelled import — dropped, like DOCUMENTS
+      addEdge(REL_COVERS, testId, targetId, { role: sym === subject ? 'subject' : 'fixture' });
+      covered++;
+    }
+    // Test → Module: the source files this test imports (whole-repo coverage gap, not just providers).
+    for (const target of t.importsModules) {
+      const moduleId = moduleIdByFilePath.get(target);
+      if (!moduleId) continue; // unresolved / non-module import — dropped
+      const moduleName = path.basename(target).replace(/\.ts$/, '');
+      addEdge(REL_COVERS, testId, moduleId, { role: moduleName === subject ? 'subject' : 'fixture' });
+      covered++;
+    }
+    if (covered === 0) uncoveredTests.push(t.filePath);
+  }
+
   if (unresolvedImplContracts.length) {
     console.warn(`[code-graph] ${unresolvedImplContracts.length} impl→contract refs unresolved (contract not found as an exported *Provider interface):`);
     for (const u of unresolvedImplContracts) console.warn(`  ${u}`);
@@ -537,10 +605,17 @@ async function main(): Promise<void> {
     for (const s of structuralImpls) console.log(`  ${s}`);
   }
   if (uncoveredTests.length) {
-    console.log(`[code-graph] ${uncoveredTests.length} test files import no modelled symbol (expected for non-provider, non-tool tests).`);
+    console.log(`[code-graph] ${uncoveredTests.length} test files cover no modelled symbol or source module (helpers/integration scaffolding).`);
   }
   if (rawErrorModules.length) {
     console.log(`[code-graph] ${rawErrorModules.length} modules throw an error outside the modelled typed hierarchy (Module.throwsRawError=true) — leads for the typed-errors convention.`);
+  }
+  // Import cycles — the project forbids circular deps, so any cycle is a real defect to fix.
+  if (importCycles.length) {
+    console.warn(`[code-graph] ${importCycles.length} import cycle(s) detected (${cyclicModulePaths.size} modules in a cycle) — the project forbids circular deps:`);
+    for (const cycle of importCycles) console.warn(`  ${cycle.join(' → ')} → ${cycle[0]}`);
+  } else {
+    console.log('[code-graph] import cycles: none (the Module→Module import graph is acyclic)');
   }
 
   // Build provenance: the commit/branch/dirty state the graph reflects (best-effort; nulls if no git).
@@ -742,6 +817,33 @@ async function main(): Promise<void> {
       { rid: REPOSITORY_ID },
     )) as Array<{ files: number }>;
     if (rawErrors[0]) console.log(`[code-graph] modules throwing a non-modelled error (typed-errors lead): ${rawErrors[0].files}`);
+
+    // Import cycles — modules flagged inImportCycle (an SCC of size > 1). Should be 0; the offending
+    // cycles themselves are logged above. The query is the queryable face of the in-memory analysis.
+    const cyclicModuleCount = (await repo.executeNativeQuery(
+      `MATCH (m:_Entity {repositoryId: $rid, entityType: 'Module', inImportCycle: true})
+       RETURN count(m) AS files`,
+      { rid: REPOSITORY_ID },
+    )) as Array<{ files: number }>;
+    if (cyclicModuleCount[0]) console.log(`[code-graph] modules in an import cycle (inImportCycle=true): ${cyclicModuleCount[0].files}`);
+
+    // Whole-repo test-coverage gap — source files no test imports (Test→Module COVERS in-edge absent).
+    const untestedModules = (await repo.executeNativeQuery(
+      `MATCH (m:_Entity {repositoryId: $rid, entityType: 'Module'})
+       OPTIONAL MATCH (m)<-[c:COVERS]-(:_Entity {entityType: 'Test'})
+       WITH m, count(c) AS covers
+       RETURN count(m) AS total, sum(CASE WHEN covers > 0 THEN 0 ELSE 1 END) AS untested`,
+      { rid: REPOSITORY_ID },
+    )) as Array<{ total: number; untested: number }>;
+    if (untestedModules[0]) console.log(`[code-graph] source modules with no covering test: ${untestedModules[0].untested}/${untestedModules[0].total}`);
+
+    // DEFINES bridge — file tier → architectural tier (every modelled construct has one defining file).
+    const defines = (await repo.executeNativeQuery(
+      `MATCH (:_Entity {repositoryId: $rid, entityType: 'Module'})-[r:DEFINES]->(c:_Entity)
+       RETURN count(r) AS edges, count(DISTINCT c) AS constructs`,
+      { rid: REPOSITORY_ID },
+    )) as Array<{ edges: number; constructs: number }>;
+    if (defines[0]) console.log(`[code-graph] DEFINES edges: ${defines[0].edges} (${defines[0].constructs} constructs bridged to their defining file)`);
   } finally {
     await provider.dispose();
   }

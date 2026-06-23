@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Vocabulary-driven graph memory for AI agents",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -90,6 +90,6 @@
     "@types/node": "^22.0.0",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.2"
+    "vitest": "^4.1.8"
   }
 }

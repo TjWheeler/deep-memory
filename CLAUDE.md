@@ -46,6 +46,7 @@ Entry points by task:
 | Identity / dedup / labels / slugs | [docs/identity-pattern.md](docs/identity-pattern.md) |
 | Provider usage telemetry | [docs/usage-tracking.md](docs/usage-tracking.md) |
 | Write a changeset | [docs/changeset-guide.md](docs/changeset-guide.md) — **load before writing any `.changeset/*.md` file**; covers format, fixed-group bumps, and replaces git-history mining |
+| Orient / blast radius without grepping (optional) | [docs/code-graph-usage.md](docs/code-graph-usage.md) — distilled query reference for the optional local code graph (load this one to query: recipes + slugs + caveats, kept terse). [docs/code-graph.md](docs/code-graph.md) is the fuller what/why/build doc. If built (`pnpm code-graph:rebuild`, needs local Neo4j), query it via the `deep-memory` MCP server for "what implements/depends on/breaks if I change X" instead of a grep sweep. Also the worked example of using Deep Memory on a codebase. |
 
 A complete documentation index sits in [docs/README.md](docs/README.md). Treat it as a table of contents — open it when you do not know which doc covers a topic, not as a doc to read in full.
 

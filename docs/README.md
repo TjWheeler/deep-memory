@@ -41,6 +41,8 @@ pnpm --filter @utaba/deep-memory-local-mcp-server build
 - [Entity Identity Pattern](identity-pattern.md) — How label, slug, type, and GUID work together to identify entities, and how to keep deduplication correct when labels collide.
 - [Usage Tracking](usage-tracking.md) — Provider-agnostic cost/consumption telemetry. How to hook a sink on each provider for billing, rate limiting, or observability.
 - [AI Requirements](ai-requirements.md) — Design principles and requirements from the AI agent perspective.
+- [Code Graph](code-graph.md) — **Optional.** A worked example of using Deep Memory on a codebase: a script maps this repo (packages, providers, MCP tools, docs, tests, source files, and the error hierarchy) into a local graph so an AI assistant can answer "what breaks if I change this?" in one query. Not part of the build; free to run (no embeddings).
+- [Code Graph Guide](code-graph-guide.md) — **How to build a code graph for *your own* codebase.** The general method behind the example above: how to design a focused, bespoke vocabulary (not a code dump), extract it deterministically, and keep it idempotent — with starter vocabularies for web apps, microservices, and data pipelines.
 
 ### Storage & embeddings providers
 

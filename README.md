@@ -278,6 +278,14 @@ pnpm --filter @utaba/deep-memory-local-mcp-server build
 - [Source Content Conversion](docs/source-content-conversion.md) — PDF to Markdown conversion
 - [Publishing Guide](docs/publishing-guide.md) — Publishing packages to npm
 
+## Are you a software developer?
+
+Deep Memory isn't only for document knowledge — you can point it at your own codebase. By modelling a large repository as a typed graph of its real architecture (packages, provider contracts and implementations, modules, MCP tools, error hierarchies, tests, and the dependency and import edges between them), an AI agent answers *"what implements this, what depends on it, what breaks if I change it?"* with a few precise graph queries instead of grepping and reading dozens of files. That keeps the agent oriented on a codebase far larger than any context window — maximising efficiency and dramatically reducing the tokens otherwise spent rediscovering structure on every task.
+
+Because the graph is modelled against *your* specific architecture, it also surfaces issues generic tooling misses: a security-sensitive module that no test covers, a package that breaks a dependency boundary, an error that escapes its typed hierarchy, a circular import, or a structural gap where an expected implementation or relationship simply isn't there. Often the value is as much in the edges that *aren't* present as the ones that are.
+
+This repository ships a working example. See [Code Graph](docs/code-graph.md) for what it is and how to build one, and the [Code Graph How-To Guide](docs/code-graph-guide.md) for a step-by-step walkthrough of modelling a codebase.
+
 ## About Us
 
 Deep Memory is built and maintained by [Utaba](https://utaba.ai).

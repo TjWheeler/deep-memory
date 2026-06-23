@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-local-mcp-server",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Local MCP server exposing @utaba/deep-memory as tools for AI agents",
   "type": "module",
   "main": "./dist/index.js",
@@ -65,6 +65,6 @@
     "@types/node": "^22.0.0",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.2"
+    "vitest": "^4.1.8"
   }
 }

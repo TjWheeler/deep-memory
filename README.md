@@ -51,6 +51,26 @@ The core `@utaba/deep-memory` library provides a vocabulary-driven knowledge gra
 
 See [docs/README.md](docs/README.md) for detailed architecture, provider setup, and API documentation.
 
+## Visualising your graph
+
+Once you have a repository, you can **see** it. The bundled Graph Viewer renders any deep-memory
+repository as an interactive, force-directed graph — the most-connected entities appear first as
+clusters, and you pull in the rest by clicking nodes, searching, and filtering by type. It is the
+fastest way to understand the shape of a knowledge graph: what the hubs are, how things relate, and
+where the structure is dense or sparse.
+
+```bash
+pnpm serve:graph-viewer    # serves on :8137 and opens your browser
+```
+
+It reads the same provider connection you configured in `.mcp.json`, so there is nothing extra to
+set up. You can also export a **self-contained `.html`** of a graph to send to someone with no
+database (`pnpm export:graph-html`), or build a **static snapshot** from `.dkg` exports
+(`pnpm build:graph-viewer`).
+
+- **How to use it:** [Graph Viewer — Usage Guide](docs/graph-viewer.md)
+- **Modes, setup, API, flags:** [graph-viewer/README.md](graph-viewer/README.md)
+
 ## Document Indexing Pipeline
 
 Note: The Indexing Pipeline is optional.  You can use and populate a memory graph using the AI without it.  The indexing pipeline is most useful when you have documents you want to import.
@@ -260,6 +280,7 @@ pnpm --filter @utaba/deep-memory-local-mcp-server build
 - [Neo4j Storage Provider](packages/storage-neo4j/README.md) — Native graph storage backed by Neo4j Community Edition over Bolt (includes Docker Compose for local dev)
 - [Embeddings Provider (OpenAI)](packages/embeddings-openai/README.md) — OpenAI-compatible embeddings setup
 - [Local MCP Server](packages/mcp-server/README.md) — MCP server tool reference (29 tools)
+- [Graph Viewer — Usage Guide](docs/graph-viewer.md) — Exploring any repository visually (`pnpm serve:graph-viewer`); modes/API in [graph-viewer/README.md](graph-viewer/README.md)
 - [Import & Export](docs/import-export-guidance.md) — Repository portability workflows
 
 **Indexing Pipeline:**

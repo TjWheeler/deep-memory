@@ -87,10 +87,10 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^22.20.0",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vite": "^7.3.5",
-    "vitest": "^4.1.8"
+    "vite": "^7.3.6",
+    "vitest": "^4.1.9"
   }
 }

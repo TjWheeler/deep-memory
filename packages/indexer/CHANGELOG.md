@@ -1,5 +1,11 @@
 # @utaba/deep-memory-indexer
 
+## 0.19.2
+
+### Patch Changes
+
+- @utaba/deep-memory@0.20.1
+
 ## 0.19.1
 
 ### Patch Changes

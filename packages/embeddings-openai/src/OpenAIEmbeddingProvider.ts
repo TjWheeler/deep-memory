@@ -14,7 +14,17 @@ export interface OpenAIEmbeddingProviderConfig {
   /** Model identifier sent in requests (e.g. "Qwen/Qwen3-Embedding-8B") */
   model: string;
 
-  /** Dimensionality of the embedding vectors. Auto-detected on first call if omitted. */
+  /**
+   * Requested output dimensionality. When set, this is sent as the OpenAI
+   * `dimensions` request parameter — a deliberate opt-in to matryoshka output
+   * truncation. Leave undefined (the default) to let the server return its
+   * native dimension; the native size is then detected from the first response.
+   *
+   * Only set this when you actually want the server to shorten its output.
+   * Many OpenAI-compatible servers (e.g. vLLM without matryoshka support)
+   * reject the `dimensions` param outright, so it must never be sent unless
+   * the caller has opted in.
+   */
   dimensions?: number;
 
   /** API key for authenticated endpoints. Optional for local servers. */
@@ -50,7 +60,18 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private readonly _timeoutMs: number;
   private readonly _maxBatchSize: number;
   private readonly _reportUsage: UsageSink | undefined;
-  private _dimensions: number | undefined;
+
+  /**
+   * Caller-requested output size. The ONLY value ever sent on the wire as the
+   * `dimensions` request param, and only when the caller opted into truncation.
+   */
+  private readonly _requestedDimensions: number | undefined;
+
+  /**
+   * Native dimension learned from the first response. Powers dimensions() and
+   * length-consistency validation. Never sent on a request.
+   */
+  private _observedDimensions: number | undefined;
 
   constructor(config: OpenAIEmbeddingProviderConfig) {
     this._baseUrl = config.baseUrl.replace(/\/+$/, '');
@@ -58,7 +79,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this._apiKey = config.apiKey;
     this._timeoutMs = config.timeoutMs ?? 30_000;
     this._maxBatchSize = config.maxBatchSize ?? 64;
-    this._dimensions = config.dimensions;
+    this._requestedDimensions = config.dimensions;
     this._reportUsage = createSafeSink(config.reportUsage);
   }
 
@@ -132,13 +153,14 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   dimensions(): number {
-    if (this._dimensions === undefined) {
+    const known = this._requestedDimensions ?? this._observedDimensions;
+    if (known === undefined) {
       throw new ProviderError(
         'Embedding dimensions not yet known. Call embed() first or provide dimensions in config.',
         'Either set dimensions in OpenAIEmbeddingProviderConfig, or call embed() once before calling dimensions().',
       );
     }
-    return this._dimensions;
+    return known;
   }
 
   modelId(): string {
@@ -163,8 +185,11 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
       input,
       model: this._model,
     };
-    if (this._dimensions !== undefined) {
-      requestBody.dimensions = this._dimensions;
+    // Send `dimensions` only when the caller deliberately requested truncation.
+    // The native size learned from responses is never echoed back — that is a
+    // no-op that strict servers (e.g. vLLM without matryoshka) reject outright.
+    if (this._requestedDimensions !== undefined) {
+      requestBody.dimensions = this._requestedDimensions;
     }
     const body = JSON.stringify(requestBody);
 
@@ -203,8 +228,17 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   private _resolveDimensions(vector: number[]): void {
-    if (this._dimensions === undefined) {
-      this._dimensions = vector.length;
+    const expected = this._requestedDimensions ?? this._observedDimensions;
+    if (expected !== undefined && vector.length !== expected) {
+      throw new ProviderError(
+        `Embedding server returned a ${vector.length}-dimension vector but ${expected} was expected`,
+        this._requestedDimensions !== undefined
+          ? `The server ignored the requested dimensions (${this._requestedDimensions}). Remove dimensions from config, or use a model that supports output truncation.`
+          : 'The server returned inconsistent vector sizes across calls. Check that the model and endpoint are stable.',
+      );
+    }
+    if (this._observedDimensions === undefined) {
+      this._observedDimensions = vector.length;
     }
   }
 }

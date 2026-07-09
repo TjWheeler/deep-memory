@@ -1,5 +1,14 @@
 # @utaba/deep-memory-indexer-mcp-server
 
+## 0.19.2
+
+### Patch Changes
+
+- @utaba/deep-memory@0.20.1
+- @utaba/deep-memory-storage-cosmosdb@0.20.1
+- @utaba/deep-memory-storage-sqlserver@0.20.1
+- @utaba/deep-memory-indexer@0.19.2
+
 ## 0.19.1
 
 ### Patch Changes

@@ -30,6 +30,16 @@ export interface OpenAIEmbeddingProviderConfig {
   /** API key for authenticated endpoints. Optional for local servers. */
   apiKey?: string;
 
+  /**
+   * Extra HTTP headers sent on every request. Needed for endpoints that
+   * authenticate on something other than `Authorization: Bearer` — a gateway
+   * token, an `x-api-key`, or Cloudflare Access `CF-Access-Client-Id` /
+   * `CF-Access-Client-Secret`. The built-in `Content-Type` and (when `apiKey`
+   * is set) `Authorization` headers take precedence, so these cannot break the
+   * JSON contract or clobber the Bearer token — they layer alongside it.
+   */
+  headers?: Record<string, string>;
+
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
 
@@ -57,6 +67,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private readonly _baseUrl: string;
   private readonly _model: string;
   private readonly _apiKey: string | undefined;
+  private readonly _headers: Record<string, string> | undefined;
   private readonly _timeoutMs: number;
   private readonly _maxBatchSize: number;
   private readonly _reportUsage: UsageSink | undefined;
@@ -77,6 +88,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this._baseUrl = config.baseUrl.replace(/\/+$/, '');
     this._model = config.model;
     this._apiKey = config.apiKey;
+    this._headers = config.headers;
     this._timeoutMs = config.timeoutMs ?? 30_000;
     this._maxBatchSize = config.maxBatchSize ?? 64;
     this._requestedDimensions = config.dimensions;
@@ -174,9 +186,11 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private async _request(input: string[]): Promise<EmbeddingsResponse> {
     const url = `${this._baseUrl}/v1/embeddings`;
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
+    // Caller headers go on first so the built-in Content-Type and Bearer
+    // always win — custom headers add auth (e.g. Cloudflare Access) rather
+    // than being able to break the JSON contract or override the token.
+    const headers: Record<string, string> = { ...this._headers };
+    headers['Content-Type'] = 'application/json';
     if (this._apiKey) {
       headers['Authorization'] = `Bearer ${this._apiKey}`;
     }

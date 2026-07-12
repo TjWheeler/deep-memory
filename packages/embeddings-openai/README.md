@@ -31,6 +31,7 @@ const dm = new DeepMemory({
 | `baseUrl` | `string` | *required* | Base URL of the embeddings API (e.g. `http://localhost:8010`) |
 | `model` | `string` | *required* | Model identifier sent in API requests |
 | `apiKey` | `string` | `undefined` | Bearer token for authenticated endpoints. Not needed for local servers. |
+| `headers` | `Record<string, string>` | `undefined` | Extra HTTP headers sent on every request, for endpoints that authenticate on something other than `Authorization: Bearer` (a gateway token, an `x-api-key`, or Cloudflare Access `CF-Access-Client-Id`/`CF-Access-Client-Secret`). The built-in `Content-Type` and (when `apiKey` is set) `Authorization` headers take precedence and cannot be overridden. |
 | `dimensions` | `number` | auto-detected | Embedding vector dimensionality. Auto-detected on the first `embed()` call if omitted. |
 | `timeoutMs` | `number` | `30000` | Request timeout in milliseconds |
 | `maxBatchSize` | `number` | `64` | Maximum number of texts per batch request. Larger batches are automatically chunked. |

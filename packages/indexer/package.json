@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-indexer",
-  "version": "0.19.2",
+  "version": "0.19.3",
   "private": true,
   "description": "Indexing pipeline for populating @utaba/deep-memory repositories from source documents",
   "type": "module",

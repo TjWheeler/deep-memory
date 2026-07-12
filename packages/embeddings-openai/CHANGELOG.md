@@ -1,5 +1,22 @@
 # @utaba/deep-memory-embeddings-openai
 
+## 0.21.0
+
+### Minor Changes
+
+- Add a `headers` option to `OpenAIEmbeddingProvider` so it can reach endpoints that authenticate on something other than `Authorization: Bearer`.
+
+  ## Custom request headers
+
+  Endpoints behind a gateway or Cloudflare Access require extra headers (a gateway token, an `x-api-key`, or `CF-Access-Client-Id`/`CF-Access-Client-Secret`) that the provider previously had no way to send — it only ever emitted `Content-Type` plus an optional Bearer. Such endpoints returned HTTP 403, so a graph using them could not be embedded or written to at all.
+
+  - `OpenAIEmbeddingProviderConfig` gains `headers?: Record<string, string>`, sent on every embeddings request.
+  - Custom headers layer alongside the built-ins: `Content-Type` and (when `apiKey` is set) `Authorization: Bearer` always take precedence, so custom headers add authentication rather than being able to break the JSON contract or clobber the token.
+
+### Patch Changes
+
+- @utaba/deep-memory@0.21.0
+
 ## 0.20.1
 
 ### Patch Changes

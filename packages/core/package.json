@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory",
-  "version": "0.20.1",
+  "version": "0.21.0",
   "description": "Vocabulary-driven graph memory for AI agents",
   "type": "module",
   "main": "./dist/index.cjs",

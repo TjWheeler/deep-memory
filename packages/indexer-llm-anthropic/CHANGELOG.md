@@ -1,5 +1,12 @@
 # @utaba/deep-memory-indexer-llm-anthropic
 
+## 0.19.2
+
+### Patch Changes
+
+- @utaba/deep-memory@0.21.0
+- @utaba/deep-memory-indexer@0.19.3
+
 ## 0.19.1
 
 ### Patch Changes

@@ -1,5 +1,16 @@
 # @utaba/deep-memory-local-mcp-server
 
+## 0.21.1
+
+### Patch Changes
+
+- Updated dependencies
+  - @utaba/deep-memory-storage-neo4j@0.21.1
+  - @utaba/deep-memory@0.21.1
+  - @utaba/deep-memory-embeddings-openai@0.21.1
+  - @utaba/deep-memory-storage-cosmosdb@0.21.1
+  - @utaba/deep-memory-storage-sqlserver@0.21.1
+
 ## 0.21.0
 
 ### Patch Changes

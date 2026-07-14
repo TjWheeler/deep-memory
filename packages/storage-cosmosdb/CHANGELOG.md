@@ -1,5 +1,11 @@
 # @utaba/deep-memory-storage-cosmosdb
 
+## 0.21.1
+
+### Patch Changes
+
+- @utaba/deep-memory@0.21.1
+
 ## 0.21.0
 
 ### Patch Changes

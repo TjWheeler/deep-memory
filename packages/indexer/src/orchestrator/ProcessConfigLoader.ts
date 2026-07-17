@@ -88,6 +88,11 @@ export interface IndexProcessConfig {
       maxRetries?: number;
       doOcr?: boolean;
       apiKey?: string;
+      mode?: 'sync' | 'async';
+      pollIntervalMs?: number;
+      maxPollIntervalMs?: number;
+      maxTotalWaitMs?: number;
+      ocrTextYieldThreshold?: number;
     };
   };
   /** Quality thresholds for review diagnostics (optional — defaults applied if omitted) */
@@ -292,9 +297,17 @@ export async function loadProcessConfig(
     const raw = processConfig.services.docling;
     const docling: DoclingServiceConfig = {
       endpoint: raw.endpoint ?? 'http://localhost:5001',
+      // Defaults for decision-carrying settings live here so the orchestrator
+      // and the tool surface agree; the client owns only the numeric backoff
+      // defaults for values the config leaves unset.
+      mode: raw.mode ?? 'async',
+      ocrTextYieldThreshold: raw.ocrTextYieldThreshold ?? 100,
       ...(raw.timeoutMs !== undefined ? { timeoutMs: raw.timeoutMs } : {}),
       ...(raw.maxRetries !== undefined ? { maxRetries: raw.maxRetries } : {}),
       ...(raw.doOcr !== undefined ? { doOcr: raw.doOcr } : {}),
+      ...(raw.pollIntervalMs !== undefined ? { pollIntervalMs: raw.pollIntervalMs } : {}),
+      ...(raw.maxPollIntervalMs !== undefined ? { maxPollIntervalMs: raw.maxPollIntervalMs } : {}),
+      ...(raw.maxTotalWaitMs !== undefined ? { maxTotalWaitMs: raw.maxTotalWaitMs } : {}),
     };
     // Treat an empty-string apiKey (the secrets-template placeholder) as absent
     // so it does not send a blank X-Api-Key header.

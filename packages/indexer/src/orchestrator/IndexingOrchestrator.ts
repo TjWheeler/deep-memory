@@ -1,4 +1,5 @@
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, readdir, stat, unlink } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join, dirname, extname, basename } from 'node:path';
 import type { DeepMemory, ExportArchive, ImportResult } from '@utaba/deep-memory';
 import type { OrchestratorConfig, WorkerConfig } from '../types/config.js';
@@ -11,6 +12,7 @@ import { StateManager, Phase } from './StateManager.js';
 import type { PipelinePhase } from './StateManager.js';
 import { DoclingClient } from '../conversion/DoclingClient.js';
 import { convertSources, type DocumentConverterSummary } from '../conversion/DocumentConverter.js';
+import { matchesSourceFilter } from '../conversion/source-filter.js';
 import { ExtractionWorker } from '../extraction/ExtractionWorker.js';
 import type { LLMProvider } from '../providers/LLMProvider.js';
 import { DocumentAnalyzer, reassignFailedSource, estimateValidationCost } from './DocumentAnalyzer.js';
@@ -101,6 +103,31 @@ export class IndexingOrchestrator {
       if (!existingPaths.has(source.path)) {
         sourceList.sources.push(source);
       }
+    }
+
+    // Re-examine already-registered binary sources for on-disk changes. The
+    // append-if-new merge above never re-reads an existing path, so an edited
+    // binary would keep feeding its stale derived Markdown to extraction. A
+    // changed source forces reconversion; an unchanged one is left alone. Only
+    // binary (convertible) sources carry a `sourceHash` and derived files, so
+    // text sources are untouched.
+    const existingByPath = new Map(newSources.map(s => [s.path, s]));
+    for (const source of sourceList.sources) {
+      if (source.originalFormat === undefined || source.sourceHash === undefined) continue;
+      // Only re-check sources that still exist on disk in this scan.
+      if (!existingByPath.has(source.path)) continue;
+      const bytes = await readFile(source.path);
+      const currentHash = createHash('sha256').update(bytes).digest('hex');
+      if (currentHash === source.sourceHash) continue;
+
+      // Changed on disk: drop stale derived files and reset the entry so
+      // convert reprocesses it. Clearing the pointers means a failed
+      // reconversion cannot leave the previous text masquerading as current.
+      await this.deleteDerivedFiles(source);
+      source.status = 'needs-conversion';
+      source.derivedTextPath = undefined;
+      source.derivedDoclingJsonPath = undefined;
+      source.sourceHash = undefined;
     }
 
     await this.state.saveSourceList(sourceList);
@@ -194,11 +221,17 @@ export class IndexingOrchestrator {
       );
     }
 
+    // The client owns per-request transport concerns (timeout, retries, auth)
+    // and the async poll backoff; the converter loop owns the sync/async mode
+    // choice and the OCR heuristic, so those are passed to convertSources.
     const doclingClient = new DoclingClient({
       endpoint: doclingConfig.endpoint,
       ...(doclingConfig.timeoutMs !== undefined ? { timeoutMs: doclingConfig.timeoutMs } : {}),
       ...(doclingConfig.maxRetries !== undefined ? { maxRetries: doclingConfig.maxRetries } : {}),
       ...(doclingConfig.apiKey !== undefined ? { apiKey: doclingConfig.apiKey } : {}),
+      ...(doclingConfig.pollIntervalMs !== undefined ? { pollIntervalMs: doclingConfig.pollIntervalMs } : {}),
+      ...(doclingConfig.maxPollIntervalMs !== undefined ? { maxPollIntervalMs: doclingConfig.maxPollIntervalMs } : {}),
+      ...(doclingConfig.maxTotalWaitMs !== undefined ? { maxTotalWaitMs: doclingConfig.maxTotalWaitMs } : {}),
     });
 
     const sourceRoot = sourceDir ?? commonAncestorDir(needsConversion.map(s => s.path));
@@ -207,9 +240,13 @@ export class IndexingOrchestrator {
     const summary = await convertSources(
       { state: this.state, doclingClient, sourceRoot },
       {
+        mode: doclingConfig.mode ?? 'async',
         ...(sourceFilter && sourceFilter.length > 0 ? { sourceFilter } : {}),
         ...(maxItems !== undefined ? { maxItems } : {}),
         ...(doclingConfig.doOcr !== undefined ? { doOcr: doclingConfig.doOcr } : {}),
+        ...(doclingConfig.ocrTextYieldThreshold !== undefined
+          ? { ocrTextYieldThreshold: doclingConfig.ocrTextYieldThreshold }
+          : {}),
       },
     );
 
@@ -244,14 +281,11 @@ export class IndexingOrchestrator {
 
     let pendingSources = await this.state.getSourcesByStatus('pending');
 
-    // Apply sourceFilter — only process matching sources
+    // Apply sourceFilter — only process matching sources. Shares the one
+    // path-filter predicate with convert and the MCP tool surface.
     const { sourceFilter, maxItems } = this.config.extraction;
     if (sourceFilter && sourceFilter.length > 0) {
-      pendingSources = pendingSources.filter(s =>
-        sourceFilter.some(filter =>
-          s.path === filter || s.path.includes(filter),
-        ),
-      );
+      pendingSources = pendingSources.filter(s => matchesSourceFilter(s.path, sourceFilter));
     }
 
     // Apply maxItems limit
@@ -986,6 +1020,22 @@ export class IndexingOrchestrator {
       } catch {
         // Domain guidance is optional
         this.domainGuidance = null;
+      }
+    }
+  }
+
+  /**
+   * Delete a source's derived Markdown + structural JSON, if present. Used to
+   * invalidate stale conversion output when a source changes on disk.
+   * Best-effort — a missing file is not an error.
+   */
+  private async deleteDerivedFiles(source: IndexSource): Promise<void> {
+    for (const path of [source.derivedTextPath, source.derivedDoclingJsonPath]) {
+      if (!path) continue;
+      try {
+        await unlink(path);
+      } catch {
+        // File may already be gone.
       }
     }
   }

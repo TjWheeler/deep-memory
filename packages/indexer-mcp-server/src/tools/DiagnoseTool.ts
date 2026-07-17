@@ -1,6 +1,6 @@
 import { BaseToolController } from './base/BaseToolController.js';
 import { StateManager, Phase, IndexingOrchestrator } from '@utaba/deep-memory-indexer';
-import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport } from '@utaba/deep-memory-indexer';
+import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport, ConversionReport } from '@utaba/deep-memory-indexer';
 import { resolveStateDir, resolveConfig } from './resolveProcess.js';
 
 interface DiagnoseCheck {
@@ -80,7 +80,65 @@ export class DiagnoseTool extends BaseToolController {
       });
     }
 
+    // Conversion diagnostics, sourced from the persisted report. No LLM work —
+    // consistent with the tool's contract. Present only after a convert run.
+    const conversionReport = await state.getConversionReport<ConversionReport>();
+    if (conversionReport && conversionReport.entries.length > 0) {
+      this.addConversionChecks(checks, conversionReport);
+    }
+
     return this.buildResponse(phase, checks, 'Run indexing_execute to prepare sources and begin extraction.');
+  }
+
+  /**
+   * Append conversion-quality checks read from the conversion report: warnings
+   * carried per document, table counts (so a PDF that dropped all its tables is
+   * visible), and conversions running far slower than their peers (the signal
+   * that a document is OCR-bound or otherwise pathological).
+   */
+  private addConversionChecks(checks: DiagnoseCheck[], report: ConversionReport): void {
+    const converted = report.entries.filter(e => e.status === 'converted');
+
+    // 1) Warnings carried by any conversion.
+    const withWarnings = report.entries.filter(e => e.warnings.length > 0);
+    checks.push({
+      name: 'conversion-warnings',
+      status: withWarnings.length > 0 ? 'warn' : 'pass',
+      detail: withWarnings.length > 0
+        ? `${withWarnings.length} conversion(s) carried warnings. For a text-light PDF that should not run OCR (e.g. a slide or diagram deck), set "doOcr": false on that source to suppress the OCR fallback.`
+        : 'No conversion warnings.',
+      items: withWarnings.length > 0
+        ? withWarnings.map(e => ({ source: e.docSlug, warnings: e.warnings.slice(0, 5) }))
+        : undefined,
+    });
+
+    // 2) Tables recovered per document — a doc reporting zero tables may have
+    //    dropped them, which is worth an operator's eye.
+    checks.push({
+      name: 'tables-extracted',
+      status: 'pass',
+      detail: `${report.summary.totalTables} table(s) recovered across ${converted.length} converted document(s).`,
+      items: converted.length > 0
+        ? converted.map(e => ({ source: e.docSlug, tables: e.tableCount ?? 0, pages: e.pageCount }))
+        : undefined,
+    });
+
+    // 3) Conversions far slower than the median — OCR-bound or pathological.
+    const durations = converted.map(e => e.durationMs).filter(ms => ms > 0).sort((a, b) => a - b);
+    if (durations.length >= 3) {
+      const median = durations[Math.floor(durations.length / 2)]!;
+      const slow = converted.filter(e => median > 0 && e.durationMs > median * 3);
+      checks.push({
+        name: 'slow-conversions',
+        status: slow.length > 0 ? 'warn' : 'pass',
+        detail: slow.length > 0
+          ? `${slow.length} conversion(s) ran more than 3× the median (${median}ms) — likely OCR-bound. If such a document is born-digital, set "doOcr": false on it to skip the OCR pass.`
+          : `All conversions ran within a normal range of the median (${median}ms).`,
+        items: slow.length > 0
+          ? slow.map(e => ({ source: e.docSlug, durationMs: e.durationMs, ocrApplied: e.doOcr }))
+          : undefined,
+      });
+    }
   }
 
   private async diagnoseExtraction(

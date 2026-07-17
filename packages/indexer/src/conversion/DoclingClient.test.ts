@@ -123,6 +123,19 @@ describe('DoclingClient.postConvert', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('treats a different do_ocr flag as a cache miss even with identical content', async () => {
+    const { fn, calls } = scriptedFetch([jsonResponse(MD_BODY), jsonResponse(MD_BODY)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    const content = Buffer.from('same-bytes');
+    // The no-OCR first pass populates the cache; the OCR-on reconversion of the
+    // same bytes must fetch again, not return the earlier no-OCR document.
+    await client.postConvert({ content, filename: 'doc.pdf', mimeType: 'application/pdf', doOcr: false });
+    await client.postConvert({ content, filename: 'doc.pdf', mimeType: 'application/pdf', doOcr: true });
+
+    expect(calls).toHaveLength(2);
+  });
+
   it('evicts the oldest cache entry once cacheMaxEntries is reached', async () => {
     const { fn, calls } = scriptedFetch([
       jsonResponse(MD_BODY),
@@ -442,6 +455,185 @@ describe('DoclingClient.postConvert', () => {
     ).rejects.toSatisfy(
       (err: unknown) => err instanceof DoclingServiceError && /not an object/i.test(err.message),
     );
+  });
+});
+
+// Task descriptors returned by the async submit and status-poll endpoints.
+function taskBody(taskStatus: string, extra: Record<string, unknown> = {}): unknown {
+  return { task_id: 'task-123', task_status: taskStatus, ...extra };
+}
+
+describe('DoclingClient async conversion', () => {
+  const asyncRequest = {
+    content: Buffer.from('%PDF-1.4 async bytes'),
+    filename: 'doc-a.pdf',
+    mimeType: 'application/pdf',
+  };
+
+  it('submits a multipart form to the async endpoint and parses the task descriptor', async () => {
+    const { fn, calls } = scriptedFetch([jsonResponse(taskBody('pending', { task_position: 4 }))]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    const task = await client.postConvertAsync(asyncRequest);
+
+    expect(task.taskId).toBe('task-123');
+    expect(task.taskStatus).toBe('pending');
+    expect(task.taskPosition).toBe(4);
+    expect(calls).toHaveLength(1);
+    const call = calls[0]!;
+    expect(call.url).toBe('http://host:8030/v1/convert/file/async');
+    expect(call.init.method).toBe('POST');
+    expect(call.init.body).toBeInstanceOf(FormData);
+    const form = call.init.body as FormData;
+    expect(form.get('to_formats')).toBe('md');
+    expect(form.get('files')).toBeInstanceOf(Blob);
+  });
+
+  it('drives submit → poll(pending → started → success) → fetch to the parsed document', async () => {
+    const { fn, calls } = scriptedFetch([
+      jsonResponse(taskBody('pending')), // submit
+      jsonResponse(taskBody('started')), // poll 1
+      jsonResponse(taskBody('success')), // poll 2
+      jsonResponse(MD_BODY), // result fetch
+    ]);
+    const { sleep, delays } = recordedSleep();
+    const client = new DoclingClient({
+      endpoint: 'http://host:8030',
+      fetch: fn,
+      sleep,
+      random: () => 0,
+    });
+
+    const out = await client.convertViaAsync(asyncRequest);
+
+    expect(out.document.name).toBe('doc-a');
+    expect(out.document.content['md_content']).toBe('# Doc A\n\nhello world');
+    expect(calls[0]!.url).toBe('http://host:8030/v1/convert/file/async');
+    expect(calls[1]!.url).toBe('http://host:8030/v1/status/poll/task-123');
+    expect(calls[2]!.url).toBe('http://host:8030/v1/status/poll/task-123');
+    expect(calls[3]!.url).toBe('http://host:8030/v1/result/task-123');
+    // Two waits between the three poll cycles (submit, poll1, poll2).
+    expect(delays).toHaveLength(2);
+  });
+
+  it('throws DoclingServiceError when the task reports failure', async () => {
+    const { fn } = scriptedFetch([
+      jsonResponse(taskBody('pending')), // submit
+      jsonResponse(taskBody('failure')), // poll 1
+    ]);
+    const { sleep } = recordedSleep();
+    const client = new DoclingClient({
+      endpoint: 'http://host:8030',
+      fetch: fn,
+      sleep,
+      random: () => 0,
+    });
+
+    await expect(client.convertViaAsync(asyncRequest)).rejects.toSatisfy(
+      (err: unknown) => err instanceof DoclingServiceError && /reported failure/i.test(err.message),
+    );
+  });
+
+  it('invokes onPoll each cycle and a stop sentinel breaks the loop before fetch', async () => {
+    const seen: string[] = [];
+    // Submit + one poll should be the only calls: the stop sentinel fires on
+    // the second onPoll (after the started poll), so no result fetch happens.
+    const { fn, calls } = scriptedFetch([
+      jsonResponse(taskBody('pending')), // submit
+      jsonResponse(taskBody('started')), // poll 1
+    ]);
+    const { sleep } = recordedSleep();
+    const client = new DoclingClient({
+      endpoint: 'http://host:8030',
+      fetch: fn,
+      sleep,
+      random: () => 0,
+    });
+
+    await expect(
+      client.convertViaAsync(asyncRequest, {
+        onPoll: (task) => {
+          seen.push(task.taskStatus);
+          return seen.length >= 2 ? 'stop' : 'continue';
+        },
+      }),
+    ).rejects.toSatisfy(
+      (err: unknown) => err instanceof DoclingServiceError && /stopped before completion/i.test(err.message),
+    );
+
+    expect(seen).toEqual(['pending', 'started']);
+    // submit + one status poll; no /v1/result call.
+    expect(calls).toHaveLength(2);
+    expect(calls.some((c) => c.url.includes('/v1/result/'))).toBe(false);
+  });
+
+  it('parses the async result envelope with the same reader the sync convert uses', async () => {
+    const { fn: syncFn } = scriptedFetch([jsonResponse(MD_BODY)]);
+    const syncClient = new DoclingClient({ endpoint: 'http://host:8030', fetch: syncFn });
+    const syncOut = await syncClient.postConvert({
+      content: Buffer.from('sync-bytes'),
+      filename: 'doc-a.pdf',
+      mimeType: 'application/pdf',
+    });
+
+    const { fn } = scriptedFetch([jsonResponse(MD_BODY)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+    const asyncOut = await client.fetchTaskResult('task-123', 'md');
+
+    expect(asyncOut.document.name).toBe(syncOut.document.name);
+    expect(asyncOut.document.schemaVersion).toBe(syncOut.document.schemaVersion);
+    expect(asyncOut.document.content['md_content']).toBe(syncOut.document.content['md_content']);
+  });
+
+  it('surfaces a non-200 result fetch as DoclingServiceError with no retry', async () => {
+    // A result requested before success is a caller bug — the poll loop is the
+    // readiness guard, so fetchTaskResult does not retry.
+    const { fn, calls } = scriptedFetch([textResponse('not ready', 425)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    await expect(client.fetchTaskResult('task-123', 'md')).rejects.toSatisfy(
+      (err: unknown) => err instanceof DoclingServiceError && err.status === 425,
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  it('attaches the mode-switch suggestion when the async submit 404s', async () => {
+    const { fn } = scriptedFetch([textResponse('no such route', 404)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    await expect(client.postConvertAsync(asyncRequest)).rejects.toSatisfy((err: unknown) => {
+      if (!(err instanceof DoclingServiceError)) return false;
+      if (err.status !== 404) return false;
+      return typeof err.suggestion === 'string' && /mode to 'sync'/i.test(err.suggestion);
+    });
+  });
+
+  it('populates the shared cache so a later identical convert is a cache hit', async () => {
+    // One async job, then an identical sync postConvert with no scripted
+    // response left: a second fetch would throw, so a clean resolve proves the
+    // cache hit crosses the async/sync boundary on the shared key.
+    const { fn, calls } = scriptedFetch([
+      jsonResponse(taskBody('success')), // submit resolves immediately
+      jsonResponse(MD_BODY), // result fetch
+    ]);
+    const { sleep } = recordedSleep();
+    const client = new DoclingClient({
+      endpoint: 'http://host:8030',
+      fetch: fn,
+      sleep,
+      random: () => 0,
+    });
+
+    const req = {
+      content: Buffer.from('cache-crossing-bytes'),
+      filename: 'doc-a.pdf',
+      mimeType: 'application/pdf',
+    };
+    const first = await client.convertViaAsync(req);
+    const second = await client.postConvert(req);
+
+    expect(second.document).toBe(first.document);
+    expect(calls).toHaveLength(2); // submit + result only; no third fetch
   });
 });
 

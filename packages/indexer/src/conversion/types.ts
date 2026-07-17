@@ -63,6 +63,26 @@ export interface DoclingConvertResponse {
   document: DoclingDocument;
 }
 
+/**
+ * A conversion task descriptor returned by the asynchronous convert endpoints.
+ *
+ * docling-serve accepts a long-running conversion via `/v1/convert/file/async`
+ * (returning this descriptor immediately), then reports progress via
+ * `/v1/status/poll/{id}` and yields the finished document via
+ * `/v1/result/{id}`. `taskStatus` walks `pending → started → success` on the
+ * happy path, or terminates at `failure`. `taskPosition` is the descriptor's
+ * queue position when the service reports one; it is advisory and may be
+ * absent.
+ */
+export interface DoclingAsyncTask {
+  /** Server-assigned identifier used to poll status and fetch the result. */
+  taskId: string;
+  /** Lifecycle state of the conversion job. */
+  taskStatus: 'pending' | 'started' | 'success' | 'failure';
+  /** Advisory queue position reported by the service, when present. */
+  taskPosition?: number;
+}
+
 /** Construction options for the conversion HTTP client. */
 export interface DoclingClientOptions {
   /**
@@ -77,14 +97,33 @@ export interface DoclingClientOptions {
    */
   convertPath?: string;
   /**
+   * HTTP path appended to `endpoint` for submitting an asynchronous
+   * conversion. Defaults to `/v1/convert/file/async`. The submit body is
+   * identical to the synchronous convert form.
+   */
+  asyncSubmitPath?: string;
+  /**
+   * HTTP path prefix appended to `endpoint` for polling task status. The task
+   * id is appended as a trailing path segment. Defaults to `/v1/status/poll`.
+   */
+  statusPollPath?: string;
+  /**
+   * HTTP path prefix appended to `endpoint` for fetching a finished task's
+   * result. The task id is appended as a trailing path segment. Defaults to
+   * `/v1/result`.
+   */
+  resultPath?: string;
+  /**
    * Optional API key sent as the `X-Api-Key` header. Present when
    * docling-serve is deployed behind authentication.
    */
   apiKey?: string;
   /**
-   * Request timeout in milliseconds. Defaults to 120_000 (2 minutes).
-   * Large PDFs routinely take ≥ 30s on CPU; shorter timeouts will retry or
-   * fail spuriously.
+   * Per-request timeout in milliseconds. Defaults to 600_000 (10 minutes).
+   * CPU-only layout/table inference on a large, table-heavy PDF routinely
+   * runs several minutes; a shorter ceiling turns a slow-but-fine conversion
+   * into a spurious timeout/retry loop. On the async path this bounds each
+   * individual HTTP call (submit / poll / result), not the whole job.
    */
   timeoutMs?: number;
   /**
@@ -101,6 +140,27 @@ export interface DoclingClientOptions {
   baseDelayMs?: number;
   /** Cap on per-retry backoff delay in milliseconds. Defaults to 8_000. */
   maxDelayMs?: number;
+  /**
+   * Base delay in milliseconds for the wait between status polls on the async
+   * path. Each wait is `random() * min(maxPollIntervalMs, pollIntervalMs *
+   * 2^N)` (full-jitter), so early polls are quick and long jobs back off.
+   * Defaults to 1_000ms.
+   */
+  pollIntervalMs?: number;
+  /**
+   * Cap on the async poll interval in milliseconds — the ceiling the jittered
+   * backoff between polls grows toward. Defaults to 15_000ms.
+   */
+  maxPollIntervalMs?: number;
+  /**
+   * Safety ceiling in milliseconds on the whole async job — from submit until
+   * a terminal status. Async deliberately has no single-request wall clock, so
+   * this exists only to stop an indefinitely-`pending` task from polling
+   * forever. Defaults to 3_600_000 (1 hour), i.e. generous enough to be
+   * effectively off for any real conversion; lower it only to fail fast on a
+   * wedged container.
+   */
+  maxTotalWaitMs?: number;
   /**
    * Maximum entries in the content-hash cache. Cache is keyed by
    * sha256(content)+filename+mimeType+format; identical bytes reuse the last
@@ -122,6 +182,31 @@ export interface DoclingClientOptions {
    * synchronous resolver so retry suites don't wait real milliseconds.
    */
   sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Decision returned by an async `onPoll` callback. `'continue'` keeps polling;
+ * `'stop'` breaks the poll loop before the next status check — the caller's
+ * escape hatch for an external stop signal. `void`/`undefined` is treated as
+ * `'continue'` so a callback that only reports progress need not return.
+ */
+export type PollDecision = 'continue' | 'stop';
+
+/** Per-call options for `DoclingClient.convertViaAsync`. */
+export interface ConvertViaAsyncOptions {
+  /**
+   * Invoked once per poll cycle with the latest task descriptor. The caller
+   * uses it to report progress and to abort: returning `'stop'` breaks the
+   * loop before the next status check without fetching a result. Returning
+   * `'continue'` (or nothing) keeps polling.
+   */
+  onPoll?: (task: DoclingAsyncTask) => PollDecision | void | Promise<PollDecision | void>;
+  /** Override the poll backoff base interval for this call. */
+  pollIntervalMs?: number;
+  /** Override the poll backoff ceiling for this call. */
+  maxPollIntervalMs?: number;
+  /** Override the whole-job safety ceiling for this call. */
+  maxTotalWaitMs?: number;
 }
 
 /** Union of the structured errors the client raises. */

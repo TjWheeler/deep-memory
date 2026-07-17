@@ -79,6 +79,7 @@ If the change touches the graph viewer, drive it in the browser with the Playwri
 - **Graph viewer (only when briefed):** the Playwright MCP tools.
 - **NEVER use blocking/streaming commands** — no `pnpm dev`, no `tail -f`, no watchers that don't return. Run one-shot commands.
 - **NEVER bypass the MCP surface** with direct DB clients to verify a memory operation (see Tier 2).
+- **Throttle status polling.** When watching a long-running job through a status tool (e.g. `indexing_status` during an async indexer conversion, which runs for minutes), sleep ~20–30s between polls instead of calling in a tight loop. Rapid polling adds no new signal and spams the tool surface. Wait between checks; a job that takes minutes does not need sub-second polling.
 
 ## CRITICAL: No Code Modifications
 

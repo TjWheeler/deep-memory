@@ -54,7 +54,7 @@ export { ProcessStateWriter } from './orchestrator/ProcessStateWriter.js';
 export type { ProcessPhase, ProcessIteration } from './orchestrator/ProcessStateWriter.js';
 
 // Conversion (document format gateway)
-export { DoclingClient, toDoclingDocument } from './conversion/DoclingClient.js';
+export { DoclingClient, toDoclingDocument, toDoclingAsyncTask } from './conversion/DoclingClient.js';
 export type {
   DoclingDocument,
   DoclingConvertRequest,
@@ -62,15 +62,26 @@ export type {
   DoclingClientOptions,
   DoclingClientError,
   DoclingExportFormat,
+  DoclingAsyncTask,
+  ConvertViaAsyncOptions,
+  PollDecision,
 } from './conversion/types.js';
 export { DoclingServiceError, DoclingTimeoutError } from './conversion/errors.js';
-export { convertSources, detectMime, deriveDocSlug } from './conversion/DocumentConverter.js';
+export { convertSources, detectMime, deriveDocSlug, decideOcr } from './conversion/DocumentConverter.js';
 export type {
   DocumentConverterDeps,
   DocumentConverterOptions,
   DocumentConverterSummary,
   DocumentConverterPerDoc,
 } from './conversion/DocumentConverter.js';
+export { matchesSourceFilter } from './conversion/source-filter.js';
+export { summarize, extractDoclingDiagnostics } from './conversion/ConversionReport.js';
+export type {
+  ConversionReport,
+  ConversionReportEntry,
+  DoclingDiagnostics,
+} from './conversion/ConversionReport.js';
+export type { ConversionProgress } from './conversion/ConversionProgress.js';
 
 // Extraction
 export { ExtractionWorker } from './extraction/ExtractionWorker.js';

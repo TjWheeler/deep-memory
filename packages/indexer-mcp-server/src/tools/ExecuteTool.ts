@@ -3,7 +3,7 @@ import { readFile, writeFile, mkdir, rename, readdir, rm, copyFile } from 'node:
 import { BaseToolController } from './base/BaseToolController.js';
 import {
   StateManager, Phase, IndexingOrchestrator, ProcessStateWriter,
-  EmbeddingsOrchestrator, CheckpointManager,
+  EmbeddingsOrchestrator, CheckpointManager, matchesSourceFilter,
 } from '@utaba/deep-memory-indexer';
 import type {
   PipelinePhase, ProposedCorrection,
@@ -184,19 +184,38 @@ export class ExecuteTool extends BaseToolController {
     const dryRun = params['dryRun'] as boolean | undefined;
     const { config, sourceDir } = await resolveConfig(params);
 
+    // Wire the tool's sourceFilter param into the run — convert previously read
+    // it only from the config file and silently ignored the tool param, unlike
+    // extract. Params take precedence over the config-file filter.
+    const sourceFilter = (params['sourceFilter'] as string[] | undefined) ?? config.extraction.sourceFilter;
+    if (sourceFilter && sourceFilter.length > 0) {
+      config.extraction.sourceFilter = sourceFilter;
+    }
+
     const stateDir = resolveStateDir(params);
     const state = new StateManager(stateDir);
     const sourceList = await state.getSourceList();
-    const needsConversion = sourceList
+    const allNeedingConversion = sourceList
       ? sourceList.sources.filter(s => s.status === 'needs-conversion' || s.status === 'converting')
       : [];
+    // Report the filtered set so the count matches what convert() will process.
+    const needsConversion = sourceFilter && sourceFilter.length > 0
+      ? allNeedingConversion.filter(s => matchesSourceFilter(s.path, sourceFilter))
+      : allNeedingConversion;
+
+    const mode = config.services?.docling?.mode ?? 'async';
 
     if (needsConversion.length === 0) {
+      const filteredOut = sourceFilter && sourceFilter.length > 0 && allNeedingConversion.length > 0;
       return {
         currentPhase: Phase.PREPARE,
         action: 'convert',
-        message: 'No sources need conversion.',
-        guidance: 'Run indexing_analyze to review estimates, then indexing_execute to start extraction.',
+        message: filteredOut
+          ? `No sources match the sourceFilter (${allNeedingConversion.length} source(s) need conversion, none matched).`
+          : 'No sources need conversion.',
+        guidance: filteredOut
+          ? 'Adjust sourceFilter, or drop it to convert all pending sources.'
+          : 'Run indexing_analyze to review estimates, then indexing_execute to start extraction.',
       };
     }
 
@@ -214,6 +233,7 @@ export class ExecuteTool extends BaseToolController {
         currentPhase: Phase.PREPARE,
         action: 'convert',
         dryRun: true,
+        mode,
         message: `Dry run: would convert ${needsConversion.length} source(s) to Markdown. No conversion started.`,
         pendingConversion: needsConversion.map(s => ({ source: basename(s.path), originalFormat: s.originalFormat })),
         guidance: 'Remove dryRun to start conversion. Ensure the docling-worker docker profile is running.',
@@ -261,9 +281,12 @@ export class ExecuteTool extends BaseToolController {
     return {
       currentPhase: Phase.PREPARE,
       action: 'convert',
-      message: `Conversion started for ${needsConversion.length} source(s). Run indexing_status to monitor progress.`,
+      mode,
+      message: `Conversion started for ${needsConversion.length} source(s) in ${mode} mode. Run indexing_status to monitor progress.`,
       pendingConversion: needsConversion.map(s => ({ source: basename(s.path), originalFormat: s.originalFormat })),
-      guidance: 'Monitor progress with indexing_status. When conversion completes, run indexing_analyze then indexing_execute to extract.',
+      guidance: mode === 'async'
+        ? 'Conversion runs asynchronously — poll indexing_status for live queue position and elapsed time. When it completes, run indexing_analyze then indexing_execute to extract.'
+        : 'Monitor progress with indexing_status. When conversion completes, run indexing_analyze then indexing_execute to extract.',
     };
   }
 
@@ -273,11 +296,20 @@ export class ExecuteTool extends BaseToolController {
     const orchestrator = new IndexingOrchestrator(config);
     await registerLLMProviders(orchestrator, config.extraction.workers);
 
+    // Resolve the effective filter up front (params take precedence over the
+    // config-file filter) so the reported pending set matches what the
+    // orchestrator will actually extract.
+    const maxItems = (params['maxItems'] as number | undefined) ?? config.extraction.maxItems;
+    const sourceFilter = (params['sourceFilter'] as string[] | undefined) ?? config.extraction.sourceFilter;
+
     const stateManager = orchestrator.getStateManager();
     const sourceList = await stateManager.getSourceList();
-    const pendingSources = sourceList
+    const allPending = sourceList
       ? sourceList.sources.filter(s => s.status === 'pending')
       : [];
+    const pendingSources = sourceFilter && sourceFilter.length > 0
+      ? allPending.filter(s => matchesSourceFilter(s.path, sourceFilter))
+      : allPending;
     const needsConversion = sourceList
       ? sourceList.sources.filter(s => s.status === 'needs-conversion' || s.status === 'converting').length
       : 0;
@@ -316,10 +348,8 @@ export class ExecuteTool extends BaseToolController {
 
     // Fire and forget — extraction runs in the background
     const processDir = params['processDir'] as string | undefined;
-    const maxItems = (params['maxItems'] as number | undefined) ?? config.extraction.maxItems;
-    const sourceFilter = params['sourceFilter'] as string[] | undefined;
 
-    // Pass sourceFilter and maxItems into the extraction config
+    // Pass the resolved sourceFilter and maxItems into the extraction config
     if (sourceFilter && sourceFilter.length > 0) {
       config.extraction.sourceFilter = sourceFilter;
     }

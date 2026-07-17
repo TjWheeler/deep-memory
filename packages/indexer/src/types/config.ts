@@ -87,17 +87,52 @@ export interface ServicesConfig {
 export interface DoclingServiceConfig {
   /** Base URL of the docling-serve container (e.g. http://localhost:5001) */
   endpoint: string;
-  /** Request timeout in milliseconds (default 120_000) */
+  /**
+   * Per-request timeout in milliseconds (default 600_000). On the async path
+   * this bounds each individual submit/poll/result call, not the whole job.
+   */
   timeoutMs?: number;
   /** Retry attempts on transient failures (default 3) */
   maxRetries?: number;
   /**
-   * Whether the service runs OCR. OCR is expensive on born-digital documents;
-   * leave unset to use the service default, or set false to skip it globally.
+   * Whether the service runs OCR. When set, it is the global OCR decision and
+   * disables the per-source text-yield heuristic. Leave unset to let the
+   * heuristic decide per PDF (non-PDF formats carry text natively and never
+   * run OCR). A per-source `doOcr` override takes precedence over this.
    */
   doOcr?: boolean;
   /** API key sent as the X-Api-Key header when the service requires auth */
   apiKey?: string;
+  /**
+   * How conversions are submitted. `async` submits a job and polls for the
+   * result, which survives the server-side synchronous wait ceiling that
+   * large documents hit; `sync` keeps a single request open. Defaults to
+   * `async`; `sync` is the escape hatch for older containers without the async
+   * routes.
+   */
+  mode?: 'sync' | 'async';
+  /**
+   * Base interval in milliseconds between async status polls (default 1_000).
+   * The wait grows with full-jitter backoff toward `maxPollIntervalMs`.
+   */
+  pollIntervalMs?: number;
+  /** Ceiling in milliseconds the async poll backoff grows toward (default 15_000). */
+  maxPollIntervalMs?: number;
+  /**
+   * Safety ceiling in milliseconds on a whole async job — from submit until a
+   * terminal status. Async has no per-request wall clock by design, so this
+   * only stops an indefinitely-pending task from polling forever. Defaults to
+   * 3_600_000 (1 hour), i.e. effectively off for any real conversion.
+   */
+  maxTotalWaitMs?: number;
+  /**
+   * Chars-per-page floor below which a born-digital PDF is treated as scanned
+   * and reconverted once with OCR. A born-digital page typically yields many
+   * hundreds of characters; a scanned page with no text layer yields near
+   * zero. Default 100. Only consulted when no explicit `doOcr` (per-source or
+   * global) is set and the converted document reported a page count.
+   */
+  ocrTextYieldThreshold?: number;
 }
 
 /**

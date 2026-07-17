@@ -1,7 +1,7 @@
 import { basename } from 'node:path';
 import { BaseToolController } from './base/BaseToolController.js';
 import { StateManager, Phase } from '@utaba/deep-memory-indexer';
-import type { PipelinePhase, EmbeddingProgress, FullValidationProgress } from '@utaba/deep-memory-indexer';
+import type { PipelinePhase, EmbeddingProgress, FullValidationProgress, ConversionProgress, ConversionReport } from '@utaba/deep-memory-indexer';
 import { resolveStateDir, formatDuration } from './resolveProcess.js';
 
 /**
@@ -29,10 +29,11 @@ export class StatusTool extends BaseToolController {
     const stateDir = resolveStateDir(params);
     const state = new StateManager(stateDir);
 
-    const [phase, sourceList, rawActiveProgress, embeddingProgress, fullValidationProgress, stopRequested, extractionStartedAt, processLock] = await Promise.all([
+    const [phase, sourceList, rawActiveProgress, activeConversionProgress, embeddingProgress, fullValidationProgress, stopRequested, extractionStartedAt, processLock] = await Promise.all([
       state.getCurrentPhase(),
       state.getSourceList(),
       state.getActiveExtractionProgress(),
+      state.getActiveConversionProgress(),
       state.getEmbeddingProgress<EmbeddingProgress>(),
       state.getFullValidationProgress<FullValidationProgress>(),
       state.isStopRequested(),
@@ -51,7 +52,7 @@ export class StatusTool extends BaseToolController {
     const needsConversion = sources.filter(s => s.status === 'needs-conversion').length;
     const converting = sources.filter(s => s.status === 'converting').length;
     if (processLock?.operation === 'conversion' || converting > 0 || (phase === Phase.PREPARE && needsConversion > 0)) {
-      return this.conversionStatus(phase, needsConversion, converting, sources.filter(s => s.status !== 'excluded').length, stopRequested, processLock);
+      return this.conversionStatus(phase, needsConversion, converting, sources.filter(s => s.status !== 'excluded').length, stopRequested, processLock, activeConversionProgress);
     }
 
     // Check for active extraction
@@ -110,6 +111,7 @@ export class StatusTool extends BaseToolController {
     total: number,
     stopRequested: boolean,
     processLock: { operation: string; acquiredAt: string; pid: number } | null,
+    activeProgress: ConversionProgress[],
   ) {
     const lockAlive = processLock?.operation === 'conversion'
       ? StateManager.isProcessAlive(processLock.pid)
@@ -117,6 +119,23 @@ export class StatusTool extends BaseToolController {
     const running = converting > 0 && lockAlive;
     const remaining = needsConversion + converting;
     const completed = Math.max(0, total - remaining);
+
+    // Enrich from the active conversion-progress file(s): current document,
+    // async task state + queue position, live elapsed, and whether OCR is
+    // running. Live elapsed is computed from startedAt so the timer ticks even
+    // between polls.
+    const activeConversions = activeProgress.map(p => {
+      const liveElapsedMs = p.startedAt
+        ? Date.now() - new Date(p.startedAt).getTime()
+        : p.elapsedMs;
+      return {
+        source: basename(p.source),
+        taskStatus: p.taskStatus,
+        queuePosition: p.taskPosition,
+        elapsed: formatDuration(liveElapsedMs),
+        ocrRunning: p.ocrApplied ?? false,
+      };
+    });
 
     return {
       currentPhase: phase,
@@ -132,6 +151,7 @@ export class StatusTool extends BaseToolController {
       },
       details: {
         byStatus: { needsConversion, converting },
+        activeConversions: activeConversions.length > 0 ? activeConversions : undefined,
       },
       guidance: running
         ? 'Conversion in progress. Poll indexing_status until it completes.'
@@ -321,7 +341,7 @@ export class StatusTool extends BaseToolController {
   }
 
   private async detectLastCompleted(
-    _state: StateManager,
+    state: StateManager,
     phase: PipelinePhase,
     sourceList: { sources: Array<{ status: string }> } | null,
     embeddingProgress: EmbeddingProgress | null,
@@ -346,6 +366,20 @@ export class StatusTool extends BaseToolController {
       const total = sourceList.sources.filter(s => s.status !== 'excluded').length;
       if (extracted > 0 && extracted === total) {
         return { operation: 'extraction', summary: `${extracted} sources extracted.` };
+      }
+    }
+    // Conversion completes during the prepare phase; surface its report summary
+    // so a finished convert run is visible while the pipeline sits idle before
+    // extraction. skippedUnchanged (not the blunt skipped count) is the true
+    // idempotency figure.
+    if (phase === Phase.PREPARE) {
+      const report = await state.getConversionReport<ConversionReport>();
+      if (report && report.entries.length > 0) {
+        const { converted, skippedUnchanged, failed, totalTables } = report.summary;
+        const parts = [`${converted} converted`, `${totalTables} tables`];
+        if (skippedUnchanged > 0) parts.push(`${skippedUnchanged} skipped unchanged`);
+        if (failed > 0) parts.push(`${failed} failed`);
+        return { operation: 'conversion', summary: parts.join(', ') + '.' };
       }
     }
     return null;

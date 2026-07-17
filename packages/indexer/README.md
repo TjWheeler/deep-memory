@@ -35,7 +35,7 @@ E.   Embeddings      — generate embedding vectors for semantic search
 | Phase | Input | Output | Resumable |
 |-------|-------|--------|-----------|
 | A — Prepare | Source directory | `index-source-list.json` | Yes — skips already-registered sources |
-| A.5 — Convert | Rich-format sources | `state/converted/{slug}.md` | Yes — skips already-converted sources |
+| A.5 — Convert | Rich-format sources | `state/converted/{slug}.md` + `{slug}.docling.json` | Yes — content-hash skips unchanged sources |
 | B — Extract | Pending sources | `extraction-notes/{worker-name}/*.json` | Yes — skips already-extracted sources |
 | B.5 — Validate | Extraction outputs | `validation-report.json` | Yes |
 | B.6 — Extraction Review | Extraction outputs + source docs | `review-diagnostics.json` + corrections | AI runs, human approves |
@@ -54,7 +54,7 @@ Pipeline states: `prepare` | `extract` | `extraction-review` | `full-validation`
 | Plain text | `.md`, `.txt`, `.json`, `.csv` | Read directly by extraction |
 | Rich documents | `.pdf`, `.docx`, `.html`, `.htm`, `.pptx` | Converted to Markdown before extraction |
 
-Rich-format sources are registered with status `needs-conversion` during prepare. The **convert** step renders each to Markdown under `state/converted/{slug}.md` (recorded as `derivedTextPath` on the source) and flips it to `pending`; everything downstream reads the derived text. Extraction refuses to run against an unconverted rich-format source.
+Rich-format sources are registered with status `needs-conversion` during prepare. The **convert** step renders each to Markdown under `state/converted/{slug}.md` (recorded as `derivedTextPath` on the source), writes a structural JSON sidecar `state/converted/{slug}.docling.json`, and flips the source to `pending`; everything downstream reads the derived text. Extraction refuses to run against an unconverted rich-format source.
 
 Conversion runs against a containerised [`docling-serve`](https://github.com/docling-project/docling-serve) service. Start it before converting:
 
@@ -69,9 +69,12 @@ The `docling-worker` profile is gated so a repo with no rich-format sources neve
   "services": {
     "docling": {
       "endpoint": "http://localhost:5001",  // match the docling-worker host port
-      "timeoutMs": 120000,
-      "maxRetries": 3,
-      "doOcr": false                          // OCR is slow on born-digital PDFs; enable per need
+      "mode": "async",                        // submit + poll; the default. "sync" is the escape hatch
+      "timeoutMs": 600000,                    // per-request ceiling (each submit/poll/result call)
+      "maxRetries": 3
+      // OCR is decided per document — omit doOcr to let the heuristic run.
+      // "doOcr": false                       // force OCR off globally (or set per source)
+      // "ocrTextYieldThreshold": 100          // chars-per-page floor below which a PDF is re-run with OCR
     }
   }
 }
@@ -84,6 +87,14 @@ indexing_execute processDir: ./index-processes/my-knowledge action: convert
 ```
 
 Poll `indexing_status` until conversion completes, then proceed to `indexing_analyze` / `indexing_execute` as usual.
+
+### How convert behaves
+
+- **Idempotent.** Each source's raw bytes are hashed (`sourceHash`). A re-run skips any source whose hash is unchanged and whose derived files still exist — no round trip — and reports it as `skipped-unchanged`. Editing a source on disk is detected at prepare: its stale derived files are deleted and it is reset to `needs-conversion` so the next convert reprocesses it.
+- **Asynchronous by default.** `mode: "async"` submits each conversion and polls for the result, so a large document no longer fails against the service's synchronous wait ceiling; there is no single-request timeout over the whole job. `indexing_status` shows the live queue position and elapsed time while polling. `mode: "sync"` keeps one request open — use it only for an older container without the async routes (an async submit that 404s says so and names the switch).
+- **OCR is decided per document.** Non-PDF formats carry text natively and never run OCR. For a PDF with no explicit `doOcr`, convert runs a fast no-OCR pass and only re-runs with OCR when the text yield per page falls below `ocrTextYieldThreshold` (default 100 chars/page) — so scanned PDFs get OCR while born-digital ones stay fast. A text-light born-digital PDF (a slide or diagram deck) can trip this; set `doOcr: false` on that source to opt out. An explicit `doOcr` (per source or global) skips the heuristic entirely.
+- **Diagnostics.** Every run writes `state/conversion-report.json` (per-document mode, OCR decision, page/table counts, warnings, timing) plus a compact mirror on each source entry. `indexing_diagnose` in the prepare phase surfaces conversion warnings, table counts, and conversions running far slower than their peers; `indexing_status` shows the run summary once it completes.
+- **The JSON sidecar** (`{slug}.docling.json`) is docling's structural representation, retained alongside the Markdown for richer downstream use.
 
 ## Quick start (via MCP — recommended)
 

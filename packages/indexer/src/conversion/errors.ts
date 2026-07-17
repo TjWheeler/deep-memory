@@ -26,11 +26,12 @@ export class DoclingServiceError extends ProviderError {
   constructor(
     url: string,
     detail: string,
-    extra: { status?: number; bodySnippet?: string } = {},
+    extra: { status?: number; bodySnippet?: string; suggestion?: string } = {},
   ) {
     super(
       `Docling service at "${url}" failed: ${detail}`,
-      `Check the docling-worker container logs and verify the endpoint is reachable.`,
+      extra.suggestion ??
+        `Check the docling-worker container logs and verify the endpoint is reachable.`,
     );
     this.name = 'DoclingServiceError';
     this.url = url;

@@ -294,6 +294,38 @@ describe('StateManager', () => {
       expect(source.status).toBe('extracted');
     });
 
+    it('overwrites a worker output on re-extraction rather than appending a second copy', async () => {
+      // Guarantees that reconverting a changed source and re-extracting it
+      // replaces that source's per-source output — the registry keys extraction
+      // files by worker name, so a second run of the same worker overwrites.
+      await manager.saveSourceList({
+        version: '1.0.0',
+        repositoryId: 'test',
+        sources: [
+          { path: '/docs/report.pdf', type: 'general', status: 'pending', assignedWorkers: ['only-worker'] },
+        ],
+      });
+
+      await manager.recordExtractionComplete(
+        '/docs/report.pdf',
+        'only-worker',
+        'extraction-notes/only-worker/report.json',
+        {},
+      );
+      // A reconversion + re-extraction writes to a fresh output path for the
+      // same worker.
+      await manager.recordExtractionComplete(
+        '/docs/report.pdf',
+        'only-worker',
+        'extraction-notes/only-worker/report-v2.json',
+        {},
+      );
+
+      const source = (await manager.getSourceList())!.sources.find(s => s.path === '/docs/report.pdf')!;
+      expect(Object.keys(source.extractionFiles ?? {})).toEqual(['only-worker']);
+      expect(source.extractionFiles!['only-worker']).toBe('extraction-notes/only-worker/report-v2.json');
+    });
+
     it('checks if extraction output exists for a worker', async () => {
       expect(await manager.hasExtractionOutput('spec-sheet.md', 'cloud-haiku')).toBe(false);
 
@@ -308,6 +340,57 @@ describe('StateManager', () => {
 
       expect(await manager.hasExtractionOutput('spec-sheet.md', 'cloud-haiku')).toBe(true);
       expect(await manager.hasExtractionOutput('spec-sheet.md', 'qwen35')).toBe(false);
+    });
+  });
+
+  describe('conversion report and progress', () => {
+    it('returns null before a conversion report is written', async () => {
+      expect(await manager.getConversionReport()).toBeNull();
+    });
+
+    it('round-trips a conversion report', async () => {
+      const report = { generatedAt: '2026-07-17T00:00:00.000Z', entries: [], summary: { converted: 0, skippedUnchanged: 0, failed: 0, totalTables: 0, totalDurationMs: 0, ocrFallbacks: 0 } };
+      await manager.saveConversionReport(report);
+      expect(await manager.getConversionReport()).toEqual(report);
+    });
+
+    it('writes, lists, and deletes active conversion progress files keyed by docSlug', async () => {
+      // Keyed by the collision-resistant slug, not the basename, so nested
+      // sources sharing a filename do not overwrite each other's progress.
+      await manager.writeConversionProgress('guides-intro', {
+        source: 'intro.pdf',
+        taskId: 'task-1',
+        taskStatus: 'started',
+        taskPosition: 3,
+        startedAt: '2026-07-17T00:00:00.000Z',
+        elapsedMs: 1200,
+        ocrApplied: false,
+      });
+
+      let active = await manager.getActiveConversionProgress();
+      expect(active).toHaveLength(1);
+      expect(active[0]!.taskId).toBe('task-1');
+      expect(active[0]!.taskStatus).toBe('started');
+
+      await manager.deleteConversionProgress('guides-intro');
+      active = await manager.getActiveConversionProgress();
+      expect(active).toHaveLength(0);
+    });
+
+    it('keeps progress for two nested sources that share a basename', async () => {
+      await manager.writeConversionProgress('guides-intro', {
+        source: 'intro.pdf', taskId: 'a', startedAt: '2026-07-17T00:00:00.000Z', elapsedMs: 0,
+      });
+      await manager.writeConversionProgress('refs-intro', {
+        source: 'intro.pdf', taskId: 'b', startedAt: '2026-07-17T00:00:00.000Z', elapsedMs: 0,
+      });
+      const active = await manager.getActiveConversionProgress();
+      expect(active).toHaveLength(2);
+      expect(active.map(p => p.taskId).sort()).toEqual(['a', 'b']);
+    });
+
+    it('returns an empty list when no conversion progress dir exists', async () => {
+      expect(await manager.getActiveConversionProgress()).toEqual([]);
     });
   });
 

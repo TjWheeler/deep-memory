@@ -48,6 +48,46 @@ export interface IndexSource {
    * source needs conversion before extraction. Absent for plain-text sources.
    */
   originalFormat?: string;
+  /**
+   * sha256 of the raw source bytes at the last successful conversion. Used to
+   * skip re-converting an unchanged source and to force reconversion when the
+   * bytes on disk change. The digest matches the client's content-hash cache
+   * key, so a hash computed here and one computed in the client agree.
+   */
+  sourceHash?: string;
+  /**
+   * Absolute path to the persisted structural JSON sidecar
+   * (`state/converted/{slug}.docling.json`) written alongside the derived
+   * Markdown. Retained as the structural substrate for later structure-aware
+   * extraction. Absent for plain-text sources.
+   */
+  derivedDoclingJsonPath?: string;
+  /**
+   * Per-source OCR override. When set, it takes precedence over the global
+   * `services.docling.doOcr` and the automatic text-yield heuristic — an
+   * explicit decision, not a hint. Absent leaves the decision to the global
+   * setting or the heuristic.
+   */
+  doOcr?: boolean;
+  /**
+   * Compact conversion diagnostics mirrored onto the entry so `indexing_status`
+   * can surface per-doc timing/warnings without reading the full conversion
+   * report. Populated by the convert step.
+   */
+  conversion?: {
+    /** Wall-clock conversion time in milliseconds. */
+    durationMs?: number;
+    /** Page count read from the converted document. */
+    pageCount?: number;
+    /** Table count recovered from the converted document. */
+    tableCount?: number;
+    /** Whether OCR was applied to the final conversion. */
+    ocrApplied?: boolean;
+    /** Whether a low-yield first pass triggered a second OCR pass. */
+    ocrFallbackApplied?: boolean;
+    /** Warnings lifted from the conversion envelope. */
+    warnings?: string[];
+  };
 }
 
 /** Token usage estimate for a single document against its assigned worker */

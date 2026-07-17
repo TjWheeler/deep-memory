@@ -32,7 +32,12 @@ import type {
 } from './types.js';
 
 const DEFAULT_CONVERT_PATH = '/v1/convert/file';
-const DEFAULT_TIMEOUT_MS = 120_000;
+// Per-request wall clock for a synchronous convert. CPU-only layout/table
+// inference on a large, table-heavy PDF routinely runs several minutes, so the
+// default is deliberately generous — a tighter ceiling turns a slow-but-fine
+// conversion into a timeout/retry loop that never lands. Override via
+// services.docling.timeoutMs for pathological outliers.
+const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_BASE_DELAY_MS = 500;
 const DEFAULT_MAX_DELAY_MS = 8_000;

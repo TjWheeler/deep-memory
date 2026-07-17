@@ -238,11 +238,16 @@ services:
     ports:
       - "5001:5001"
     environment:
-      # Cap CPU threading so conversion does not starve the host. Tune to the
-      # available cores.
-      - OMP_NUM_THREADS=${DOCLING_OMP_NUM_THREADS:-4}
-      - MKL_NUM_THREADS=${DOCLING_MKL_NUM_THREADS:-4}
-      - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=${DOCLING_NUM_WORKERS:-2}
+      # Conversion is CPU-bound on layout/table inference. The upstream image
+      # bakes in OMP_NUM_THREADS=4, which throttles a single large document to
+      # 4 cores no matter how big the host is. Override it high so one document
+      # converts as fast as the host allows (the pipeline converts serially, so
+      # threads-per-conversion, not worker count, drives single-doc speed).
+      # Lower these via the env vars to stop conversion starving other work on
+      # a shared host.
+      - OMP_NUM_THREADS=${DOCLING_OMP_NUM_THREADS:-24}
+      - MKL_NUM_THREADS=${DOCLING_MKL_NUM_THREADS:-24}
+      - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=${DOCLING_NUM_WORKERS:-4}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5001/health"]
       interval: 30s

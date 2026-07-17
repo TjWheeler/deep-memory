@@ -1,5 +1,6 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, basename } from 'node:path';
+import { InvalidInputError } from '@utaba/deep-memory';
 import type { ExtractionConfig, WorkerConfig } from '../types/config.js';
 import type { ExtractionOutput, ExtractedEntity, ExtractedRelationship } from '../types/extraction.js';
 import type { IndexSource } from '../types/source-list.js';
@@ -122,7 +123,20 @@ export class ExtractionWorker {
     onCheckpoint?: OnCheckpoint,
     resumeCheckpoint?: ExtractionCheckpoint,
   ): Promise<ExtractionOutput> {
-    const documentContent = await readFile(source.path, 'utf-8');
+    // A rich-format source must be converted before extraction — feeding raw
+    // binary bytes to an LLM produces garbage. Guard rather than silently
+    // reading nonsense.
+    if (source.originalFormat && !source.derivedTextPath) {
+      throw new InvalidInputError(
+        'source.derivedTextPath',
+        `Source "${source.path}" is a ${source.originalFormat} document that has not been converted to text.`,
+        'Run the convert action first so extraction reads the derived Markdown.',
+      );
+    }
+
+    // Read the derived text when the source has been converted; the original
+    // path otherwise.
+    const documentContent = await readFile(source.derivedTextPath ?? source.path, 'utf-8');
     const systemPrompt = this.promptBuilder.buildSystemPrompt();
 
     let entities: ExtractedEntity[];

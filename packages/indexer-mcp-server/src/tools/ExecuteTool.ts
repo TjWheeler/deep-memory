@@ -26,7 +26,8 @@ export class ExecuteTool extends BaseToolController {
         processDir: { type: 'string', description: 'Path to the indexing process directory (contains config.json).' },
         action: {
           type: 'string',
-          description: 'Override the default action for the current phase. Supported actions: prepare, analyze, extract, validate-full, apply-corrections, consolidate, reconsolidate, import, resume, embed.',
+          description: 'Override the default action for the current phase. Supported actions: prepare, analyze, convert, extract, validate-full, apply-corrections, consolidate, reconsolidate, import, resume, embed.',
+          enum: ['prepare', 'analyze', 'convert', 'extract', 'validate-full', 'apply-corrections', 'consolidate', 'reconsolidate', 'import', 'resume', 'embed'],
         },
         maxItems: { type: 'number', description: 'Limit documents processed (extraction).' },
         sourceFilter: { type: 'array', items: { type: 'string' }, description: 'Filter to specific source(s) by filename or path substring.' },
@@ -84,7 +85,9 @@ export class ExecuteTool extends BaseToolController {
     // Phase-based default routing
     switch (phase) {
       case Phase.PREPARE:
-        return action === 'analyze' ? this.executeAnalyze(params) : this.executePrepare(params);
+        if (action === 'analyze') return this.executeAnalyze(params);
+        if (action === 'convert') return this.executeConvert(params);
+        return this.executePrepare(params);
       case Phase.EXTRACT:
         return this.executeExtract(params);
       case Phase.EXTRACTION_REVIEW:
@@ -119,17 +122,23 @@ export class ExecuteTool extends BaseToolController {
     const orchestrator = new IndexingOrchestrator(config);
     const sourceList = await orchestrator.prepare(sourceDir);
 
+    const needsConversion = sourceList.sources.filter(s => s.status === 'needs-conversion').length;
+    const guidance = needsConversion > 0
+      ? `${needsConversion} source(s) are rich formats needing conversion. Start the docling-worker docker profile, then run indexing_execute action: "convert" before extraction. Run indexing_analyze to review cost estimates for the text sources.`
+      : 'Run indexing_analyze to review cost estimates, then indexing_execute to start extraction.';
+
     return {
       currentPhase: Phase.PREPARE,
       action: 'prepare',
       message: `Prepared ${sourceList.sources.length} source documents for indexing`,
+      sourcesNeedingConversion: needsConversion,
       sources: sourceList.sources.map(s => ({
         path: s.path,
         type: s.type,
         status: s.status,
         notes: s.notes,
       })),
-      guidance: 'Run indexing_analyze to review cost estimates, then indexing_execute to start extraction.',
+      guidance,
     };
   }
 
@@ -138,10 +147,20 @@ export class ExecuteTool extends BaseToolController {
     const orchestrator = new IndexingOrchestrator(config);
     const report = await orchestrator.analyze();
 
+    const stateManager = orchestrator.getStateManager();
+    const analyzeSourceList = await stateManager.getSourceList();
+    const needsConversion = analyzeSourceList
+      ? analyzeSourceList.sources.filter(s => s.status === 'needs-conversion').length
+      : 0;
+    const guidance = needsConversion > 0
+      ? `${needsConversion} source(s) still need conversion (excluded from these estimates). Run indexing_execute action: "convert" first. Then review estimates and run indexing_execute to start extraction.`
+      : 'Review the estimates. Run indexing_execute to start extraction.';
+
     return {
       currentPhase: Phase.PREPARE,
       action: 'analyze',
       message: `Analysis complete: ${report.summary.totalDocuments} documents analyzed`,
+      sourcesNeedingConversion: needsConversion,
       summary: report.summary,
       byWorker: Object.fromEntries(
         Object.entries(report.byWorker).map(([name, ws]) => [name, {
@@ -157,7 +176,94 @@ export class ExecuteTool extends BaseToolController {
         chunks: d.estimatedTokens.chunks,
         estimatedCost: `$${d.estimatedCost.toFixed(2)}`,
       })),
-      guidance: 'Review the estimates. Run indexing_execute to start extraction.',
+      guidance,
+    };
+  }
+
+  private async executeConvert(params: Record<string, unknown>) {
+    const dryRun = params['dryRun'] as boolean | undefined;
+    const { config, sourceDir } = await resolveConfig(params);
+
+    const stateDir = resolveStateDir(params);
+    const state = new StateManager(stateDir);
+    const sourceList = await state.getSourceList();
+    const needsConversion = sourceList
+      ? sourceList.sources.filter(s => s.status === 'needs-conversion' || s.status === 'converting')
+      : [];
+
+    if (needsConversion.length === 0) {
+      return {
+        currentPhase: Phase.PREPARE,
+        action: 'convert',
+        message: 'No sources need conversion.',
+        guidance: 'Run indexing_analyze to review estimates, then indexing_execute to start extraction.',
+      };
+    }
+
+    if (!config.services?.docling) {
+      return {
+        currentPhase: Phase.PREPARE,
+        action: 'convert',
+        error: `${needsConversion.length} source(s) need conversion but no document-conversion service is configured.`,
+        guidance: 'Add a "services.docling" section to config.json (endpoint defaults to http://localhost:5001) and start the docling-worker docker profile, then retry.',
+      };
+    }
+
+    if (dryRun) {
+      return {
+        currentPhase: Phase.PREPARE,
+        action: 'convert',
+        dryRun: true,
+        message: `Dry run: would convert ${needsConversion.length} source(s) to Markdown. No conversion started.`,
+        pendingConversion: needsConversion.map(s => ({ source: basename(s.path), originalFormat: s.originalFormat })),
+        guidance: 'Remove dryRun to start conversion. Ensure the docling-worker docker profile is running.',
+      };
+    }
+
+    // Report busy only when a live process still holds the lock. A lock left
+    // behind by a crashed operation (dead PID) is stale and must not wedge the
+    // pipeline — it falls through to acquireProcessLock, which reclaims it.
+    const existingLock = await state.getProcessLock();
+    if (existingLock && StateManager.isProcessAlive(existingLock.pid)) {
+      return {
+        error: 'busy',
+        message: `A ${existingLock.operation} operation is already running (started ${existingLock.acquiredAt}). Only one background operation can run at a time.`,
+        runningOperation: existingLock.operation,
+        startedAt: existingLock.acquiredAt,
+        guidance: 'Use indexing_status to monitor progress, or indexing_stop to cancel the running operation.',
+      };
+    }
+
+    const orchestrator = new IndexingOrchestrator(config);
+    // Acquire the lock atomically. If a concurrent operation won the lock in the
+    // window since the check above, do not dispatch — report busy instead.
+    const acquired = await state.acquireProcessLock('conversion');
+    if (!acquired) {
+      const lock = await state.getProcessLock();
+      return {
+        error: 'busy',
+        message: lock
+          ? `A ${lock.operation} operation is already running (started ${lock.acquiredAt}). Only one background operation can run at a time.`
+          : 'Another operation acquired the process lock. Only one background operation can run at a time.',
+        ...(lock ? { runningOperation: lock.operation, startedAt: lock.acquiredAt } : {}),
+        guidance: 'Use indexing_status to monitor progress, or indexing_stop to cancel the running operation.',
+      };
+    }
+
+    // Fire and forget — conversion runs in the background against a possibly
+    // slow container, mirroring how extraction is dispatched.
+    orchestrator.convert(sourceDir).catch(err => {
+      this.logger.error('ExecuteTool', `Background conversion failed: ${err instanceof Error ? err.message : String(err)}`);
+    }).finally(async () => {
+      await state.releaseProcessLock();
+    });
+
+    return {
+      currentPhase: Phase.PREPARE,
+      action: 'convert',
+      message: `Conversion started for ${needsConversion.length} source(s). Run indexing_status to monitor progress.`,
+      pendingConversion: needsConversion.map(s => ({ source: basename(s.path), originalFormat: s.originalFormat })),
+      guidance: 'Monitor progress with indexing_status. When conversion completes, run indexing_analyze then indexing_execute to extract.',
     };
   }
 
@@ -172,6 +278,18 @@ export class ExecuteTool extends BaseToolController {
     const pendingSources = sourceList
       ? sourceList.sources.filter(s => s.status === 'pending')
       : [];
+    const needsConversion = sourceList
+      ? sourceList.sources.filter(s => s.status === 'needs-conversion' || s.status === 'converting').length
+      : 0;
+
+    if (needsConversion > 0) {
+      return {
+        currentPhase: Phase.EXTRACT,
+        action: 'extract',
+        message: `${needsConversion} source(s) need conversion before extraction — run action: convert.`,
+        guidance: 'Start the docling-worker docker profile, then run indexing_execute action: "convert". Extraction will not read unconverted binary sources.',
+      };
+    }
 
     if (pendingSources.length === 0) {
       return {

@@ -4,6 +4,14 @@ Practical guidance for configuring the extraction pipeline, choosing models, tun
 
 ---
 
+## Rich-format sources need conversion first
+
+Extraction reads text. Rich formats (`.pdf`, `.docx`, `.html`, `.htm`, `.pptx`) are registered as `needs-conversion` during prepare and must be rendered to Markdown by the **convert** step before extraction will process them — extraction throws rather than feed raw binary bytes to an LLM.
+
+Start the conversion service (`docker compose -f docker-compose.indexer.yml --profile docling-worker up -d`), configure `services.docling.endpoint` in `config.json` to match its host port, then run `indexing_execute action: convert` and wait for `indexing_status` to report it complete. The converted Markdown is written to `state/converted/{slug}.md` and recorded as `derivedTextPath`; the chunk-sizing and model guidance below then applies to that derived text. Plain-text sources skip conversion entirely.
+
+---
+
 ## Hardware
 
 GPU: RTX 5090, 32 GB VRAM.

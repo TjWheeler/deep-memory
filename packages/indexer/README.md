@@ -22,6 +22,7 @@ pnpm add @utaba/deep-memory-indexer-mcp-server
 Source Documents
     |
 A.   Prepare         — scan directory, register sources
+A.5  Convert         — (rich formats only) render PDF/DOCX/HTML/PPTX to Markdown
 B.   Extract         — LLM workers extract entities + relationships (parallel)
 B.6  Review          — structural diagnostics + property accuracy spot-checks
 B.7  Full Validate   — (optional) LLM agents verify every entity against source
@@ -34,6 +35,7 @@ E.   Embeddings      — generate embedding vectors for semantic search
 | Phase | Input | Output | Resumable |
 |-------|-------|--------|-----------|
 | A — Prepare | Source directory | `index-source-list.json` | Yes — skips already-registered sources |
+| A.5 — Convert | Rich-format sources | `state/converted/{slug}.md` | Yes — skips already-converted sources |
 | B — Extract | Pending sources | `extraction-notes/{worker-name}/*.json` | Yes — skips already-extracted sources |
 | B.5 — Validate | Extraction outputs | `validation-report.json` | Yes |
 | B.6 — Extraction Review | Extraction outputs + source docs | `review-diagnostics.json` + corrections | AI runs, human approves |
@@ -44,6 +46,44 @@ E.   Embeddings      — generate embedding vectors for semantic search
 | E — Embeddings | Imported entities | Embeddings stored on entities | Yes |
 
 Pipeline states: `prepare` | `extract` | `extraction-review` | `full-validation` | `consolidate` | `consolidation-review` | `import` | `import-review` | `embeddings` | `complete`
+
+## Supported source formats
+
+| Format | Extensions | Handling |
+|--------|-----------|----------|
+| Plain text | `.md`, `.txt`, `.json`, `.csv` | Read directly by extraction |
+| Rich documents | `.pdf`, `.docx`, `.html`, `.htm`, `.pptx` | Converted to Markdown before extraction |
+
+Rich-format sources are registered with status `needs-conversion` during prepare. The **convert** step renders each to Markdown under `state/converted/{slug}.md` (recorded as `derivedTextPath` on the source) and flips it to `pending`; everything downstream reads the derived text. Extraction refuses to run against an unconverted rich-format source.
+
+Conversion runs against a containerised [`docling-serve`](https://github.com/docling-project/docling-serve) service. Start it before converting:
+
+```bash
+docker compose -f docker-compose.indexer.yml --profile docling-worker up -d
+```
+
+The `docling-worker` profile is gated so a repo with no rich-format sources never starts the (~4.4 GB) container. Configure the service in `config.json`:
+
+```jsonc
+{
+  "services": {
+    "docling": {
+      "endpoint": "http://localhost:5001",  // match the docling-worker host port
+      "timeoutMs": 120000,
+      "maxRetries": 3,
+      "doOcr": false                          // OCR is slow on born-digital PDFs; enable per need
+    }
+  }
+}
+```
+
+Then run convert before extraction:
+
+```
+indexing_execute processDir: ./index-processes/my-knowledge action: convert
+```
+
+Poll `indexing_status` until conversion completes, then proceed to `indexing_analyze` / `indexing_execute` as usual.
 
 ## Quick start (via MCP — recommended)
 

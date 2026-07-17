@@ -6,8 +6,11 @@ import type { ExtractionOutput } from '../types/extraction.js';
 import type { IndexSourceList, IndexSource } from '../types/source-list.js';
 import type { EntityRegistry } from '../types/registry.js';
 import type { ValidationResult } from '../types/validation.js';
+import { InvalidInputError } from '@utaba/deep-memory';
 import { StateManager, Phase } from './StateManager.js';
 import type { PipelinePhase } from './StateManager.js';
+import { DoclingClient } from '../conversion/DoclingClient.js';
+import { convertSources, type DocumentConverterSummary } from '../conversion/DocumentConverter.js';
 import { ExtractionWorker } from '../extraction/ExtractionWorker.js';
 import type { LLMProvider } from '../providers/LLMProvider.js';
 import { DocumentAnalyzer, reassignFailedSource, estimateValidationCost } from './DocumentAnalyzer.js';
@@ -160,6 +163,57 @@ export class IndexingOrchestrator {
     await this.state.saveAnalysisReport(report);
 
     return report;
+  }
+
+  /**
+   * Convert: turn every `needs-conversion` source into derived Markdown via
+   * the document-conversion service, so extraction reads clean text.
+   *
+   * Requires a `services.docling` config section — a repo with binary sources
+   * but no service configured is a setup error, surfaced with an actionable
+   * message. Stuck `converting` sources from an interrupted run are reset
+   * before the batch starts. `sourceDir`, when provided, roots the derived
+   * filename slugs; otherwise the common ancestor of the source paths is used.
+   */
+  async convert(sourceDir?: string): Promise<DocumentConverterSummary> {
+    await this.state.setPipelineState(Phase.PREPARE);
+    await this.state.clearStopRequest();
+    await this.state.resetConvertingSources();
+
+    const needsConversion = await this.state.getSourcesByStatus('needs-conversion');
+    if (needsConversion.length === 0) {
+      return { converted: 0, skipped: 0, failed: 0, stoppedEarly: false, perDoc: [] };
+    }
+
+    const doclingConfig = this.config.services?.docling;
+    if (!doclingConfig) {
+      throw new InvalidInputError(
+        'services.docling',
+        `${needsConversion.length} source(s) need conversion but no document-conversion service is configured.`,
+        'Add a "services.docling" section to config.json (endpoint defaults to http://localhost:5001) and start the docling-worker docker profile.',
+      );
+    }
+
+    const doclingClient = new DoclingClient({
+      endpoint: doclingConfig.endpoint,
+      ...(doclingConfig.timeoutMs !== undefined ? { timeoutMs: doclingConfig.timeoutMs } : {}),
+      ...(doclingConfig.maxRetries !== undefined ? { maxRetries: doclingConfig.maxRetries } : {}),
+      ...(doclingConfig.apiKey !== undefined ? { apiKey: doclingConfig.apiKey } : {}),
+    });
+
+    const sourceRoot = sourceDir ?? commonAncestorDir(needsConversion.map(s => s.path));
+
+    const { sourceFilter, maxItems } = this.config.extraction;
+    const summary = await convertSources(
+      { state: this.state, doclingClient, sourceRoot },
+      {
+        ...(sourceFilter && sourceFilter.length > 0 ? { sourceFilter } : {}),
+        ...(maxItems !== undefined ? { maxItems } : {}),
+        ...(doclingConfig.doOcr !== undefined ? { doOcr: doclingConfig.doOcr } : {}),
+      },
+    );
+
+    return summary;
   }
 
   /**
@@ -939,20 +993,36 @@ export class IndexingOrchestrator {
   /** Scan a directory recursively for indexable documents */
   private async scanSourceDirectory(dir: string): Promise<IndexSource[]> {
     const sources: IndexSource[] = [];
-    const indexableExtensions = new Set(['.md', '.txt', '.json', '.csv']);
+    // Plain-text formats the extractor reads directly.
+    const textExtensions = new Set(['.md', '.txt', '.json', '.csv']);
+    // Rich formats docling-serve converts to Markdown before extraction.
+    // Legacy binary `.doc` is intentionally excluded — docling accepts DOCX
+    // but not the Word 97-2003 binary format, so registering it would create
+    // sources that can never convert.
+    const convertExtensions = new Set(['.pdf', '.docx', '.html', '.htm', '.pptx']);
 
     const walk = async (currentDir: string): Promise<void> => {
       const entries = await readdir(currentDir, { withFileTypes: true });
       for (const entry of entries) {
         const fullPath = join(currentDir, entry.name);
+        const ext = extname(entry.name).toLowerCase();
         if (entry.isDirectory()) {
           await walk(fullPath);
-        } else if (indexableExtensions.has(extname(entry.name).toLowerCase())) {
+        } else if (textExtensions.has(ext)) {
           const stats = await stat(fullPath);
           sources.push({
             path: fullPath,
             type: inferDocumentType(entry.name),
             status: 'pending',
+            notes: `${Math.round(stats.size / 1024)} KB`,
+          });
+        } else if (convertExtensions.has(ext)) {
+          const stats = await stat(fullPath);
+          sources.push({
+            path: fullPath,
+            type: inferDocumentType(entry.name),
+            status: 'needs-conversion',
+            originalFormat: ext,
             notes: `${Math.round(stats.size / 1024)} KB`,
           });
         }
@@ -962,6 +1032,31 @@ export class IndexingOrchestrator {
     await walk(dir);
     return sources;
   }
+}
+
+/**
+ * Compute the deepest directory that contains every given path. Used to root
+ * derived-filename slugs when the caller does not supply the source directory.
+ * Falls back to an empty string (converter then uses basenames) when the paths
+ * share no common ancestor.
+ */
+function commonAncestorDir(paths: string[]): string {
+  if (paths.length === 0) return '';
+  const split = paths.map(p => p.split(/[\\/]/));
+  const first = split[0]!;
+  const common: string[] = [];
+  for (let i = 0; i < first.length; i++) {
+    const segment = first[i]!;
+    if (split.every(parts => parts[i] === segment)) {
+      common.push(segment);
+    } else {
+      break;
+    }
+  }
+  // Drop the trailing segment if it is a shared filename rather than a directory
+  // (only relevant when a single path is supplied).
+  if (paths.length === 1) common.pop();
+  return common.join('/');
 }
 
 /** Infer document type from filename patterns */

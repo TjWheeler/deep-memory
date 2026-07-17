@@ -96,7 +96,7 @@ export class StateManager {
   }
 
   /** Update arbitrary fields on a source document */
-  async updateSource(path: string, updates: Partial<Pick<IndexSource, 'assignedWorkers' | 'estimatedTokens' | 'actualTokens' | 'lastError' | 'attempts' | 'status' | 'extractionFiles' | 'selectedExtraction' | 'notes' | 'processingTimeMs' | 'statusReason'>>): Promise<void> {
+  async updateSource(path: string, updates: Partial<Pick<IndexSource, 'assignedWorkers' | 'estimatedTokens' | 'actualTokens' | 'lastError' | 'attempts' | 'status' | 'extractionFiles' | 'selectedExtraction' | 'notes' | 'processingTimeMs' | 'statusReason' | 'derivedTextPath' | 'originalFormat'>>): Promise<void> {
     const sourceList = await this.getSourceList();
     if (!sourceList) throw new Error(`Source list not found in ${this.stateDir}`);
     const source = sourceList.sources.find(s => s.path === path);
@@ -544,6 +544,29 @@ export class StateManager {
     return count;
   }
 
+  /**
+   * Reset any source stuck in 'converting' back to 'needs-conversion'.
+   *
+   * A process killed mid-conversion leaves the source flagged as in-flight
+   * with no worker to finish it; on resume it must be re-offered to convert
+   * rather than stranded. Returns the number of sources reset.
+   */
+  async resetConvertingSources(): Promise<number> {
+    const sourceList = await this.getSourceList();
+    if (!sourceList) return 0;
+    let count = 0;
+    for (const source of sourceList.sources) {
+      if (source.status === 'converting') {
+        source.status = 'needs-conversion';
+        count++;
+      }
+    }
+    if (count > 0) {
+      await this.saveSourceList(sourceList);
+    }
+    return count;
+  }
+
   // ── Resume Detection ────────────────────────────────────────────
 
   /**
@@ -588,6 +611,15 @@ export class StateManager {
     // All sources validated — fully complete
     if (statuses.every(s => s === 'validated')) {
       return Phase.COMPLETE;
+    }
+
+    // Any source still awaiting or undergoing conversion holds the pipeline in
+    // prepare — the convert action lives in the prepare route, and extraction
+    // must never run against unconverted binary bytes. This precedes the
+    // extract check so a mixed repo (pending text + unconverted binaries)
+    // routes to prepare/convert first rather than skipping straight to extract.
+    if (statuses.some(s => s === 'needs-conversion' || s === 'converting')) {
+      return Phase.PREPARE;
     }
 
     // Any sources still pending, extracting, or deduplicating — continue extraction

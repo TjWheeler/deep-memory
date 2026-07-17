@@ -46,6 +46,14 @@ export class StatusTool extends BaseToolController {
       assignedWorker: p.assignedWorker ?? 'unknown',
     }));
 
+    // Check for active or pending conversion (runs during the prepare phase)
+    const sources = sourceList?.sources ?? [];
+    const needsConversion = sources.filter(s => s.status === 'needs-conversion').length;
+    const converting = sources.filter(s => s.status === 'converting').length;
+    if (processLock?.operation === 'conversion' || converting > 0 || (phase === Phase.PREPARE && needsConversion > 0)) {
+      return this.conversionStatus(phase, needsConversion, converting, sources.filter(s => s.status !== 'excluded').length, stopRequested, processLock);
+    }
+
     // Check for active extraction
     if (activeProgress.length > 0 || phase === Phase.EXTRACT) {
       return this.extractionStatus(phase, sourceList, activeProgress, stopRequested, extractionStartedAt, processLock);
@@ -92,6 +100,42 @@ export class StatusTool extends BaseToolController {
       details: null,
       stopRequested,
       lastCompleted: await this.detectLastCompleted(state, phase, sourceList, embeddingProgress, fullValidationProgress),
+    };
+  }
+
+  private conversionStatus(
+    phase: PipelinePhase,
+    needsConversion: number,
+    converting: number,
+    total: number,
+    stopRequested: boolean,
+    processLock: { operation: string; acquiredAt: string; pid: number } | null,
+  ) {
+    const lockAlive = processLock?.operation === 'conversion'
+      ? StateManager.isProcessAlive(processLock.pid)
+      : false;
+    const running = converting > 0 && lockAlive;
+    const remaining = needsConversion + converting;
+    const completed = Math.max(0, total - remaining);
+
+    return {
+      currentPhase: phase,
+      operation: 'conversion',
+      running,
+      stale: converting > 0 && !lockAlive ? true : undefined,
+      stopRequested,
+      progress: {
+        completed,
+        total,
+        percentage: total > 0 ? Math.round((completed / total) * 100) : 0,
+        eta: null,
+      },
+      details: {
+        byStatus: { needsConversion, converting },
+      },
+      guidance: running
+        ? 'Conversion in progress. Poll indexing_status until it completes.'
+        : `${needsConversion} source(s) need conversion. Start the docling-worker docker profile, then run indexing_execute action: "convert".`,
     };
   }
 

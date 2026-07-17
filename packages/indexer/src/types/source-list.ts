@@ -37,6 +37,17 @@ export interface IndexSource {
   attempts?: number;
   /** Human-readable reason for the current status (especially useful for 'excluded') */
   statusReason?: string;
+  /**
+   * Absolute path to the derived text the extractor reads instead of the raw
+   * source. Set when a binary/rich-format source has been converted to
+   * Markdown. Absent for sources that are already plain text.
+   */
+  derivedTextPath?: string;
+  /**
+   * File extension of the original source (e.g. ".pdf", ".docx") when the
+   * source needs conversion before extraction. Absent for plain-text sources.
+   */
+  originalFormat?: string;
 }
 
 /** Token usage estimate for a single document against its assigned worker */
@@ -47,4 +58,4 @@ export interface DocumentTokenEstimate {
 }
 
 /** Source document processing lifecycle */
-export type IndexSourceStatus = 'pending' | 'extracting' | 'deduplicating' | 'extracted' | 'consolidated' | 'imported' | 'validated' | 'excluded';
+export type IndexSourceStatus = 'needs-conversion' | 'converting' | 'pending' | 'extracting' | 'deduplicating' | 'extracted' | 'consolidated' | 'imported' | 'validated' | 'excluded';

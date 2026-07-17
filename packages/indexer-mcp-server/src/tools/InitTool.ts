@@ -129,6 +129,15 @@ export class InitTool extends BaseToolController {
           ...(storageConfig ? { config: storageConfig } : {}),
         },
       },
+      // Document-conversion service for rich formats (PDF/DOCX/HTML/PPTX).
+      // Only used when the source directory contains such files. Start the
+      // docling-worker docker profile before running the convert action. The
+      // endpoint below matches the host port the compose profile publishes.
+      services: {
+        docling: {
+          endpoint: 'http://localhost:5001',
+        },
+      },
       qualityThresholds: DEFAULT_QUALITY_THRESHOLDS,
     };
 
@@ -152,6 +161,9 @@ export class InitTool extends BaseToolController {
       // Validation workers reuse the same cloud workers
       secretsTemplate['validation'] = { workers: workerSecrets };
     }
+    // Slot for the document-conversion service API key. Left empty — populate
+    // only when docling-serve is deployed behind authentication.
+    secretsTemplate['docling'] = { apiKey: '' };
 
     await writeFile(
       join(processDir, 'config.secrets.json'),

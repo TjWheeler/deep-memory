@@ -73,6 +73,31 @@ export interface OrchestratorConfig {
   embeddings?: EmbeddingsConfig;
   /** Quality thresholds for review diagnostics — domain-specific acceptable error rates */
   qualityThresholds: QualityThresholds;
+  /** External services the pipeline can call (e.g. document conversion) */
+  services?: ServicesConfig;
+}
+
+/** External-service configuration block */
+export interface ServicesConfig {
+  /** Document-conversion service (docling-serve) for rich-format sources */
+  docling?: DoclingServiceConfig;
+}
+
+/** Configuration for the document-conversion service */
+export interface DoclingServiceConfig {
+  /** Base URL of the docling-serve container (e.g. http://localhost:5001) */
+  endpoint: string;
+  /** Request timeout in milliseconds (default 120_000) */
+  timeoutMs?: number;
+  /** Retry attempts on transient failures (default 3) */
+  maxRetries?: number;
+  /**
+   * Whether the service runs OCR. OCR is expensive on born-digital documents;
+   * leave unset to use the service default, or set false to skip it globally.
+   */
+  doOcr?: boolean;
+  /** API key sent as the X-Api-Key header when the service requires auth */
+  apiKey?: string;
 }
 
 /**

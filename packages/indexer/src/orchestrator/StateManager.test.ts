@@ -353,6 +353,57 @@ describe('StateManager', () => {
 
       expect(await manager.getCurrentPhase()).toBe('complete');
     });
+
+    it('returns prepare for a mixed repo where a source still needs conversion', async () => {
+      await manager.saveSourceList({
+        version: '1.0.0',
+        repositoryId: 'test',
+        sources: [
+          { path: '/a.md', type: 'general', status: 'pending' },
+          { path: '/b.pdf', type: 'general', status: 'needs-conversion', originalFormat: '.pdf' },
+        ],
+      });
+
+      // Conversion must precede extraction — the convert action lives in the
+      // prepare route, so a repo with any unconverted source stays in prepare
+      // rather than routing to extract (which would leave convert unreachable).
+      expect(await manager.getCurrentPhase()).toBe('prepare');
+    });
+
+    it('does not report complete when every source still needs conversion', async () => {
+      await manager.saveSourceList({
+        version: '1.0.0',
+        repositoryId: 'test',
+        sources: [
+          { path: '/a.pdf', type: 'general', status: 'needs-conversion', originalFormat: '.pdf' },
+          { path: '/b.docx', type: 'general', status: 'converting', originalFormat: '.docx' },
+        ],
+      });
+
+      expect(await manager.getCurrentPhase()).toBe('prepare');
+    });
+  });
+
+  describe('resetConvertingSources', () => {
+    it('returns converting sources to needs-conversion and leaves others untouched', async () => {
+      await manager.saveSourceList({
+        version: '1.0.0',
+        repositoryId: 'test',
+        sources: [
+          { path: '/a.pdf', type: 'general', status: 'converting', originalFormat: '.pdf' },
+          { path: '/b.md', type: 'general', status: 'pending' },
+          { path: '/c.docx', type: 'general', status: 'needs-conversion', originalFormat: '.docx' },
+        ],
+      });
+
+      const reset = await manager.resetConvertingSources();
+      expect(reset).toBe(1);
+
+      const loaded = await manager.getSourceList();
+      expect(loaded!.sources.find(s => s.path === '/a.pdf')!.status).toBe('needs-conversion');
+      expect(loaded!.sources.find(s => s.path === '/b.md')!.status).toBe('pending');
+      expect(loaded!.sources.find(s => s.path === '/c.docx')!.status).toBe('needs-conversion');
+    });
   });
 
   describe('reorderSource', () => {

@@ -11,6 +11,8 @@ export type {
   EmbeddingsConfig,
   EmbeddingsWorkerConfig,
   QualityThresholds,
+  ServicesConfig,
+  DoclingServiceConfig,
 } from './types/config.js';
 export { DEFAULT_QUALITY_THRESHOLDS } from './types/config.js';
 
@@ -50,6 +52,25 @@ export { loadProcessConfig } from './orchestrator/ProcessConfigLoader.js';
 export type { IndexProcessConfig, IndexProcessSecrets } from './orchestrator/ProcessConfigLoader.js';
 export { ProcessStateWriter } from './orchestrator/ProcessStateWriter.js';
 export type { ProcessPhase, ProcessIteration } from './orchestrator/ProcessStateWriter.js';
+
+// Conversion (document format gateway)
+export { DoclingClient, toDoclingDocument } from './conversion/DoclingClient.js';
+export type {
+  DoclingDocument,
+  DoclingConvertRequest,
+  DoclingConvertResponse,
+  DoclingClientOptions,
+  DoclingClientError,
+  DoclingExportFormat,
+} from './conversion/types.js';
+export { DoclingServiceError, DoclingTimeoutError } from './conversion/errors.js';
+export { convertSources, detectMime, deriveDocSlug } from './conversion/DocumentConverter.js';
+export type {
+  DocumentConverterDeps,
+  DocumentConverterOptions,
+  DocumentConverterSummary,
+  DocumentConverterPerDoc,
+} from './conversion/DocumentConverter.js';
 
 // Extraction
 export { ExtractionWorker } from './extraction/ExtractionWorker.js';

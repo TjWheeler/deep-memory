@@ -27,10 +27,10 @@ import { VerificationWorker, readSourceContent } from '../validation/Verificatio
 import { ReviewDiagnostics } from '../review/ReviewDiagnostics.js';
 import { VocabularyConformanceGate } from '../review/VocabularyConformanceGate.js';
 import type { ConformanceReport } from '../review/VocabularyConformanceGate.js';
-import { parseVocabularyMarkdown } from '../consolidation/VocabularyMarkdownParser.js';
+import { parseVocabularyMarkdown, extractControlledValuesByEntityType } from '../consolidation/VocabularyMarkdownParser.js';
 import { ConsolidationReviewDiagnostics } from '../review/ConsolidationReviewDiagnostics.js';
 import type { ConsolidationReviewReport } from '../review/consolidation-review-types.js';
-import type { ReviewReport } from '../review/types.js';
+import type { ReviewReport, ReviewVocabularyContext } from '../review/types.js';
 import { FullValidationOrchestrator } from '../validation/FullValidationOrchestrator.js';
 import { summarizeVocabularyForValidation } from '../validation/VocabularySummarizer.js';
 import type { FullValidationRunOptions, FullValidationProgressCallbacks } from '../validation/FullValidationOrchestrator.js';
@@ -287,7 +287,7 @@ export class IndexingOrchestrator {
    * documents produce nothing. Pure computation — no LLM calls — safe to run at
    * both `analyze` (pre-extraction) and `diagnose`.
    */
-  async detectTableCorruption(sourceFilter?: string[]): Promise<TableCorruptionRecommendation[]> {
+  public async detectTableCorruption(sourceFilter?: string[]): Promise<TableCorruptionRecommendation[]> {
     const sourceList = await this.state.getSourceList();
     if (!sourceList) return [];
 
@@ -705,9 +705,61 @@ export class IndexingOrchestrator {
    * property coverage, orphan relationships, duplicates, and label quality.
    * Persists the report to state/review-diagnostics.json.
    */
-  async reviewDiagnostics(sourceFilter?: string[], workerName?: string): Promise<ReviewReport> {
-    const diagnostics = new ReviewDiagnostics(this.state, this.config.qualityThresholds.extraction);
+  public async reviewDiagnostics(sourceFilter?: string[], workerName?: string): Promise<ReviewReport> {
+    const vocabularyContext = await this.buildReviewVocabularyContext(sourceFilter);
+    const diagnostics = new ReviewDiagnostics(
+      this.state,
+      this.config.qualityThresholds.extraction,
+      vocabularyContext,
+    );
     return diagnostics.run(sourceFilter, workerName);
+  }
+
+  /**
+   * Build the optional vocabulary context that enables the review report's
+   * vocabulary-aware signals: a conformance summary and the enum-checklist
+   * fabrication smell. Returns undefined when no vocabulary is available so the
+   * structural checks still run for a repo without one.
+   *
+   * The vocabulary here is optional enrichment of the review report: if it
+   * cannot be read or parsed, the review still runs its structural checks rather
+   * than failing. This degrade only affects the enrichment fields — it does not
+   * suppress a failure of the structural checks themselves.
+   *
+   * The conformance gate is run a second time here (the diagnose tool also runs
+   * it via {@link conformanceDiagnostics} for its own richer check). The passes
+   * are kept separate deliberately: this one produces only the compact summary
+   * carried in the persisted review report, independent of the tool's check.
+   */
+  private async buildReviewVocabularyContext(
+    sourceFilter?: string[],
+  ): Promise<ReviewVocabularyContext | undefined> {
+    let vocabularyMarkdown: string;
+    try {
+      await this.loadVocabularyAndRules();
+      if (!this.vocabulary) return undefined;
+      vocabularyMarkdown = this.vocabulary;
+    } catch {
+      return undefined;
+    }
+
+    const parsed = parseVocabularyMarkdown(vocabularyMarkdown);
+    const mode = this.config.governanceMode ?? 'managed';
+
+    let outputs = await this.state.getExtractionOutputs();
+    if (sourceFilter && sourceFilter.length > 0) {
+      outputs = outputs.filter(o => matchesSourceFilter(o.sourcePath, sourceFilter));
+    }
+
+    const report = new VocabularyConformanceGate(parsed, mode).run(outputs);
+    return {
+      conformance: {
+        mode: report.mode,
+        violationCount: report.violationCount,
+        countsByClass: report.countsByClass,
+      },
+      controlledValuesByType: extractControlledValuesByEntityType(vocabularyMarkdown),
+    };
   }
 
   /**
@@ -721,7 +773,7 @@ export class IndexingOrchestrator {
    * vocabulary-extension recommendations for recurring closed-enum values.
    * Pure computation — no LLM calls, no repository access.
    */
-  async conformanceDiagnostics(sourceFilter?: string[]): Promise<ConformanceReport> {
+  public async conformanceDiagnostics(sourceFilter?: string[]): Promise<ConformanceReport> {
     await this.loadVocabularyAndRules();
     const vocabulary = parseVocabularyMarkdown(this.vocabulary ?? '');
     const mode = this.config.governanceMode ?? 'managed';

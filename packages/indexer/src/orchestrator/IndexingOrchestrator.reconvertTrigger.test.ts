@@ -132,6 +132,37 @@ describe('IndexingOrchestrator prepare re-convert trigger', () => {
     expect(await fileExists(mdPath)).toBe(true);
   });
 
+  it('prepare → convert → prepare converges: once options match convertOptionsUsed, no re-queue', async () => {
+    // First prepare: a converted source gains a per-source override its recorded
+    // options don't match, so it re-queues for conversion.
+    await seed(convertedSource({ sourceConvertOptions: { tableCellMatching: false } }));
+    await new IndexingOrchestrator(baseConfig(stateDir)).prepare(sourceDir);
+    let source = (await state.getSourceList())!.sources[0]!;
+    expect(source.status).toBe('needs-conversion');
+
+    // Simulate the convert step: it reconverts, restores derived files, and
+    // records the options it used plus the current source hash.
+    await writeFile(mdPath, '# reconverted derived text', 'utf-8');
+    await writeFile(jsonPath, '{}', 'utf-8');
+    await state.updateSource(pdfPath, {
+      status: 'pending',
+      derivedTextPath: mdPath,
+      derivedDoclingJsonPath: jsonPath,
+      sourceHash: createHash('sha256').update(PDF_BYTES).digest('hex'),
+      convertOptionsUsed: { tableCellMatching: false },
+    });
+
+    // Second prepare: effective options now equal what was used and bytes are
+    // unchanged — the source stays put, so the cycle terminates instead of
+    // re-queueing forever.
+    await new IndexingOrchestrator(baseConfig(stateDir)).prepare(sourceDir);
+    source = (await state.getSourceList())!.sources[0]!;
+    expect(source.status).toBe('pending');
+    expect(source.derivedTextPath).toBe(mdPath);
+    expect(source.sourceHash).toBeDefined();
+    expect(await fileExists(mdPath)).toBe(true);
+  });
+
   it('does not re-queue an option-less source whose recorded options are absent', async () => {
     // Neither process default nor per-source options; recorded options absent.
     // Effective {} equals undefined, so an existing corpus is left alone.

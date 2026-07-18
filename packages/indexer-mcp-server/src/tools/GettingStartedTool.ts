@@ -105,6 +105,8 @@ Pairings (extraction → validation):
 
 The validation worker is configured separately from the extraction worker in \`config.json\`. When you advance to the \`full-validation\` phase, confirm with the user that the validation endpoint/model is set to a stronger tier than extraction before calling \`indexing_execute\`.
 
+**Recommended backstop for fabrication-prone corpora.** The extraction prompt already discourages fabrication — it tells the model that a list of allowed values is a naming vocabulary rather than a checklist of entities to create, and that a cross-reference or deferral cell ("Refer to Clause X") is not a property value. That is a prompt-level guardrail, and prompts are not perfectly reliable. For corpora where fabrication is a known risk — dense tables, closed-enum properties, spec sheets, regulatory documents with cross-references — run \`full-validation\` with a stronger model as the verification backstop. It re-checks each extracted item against the source text and catches the fabricated entities and forced property values that slip past the extraction prompt. Treat it as recommended rather than optional whenever data fidelity matters more than run cost.
+
 ## Worker Assignment & Parallelism
 
 Workers run in parallel **across different source files**, not within a single file. You control this by assigning workers to sources with \`indexing_update source: "<file>" sourceWorkers: "<worker-name>"\` (comma-separated for multiple).

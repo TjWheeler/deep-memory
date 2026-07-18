@@ -100,4 +100,23 @@ describe('UpdateTool sourceConvertOptions', () => {
     const source = (await state.getSourceList())!.sources[0]!;
     expect(source.status).toBe('needs-conversion');
   });
+
+  it('lets an explicit sourceStatus win over the options-change auto-queue', async () => {
+    // A converted source with a genuine options change would normally auto-queue
+    // to needs-conversion; an explicit status in the same call must not be
+    // clobbered by that convenience.
+    await seed(convertedSource());
+    const tool = new UpdateTool(silentLogger);
+
+    await tool.execute({
+      processDir,
+      source: 'doc.pdf',
+      sourceStatus: 'extracted',
+      sourceConvertOptions: { tableCellMatching: false },
+    });
+
+    const source = (await state.getSourceList())!.sources[0]!;
+    expect(source.status).toBe('extracted');
+    expect(source.sourceConvertOptions).toEqual({ tableCellMatching: false });
+  });
 });

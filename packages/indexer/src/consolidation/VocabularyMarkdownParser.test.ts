@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseVocabularyMarkdown, augmentVocabularyFromData } from './VocabularyMarkdownParser.js';
+import { parseVocabularyMarkdown, augmentVocabularyFromData, extractControlledValuesByEntityType } from './VocabularyMarkdownParser.js';
 import type { StoredEntity, StoredRelationship, Provenance } from '@utaba/deep-memory';
 
 const prov: Provenance = {
@@ -573,5 +573,88 @@ Some equipment.
 
     // Should be the exact same object reference
     expect(result).toBe(vocab);
+  });
+});
+
+describe('extractControlledValuesByEntityType', () => {
+  it('captures both open recommended and closed allowed value grids per type', () => {
+    const md = `# Vocabulary
+
+## Entity Types
+
+### Facility
+
+A community facility.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`facilityType\` | string | yes | See recommended values |
+
+**Recommended \`facilityType\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`library\` | A library |
+| \`pool\` | A swimming pool |
+| \`hall\` | A community hall |
+
+### Provision
+
+A rule.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`permissibility\` | enum | yes | Allowed set |
+
+**Allowed \`permissibility\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`P\` | Permitted |
+| \`D\` | Discretionary |
+
+## Relationship Types
+`;
+
+    const result = extractControlledValuesByEntityType(md);
+    expect(result['Facility']).toEqual(['library', 'pool', 'hall']);
+    expect(result['Provision']).toEqual(['P', 'D']);
+  });
+
+  it('merges qualified recommended grids for the same type', () => {
+    const md = `## Entity Types
+
+### Structure
+
+A structure.
+
+**Recommended \`structureSubtype\` values for signs:**
+
+| Value | Description |
+|-------|-------------|
+| \`billboard\` | A billboard |
+
+**Recommended \`structureSubtype\` values for jetties:**
+
+| Value | Description |
+|-------|-------------|
+| \`pontoon\` | A pontoon |
+`;
+    const result = extractControlledValuesByEntityType(md);
+    expect(result['Structure']).toEqual(['billboard', 'pontoon']);
+  });
+
+  it('returns an empty map when there are no controlled-value grids', () => {
+    const md = `## Entity Types
+
+### Person
+
+A person.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`name\` | string | yes | Full name |
+`;
+    expect(extractControlledValuesByEntityType(md)).toEqual({});
   });
 });

@@ -68,7 +68,7 @@ export type {
   PollDecision,
 } from './conversion/types.js';
 export { DoclingServiceError, DoclingTimeoutError } from './conversion/errors.js';
-export { convertSources, detectMime, deriveDocSlug, decideOcr, CONVERT_OPTION_KEYS, mergeConvertOptions, convertOptionsEqual } from './conversion/DocumentConverter.js';
+export { convertSources, detectMime, deriveDocSlug, decideOcr, CONVERT_OPTION_KEYS, convertOptionsEqual } from './conversion/DocumentConverter.js';
 export type {
   DocumentConverterDeps,
   DocumentConverterOptions,
@@ -113,7 +113,7 @@ export type { ConsolidationReport, ConsolidationPipelineContext } from './consol
 export { EntityMatcher } from './consolidation/EntityMatcher.js';
 export type { MatchResult } from './consolidation/EntityMatcher.js';
 export type { MergeEvent, MergeLog, MergeMatchType } from './consolidation/types.js';
-export { parseVocabularyMarkdown, augmentVocabularyFromData } from './consolidation/VocabularyMarkdownParser.js';
+export { parseVocabularyMarkdown, augmentVocabularyFromData, extractControlledValuesByEntityType } from './consolidation/VocabularyMarkdownParser.js';
 
 // Import
 export { BatchImporter } from './import/BatchImporter.js';
@@ -154,6 +154,12 @@ export type {
   WorkerSummary,
   WorkerComparison,
   SourceComparison,
+  ConformanceSummary,
+  FabricationSmells,
+  EnumChecklistSmell,
+  SharedSourceRefSmell,
+  ZeroPropertyEndpointReport,
+  ReviewVocabularyContext,
 } from './review/types.js';
 export type {
   ConsolidationReviewReport,

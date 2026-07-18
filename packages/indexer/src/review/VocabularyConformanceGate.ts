@@ -101,8 +101,13 @@ export interface ConformanceReport {
   recommendations: VocabularyExtensionRecommendation[];
 }
 
-/** Maximum violation examples carried in a report */
-const MAX_EXAMPLES = 10;
+/**
+ * Maximum violation examples carried in a report per violation class. Capping
+ * per class rather than in total stops the first-processed classes (entities are
+ * checked before relationships) from starving later classes of examples — every
+ * class that occurs keeps a representative sample.
+ */
+const MAX_EXAMPLES_PER_CLASS = 5;
 
 /** Accumulator for one (scope, type, property) closed-enum offender group */
 interface EnumOffenderGroup {
@@ -145,6 +150,13 @@ export class VocabularyConformanceGate {
       other: 0,
     };
     const examples: ConformanceViolation[] = [];
+    const exampleCountByClass: Record<ConformanceViolationClass, number> = {
+      'unknown-type': 0,
+      'endpoint-type': 0,
+      'required-property-missing': 0,
+      'closed-enum-value': 0,
+      other: 0,
+    };
     const enumOffenders = new Map<string, EnumOffenderGroup>();
 
     let totalEntities = 0;
@@ -154,7 +166,8 @@ export class VocabularyConformanceGate {
     const record = (violation: ConformanceViolation): void => {
       countsByClass[violation.class] += 1;
       violationCount += 1;
-      if (examples.length < MAX_EXAMPLES) {
+      if (exampleCountByClass[violation.class] < MAX_EXAMPLES_PER_CLASS) {
+        exampleCountByClass[violation.class] += 1;
         examples.push(violation);
       }
     };

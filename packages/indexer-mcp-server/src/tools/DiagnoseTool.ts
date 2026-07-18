@@ -270,14 +270,32 @@ export class DiagnoseTool extends BaseToolController {
         ] : undefined,
       });
 
+      // Status reflects only normalized exact duplicates. Token-subset pairs are
+      // candidates, not confirmed duplicates — compound/hierarchical names
+      // legitimately nest (e.g. "Main Street" within "Main Street Bridge") — so
+      // they must not downgrade the corpus rating.
       checks.push({
         name: 'duplicates',
         status: a.duplicateRating === 'good' ? 'pass' : 'warn',
-        detail: `${a.duplicateCount} duplicate entities detected`,
+        detail: `${a.duplicateCount} normalized-duplicate entities detected`,
         items: report.documents
           .flatMap(d => d.duplicateCheck.duplicates.map(dup => ({ source: d.source, ...dup })))
           .slice(0, 20),
       });
+
+      // Separate, informational listing of token-subset pairs: candidates for the
+      // agent to verify, kept out of the pass/fail rating above.
+      const tokenSubsetTotal = report.documents.reduce((sum, d) => sum + d.duplicateCheck.tokenSubsetCount, 0);
+      if (tokenSubsetTotal > 0) {
+        const possibleDuplicateExamples = report.documents
+          .flatMap(d => d.duplicateCheck.possibleDuplicates.map(pd => ({ source: d.source, ...pd })));
+        checks.push({
+          name: 'possible-duplicates',
+          status: 'pass',
+          detail: `${tokenSubsetTotal} possible duplicate(s) by token-subset — one label's words are contained in another's (e.g. "Main Street" within "Main Street Bridge"). Candidates to verify, not counted as duplicates.`,
+          items: possibleDuplicateExamples.slice(0, 20),
+        });
+      }
 
       const badLabelExamples = report.documents
         .flatMap(d => d.labelCheck.examples.map(ex => ({ source: d.source, ...ex })));
@@ -296,6 +314,42 @@ export class DiagnoseTool extends BaseToolController {
           status: 'warn',
           detail: `${a.zeroPropertyCount} entities with zero properties`,
           items: zeroPropertyExamples.slice(0, 20),
+        });
+      }
+
+      // Zero-property entities that anchor relationships — surfaced regardless of
+      // the aggregate coverage rating, which can otherwise average these away.
+      const endpoints = report.zeroPropertyEndpoints;
+      if (endpoints && endpoints.count > 0) {
+        checks.push({
+          name: 'zero-property-endpoints',
+          status: 'warn',
+          detail: `${endpoints.count} zero-property entit${endpoints.count === 1 ? 'y is a' : 'ies are'} relationship endpoint(s) — placeholder nodes that exist only to anchor edges.`,
+          items: endpoints.examples.slice(0, 20),
+        });
+      }
+
+      // Fabrication smells: labels enumerating a controlled vocabulary, and many
+      // relationships hanging off one narrow source passage.
+      const smells = report.fabricationSmells;
+      if (smells && smells.enumChecklist.length > 0) {
+        checks.push({
+          name: 'controlled-vocabulary-as-entities',
+          status: 'warn',
+          detail: `${smells.enumChecklist.length} entity type(s) whose labels enumerate the type's controlled vocabulary rather than being read from source — a fabrication smell.`,
+          items: smells.enumChecklist.map(s => ({
+            entityType: s.entityType,
+            matched: `${s.matchedCount}/${s.distinctLabelCount} labels match ${s.controlledValueCount} controlled values`,
+            examples: s.examples,
+          })),
+        });
+      }
+      if (smells && smells.sharedSourceRefs.length > 0) {
+        checks.push({
+          name: 'cross-product-relationships',
+          status: 'warn',
+          detail: `${smells.sharedSourceRefs.length} narrow source passage(s) cited by many relationships — a cross-product fabrication smell.`,
+          items: smells.sharedSourceRefs.slice(0, 20),
         });
       }
 

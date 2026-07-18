@@ -239,4 +239,39 @@ describe('VocabularyConformanceGate', () => {
     expect(report.countsByClass['endpoint-type']).toBe(0);
     expect(report.violationCount).toBe(0);
   });
+
+  it('keeps examples for every violation class rather than starving later classes', () => {
+    // Entities are processed before relationships, so a flood of entity-scope
+    // unknown-type violations must not exhaust the example budget and leave the
+    // relationship-scope endpoint / enum classes with none.
+    const output: ExtractionOutput = {
+      source: 'lps.md',
+      sourcePath: '/corpus/lps.md',
+      extractedAt: NOW,
+      extractedBy: 'worker',
+      entities: [
+        entity('Zone', 'Residential Zone'),
+        entity('LandUse', 'Shop'),
+        entity('Provision', 'Setback Rule'),
+        // Many unknown-type entities up front.
+        ...Array.from({ length: 20 }, (_, i) => entity('Ghost', `Ghost ${i}`)),
+      ],
+      relationships: [
+        relationship('PERMITS', 'Residential Zone', 'Shop', { permissibility: 'I' }),
+        relationship('PERMITS', 'Setback Rule', 'Shop', { permissibility: 'P' }),
+      ],
+    };
+
+    const gate = new VocabularyConformanceGate(buildVocabulary(), 'managed');
+    const report = gate.run([output]);
+
+    const classesWithExamples = new Set(report.examples.map(v => v.class));
+    expect(classesWithExamples.has('unknown-type')).toBe(true);
+    expect(classesWithExamples.has('endpoint-type')).toBe(true);
+    expect(classesWithExamples.has('closed-enum-value')).toBe(true);
+
+    // The dominant class is capped per class, not allowed to consume the whole budget.
+    const unknownExamples = report.examples.filter(v => v.class === 'unknown-type');
+    expect(unknownExamples.length).toBeLessThanOrEqual(5);
+  });
 });

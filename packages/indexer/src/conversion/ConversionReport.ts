@@ -132,8 +132,12 @@ export function extractDoclingDiagnostics(doc: DoclingDocument): DoclingDiagnost
  * into a record. Tolerant by contract: a non-object, a non-string, or an
  * unparseable string yields `undefined` rather than throwing — diagnostics must
  * never fail a conversion.
+ *
+ * Exported so other readers of the opaque docling envelope (e.g. the
+ * table-structure detector) resolve `json_content` through the same tolerant
+ * path rather than growing a second, divergent parser.
  */
-function resolveRecord(value: unknown): Record<string, unknown> | undefined {
+export function resolveRecord(value: unknown): Record<string, unknown> | undefined {
   if (isRecord(value)) return value;
   if (typeof value === 'string') {
     try {

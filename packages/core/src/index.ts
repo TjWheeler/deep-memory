@@ -44,6 +44,19 @@ export { matchesPropertyFilters } from './relationships/PropertyFilterMatcher.js
 export { projectEntity } from './entities/entityProjection.js';
 export { createSafeSink } from './usage/safeSink.js';
 
+// Vocabulary validation — pure functions that validate entity/relationship
+// inputs against a MemoryVocabulary. Exposed so out-of-repository callers
+// (e.g. the indexer's pre-import conformance gate) enforce the same contract
+// the core repository does, instead of re-implementing type/endpoint/enum checks.
+export {
+  validateEntity,
+  validateRelationship,
+  validatePropertyValue,
+  getEntityTypeDef,
+  getRelationshipTypeDef,
+} from './vocabulary/VocabularyValidator.js';
+export type { ValidationResult, ValidationError } from './vocabulary/VocabularyValidator.js';
+
 // Compilers (for provider authors who want to reuse them)
 export {
   GremlinCompiler,

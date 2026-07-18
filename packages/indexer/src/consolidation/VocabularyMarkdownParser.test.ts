@@ -142,6 +142,209 @@ A fluid used in equipment maintenance.
     }));
   });
 
+  it('populates enumValues for a closed-enum relationship property from its Allowed values table', () => {
+    const md = `# Council Planning Domain — Vocabulary
+
+## Entity Types
+
+## Relationship Types
+
+### Zone and Land Use Relationships
+
+| Type | Description | Source → Target | Bidirectional |
+|------|-------------|-----------------|---------------|
+| \`PERMITS\` | This zone allows this land use | Zone → LandUse | no |
+
+#### Properties for \`PERMITS\`
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`permissibility\` | enum | yes | Whether a use is permitted, discretionary, or prohibited |
+| \`conditions\` | string | no | Special conditions |
+
+**Allowed \`permissibility\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`P\` | Permitted |
+| \`D\` | Discretionary |
+| \`A\` | Not permitted unless advertised |
+| \`X\` | Not permitted |
+`;
+
+    const vocab = parseVocabularyMarkdown(md);
+    const permits = vocab.relationshipTypes.find(t => t.type === 'PERMITS')!;
+    const permissibility = permits.properties!.find(p => p.name === 'permissibility')!;
+
+    expect(permissibility.type).toBe('enum');
+    expect(permissibility.enumValues).toEqual(['P', 'D', 'A', 'X']);
+
+    // A sibling open property carries no enum set.
+    const conditions = permits.properties!.find(p => p.name === 'conditions')!;
+    expect(conditions.type).toBe('string');
+    expect(conditions.enumValues).toBeUndefined();
+  });
+
+  it('leaves a Recommended-values property open (string, no enumValues)', () => {
+    const md = `# Vocabulary
+
+## Entity Types
+
+### CommunityFacility
+
+A social infrastructure facility.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`facilityType\` | string | yes | Type of facility — see recommended values below |
+| \`landSize\` | string | no | Recommended land area |
+
+**Recommended \`facilityType\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`library\` | Public lending library |
+| \`playground\` | Children's play equipment area |
+
+## Relationship Types
+`;
+
+    const vocab = parseVocabularyMarkdown(md);
+    const facility = vocab.entityTypes.find(t => t.type === 'CommunityFacility')!;
+    const facilityType = facility.properties.find(p => p.name === 'facilityType')!;
+
+    expect(facilityType.type).toBe('string');
+    expect(facilityType.enumValues).toBeUndefined();
+  });
+
+  it('populates enumValues for a closed-enum entity property from its Allowed values table', () => {
+    const md = `# Vocabulary
+
+## Entity Types
+
+### Application
+
+A development application.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`decision\` | enum | yes | The outcome of the application |
+
+**Allowed \`decision\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`approved\` | Approved |
+| \`refused\` | Refused |
+| \`withdrawn\` | Withdrawn |
+
+## Relationship Types
+`;
+
+    const vocab = parseVocabularyMarkdown(md);
+    const application = vocab.entityTypes.find(t => t.type === 'Application')!;
+    const decision = application.properties.find(p => p.name === 'decision')!;
+
+    expect(decision.type).toBe('enum');
+    expect(decision.enumValues).toEqual(['approved', 'refused', 'withdrawn']);
+  });
+
+  it('leaves enumValues undefined for an enum property with no Allowed table', () => {
+    // A missing Allowed table must yield undefined, never an empty array: an
+    // empty enumValues array would make the core validator reject every value.
+    const md = `# Vocabulary
+
+## Entity Types
+
+### Application
+
+A development application.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`decision\` | enum | yes | The outcome |
+
+## Relationship Types
+`;
+
+    const vocab = parseVocabularyMarkdown(md);
+    const decision = vocab.entityTypes.find(t => t.type === 'Application')!.properties.find(p => p.name === 'decision')!;
+
+    expect(decision.type).toBe('enum');
+    expect(decision.enumValues).toBeUndefined();
+  });
+
+  it('leaves enumValues undefined for an enum property that only has a Recommended table', () => {
+    const md = `# Vocabulary
+
+## Entity Types
+
+### Application
+
+A development application.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`decision\` | enum | yes | The outcome |
+
+**Recommended \`decision\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`approved\` | Approved |
+| \`refused\` | Refused |
+
+## Relationship Types
+`;
+
+    const vocab = parseVocabularyMarkdown(md);
+    const decision = vocab.entityTypes.find(t => t.type === 'Application')!.properties.find(p => p.name === 'decision')!;
+
+    expect(decision.type).toBe('enum');
+    expect(decision.enumValues).toBeUndefined();
+  });
+
+  it('binds each enum property to its own Allowed table within one section', () => {
+    const md = `# Vocabulary
+
+## Entity Types
+
+### Application
+
+A development application.
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| \`decision\` | enum | yes | The outcome |
+| \`stage\` | enum | yes | The processing stage |
+
+**Allowed \`decision\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`approved\` | Approved |
+| \`refused\` | Refused |
+
+**Allowed \`stage\` values:**
+
+| Value | Description |
+|-------|-------------|
+| \`lodged\` | Lodged |
+| \`assessment\` | Under assessment |
+| \`determined\` | Determined |
+
+## Relationship Types
+`;
+
+    const vocab = parseVocabularyMarkdown(md);
+    const application = vocab.entityTypes.find(t => t.type === 'Application')!;
+    const decision = application.properties.find(p => p.name === 'decision')!;
+    const stage = application.properties.find(p => p.name === 'stage')!;
+
+    expect(decision.enumValues).toEqual(['approved', 'refused']);
+    expect(stage.enumValues).toEqual(['lodged', 'assessment', 'determined']);
+  });
+
   it('returns empty vocabulary when no sections found', () => {
     const md = `# Just a title
 

@@ -1,6 +1,6 @@
 import { BaseToolController } from './base/BaseToolController.js';
 import { StateManager, Phase, IndexingOrchestrator } from '@utaba/deep-memory-indexer';
-import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport, ConversionReport } from '@utaba/deep-memory-indexer';
+import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport, ConversionReport, TableCorruptionRecommendation } from '@utaba/deep-memory-indexer';
 import { resolveStateDir, resolveConfig } from './resolveProcess.js';
 
 interface DiagnoseCheck {
@@ -36,7 +36,7 @@ export class DiagnoseTool extends BaseToolController {
 
     switch (phase) {
       case Phase.PREPARE:
-        return this.diagnosePrepare(state, phase);
+        return this.diagnosePrepare(params, state, phase);
       case Phase.EXTRACT:
       case Phase.EXTRACTION_REVIEW:
         return this.diagnoseExtraction(params, state, phase, params['workerName'] as string | undefined);
@@ -61,7 +61,7 @@ export class DiagnoseTool extends BaseToolController {
     }
   }
 
-  private async diagnosePrepare(state: StateManager, phase: PipelinePhase) {
+  private async diagnosePrepare(params: Record<string, unknown>, state: StateManager, phase: PipelinePhase) {
     const checks: DiagnoseCheck[] = [];
     const sourceList = await state.getSourceList();
 
@@ -85,9 +85,58 @@ export class DiagnoseTool extends BaseToolController {
     const conversionReport = await state.getConversionReport<ConversionReport>();
     if (conversionReport && conversionReport.entries.length > 0) {
       this.addConversionChecks(checks, conversionReport);
+      await this.addTableStructureCheck(params, checks);
     }
 
     return this.buildResponse(phase, checks, 'Run indexing_execute to prepare sources and begin extraction.');
+  }
+
+  /**
+   * Defense-in-depth table-structure check: runs the same static detector the
+   * analyze tool uses over the persisted docling sidecars and reports `warn`
+   * when any converted document looks suspect/corrupt, `pass` when all are
+   * clean. Post-extraction-safe — it only reads the sidecars on disk. The
+   * per-file re-convert remediation rides in the check detail and items.
+   */
+  private async addTableStructureCheck(params: Record<string, unknown>, checks: DiagnoseCheck[]): Promise<void> {
+    let recommendations: TableCorruptionRecommendation[];
+    try {
+      const { config } = await resolveConfig(params);
+      const orchestrator = new IndexingOrchestrator(config);
+      recommendations = await orchestrator.detectTableCorruption();
+    } catch (error) {
+      checks.push({
+        name: 'table-structure',
+        status: 'warn',
+        detail: `Could not run table-structure detection: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+
+    if (recommendations.length === 0) {
+      checks.push({
+        name: 'table-structure',
+        status: 'pass',
+        detail: 'No table-structure corruption detected in converted documents.',
+      });
+      return;
+    }
+
+    checks.push({
+      name: 'table-structure',
+      status: 'warn',
+      detail:
+        `${recommendations.length} converted document(s) show possible table-structure corruption. ` +
+        `Re-convert each flagged file with sourceConvertOptions { tableCellMatching: false } via indexing_update, ` +
+        `then reset it to pending and re-extract. Conversion is the fix site, not extraction.`,
+      items: recommendations.map(r => ({
+        source: r.source,
+        rating: r.rating,
+        message: r.message,
+        evidence: r.evidence.slice(0, 5),
+        remediation: r.remediation,
+      })),
+    });
   }
 
   /**
@@ -264,6 +313,51 @@ export class DiagnoseTool extends BaseToolController {
           name: 'truncation',
           status: 'pass',
           detail: `No LLM output truncation detected across ${a.totalChunkCount} calls.`,
+        });
+      }
+
+      // Vocabulary conformance — validate extraction output against the domain
+      // vocabulary via core's validator (unknown/endpoint types, required
+      // properties, closed-enum values). Honours the configured governance
+      // mode: locked violations fail, managed/open violations warn. A bad input
+      // (e.g. an unreadable vocabulary file) degrades only this check to a warn,
+      // never the whole diagnose tool.
+      try {
+        const conformance = await orchestrator.conformanceDiagnostics(sourceFilter);
+        const conformanceStatus: DiagnoseCheck['status'] =
+          conformance.violationCount === 0
+            ? 'pass'
+            : conformance.severity === 'fail'
+              ? 'fail'
+              : 'warn';
+        checks.push({
+          name: 'vocabulary-conformance',
+          status: conformanceStatus,
+          detail: conformance.violationCount === 0
+            ? `Extraction output conforms to the vocabulary (${conformance.mode} mode).`
+            : `${conformance.violationCount} vocabulary conformance violation(s) under ${conformance.mode} mode — ` +
+              `${conformance.countsByClass['unknown-type']} unknown-type, ` +
+              `${conformance.countsByClass['endpoint-type']} endpoint-type, ` +
+              `${conformance.countsByClass['required-property-missing']} required-property-missing, ` +
+              `${conformance.countsByClass['closed-enum-value']} closed-enum-value` +
+              (conformance.recommendations.length > 0
+                ? `; ${conformance.recommendations.length} vocabulary-extension recommendation(s).`
+                : '.'),
+          items: conformance.violationCount > 0
+            ? [
+                { kind: 'countsByClass', counts: conformance.countsByClass },
+                { kind: 'examples', violations: conformance.examples },
+                ...(conformance.recommendations.length > 0
+                  ? [{ kind: 'recommendations', recommendations: conformance.recommendations }]
+                  : []),
+              ]
+            : undefined,
+        });
+      } catch (error) {
+        checks.push({
+          name: 'vocabulary-conformance',
+          status: 'warn',
+          detail: `Could not run vocabulary conformance: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
 

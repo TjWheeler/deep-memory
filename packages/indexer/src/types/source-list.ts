@@ -2,6 +2,8 @@
  * Index source list types — tracks which documents have been indexed and their status.
  */
 
+import type { DoclingConvertOptions } from '../conversion/types.js';
+
 /** The complete source document inventory */
 export interface IndexSourceList {
   version: string;
@@ -69,6 +71,21 @@ export interface IndexSource {
    * setting or the heuristic.
    */
   doOcr?: boolean;
+  /**
+   * Explicit per-source conversion overrides. When set, these take precedence
+   * over the process-wide `services.docling.convertOptions` for this source —
+   * an explicit decision, not a hint. Used to fix a single document whose
+   * tables need different handling (e.g. `{ tableCellMatching: false }`).
+   */
+  sourceConvertOptions?: DoclingConvertOptions;
+  /**
+   * The effective conversion options actually used at the last successful
+   * conversion (process default merged with any per-source override). Recorded
+   * so the idempotency skip can reconvert when the effective options change,
+   * not only when the source bytes change. Absent when the last conversion used
+   * docling's defaults.
+   */
+  convertOptionsUsed?: DoclingConvertOptions;
   /**
    * Compact conversion diagnostics mirrored onto the entry so `indexing_status`
    * can surface per-doc timing/warnings without reading the full conversion

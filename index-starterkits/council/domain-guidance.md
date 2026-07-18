@@ -12,6 +12,24 @@ This domain does **not** use Identity entities. Zone codes, provision references
 
 ---
 
+## Enumerated "Recommended values" Are a Controlled Vocabulary — Not a Checklist
+
+Throughout the vocabulary, each entity type lists **Recommended values** for its classifying property — `facilityType`, `structureCategory`, `precinctType`, `zoneType`, `useClass`, `provisionType`, `reserveType`, `instrumentType`, `levelName`, `code`, and the signage/jetty `structureSubtype` lists. These lists are a **controlled vocabulary**: they standardise the *string you write into a property* when the source text describes such a thing, so that separate documents converge on the same canonical value. That is their only purpose.
+
+**They are NOT a checklist of entities or relationships to instantiate.** Never walk an enum list and create one entity per value. A value appearing in the vocabulary is not evidence that the thing exists in your document. Create an entity or relationship **only** when specific source text describes that specific thing.
+
+**The one test that governs every entity and relationship:** can you point to the exact line(s) in the source that state it? If the only support you can find is the vocabulary's recommended-values list — or a generic objective/purpose sentence that names a category in passing — the source does not support it. Do not create it.
+
+Two concrete tells that you have fabricated a layer from the enum list:
+- The set of entities of a type is *identical to* (or a prefix of) that type's recommended-values list. Example: 13 `CommunityFacility` entities that are exactly the 13 recommended `facilityType` values.
+- Several entities or relationships all cite the same one or two source lines, and those lines do not actually name the things being created (e.g. a population/land-size table cited as the source for facility requirements it never mentions).
+
+This is the most damaging error in this domain — it invents a plausible-looking but non-existent slice of the graph. When genuinely unsure, create fewer entities: an omission is easy to add later; a fabrication silently corrupts every query that traverses it.
+
+This principle applies to *all* enumerated sections below, not only community facilities. The community-infrastructure guidance and Anti-Hallucination Rule 6 are specific instances of it.
+
+---
+
 ## MANDATORY Extraction Checklist
 
 You MUST follow this checklist for every document. Do NOT skip steps. Incomplete extraction is a failure.
@@ -61,9 +79,9 @@ Create a `DensityCode` entity for every R-Code referenced with specific standard
 Create a `Precinct` entity for every named area that has its own special provisions differing from zone-wide standards. Link to zones via `LOCATED_IN` and to provisions via `APPLIES_IN_PRECINCT`. Named suburbs or localities where specific policy provisions apply (e.g., developing suburb acquisition strategies) are valid Precincts — use `precinctType: "development-area"`.
 
 ### Step 8: Extract Community Facilities and Hierarchy (if present)
-Create `HierarchyLevel` and `CommunityFacility` entities if the document establishes population-based infrastructure requirements. Link via `REQUIRES_FACILITY`.
+Create a `HierarchyLevel` entity for each tier the document defines (population range, land size). **Create `CommunityFacility` entities and `REQUIRES_FACILITY` relationships ONLY when the source explicitly maps specific facility types to specific tiers** — see Anti-Hallucination Rule 6 for the zero-tolerance test.
 
-**REQUIRES_FACILITY accuracy:** Only create a `REQUIRES_FACILITY` relationship when the document explicitly states that a specific facility type is required at a specific hierarchy level (e.g., "District level requires a branch library"). A table that only shows population ranges and land sizes does NOT justify creating REQUIRES_FACILITY — it defines the tiers, not the facility mix. Do NOT infer that every facility type applies at every tier. This is a common hallucination.
+**REQUIRES_FACILITY accuracy:** Only create a `REQUIRES_FACILITY` relationship when the document explicitly states that a specific facility type is required at a specific hierarchy level (e.g., "District level requires a branch library"). A table that only shows population ranges and land sizes does NOT justify creating REQUIRES_FACILITY **or** any `CommunityFacility` entity — it defines the tiers, not the facility mix. Do NOT infer that every facility type applies at every tier, and do NOT create a `CommunityFacility` per recommended `facilityType` value. This is a common hallucination (see "Enumerated 'Recommended values' Are a Controlled Vocabulary" above).
 
 ### Step 9: Create ALL Relationships — This Is Critical
 After extracting entities, you MUST create these relationships:
@@ -447,11 +465,11 @@ Some density codes permit walls on or close to boundaries. These are conditional
 
 ### Population-Based Model
 
-The community purpose land policy establishes a 5-tier hierarchy. For each tier:
-1. Create a `HierarchyLevel` entity with population range
-2. Identify the facility types required at that tier
-3. Create `CommunityFacility` entities (deduplicate across tiers)
-4. Create `REQUIRES_FACILITY` relationships with land size and priority
+Community infrastructure documents define a population-based tier hierarchy. For each tier:
+1. Create a `HierarchyLevel` entity with its population range and typical land size.
+2. **Only if the source explicitly maps facility types to that tier** (a table column or sentence stating which facilities serve which tier), create `CommunityFacility` entities (deduplicate across tiers) and `REQUIRES_FACILITY` relationships with land size and priority.
+
+**If the document only provides a tier table of population ranges and land sizes — with no facility-to-tier mapping — stop after step 1.** Create the `HierarchyLevel` entities and nothing else. Do not create `CommunityFacility` entities or `REQUIRES_FACILITY` relationships, and do not populate them from the recommended `facilityType` list. This is the zero-tolerance rule in Anti-Hallucination Rule 6.
 
 ### Developing vs Developed Suburb Strategies
 

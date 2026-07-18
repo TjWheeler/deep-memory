@@ -2,8 +2,10 @@
  * Configuration types for the indexing pipeline.
  */
 
+import type { GovernanceMode } from '@utaba/deep-memory';
 import type { ValidationConfig } from './validation.js';
 import type { FullValidationConfig } from '../validation/full-validation-types.js';
+import type { DoclingConvertOptions } from '../conversion/types.js';
 
 /**
  * Configurable quality thresholds for extraction and consolidation review.
@@ -75,6 +77,13 @@ export interface OrchestratorConfig {
   qualityThresholds: QualityThresholds;
   /** External services the pipeline can call (e.g. document conversion) */
   services?: ServicesConfig;
+  /**
+   * How vocabulary-conformance violations are treated by the pre-consolidation
+   * gate. `locked` fails on any violation; `managed` (default) warns and
+   * surfaces vocabulary-extension recommendations for recurring closed-enum
+   * values; `open` warns. Defaults to `managed` when omitted.
+   */
+  governanceMode?: GovernanceMode;
 }
 
 /** External-service configuration block */
@@ -133,6 +142,13 @@ export interface DoclingServiceConfig {
    * global) is set and the converted document reported a page count.
    */
   ocrTextYieldThreshold?: number;
+  /**
+   * Process-wide default conversion options forwarded to docling-serve's
+   * convert step. Each field is optional and, when unset, leaves docling's
+   * default in force. A per-source `sourceConvertOptions` override wins over
+   * this default for that source.
+   */
+  convertOptions?: DoclingConvertOptions;
 }
 
 /**
@@ -212,6 +228,28 @@ export interface ExtractionConfig {
    * reference quality but increase prompt size. Default: 6.
    */
   progressiveContextWindow?: number;
+  /**
+   * Consume the completion as a Server-Sent Events stream on the built-in
+   * openai-compat provider. Applies to that provider only — workers using
+   * `llmProvider: "anthropic"` ignore it. Resolves to `true` when unset;
+   * streaming keeps long generations alive because response headers arrive
+   * immediately and the transport idle timer resets on every token, so a
+   * dense chunk that generates for minutes does not outrun the client's
+   * idle timeout. Opt out (`false`) only for pathological servers or proxies
+   * that do not stream SSE correctly.
+   */
+  stream?: boolean;
+  /**
+   * Total wall-clock cap, in milliseconds, on a single completion request to
+   * the built-in openai-compat provider. Applies to that provider only —
+   * workers using `llmProvider: "anthropic"` ignore it. Default `undefined`
+   * imposes no extra cap. This can only *shorten* a request: it does not extend
+   * the ~300s non-streaming time-to-first-byte limit (streaming is the
+   * mechanism for long generations), so it is a defense-in-depth ceiling on a
+   * genuinely stuck request, not a way to allow longer ones. When set it must
+   * be a positive integer number of milliseconds.
+   */
+  requestTimeoutMs?: number;
 }
 
 /** Capability tags for worker routing decisions */
@@ -255,6 +293,28 @@ export interface WorkerConfig {
    * a vendor-specific provider package.
    */
   llmProvider?: string;
+  /**
+   * Consume the completion as a Server-Sent Events stream on the built-in
+   * openai-compat provider. Applies to that provider only — a worker with
+   * `llmProvider: "anthropic"` ignores it. Resolves to `true` when unset;
+   * streaming keeps long generations alive because response headers arrive
+   * immediately and the transport idle timer resets on every token, so a
+   * dense chunk that generates for minutes does not outrun the client's
+   * idle timeout. Opt out (`false`) only for pathological servers or proxies
+   * that do not stream SSE correctly.
+   */
+  stream?: boolean;
+  /**
+   * Total wall-clock cap, in milliseconds, on a single completion request to
+   * the built-in openai-compat provider. Applies to that provider only — a
+   * worker with `llmProvider: "anthropic"` ignores it. Default `undefined`
+   * imposes no extra cap. This can only *shorten* a request: it does not extend
+   * the ~300s non-streaming time-to-first-byte limit (streaming is the
+   * mechanism for long generations), so it is a defense-in-depth ceiling on a
+   * genuinely stuck request, not a way to allow longer ones. When set it must
+   * be a positive integer number of milliseconds.
+   */
+  requestTimeoutMs?: number;
 }
 
 /** Configuration for the consolidation Reasoning Agent */

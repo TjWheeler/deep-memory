@@ -326,16 +326,59 @@ function parsePropertyTable(sectionContent: string): PropertySchema[] {
     const typeStr = row[1]!.toLowerCase().trim();
     const requiredStr = row[2]!.toLowerCase().trim();
     const description = row[3]!;
+    const type = mapPropertyType(typeStr);
 
-    properties.push({
+    const property: PropertySchema = {
       name,
-      type: mapPropertyType(typeStr),
+      type,
       required: requiredStr === 'yes',
       description: description || undefined,
-    });
+    };
+
+    // A closed enum declares its allowed set in a labelled "Allowed values"
+    // table alongside the property table. Populate enumValues from it so the
+    // closed set survives parsing and can be enforced. An open naming guide
+    // uses a "Recommended values" table instead and is deliberately not matched
+    // here, leaving such properties as open strings with no enumValues.
+    if (type === 'enum') {
+      const enumValues = extractAllowedEnumValues(sectionContent, name);
+      if (enumValues.length > 0) {
+        property.enumValues = enumValues;
+      }
+    }
+
+    properties.push(property);
   }
 
   return properties;
+}
+
+/**
+ * Extract the allowed value set for a closed-enum property from the labelled
+ * table `**Allowed \`<propName>\` values:**` that follows the property table.
+ *
+ * The table mirrors the open "Recommended values" tables (a `| Value |
+ * Description |` grid); only the first (Value) column is read. Backticks are
+ * stripped. Returns an empty array when no such table is present so the caller
+ * can leave enumValues unset.
+ */
+function extractAllowedEnumValues(sectionContent: string, propName: string): string[] {
+  const escaped = propName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const labelPattern = new RegExp('\\*\\*Allowed `' + escaped + '` values:\\*\\*', 'm');
+  const labelMatch = labelPattern.exec(sectionContent);
+  if (!labelMatch) return [];
+
+  const afterLabel = sectionContent.slice(labelMatch.index + labelMatch[0].length);
+  const rows = extractTableRows(afterLabel);
+
+  const values: string[] = [];
+  for (const row of rows) {
+    const first = row[0];
+    if (first === undefined) continue;
+    const value = stripBackticks(first);
+    if (value.length > 0) values.push(value);
+  }
+  return values;
 }
 
 /** Extract data rows from a markdown table (skipping the separator row) */

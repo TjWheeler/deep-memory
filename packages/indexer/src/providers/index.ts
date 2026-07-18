@@ -10,3 +10,4 @@ export type {
   LLMToolUseTurnResult,
 } from './LLMProvider.js';
 export { OpenAIChatProvider, type OpenAIChatProviderConfig } from './OpenAIChatProvider.js';
+export { LLMTransportError } from './errors.js';

@@ -31,6 +31,32 @@ export interface DoclingDocument {
 /** Export format requested from docling-serve for a single conversion. */
 export type DoclingExportFormat = 'md' | 'json' | 'text' | 'html';
 
+/**
+ * Conversion tuning passed through to docling-serve's convert/prepare step.
+ * Every field is optional; an unset field is not sent, so docling's own
+ * default applies. These control how a document is turned into text — most
+ * notably `tableCellMatching`, which when disabled stops docling matching its
+ * table predictions back to raw PDF cells, the behaviour that fragments
+ * merged/dense columns.
+ */
+export interface DoclingConvertOptions {
+  /**
+   * Match predicted table structure back to raw PDF text cells. docling's
+   * default is on, which is best for well-separated tables but corrupts
+   * merged/dense columns; disable it for a document whose tables fragment.
+   */
+  tableCellMatching?: boolean;
+  /**
+   * Table-structure model mode. `accurate` is docling's default and the
+   * higher-fidelity choice; `fast` trades quality for speed.
+   */
+  tableMode?: 'fast' | 'accurate';
+  /** Run table-structure recovery at all. */
+  doTableStructure?: boolean;
+  /** PDF parsing backend docling uses for the conversion. */
+  pdfBackend?: string;
+}
+
 /** Arguments accepted by `DoclingClient.postConvert`. */
 export interface DoclingConvertRequest {
   /** Source bytes. */
@@ -55,6 +81,12 @@ export interface DoclingConvertRequest {
    * applies.
    */
   doOcr?: boolean;
+  /**
+   * Conversion tuning forwarded to docling-serve's convert step. Each field is
+   * sent only when set; an absent option leaves docling's default in force, so
+   * an unset `convertOptions` reproduces the prior form byte-for-byte.
+   */
+  convertOptions?: DoclingConvertOptions;
 }
 
 /** Response returned by `DoclingClient.postConvert`. */

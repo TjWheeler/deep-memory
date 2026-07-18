@@ -11,8 +11,10 @@ import { InvalidInputError } from '@utaba/deep-memory';
 import { StateManager, Phase } from './StateManager.js';
 import type { PipelinePhase } from './StateManager.js';
 import { DoclingClient } from '../conversion/DoclingClient.js';
-import { convertSources, type DocumentConverterSummary } from '../conversion/DocumentConverter.js';
+import { convertSources, mergeConvertOptions, convertOptionsEqual, type DocumentConverterSummary } from '../conversion/DocumentConverter.js';
 import { matchesSourceFilter } from '../conversion/source-filter.js';
+import { TableStructureDetector, buildTableCorruptionRecommendation } from '../conversion/TableStructureDetector.js';
+import type { TableCorruptionRecommendation } from '../conversion/TableStructureDetector.js';
 import { ExtractionWorker } from '../extraction/ExtractionWorker.js';
 import type { LLMProvider } from '../providers/LLMProvider.js';
 import { DocumentAnalyzer, reassignFailedSource, estimateValidationCost } from './DocumentAnalyzer.js';
@@ -23,6 +25,9 @@ import { Validator } from '../validation/Validator.js';
 import { ValidationRulesLoader } from '../validation/ValidationRulesLoader.js';
 import { VerificationWorker, readSourceContent } from '../validation/VerificationWorker.js';
 import { ReviewDiagnostics } from '../review/ReviewDiagnostics.js';
+import { VocabularyConformanceGate } from '../review/VocabularyConformanceGate.js';
+import type { ConformanceReport } from '../review/VocabularyConformanceGate.js';
+import { parseVocabularyMarkdown } from '../consolidation/VocabularyMarkdownParser.js';
 import { ConsolidationReviewDiagnostics } from '../review/ConsolidationReviewDiagnostics.js';
 import type { ConsolidationReviewReport } from '../review/consolidation-review-types.js';
 import type { ReviewReport } from '../review/types.js';
@@ -105,12 +110,16 @@ export class IndexingOrchestrator {
       }
     }
 
-    // Re-examine already-registered binary sources for on-disk changes. The
-    // append-if-new merge above never re-reads an existing path, so an edited
-    // binary would keep feeding its stale derived Markdown to extraction. A
-    // changed source forces reconversion; an unchanged one is left alone. Only
-    // binary (convertible) sources carry a `sourceHash` and derived files, so
-    // text sources are untouched.
+    // Re-examine already-registered binary sources for changes that invalidate
+    // their derived Markdown. The append-if-new merge above never re-reads an
+    // existing path, so an edited binary — or an unchanged binary whose convert
+    // options have since changed — would keep feeding stale derived text to
+    // extraction. Two triggers force reconversion: the on-disk bytes changed,
+    // or the effective convert options (process default merged with any
+    // per-source override) differ from those recorded at the last conversion.
+    // Only binary (convertible) sources carry a `sourceHash` and derived files,
+    // so text sources are untouched.
+    const processConvertOptions = this.config.services?.docling?.convertOptions;
     const existingByPath = new Map(newSources.map(s => [s.path, s]));
     for (const source of sourceList.sources) {
       if (source.originalFormat === undefined || source.sourceHash === undefined) continue;
@@ -118,11 +127,22 @@ export class IndexingOrchestrator {
       if (!existingByPath.has(source.path)) continue;
       const bytes = await readFile(source.path);
       const currentHash = createHash('sha256').update(bytes).digest('hex');
-      if (currentHash === source.sourceHash) continue;
+      const bytesChanged = currentHash !== source.sourceHash;
 
-      // Changed on disk: drop stale derived files and reset the entry so
-      // convert reprocesses it. Clearing the pointers means a failed
-      // reconversion cannot leave the previous text masquerading as current.
+      // Options change only re-queues an already-converted source; an unconverted
+      // one is picked up by convert regardless. Compare the effective options
+      // against what the last conversion actually used.
+      const effectiveConvertOptions = mergeConvertOptions(processConvertOptions, source.sourceConvertOptions);
+      const optionsChanged =
+        source.derivedTextPath !== undefined &&
+        !convertOptionsEqual(effectiveConvertOptions, source.convertOptionsUsed);
+
+      if (!bytesChanged && !optionsChanged) continue;
+
+      // Changed bytes, or changed convert options: drop stale derived files and
+      // reset the entry so convert reprocesses it. Clearing the pointers means a
+      // failed reconversion cannot leave the previous text masquerading as
+      // current.
       await this.deleteDerivedFiles(source);
       source.status = 'needs-conversion';
       source.derivedTextPath = undefined;
@@ -247,10 +267,49 @@ export class IndexingOrchestrator {
         ...(doclingConfig.ocrTextYieldThreshold !== undefined
           ? { ocrTextYieldThreshold: doclingConfig.ocrTextYieldThreshold }
           : {}),
+        ...(doclingConfig.convertOptions !== undefined ? { convertOptions: doclingConfig.convertOptions } : {}),
       },
     );
 
     return summary;
+  }
+
+  /**
+   * Inspect converted documents for table-structure corruption and return
+   * non-blocking, options-aware recommendations.
+   *
+   * Runs the static {@link TableStructureDetector} over every converted source
+   * that has a structural sidecar, then gates each suspect/corrupt finding
+   * against the options the source was last converted with: a file converted
+   * under docling's defaults earns an executable re-convert with
+   * `tableCellMatching` disabled; a file already converted with the flag earns
+   * only a note that it did not resolve, so the same advice never loops. Clean
+   * documents produce nothing. Pure computation — no LLM calls — safe to run at
+   * both `analyze` (pre-extraction) and `diagnose`.
+   */
+  async detectTableCorruption(sourceFilter?: string[]): Promise<TableCorruptionRecommendation[]> {
+    const sourceList = await this.state.getSourceList();
+    if (!sourceList) return [];
+
+    let sources = sourceList.sources.filter(
+      s => s.status !== 'excluded' && s.derivedDoclingJsonPath !== undefined,
+    );
+    if (sourceFilter && sourceFilter.length > 0) {
+      sources = sources.filter(s => matchesSourceFilter(s.path, sourceFilter));
+    }
+
+    const detector = new TableStructureDetector();
+    const recommendations: TableCorruptionRecommendation[] = [];
+    for (const source of sources) {
+      const finding = await detector.analyzeSource({
+        path: source.path,
+        derivedTextPath: source.derivedTextPath,
+        derivedDoclingJsonPath: source.derivedDoclingJsonPath,
+      });
+      const recommendation = buildTableCorruptionRecommendation(finding, source.convertOptionsUsed);
+      if (recommendation) recommendations.push(recommendation);
+    }
+    return recommendations;
   }
 
   /**
@@ -649,6 +708,31 @@ export class IndexingOrchestrator {
   async reviewDiagnostics(sourceFilter?: string[], workerName?: string): Promise<ReviewReport> {
     const diagnostics = new ReviewDiagnostics(this.state, this.config.qualityThresholds.extraction);
     return diagnostics.run(sourceFilter, workerName);
+  }
+
+  /**
+   * Vocabulary conformance: validate extraction output against the domain
+   * vocabulary before consolidation, reusing core's validator.
+   *
+   * Parses the vocabulary markdown into the same contract the live repository
+   * enforces, then runs the conformance gate over the active extraction outputs
+   * under the configured governance mode (default `managed`). Returns a report
+   * of violations grouped by class plus, under `managed`, structured
+   * vocabulary-extension recommendations for recurring closed-enum values.
+   * Pure computation — no LLM calls, no repository access.
+   */
+  async conformanceDiagnostics(sourceFilter?: string[]): Promise<ConformanceReport> {
+    await this.loadVocabularyAndRules();
+    const vocabulary = parseVocabularyMarkdown(this.vocabulary ?? '');
+    const mode = this.config.governanceMode ?? 'managed';
+
+    let outputs = await this.state.getExtractionOutputs();
+    if (sourceFilter && sourceFilter.length > 0) {
+      outputs = outputs.filter(o => matchesSourceFilter(o.sourcePath, sourceFilter));
+    }
+
+    const gate = new VocabularyConformanceGate(vocabulary, mode);
+    return gate.run(outputs);
   }
 
   /**

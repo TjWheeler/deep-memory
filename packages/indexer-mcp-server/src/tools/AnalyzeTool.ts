@@ -1,7 +1,7 @@
 import { basename } from 'node:path';
 import { BaseToolController } from './base/BaseToolController.js';
 import { StateManager, Phase, IndexingOrchestrator } from '@utaba/deep-memory-indexer';
-import type { PipelinePhase, EmbeddingProgress, FullValidationProgress, FullValidationReport, ReviewReport, ConsolidationReviewReport } from '@utaba/deep-memory-indexer';
+import type { PipelinePhase, EmbeddingProgress, FullValidationProgress, FullValidationReport, ReviewReport, ConsolidationReviewReport, TableCorruptionRecommendation } from '@utaba/deep-memory-indexer';
 import { resolveStateDir, resolveConfig, formatDuration } from './resolveProcess.js';
 
 /** Ordered pipeline phases for navigation */
@@ -87,6 +87,12 @@ export class AnalyzeTool extends BaseToolController {
   private async analyzePrepare(state: StateManager, params: Record<string, unknown>) {
     const sourceList = await state.getSourceList();
 
+    // Table-structure detection runs on every PREPARE analyze, before extraction
+    // is spent — regardless of whether a source list already exists (the branch
+    // below short-circuits, so detection cannot live only in the analysis path).
+    const detection = await this.tableCorruptionRecommendations(params);
+    const conversionRecommendations = detection.recommendations;
+
     // If no source list yet, check if we can run analysis
     if (!sourceList) {
       // Try to run the cost/token analysis
@@ -122,6 +128,7 @@ export class AnalyzeTool extends BaseToolController {
             chunks: d.estimatedTokens.chunks,
             estimatedCost: `$${d.estimatedCost.toFixed(2)}`,
           })),
+          ...(conversionRecommendations.length > 0 ? { conversionRecommendations } : {}),
           guidance: 'Review the cost estimates. Run indexing_execute to prepare sources and begin extraction.',
         };
       } catch {
@@ -144,8 +151,34 @@ export class AnalyzeTool extends BaseToolController {
         total: sourceList.sources.length,
         byStatus: statusCounts,
       },
-      guidance: 'Sources are inventoried. Run indexing_execute to start extraction.',
+      ...(conversionRecommendations.length > 0 ? { conversionRecommendations } : {}),
+      // A detector/config failure at this primary surface must not masquerade as
+      // a clean corpus — surface it as a note (non-blocking), mirroring how the
+      // diagnose tool reports the same failure.
+      ...(detection.error !== undefined ? { conversionDetectionNote: detection.error } : {}),
+      guidance: conversionRecommendations.length > 0
+        ? 'Sources are inventoried. Some converted documents show possible table-structure corruption — see conversionRecommendations and apply the per-file re-convert before extracting. Run indexing_execute to start extraction.'
+        : 'Sources are inventoried. Run indexing_execute to start extraction.',
     };
+  }
+
+  /**
+   * Run the static table-structure detector over converted sources and return
+   * non-blocking, options-aware re-convert recommendations. Best-effort — it
+   * never fails the analyze call — but a real detector/config failure is
+   * reported as `error` rather than silently collapsing to an empty result that
+   * looks like a clean corpus.
+   */
+  private async tableCorruptionRecommendations(
+    params: Record<string, unknown>,
+  ): Promise<{ recommendations: TableCorruptionRecommendation[]; error?: string }> {
+    try {
+      const { config } = await resolveConfig(params);
+      const orchestrator = new IndexingOrchestrator(config);
+      return { recommendations: await orchestrator.detectTableCorruption() };
+    } catch (error) {
+      return { recommendations: [], error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   private async analyzeExtract(state: StateManager, verbose?: boolean, sourceFilter?: string) {

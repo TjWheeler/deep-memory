@@ -475,9 +475,18 @@ A named geographic area with special planning provisions that override or supple
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
-| `permissibility` | string | yes | `P` (permitted), `D` (discretionary), `A` (not-permitted-unless-advertised), `X` (not-permitted) |
+| `permissibility` | enum | yes | Whether a use is permitted, discretionary, or prohibited in this zone |
 | `conditions` | string | no | Special conditions on the permissibility |
 | `maxFloorspace` | string | no | Maximum floorspace limit if applicable |
+
+**Allowed `permissibility` values:**
+
+| Value | Description |
+|-------|-------------|
+| `P` | Permitted |
+| `D` | Discretionary |
+| `A` | Not permitted unless advertised |
+| `X` | Not permitted |
 
 #### Properties for `APPLIES_IN`
 

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { convertSources, deriveDocSlug, detectMime, decideOcr, type DocumentConverterDeps, type DocumentConverterOptions } from './DocumentConverter.js';
 import { DoclingServiceError } from './errors.js';
 import type { DoclingClient } from './DoclingClient.js';
-import type { ConvertViaAsyncOptions, DoclingConvertRequest, DoclingConvertResponse, PollDecision } from './types.js';
+import type { ConvertViaAsyncOptions, DoclingConvertOptions, DoclingConvertRequest, DoclingConvertResponse, PollDecision } from './types.js';
 import type { ConversionReport } from './ConversionReport.js';
 import { StateManager } from '../orchestrator/StateManager.js';
 import type { IndexSource, IndexSourceList } from '../types/source-list.js';
@@ -26,6 +26,7 @@ interface FakeCall {
   format: string;
   doOcr: boolean | undefined;
   mode: 'sync' | 'async';
+  convertOptions: DoclingConvertOptions | undefined;
 }
 
 /**
@@ -47,7 +48,7 @@ function fakeClient(opts: {
   const fail = opts.fail ?? new Set<string>();
 
   function respond(request: DoclingConvertRequest, mode: 'sync' | 'async'): DoclingConvertResponse {
-    calls.push({ filename: request.filename, format: request.toFormat ?? 'md', doOcr: request.doOcr, mode });
+    calls.push({ filename: request.filename, format: request.toFormat ?? 'md', doOcr: request.doOcr, mode, convertOptions: request.convertOptions });
     if (fail.has(request.filename)) {
       throw new DoclingServiceError('http://host:8030/v1/convert/file', 'boom', { status: 500 });
     }
@@ -280,6 +281,128 @@ describe('convertSources', () => {
     const after = (await state.getSourceList())!.sources[0]!;
     expect(await readFile(after.derivedTextPath!, 'utf-8')).toBe('# rewritten');
     expect(after.sourceHash).not.toBe(before.sourceHash);
+  });
+
+  it('reconverts when only the per-source convert options change, with unchanged bytes', async () => {
+    const pdfPath = join(sourceDir, 'doc.pdf');
+    await seedSources(
+      { ...baseList(), sources: [{ path: pdfPath, type: 'general', status: 'needs-conversion', originalFormat: '.pdf' }] },
+      { [pdfPath]: 'stable bytes' },
+    );
+
+    const md = `# original\n\n${'x'.repeat(300)}`;
+    const first = fakeClient({ docs: { 'doc.pdf': { md, pages: 1 } } });
+    await convertSources({ state, doclingClient: first.client, sourceRoot: sourceDir }, SYNC);
+    const before = (await state.getSourceList())!.sources[0]!;
+    expect(before.convertOptionsUsed).toBeUndefined();
+
+    // Same bytes, but set a per-source convert option and re-run: the derived
+    // text depends on the options, so this must reconvert, not skip.
+    await state.updateSource(pdfPath, { status: 'needs-conversion', sourceConvertOptions: { tableCellMatching: false } });
+    const reconverted = `# reconverted\n\n${'y'.repeat(300)}`;
+    const second = fakeClient({ docs: { 'doc.pdf': { md: reconverted, pages: 1 } } });
+    const summary = await convertSources({ state, doclingClient: second.client, sourceRoot: sourceDir }, SYNC);
+
+    expect(summary.converted).toBe(1);
+    expect(summary.skipped).toBe(0);
+    expect(second.calls.length).toBeGreaterThan(0);
+    const after = (await state.getSourceList())!.sources[0]!;
+    expect(after.status).toBe('pending');
+    expect(await readFile(after.derivedTextPath!, 'utf-8')).toBe(reconverted);
+    // The effective options used are recorded so the next run is options-aware.
+    expect(after.convertOptionsUsed).toEqual({ tableCellMatching: false });
+    // Bytes were unchanged, so the hash is stable across the option-driven reconvert.
+    expect(after.sourceHash).toBe(before.sourceHash);
+  });
+
+  it('skips when both the bytes and the per-source convert options are unchanged', async () => {
+    const pdfPath = join(sourceDir, 'doc.pdf');
+    await seedSources({
+      ...baseList(),
+      sources: [{
+        path: pdfPath,
+        type: 'general',
+        status: 'needs-conversion',
+        originalFormat: '.pdf',
+        sourceConvertOptions: { tableCellMatching: false },
+      }],
+    });
+
+    const md = `# once\n\n${'x'.repeat(300)}`;
+    const first = fakeClient({ docs: { 'doc.pdf': { md, pages: 1 } } });
+    await convertSources({ state, doclingClient: first.client, sourceRoot: sourceDir }, SYNC);
+    const afterFirst = (await state.getSourceList())!.sources[0]!;
+    expect(afterFirst.convertOptionsUsed).toEqual({ tableCellMatching: false });
+
+    // Re-mark as needs-conversion (as resume would) with the same option and
+    // re-run: identical bytes and identical options must skip the round trip.
+    await state.updateSource(pdfPath, { status: 'needs-conversion' });
+    const second = fakeClient({ docs: { 'doc.pdf': { md: '# twice' } } });
+    const summary = await convertSources({ state, doclingClient: second.client, sourceRoot: sourceDir }, SYNC);
+
+    expect(second.calls).toHaveLength(0);
+    expect(summary.converted).toBe(0);
+    expect(summary.skipped).toBe(1);
+    const source = (await state.getSourceList())!.sources[0]!;
+    expect(source.status).toBe('pending');
+  });
+
+  it('skips an option-less source whose recorded options are absent (empty matches undefined)', async () => {
+    const pdfPath = join(sourceDir, 'doc.pdf');
+    await seedSources({
+      ...baseList(),
+      sources: [{ path: pdfPath, type: 'general', status: 'needs-conversion', originalFormat: '.pdf' }],
+    });
+
+    const md = `# once\n\n${'x'.repeat(300)}`;
+    const first = fakeClient({ docs: { 'doc.pdf': { md, pages: 1 } } });
+    await convertSources({ state, doclingClient: first.client, sourceRoot: sourceDir }, SYNC);
+    const afterFirst = (await state.getSourceList())!.sources[0]!;
+    // No options were used, so nothing is recorded on the entry.
+    expect(afterFirst.convertOptionsUsed).toBeUndefined();
+
+    // Re-mark and re-run with still no options: the effective empty option set
+    // matches the absent recorded set, so the source is skipped — an existing
+    // corpus is not forced to reconvert by this feature.
+    await state.updateSource(pdfPath, { status: 'needs-conversion' });
+    const second = fakeClient({ docs: { 'doc.pdf': { md: '# twice' } } });
+    const summary = await convertSources({ state, doclingClient: second.client, sourceRoot: sourceDir }, SYNC);
+
+    expect(second.calls).toHaveLength(0);
+    expect(summary.converted).toBe(0);
+    expect(summary.skipped).toBe(1);
+  });
+
+  it('lets a per-source override beat the process-wide default per field in the request options', async () => {
+    const pdfPath = join(sourceDir, 'doc.pdf');
+    await seedSources({
+      ...baseList(),
+      sources: [{
+        path: pdfPath,
+        type: 'general',
+        status: 'needs-conversion',
+        originalFormat: '.pdf',
+        sourceConvertOptions: { tableCellMatching: false },
+      }],
+    });
+    const md = `# doc\n\n${'x'.repeat(300)}`;
+    const { client, calls } = fakeClient({ docs: { 'doc.pdf': { md, pages: 1 } } });
+
+    const summary = await convertSources(
+      { state, doclingClient: client, sourceRoot: sourceDir },
+      { mode: 'sync', convertOptions: { tableCellMatching: true, tableMode: 'accurate' } },
+    );
+
+    expect(summary.converted).toBe(1);
+    expect(calls.length).toBeGreaterThan(0);
+    // Per-source tableCellMatching:false wins over the process default true;
+    // the process-wide tableMode:accurate carries through since the source did
+    // not override it. Both export passes see the identical merged options.
+    for (const call of calls) {
+      expect(call.convertOptions).toEqual({ tableCellMatching: false, tableMode: 'accurate' });
+    }
+    const source = (await state.getSourceList())!.sources[0]!;
+    expect(source.convertOptionsUsed).toEqual({ tableCellMatching: false, tableMode: 'accurate' });
   });
 
   it('drives submit/poll/fetch through the async client and writes progress', async () => {

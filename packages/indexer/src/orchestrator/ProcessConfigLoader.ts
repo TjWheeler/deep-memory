@@ -1,7 +1,9 @@
 import { readFile, access } from 'node:fs/promises';
 import { join, resolve, isAbsolute } from 'node:path';
+import type { GovernanceMode } from '@utaba/deep-memory';
 import type { OrchestratorConfig, WorkerConfig, ExtractionConfig, ConsolidationConfig, QualityThresholds, ServicesConfig, DoclingServiceConfig } from '../types/config.js';
 import { DEFAULT_QUALITY_THRESHOLDS } from '../types/config.js';
+import type { DoclingConvertOptions } from '../conversion/types.js';
 import type { FullValidationConfig, FullValidationWorkerConfig } from '../validation/full-validation-types.js';
 
 const CONFIG_FILE = 'config.json';
@@ -93,6 +95,7 @@ export interface IndexProcessConfig {
       maxPollIntervalMs?: number;
       maxTotalWaitMs?: number;
       ocrTextYieldThreshold?: number;
+      convertOptions?: DoclingConvertOptions;
     };
   };
   /** Quality thresholds for review diagnostics (optional — defaults applied if omitted) */
@@ -100,6 +103,11 @@ export interface IndexProcessConfig {
     extraction: Partial<QualityThresholds['extraction']>;
     consolidation: Partial<QualityThresholds['consolidation']>;
   }>;
+  /**
+   * How the vocabulary-conformance gate treats violations. Defaults to
+   * `managed` when omitted. See OrchestratorConfig.governanceMode.
+   */
+  governanceMode?: GovernanceMode;
 }
 
 /**
@@ -308,6 +316,7 @@ export async function loadProcessConfig(
       ...(raw.pollIntervalMs !== undefined ? { pollIntervalMs: raw.pollIntervalMs } : {}),
       ...(raw.maxPollIntervalMs !== undefined ? { maxPollIntervalMs: raw.maxPollIntervalMs } : {}),
       ...(raw.maxTotalWaitMs !== undefined ? { maxTotalWaitMs: raw.maxTotalWaitMs } : {}),
+      ...(raw.convertOptions !== undefined ? { convertOptions: raw.convertOptions } : {}),
     };
     // Treat an empty-string apiKey (the secrets-template placeholder) as absent
     // so it does not send a blank X-Api-Key header.
@@ -334,6 +343,7 @@ export async function loadProcessConfig(
     embeddings,
     qualityThresholds,
     ...(services ? { services } : {}),
+    ...(processConfig.governanceMode ? { governanceMode: processConfig.governanceMode } : {}),
   };
 
   return { config, processConfig, sourceDir };

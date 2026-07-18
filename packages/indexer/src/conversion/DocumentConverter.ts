@@ -32,7 +32,7 @@ import { extractDoclingDiagnostics, summarize } from './ConversionReport.js';
 import type { ConversionReport, ConversionReportEntry } from './ConversionReport.js';
 import type { ConversionProgress } from './ConversionProgress.js';
 import type { DoclingClient } from './DoclingClient.js';
-import type { DoclingConvertResponse, PollDecision } from './types.js';
+import type { DoclingConvertOptions, DoclingConvertResponse, PollDecision } from './types.js';
 import type { StateManager } from '../orchestrator/StateManager.js';
 import type { IndexSource } from '../types/source-list.js';
 
@@ -69,6 +69,12 @@ export interface DocumentConverterOptions {
   mode: 'sync' | 'async';
   /** Chars-per-page floor below which a PDF is reconverted with OCR. */
   ocrTextYieldThreshold?: number;
+  /**
+   * Process-wide default conversion options. A per-source
+   * `source.sourceConvertOptions` override takes precedence over these for that
+   * source. When neither is set, docling's own defaults apply.
+   */
+  convertOptions?: DoclingConvertOptions;
 }
 
 export interface DocumentConverterDeps {
@@ -185,10 +191,26 @@ export async function convertSources(
         const mdPath = join(convertedDir, `${docSlug}.md`);
         const jsonPath = join(convertedDir, `${docSlug}.docling.json`);
 
+        // Effective conversion options: the process default with any per-source
+        // override layered on top, so a single document can be re-converted with
+        // different settings from the rest of the batch. Computed once here so
+        // the idempotency check and both export passes use the same options.
+        const effectiveConvertOptions = mergeConvertOptions(
+          options.convertOptions,
+          source.sourceConvertOptions,
+        );
+        const optionsUnchanged = convertOptionsEqual(
+          effectiveConvertOptions,
+          source.convertOptionsUsed,
+        );
+
         // Idempotency: an unchanged source with both derived files already on
-        // disk skips the round trip entirely.
+        // disk, and the same effective options as last time, skips the round
+        // trip entirely. A changed option forces a re-convert even when the
+        // bytes are identical — the derived text depends on the options.
         if (
           source.sourceHash === sourceHash &&
+          optionsUnchanged &&
           (await fileExists(mdPath)) &&
           (await fileExists(jsonPath))
         ) {
@@ -203,10 +225,11 @@ export async function convertSources(
           continue;
         }
 
-        // Changed source: drop stale derived files and clear the entry's
-        // pointers before reconverting, so a failed reconversion cannot leave
-        // the previous document's text masquerading as current.
-        if (source.sourceHash !== undefined && source.sourceHash !== sourceHash) {
+        // Reconverting: drop stale derived files and clear the entry's pointers
+        // first, so a failed reconversion cannot leave the previous document's
+        // text masquerading as current. This covers both a byte change and an
+        // options change against a previously-converted source.
+        if (source.sourceHash !== undefined && (source.sourceHash !== sourceHash || !optionsUnchanged)) {
           await deleteDerivedFiles(mdPath, jsonPath);
           await deps.state.updateSource(source.path, {
             derivedTextPath: undefined,
@@ -227,6 +250,7 @@ export async function convertSources(
           startedAt,
           now,
           stopRequested,
+          convertOptions: effectiveConvertOptions,
         });
 
         await writeFile(mdPath, outcome.markdown, 'utf-8');
@@ -248,6 +272,10 @@ export async function convertSources(
           derivedDoclingJsonPath: jsonPath,
           sourceHash,
           conversion: conversionMirror,
+          // Record the effective options actually used so the next run's
+          // idempotency check is options-aware. Cleared when docling's defaults
+          // were used, so a later options change is detectable.
+          convertOptionsUsed: hasConvertOptions(effectiveConvertOptions) ? effectiveConvertOptions : undefined,
           lastError: undefined,
         });
         await deps.state.deleteConversionProgress(docSlug);
@@ -339,6 +367,11 @@ interface ConvertOneContext {
    * without inspecting the thrown error's message.
    */
   stopRequested: { value: boolean };
+  /**
+   * Effective conversion options (process default merged with the per-source
+   * override) applied identically to both the Markdown and JSON passes.
+   */
+  convertOptions: DoclingConvertOptions;
 }
 
 /**
@@ -450,6 +483,7 @@ async function convertForFormat(
     mimeType: detectMime(source.path),
     toFormat: format,
     doOcr,
+    ...(hasConvertOptions(ctx.convertOptions) ? { convertOptions: ctx.convertOptions } : {}),
   };
 
   if (options.mode === 'sync') {
@@ -502,6 +536,48 @@ export function decideOcr(
 function effectiveOcr(source: IndexSource, options: DocumentConverterOptions): boolean {
   const decision = decideOcr(source, options);
   return decision.doOcr ?? false;
+}
+
+/**
+ * The convert-option keys compared for idempotency and threaded to the client.
+ * The `satisfies` binds this list to the type: renaming or adding a field on
+ * `DoclingConvertOptions` breaks the build here rather than silently dropping
+ * the field from the idempotency comparison.
+ */
+export const CONVERT_OPTION_KEYS = [
+  'tableCellMatching',
+  'tableMode',
+  'doTableStructure',
+  'pdfBackend',
+] as const satisfies readonly (keyof DoclingConvertOptions)[];
+
+/**
+ * Merge a process-default option set with a per-source override so the override
+ * wins per field. The result carries only set keys, since both inputs carry
+ * only set keys.
+ */
+export function mergeConvertOptions(
+  base: DoclingConvertOptions | undefined,
+  override: DoclingConvertOptions | undefined,
+): DoclingConvertOptions {
+  return { ...base, ...override };
+}
+
+/** True when at least one convert option is set. */
+function hasConvertOptions(options: DoclingConvertOptions): boolean {
+  return CONVERT_OPTION_KEYS.some((key) => options[key] !== undefined);
+}
+
+/**
+ * Field-wise equality over the known convert-option keys. An unset field on
+ * either side compares equal to an unset field on the other, so an effective
+ * `{}` matches a recorded `undefined` and no spurious re-convert results.
+ */
+export function convertOptionsEqual(
+  a: DoclingConvertOptions | undefined,
+  b: DoclingConvertOptions | undefined,
+): boolean {
+  return CONVERT_OPTION_KEYS.every((key) => a?.[key] === b?.[key]);
 }
 
 /**

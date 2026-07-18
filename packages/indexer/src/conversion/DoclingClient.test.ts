@@ -396,6 +396,97 @@ describe('DoclingClient.postConvert', () => {
     expect(form.get('do_ocr')).toBeNull();
   });
 
+  it('appends only the set convert options to the form, snake-cased', async () => {
+    const { fn, calls } = scriptedFetch([jsonResponse(MD_BODY)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    await client.postConvert({
+      content: Buffer.from('x'),
+      filename: 'x.pdf',
+      mimeType: 'application/pdf',
+      convertOptions: { tableCellMatching: false, tableMode: 'accurate' },
+    });
+
+    const form = calls[0]!.init.body as FormData;
+    expect(form.get('table_cell_matching')).toBe('false');
+    expect(form.get('table_mode')).toBe('accurate');
+    // Unset options are not appended, so docling's defaults apply.
+    expect(form.get('do_table_structure')).toBeNull();
+    expect(form.get('pdf_backend')).toBeNull();
+  });
+
+  it('omits all convert-option fields when convertOptions is absent', async () => {
+    const { fn, calls } = scriptedFetch([jsonResponse(MD_BODY)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    await client.postConvert({ content: Buffer.from('x'), filename: 'x.pdf' });
+
+    const form = calls[0]!.init.body as FormData;
+    expect(form.get('table_cell_matching')).toBeNull();
+    expect(form.get('table_mode')).toBeNull();
+    expect(form.get('do_table_structure')).toBeNull();
+    expect(form.get('pdf_backend')).toBeNull();
+  });
+
+  it('treats a different tableCellMatching option as a cache miss even with identical content', async () => {
+    const { fn, calls } = scriptedFetch([jsonResponse(MD_BODY), jsonResponse(MD_BODY)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    const content = Buffer.from('same-bytes');
+    // A re-convert flipping only tableCellMatching must fetch again, not return
+    // the earlier document converted under the default option.
+    await client.postConvert({ content, filename: 'doc.pdf', mimeType: 'application/pdf' });
+    await client.postConvert({
+      content,
+      filename: 'doc.pdf',
+      mimeType: 'application/pdf',
+      convertOptions: { tableCellMatching: false },
+    });
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it('does not collide when a free-form pdfBackend value contains the fragment delimiters', async () => {
+    const { fn, calls } = scriptedFetch([jsonResponse(MD_BODY), jsonResponse(MD_BODY)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    const content = Buffer.from('same-bytes');
+    // A single pdfBackend value that embeds another option's serialized form
+    // must not key the same as two distinct options — else a re-convert would
+    // return the wrong cached document.
+    await client.postConvert({
+      content,
+      filename: 'doc.pdf',
+      mimeType: 'application/pdf',
+      convertOptions: { pdfBackend: 'x,tableMode=fast' },
+    });
+    await client.postConvert({
+      content,
+      filename: 'doc.pdf',
+      mimeType: 'application/pdf',
+      convertOptions: { pdfBackend: 'x', tableMode: 'fast' },
+    });
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it('returns the cached document when the convert options are identical', async () => {
+    const { fn, calls } = scriptedFetch([jsonResponse(MD_BODY)]);
+    const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn });
+
+    const req = {
+      content: Buffer.from('identical-bytes'),
+      filename: 'doc.pdf',
+      mimeType: 'application/pdf',
+      convertOptions: { tableCellMatching: false, tableMode: 'accurate' as const },
+    };
+    const first = await client.postConvert(req);
+    const second = await client.postConvert(req);
+
+    expect(calls).toHaveLength(1);
+    expect(second.document).toBe(first.document);
+  });
+
   it('sends the X-Api-Key header when an apiKey is configured', async () => {
     const { fn, calls } = scriptedFetch([jsonResponse(MD_BODY)]);
     const client = new DoclingClient({ endpoint: 'http://host:8030', fetch: fn, apiKey: 'secret-key' });

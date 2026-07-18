@@ -27,6 +27,7 @@ import type {
   ConvertViaAsyncOptions,
   DoclingAsyncTask,
   DoclingClientOptions,
+  DoclingConvertOptions,
   DoclingConvertRequest,
   DoclingConvertResponse,
   DoclingDocument,
@@ -285,6 +286,23 @@ export class DoclingClient {
     if (request.doOcr !== undefined) {
       form.append('do_ocr', request.doOcr ? 'true' : 'false');
     }
+    const convertOptions = request.convertOptions;
+    if (convertOptions !== undefined) {
+      // Each option is appended only when set, so an unset field leaves
+      // docling's default in force and the form matches the pre-options shape.
+      if (convertOptions.tableCellMatching !== undefined) {
+        form.append('table_cell_matching', convertOptions.tableCellMatching ? 'true' : 'false');
+      }
+      if (convertOptions.tableMode !== undefined) {
+        form.append('table_mode', convertOptions.tableMode);
+      }
+      if (convertOptions.doTableStructure !== undefined) {
+        form.append('do_table_structure', convertOptions.doTableStructure ? 'true' : 'false');
+      }
+      if (convertOptions.pdfBackend !== undefined) {
+        form.append('pdf_backend', convertOptions.pdfBackend);
+      }
+    }
     return form;
   }
 
@@ -381,7 +399,11 @@ export class DoclingClient {
     // bytes/filename/mime/format with doOcr flipped, and must not resolve the
     // earlier no-OCR document from the cache.
     const ocr = request.doOcr === undefined ? 'default' : String(request.doOcr);
-    return `${sha}:${request.filename}:${request.mimeType ?? ''}:${format}:${ocr}`;
+    // Convert options are part of the key: a re-convert that only changes a
+    // convert option (e.g. flipping tableCellMatching) reconverts the same
+    // bytes/filename/mime/format and must not resolve the earlier document.
+    const convertOptions = serializeConvertOptions(request.convertOptions);
+    return `${sha}:${request.filename}:${request.mimeType ?? ''}:${format}:${ocr}:${convertOptions}`;
   }
 
   private cacheGet(key: string): DoclingDocument | undefined {
@@ -406,6 +428,25 @@ export class DoclingClient {
 
 function stripTrailingSlash(s: string): string {
   return s.endsWith('/') ? s.slice(0, -1) : s;
+}
+
+/**
+ * Serialise convert options into a stable, order-independent cache-key fragment.
+ * Fields are emitted in a fixed key order and only when set, so two option sets
+ * with the same values collide and any difference (including set-vs-unset)
+ * produces a distinct fragment.
+ */
+function serializeConvertOptions(options: DoclingConvertOptions | undefined): string {
+  if (options === undefined) return 'default';
+  // Emit fixed-order [key, value] pairs and JSON.stringify the whole array, so a
+  // free-form value (pdfBackend) containing a delimiter cannot forge a fragment
+  // boundary and collide with a different option set.
+  const pairs: Array<[string, string | boolean]> = [];
+  if (options.doTableStructure !== undefined) pairs.push(['doTableStructure', options.doTableStructure]);
+  if (options.pdfBackend !== undefined) pairs.push(['pdfBackend', options.pdfBackend]);
+  if (options.tableCellMatching !== undefined) pairs.push(['tableCellMatching', options.tableCellMatching]);
+  if (options.tableMode !== undefined) pairs.push(['tableMode', options.tableMode]);
+  return pairs.length > 0 ? JSON.stringify(pairs) : 'default';
 }
 
 /** Full-jitter exponential backoff: `random * min(cap, base * 2^attempt)`. */

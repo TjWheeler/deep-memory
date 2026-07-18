@@ -48,6 +48,10 @@ interface EffectiveWorkerConfig {
   progressiveContextWindow: number;
   logDir?: string;
   workerName?: string;
+  /** Undefined passes through; the built-in provider resolves the default (streaming on). */
+  stream?: boolean;
+  /** Undefined passes through; the built-in provider imposes no extra wall-clock cap. */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -89,6 +93,8 @@ export class ExtractionWorker {
           progressiveContextWindow: config.progressiveContextWindow ?? 6,
           logDir,
           workerName: workerOverride.name,
+          stream: workerOverride.stream,
+          requestTimeoutMs: workerOverride.requestTimeoutMs,
         }
       : {
           endpoint: config.endpoint,
@@ -100,12 +106,16 @@ export class ExtractionWorker {
           chunkingStrategy: config.chunkingStrategy ?? 'auto',
           progressiveContextWindow: config.progressiveContextWindow ?? 6,
           logDir,
+          stream: config.stream,
+          requestTimeoutMs: config.requestTimeoutMs,
         };
 
     // Use the provided LLM provider, or fall back to built-in OpenAI-compat
     this.llmProvider = llmProvider ?? new OpenAIChatProvider({
       endpoint: this.effective.endpoint,
       apiKey: this.effective.apiKey,
+      stream: this.effective.stream,
+      requestTimeoutMs: this.effective.requestTimeoutMs,
     });
   }
 

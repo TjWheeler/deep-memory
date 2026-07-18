@@ -99,7 +99,7 @@ export class StateManager {
   }
 
   /** Update arbitrary fields on a source document */
-  async updateSource(path: string, updates: Partial<Pick<IndexSource, 'assignedWorkers' | 'estimatedTokens' | 'actualTokens' | 'lastError' | 'attempts' | 'status' | 'extractionFiles' | 'selectedExtraction' | 'notes' | 'processingTimeMs' | 'statusReason' | 'derivedTextPath' | 'originalFormat' | 'sourceHash' | 'derivedDoclingJsonPath' | 'doOcr' | 'conversion'>>): Promise<void> {
+  async updateSource(path: string, updates: Partial<Pick<IndexSource, 'assignedWorkers' | 'estimatedTokens' | 'actualTokens' | 'lastError' | 'attempts' | 'status' | 'extractionFiles' | 'selectedExtraction' | 'notes' | 'processingTimeMs' | 'statusReason' | 'derivedTextPath' | 'originalFormat' | 'sourceHash' | 'derivedDoclingJsonPath' | 'doOcr' | 'conversion' | 'sourceConvertOptions' | 'convertOptionsUsed'>>): Promise<void> {
     const sourceList = await this.getSourceList();
     if (!sourceList) throw new Error(`Source list not found in ${this.stateDir}`);
     const source = sourceList.sources.find(s => s.path === path);

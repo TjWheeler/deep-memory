@@ -232,6 +232,8 @@ interface OrchestratorConfig {
     maxTokens?: number;                // Max tokens per request (default 4096)
     temperature?: number;              // LLM temperature (default 0)
     maxChunkSize?: number;             // Max chars per chunk (default 100,000)
+    stream?: boolean;                  // Stream SSE on the built-in provider (default true); see below
+    requestTimeoutMs?: number;         // Total wall-clock cap per request on the built-in provider; see below
     extraBodyParams?: Record<string, unknown>;
     workers?: WorkerConfig[];          // Worker pool — see above
     maxItems?: number;                 // Max documents per extraction run
@@ -272,6 +274,8 @@ interface WorkerConfig {
   concurrency: number;
   capabilities: WorkerCapability[];
   temperature?: number;
+  stream?: boolean;                    // Stream SSE on the built-in provider (default true); see below
+  requestTimeoutMs?: number;           // Total wall-clock cap per request on the built-in provider; see below
   extraBodyParams?: Record<string, unknown>;
   apiKey?: string;
   llmProvider?: string;                // e.g. "anthropic" — see LLM providers below
@@ -283,6 +287,20 @@ type WorkerCapability =
   | 'reasoning'               // Judgment-heavy tasks
   | 'large-context';          // Documents requiring >32K tokens
 ```
+
+### `stream` — surviving long generations on dense chunks
+
+`stream` controls whether the **built-in openai-compat provider** consumes the completion as a Server-Sent Events stream. It applies to that provider only — a worker with `llmProvider: "anthropic"` ignores it. It defaults to `true` when unset.
+
+Streaming exists to keep long generations alive. On a non-streaming completion the endpoint sends nothing — not even headers — until generation finishes, so a dense (e.g. tabular) chunk that generates for minutes can outrun the client's idle timeout and fail as a bare `fetch failed`. With streaming, headers arrive as soon as the model starts producing tokens and the transport idle timer resets on every delta, so the request no longer dies from inter-token idle; the effective ceiling becomes the server/proxy total request timeout. The returned result (content, usage, `finish_reason`) is identical to the non-streaming path.
+
+Every OpenAI-compatible target this pipeline supports (vLLM, OpenAI, Azure, Ollama, llama.cpp) speaks SSE, so the default is safe. Set `stream: false` only for a pathological server or proxy that does not stream SSE correctly. Note that a proxy which *buffers* SSE (e.g. nginx `proxy_buffering on`) delivers all deltas in one terminal burst and defeats the protection — that is an operator-owned proxy fix, not a client setting.
+
+### `requestTimeoutMs` — a hard ceiling on a stuck request
+
+`requestTimeoutMs` sets a total wall-clock cap, in milliseconds, on a single completion request to the **built-in openai-compat provider**. Like `stream`, it applies to that provider only — a worker with `llmProvider: "anthropic"` ignores it. It is unset by default, which imposes no extra cap.
+
+It exists as defense-in-depth against a genuinely stuck request, not as a way to allow longer ones: the cap can only *shorten* a request. It does **not** extend the ~300s non-streaming time-to-first-byte limit that the transport enforces before any bytes arrive — streaming is the mechanism for surviving long generations, and `requestTimeoutMs` is the deterministic upper bound layered on top. When the cap fires it surfaces as a typed transport error distinct from a caller-initiated stop, so a timed-out request is never mistaken for a cancellation. Leave it unset unless you need a firm per-request ceiling; size it above the worst-case legitimate generation time (`maxOutputTokens ÷ token-rate`) so it only trips on a true stall.
 
 ## Validation
 

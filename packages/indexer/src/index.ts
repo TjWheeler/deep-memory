@@ -57,6 +57,7 @@ export type { ProcessPhase, ProcessIteration } from './orchestrator/ProcessState
 export { DoclingClient, toDoclingDocument, toDoclingAsyncTask } from './conversion/DoclingClient.js';
 export type {
   DoclingDocument,
+  DoclingConvertOptions,
   DoclingConvertRequest,
   DoclingConvertResponse,
   DoclingClientOptions,
@@ -67,7 +68,7 @@ export type {
   PollDecision,
 } from './conversion/types.js';
 export { DoclingServiceError, DoclingTimeoutError } from './conversion/errors.js';
-export { convertSources, detectMime, deriveDocSlug, decideOcr } from './conversion/DocumentConverter.js';
+export { convertSources, detectMime, deriveDocSlug, decideOcr, CONVERT_OPTION_KEYS, mergeConvertOptions, convertOptionsEqual } from './conversion/DocumentConverter.js';
 export type {
   DocumentConverterDeps,
   DocumentConverterOptions,
@@ -81,6 +82,16 @@ export type {
   ConversionReportEntry,
   DoclingDiagnostics,
 } from './conversion/ConversionReport.js';
+export { TableStructureDetector, buildTableCorruptionRecommendation } from './conversion/TableStructureDetector.js';
+export type {
+  TableStructureCheck,
+  TableStructureRating,
+  TableStructureEvidence,
+  TableStructureFinding,
+  TableStructureSourceInput,
+  TableCorruptionRemediation,
+  TableCorruptionRecommendation,
+} from './conversion/TableStructureDetector.js';
 export type { ConversionProgress } from './conversion/ConversionProgress.js';
 
 // Extraction
@@ -121,9 +132,18 @@ export type {
   LLMToolUseTurnResult,
 } from './providers/LLMProvider.js';
 export { OpenAIChatProvider, type OpenAIChatProviderConfig } from './providers/OpenAIChatProvider.js';
+export { LLMTransportError } from './providers/errors.js';
 
 // Review
 export { ReviewDiagnostics } from './review/ReviewDiagnostics.js';
+export { VocabularyConformanceGate } from './review/VocabularyConformanceGate.js';
+export type {
+  ConformanceReport,
+  ConformanceViolation,
+  ConformanceViolationClass,
+  ConformanceSeverity,
+  VocabularyExtensionRecommendation,
+} from './review/VocabularyConformanceGate.js';
 export { ConsolidationReviewDiagnostics } from './review/ConsolidationReviewDiagnostics.js';
 export type {
   ReviewReport,

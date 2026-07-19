@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { OperationAbortedError } from '@utaba/deep-memory';
 import type { LLMProvider, LLMToolUseMessage, LLMRequestOptions } from '../providers/LLMProvider.js';
 import type { ExtractedEntity, ExtractedRelationship, SourceRef } from '../types/extraction.js';
 import { ValidationToolProvider } from './ValidationToolProvider.js';
@@ -66,6 +67,25 @@ interface RawAliasVerdict {
 }
 
 /**
+ * Turns granted after the tool-call cap is reached, during which the worker is
+ * asked to conclude with the evidence gathered so far. These give a cooperative
+ * model room to return a text verdict; a model that keeps emitting tool calls
+ * instead is stopped by the hard per-batch turn ceiling.
+ */
+const CONCLUSION_GRACE_TURNS = 3;
+
+/**
+ * Note stamped on every item of a batch whose loop hit the hard turn ceiling
+ * without a conclusive response. Deliberately distinct from the "did not return a
+ * result" message so a runaway sequence is unmistakable in the report.
+ */
+const TURN_CEILING_EXHAUSTED_NOTE =
+  'Validation exhausted the maximum turn count without a conclusive response — see logs for the runaway sequence.';
+
+/** A parsed response with no verdicts — every batch item falls through to the missing-result path. */
+const EMPTY_PARSED: RawValidationResponse = { entities: [], relationships: [] };
+
+/**
  * FullValidationWorker — LLM-powered agent that validates a batch of
  * extracted entities and relationships against their source documents.
  *
@@ -81,6 +101,7 @@ interface RawAliasVerdict {
  */
 export class FullValidationWorker {
   private readonly maxToolCallsPerBatch: number;
+  private readonly maxTurnsPerBatch: number;
   private callCounter = 0;
 
   constructor(
@@ -92,6 +113,13 @@ export class FullValidationWorker {
     private readonly domainGuidance?: string,
   ) {
     this.maxToolCallsPerBatch = config.maxToolCallsPerBatch ?? 20;
+    // Hard ceiling on provider calls for one batch. Every non-terminal turn issues
+    // at least one tool call, so the tool-call cap bounds the exploratory turns; the
+    // grace turns are the only further calls permitted for the model to conclude.
+    // Past this ceiling no additional provider call is made for the batch — the
+    // invariant is a fixed upper bound on API calls per batch, independent of whether
+    // the model ever cooperates.
+    this.maxTurnsPerBatch = this.maxToolCallsPerBatch + CONCLUSION_GRACE_TURNS;
   }
 
   private async writeLog(callId: number, phase: string, data: Record<string, unknown>): Promise<void> {
@@ -110,9 +138,10 @@ export class FullValidationWorker {
    * Validate a single batch of entities/relationships.
    * Returns per-item verdicts and token usage.
    */
-  async validateBatch(
+  public async validateBatch(
     batch: ValidationBatch,
     signal?: AbortSignal,
+    isStopRequested?: () => Promise<boolean>,
   ): Promise<BatchValidationResult> {
     if (!this.provider.chatCompletionWithTools) {
       throw new Error(
@@ -178,12 +207,29 @@ export class FullValidationWorker {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let toolCallCount = 0;
+    let turnCount = 0;
     let finalContent = '';
+    let exhausted = false;
 
     while (true) {
+      // A live abort or stop request must interrupt an in-progress batch within a
+      // single turn — not only at batch boundaries — so both are checked before
+      // every provider call, not once at entry.
       if (signal?.aborted) {
-        throw new Error('Validation aborted');
+        throw new OperationAbortedError('Full validation batch');
       }
+      if (isStopRequested && await isStopRequested()) {
+        throw new OperationAbortedError('Full validation batch');
+      }
+
+      // Hard ceiling on provider calls for this batch. Once reached, the batch
+      // concludes without another call regardless of whether the model ever returned
+      // text — an uncooperative model cannot pin an unbounded number of API calls.
+      if (turnCount >= this.maxTurnsPerBatch) {
+        exhausted = true;
+        break;
+      }
+      turnCount++;
 
       const turn = await this.provider.chatCompletionWithTools(
         systemPrompt,
@@ -271,6 +317,37 @@ export class FullValidationWorker {
     }
 
     const processingTimeMs = Date.now() - startTime;
+
+    if (exhausted) {
+      // The loop hit the hard turn ceiling without a conclusive response. Every item
+      // is returned unverifiable with the distinct exhaustion note rather than throwing:
+      // a throw would leave the batch pending for retry, re-triggering the same runaway
+      // sequence on resume. A graceful unverifiable result records the outcome and lets
+      // the run make progress.
+      const entityResults = this.buildEntityResults(batch.items, EMPTY_PARSED, TURN_CEILING_EXHAUSTED_NOTE);
+      const relationshipResults = this.buildRelationshipResults(batch.items, EMPTY_PARSED, TURN_CEILING_EXHAUSTED_NOTE);
+
+      await this.writeLog(callId, 'exhausted', {
+        batchIndex: batch.batchIndex,
+        source: primaryItem.source,
+        processingTimeMs,
+        usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+        toolCallCount,
+        turnCount,
+        maxTurnsPerBatch: this.maxTurnsPerBatch,
+        itemCount: batch.items.length,
+      });
+
+      return {
+        batchIndex: batch.batchIndex,
+        entityResults,
+        relationshipResults,
+        usage: { inputTokens: totalInputTokens, outputTokens: totalOutputTokens },
+        toolCalls: toolCallCount,
+        processingTimeMs,
+        worker: this.config.name,
+      };
+    }
 
     // Parse the structured validation response from finalContent
     const parsed = parseValidationResponse(finalContent);
@@ -479,6 +556,7 @@ ${sourceRefsText}`);
   private buildEntityResults(
     items: ValidationBatchItem[],
     parsed: RawValidationResponse,
+    missingResultNote: string = 'Worker did not return a result for this entity',
   ): EntityValidationResult[] {
     const results: EntityValidationResult[] = [];
     const rawByLabel = new Map<string, RawEntityValidation>();
@@ -494,7 +572,7 @@ ${sourceRefsText}`);
       const raw = rawByLabel.get(entity.label.toLowerCase());
 
       if (!raw) {
-        // Worker did not return a result for this entity — treat as unverifiable
+        // No verdict for this entity — treat as unverifiable, recording why
         results.push({
           source,
           entityType: entity.entityType,
@@ -506,14 +584,14 @@ ${sourceRefsText}`);
             property: prop,
             extractedValue: entity.properties[prop],
             verdict: 'unverifiable' as FullValidationVerdict,
-            evidence: 'Worker did not return a result for this entity',
+            evidence: missingResultNote,
           })),
           aliasVerdicts: entity.aliases.map(alias => ({
             alias,
             verdict: 'unverifiable' as FullValidationVerdict,
-            evidence: 'Worker did not return a result for this entity',
+            evidence: missingResultNote,
           })),
-          notes: 'Worker did not return a result for this entity',
+          notes: missingResultNote,
         });
         continue;
       }
@@ -580,6 +658,7 @@ ${sourceRefsText}`);
   private buildRelationshipResults(
     items: ValidationBatchItem[],
     parsed: RawValidationResponse,
+    missingResultNote: string = 'Worker did not return a result for this relationship',
   ): RelationshipValidationResult[] {
     const results: RelationshipValidationResult[] = [];
     const rawByKey = new Map<string, RawRelationshipValidation>();
@@ -611,9 +690,9 @@ ${sourceRefsText}`);
             property: prop,
             extractedValue: relationship.properties[prop],
             verdict: 'unverifiable' as FullValidationVerdict,
-            evidence: 'Worker did not return a result for this relationship',
+            evidence: missingResultNote,
           })),
-          notes: 'Worker did not return a result for this relationship',
+          notes: missingResultNote,
         });
         continue;
       }

@@ -175,7 +175,7 @@ describe('FullValidationWorker', () => {
       chatCompletion: vi.fn(),
       // No chatCompletionWithTools
     };
-    const worker = new FullValidationWorker(makeWorkerConfig(), provider, 'report', [sourceFile]);
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
     await expect(worker.validateBatch(makeEntityBatch())).rejects.toThrow(
       'does not support tool use',
     );
@@ -187,7 +187,7 @@ describe('FullValidationWorker', () => {
       chatCompletion: vi.fn(),
       chatCompletionWithTools: vi.fn(),
     };
-    const worker = new FullValidationWorker(makeWorkerConfig(), provider, 'report', [sourceFile]);
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
     const result = await worker.validateBatch({ batchIndex: 0, items: [] });
     expect(result.entityResults).toHaveLength(0);
     expect(result.relationshipResults).toHaveLength(0);
@@ -223,7 +223,7 @@ describe('FullValidationWorker', () => {
       chatCompletionWithTools: vi.fn().mockResolvedValue(textResult),
     };
 
-    const worker = new FullValidationWorker(makeWorkerConfig(), provider, 'report', [sourceFile]);
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
     const result = await worker.validateBatch(makeEntityBatch());
 
     expect(result.entityResults).toHaveLength(1);
@@ -271,7 +271,7 @@ describe('FullValidationWorker', () => {
         .mockResolvedValueOnce(textResult),
     };
 
-    const worker = new FullValidationWorker(makeWorkerConfig(), provider, 'report', [sourceFile]);
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
     const result = await worker.validateBatch(makeEntityBatch());
 
     expect(result.toolCalls).toBe(1);
@@ -294,7 +294,7 @@ describe('FullValidationWorker', () => {
       chatCompletionWithTools: vi.fn().mockResolvedValue(textResult),
     };
 
-    const worker = new FullValidationWorker(makeWorkerConfig(), provider, 'report', [sourceFile]);
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
     const result = await worker.validateBatch(makeEntityBatch());
 
     expect(result.entityResults[0]!.entityVerdict).toBe('unverifiable');
@@ -311,8 +311,67 @@ describe('FullValidationWorker', () => {
       chatCompletionWithTools: vi.fn().mockRejectedValue(new Error('aborted')),
     };
 
-    const worker = new FullValidationWorker(makeWorkerConfig(), provider, 'report', [sourceFile]);
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
     await expect(worker.validateBatch(makeEntityBatch(), controller.signal)).rejects.toThrow();
+  });
+
+  it('terminates on the hard turn ceiling when the model never returns text', async () => {
+    // A model that keeps emitting tool calls and never concludes must not pin an
+    // unbounded number of provider calls — the batch stops itself after a fixed number
+    // of turns and every item is returned unverifiable with the exhaustion note.
+    const toolCallResult: LLMToolUseTurnResult = {
+      type: 'tool_use',
+      toolCalls: [{ id: 'tc-loop', name: 'read_source_lines', input: { lineStart: 1, lineEnd: 3 } }],
+      usage: { inputTokens: 100, outputTokens: 20 },
+      finish_reason: 'tool_use',
+    };
+
+    const chatFn = vi.fn().mockResolvedValue(toolCallResult);
+    const provider: LLMProvider = {
+      name: 'test',
+      chatCompletion: vi.fn(),
+      chatCompletionWithTools: chatFn,
+    };
+
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
+    const result = await worker.validateBatch(makeEntityBatch());
+
+    // maxToolCallsPerBatch (5) exploratory turns + 3 grace turns = 8 provider calls, then stop.
+    expect(chatFn).toHaveBeenCalledTimes(8);
+    expect(result.entityResults).toHaveLength(1);
+    expect(result.entityResults[0]!.entityVerdict).toBe('unverifiable');
+    expect(result.entityResults[0]!.notes).toContain('exhausted the maximum turn count');
+    expect(result.entityResults[0]!.notes).not.toContain('did not return a result');
+  });
+
+  it('interrupts a mid-loop batch when a stop is requested', async () => {
+    // indexing_stop must break a runaway in-batch loop within one turn, not only at
+    // batch boundaries. The stop-check is polled before every provider call.
+    const toolCallResult: LLMToolUseTurnResult = {
+      type: 'tool_use',
+      toolCalls: [{ id: 'tc-loop', name: 'read_source_lines', input: { lineStart: 1, lineEnd: 3 } }],
+      usage: { inputTokens: 100, outputTokens: 20 },
+      finish_reason: 'tool_use',
+    };
+
+    const chatFn = vi.fn().mockResolvedValue(toolCallResult);
+    const provider: LLMProvider = {
+      name: 'test',
+      chatCompletion: vi.fn(),
+      chatCompletionWithTools: chatFn,
+    };
+
+    // Not stopped for the first check (one turn runs), stopped on the next check.
+    let stopChecks = 0;
+    const isStopRequested = async (): Promise<boolean> => (++stopChecks) > 1;
+
+    const worker = new FullValidationWorker(makeWorkerConfig(), provider, [sourceFile]);
+    await expect(
+      worker.validateBatch(makeEntityBatch(), undefined, isStopRequested),
+    ).rejects.toThrow(/aborted/i);
+
+    // Interrupted after a single turn — far below the hard ceiling of 8.
+    expect(chatFn).toHaveBeenCalledTimes(1);
   });
 
   afterEach(async () => {

@@ -1,4 +1,4 @@
-import { InvalidInputError } from '@utaba/deep-memory';
+import { InvalidInputError, OperationAbortedError } from '@utaba/deep-memory';
 import type { LLMProvider } from '../providers/LLMProvider.js';
 import type { ExtractionOutput } from '../types/extraction.js';
 import { FullValidationWorker } from './FullValidationWorker.js';
@@ -208,7 +208,9 @@ export class FullValidationOrchestrator {
           }
 
           try {
-            const batchResult = await worker.validateBatch(batch, signal);
+            // Thread the stop-check into the worker so a stop request interrupts a
+            // runaway in-batch loop within one turn, not only between batches.
+            const batchResult = await worker.validateBatch(batch, signal, isStopRequested);
 
             // Accumulate results (synchronized — JS is single-threaded between awaits)
             allEntityResults.push(...batchResult.entityResults);
@@ -242,6 +244,14 @@ export class FullValidationOrchestrator {
               costExceeded = true;
             }
           } catch (err) {
+            // An operator-initiated stop mid-batch is not a batch failure — it must not
+            // consume a retry slot or record a spurious failed/pending checkpoint. Signal
+            // the run to wind down cleanly, matching the batch-boundary stop path.
+            if (err instanceof OperationAbortedError) {
+              stopped = true;
+              break;
+            }
+
             const maxRetries = this.config.maxRetries ?? 2;
             const retries = getRetryCount(progress.batchCheckpoints, batch.batchIndex);
 

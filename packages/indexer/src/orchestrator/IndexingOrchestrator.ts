@@ -33,6 +33,7 @@ import type { ConsolidationReviewReport } from '../review/consolidation-review-t
 import type { ReviewReport, ReviewVocabularyContext } from '../review/types.js';
 import { FullValidationOrchestrator } from '../validation/FullValidationOrchestrator.js';
 import { summarizeVocabularyForValidation } from '../validation/VocabularySummarizer.js';
+import { resolveExtractionSourcePaths } from '../validation/resolve-source-paths.js';
 import type { FullValidationRunOptions, FullValidationProgressCallbacks } from '../validation/FullValidationOrchestrator.js';
 import type { FullValidationProgress, FullValidationReport, FullValidationConfig } from '../validation/full-validation-types.js';
 import { CorrectionApplier } from '../validation/CorrectionApplier.js';
@@ -846,6 +847,16 @@ export class IndexingOrchestrator {
       throw new Error('No extraction outputs found — run extract() first');
     }
 
+    // Extraction records the original source path (e.g. a binary .pdf) on every
+    // output. Validation workers read that path as UTF-8 text, so a converted
+    // source must be pointed at its derived text; otherwise the worker reads
+    // binary and mistakes real entities for hallucinations. Resolve each path to
+    // the source's derived text where one exists.
+    const sourceList = await this.state.getSourceList();
+    const resolvedExtractions = sourceList
+      ? resolveExtractionSourcePaths(extractions, sourceList.sources)
+      : extractions;
+
     // Load vocabulary and domain guidance for validation context
     await this.loadVocabularyAndRules();
     const vocabularySummary = this.vocabulary
@@ -864,7 +875,7 @@ export class IndexingOrchestrator {
     };
 
     const { progress, report } = await orchestrator.run(
-      extractions,
+      resolvedExtractions,
       null,
       options,
       wrappedCallbacks,

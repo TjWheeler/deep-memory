@@ -217,7 +217,36 @@ export type {
   EntityTypeValidationSummary,
   FlaggedValidationItem,
   ProposedCorrection,
+  CorrectionBase,
+  PropertyCorrection,
+  DeleteCorrection,
+  CreateEntityCorrection,
+  CreateRelationshipCorrection,
+  RetargetRelationshipCorrection,
+  RemediationStep,
+  RelationshipKey,
   CorrectionOperation,
   FullValidationReport,
   ValidationCostEstimate,
 } from './validation/full-validation-types.js';
+
+// Correction applier
+export { CorrectionApplier } from './validation/CorrectionApplier.js';
+export type {
+  CorrectionSelection,
+  ApplyCorrectionsOptions,
+  ApplyCorrectionsResult,
+  ApplyOutcome,
+  CorrectionSummaryItem,
+  AppliedCorrectionRef,
+  CreatedEntityRef,
+  RetargetedRef,
+  SkippedCorrectionRef,
+  CorrectionSkipKind,
+  FailedCorrectionRef,
+  CascadedRef,
+  SkippedGroupRef,
+  GroupExpansionRef,
+  CorrectionWarningRef,
+  CorrectionWarningCode,
+} from './validation/CorrectionApplier.js';

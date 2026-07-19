@@ -1,3 +1,4 @@
+import { InvalidInputError } from '@utaba/deep-memory';
 import type { LLMProvider } from '../providers/LLMProvider.js';
 import type { ExtractionOutput } from '../types/extraction.js';
 import { FullValidationWorker } from './FullValidationWorker.js';
@@ -18,6 +19,7 @@ import type {
   EntityTypeValidationSummary,
   FlaggedValidationItem,
   ProposedCorrection,
+  RemediationStep,
   EntityValidationResult,
   RelationshipValidationResult,
   FullValidationVerdict,
@@ -689,13 +691,19 @@ function buildFlaggedItems(
 }
 
 /**
- * Build mechanical, AI-applicable corrections from validation verdicts.
+ * Build the deterministic corrections that the applier consumes from a run's verdicts.
  *
- * Four correction classes are emitted (see plan/correction-workflow-plan.md):
- * - entity property update / remove-property (property mismatch with or without a concrete replacement)
- * - entity delete (hallucinated entity — the apply step cascades relationships referencing it)
- * - relationship property update / remove-property
- * - relationship delete (hallucinated relationship)
+ * Two kinds of correction are produced:
+ * - **Field-level** — derived directly from verdicts: a property `update` /
+ *   `remove-property` for a per-property correction, and a `delete` for a hallucinated
+ *   entity or relationship. These are standalone (no group) and keep per-item apply
+ *   semantics.
+ * - **Structural** — a worker may attach a `remediations` set to an item when the correct
+ *   fix is a remodel (a deferral/cross-reference that should be its own entity, or an edge
+ *   on the wrong endpoint). Each set is stamped with a shared `remediationGroupId` so its
+ *   primitives apply as one atomic unit. A set comes from a single validated item, so
+ *   every member of a group shares that item's `source` — the invariant the applier relies
+ *   on to resolve endpoint labels within a source file. It is asserted here.
  *
  * `unverifiable` verdicts never become corrections — the user must decide.
  */
@@ -704,6 +712,17 @@ function buildCorrections(
   relationshipResults: RelationshipValidationResult[],
 ): ProposedCorrection[] {
   const corrections: ProposedCorrection[] = [];
+
+  // Per-report group counter — "g1", "g2", … — links the primitives of one remodel.
+  let groupCounter = 0;
+
+  const appendRemediationGroup = (source: string, remediations: RemediationStep[] | undefined): void => {
+    if (!remediations || remediations.length === 0) return;
+    const remediationGroupId = `g${++groupCounter}`;
+    const group = remediations.map(step => stampStep(step, source, remediationGroupId));
+    assertSingleSourcePerGroup(group);
+    corrections.push(...group);
+  };
 
   for (const r of entityResults) {
     for (const pv of r.propertyVerdicts) {
@@ -738,6 +757,8 @@ function buildCorrections(
         confidence: 0.9,
       });
     }
+
+    appendRemediationGroup(r.source, r.remediations);
   }
 
   for (const r of relationshipResults) {
@@ -778,7 +799,38 @@ function buildCorrections(
         relationshipKey: key,
       });
     }
+
+    appendRemediationGroup(r.source, r.remediations);
   }
 
   return corrections;
+}
+
+/**
+ * Reattach the orchestrator-owned bookkeeping a {@link RemediationStep} omits: `source`
+ * (from the validated item) and the shared `remediationGroupId`. The step already carries
+ * the operation-specific payload, so this only stamps the two fields back on.
+ */
+function stampStep(step: RemediationStep, source: string, remediationGroupId: string): ProposedCorrection {
+  return { ...step, source, remediationGroupId };
+}
+
+/**
+ * A remediation group is the primitives of one remodel proposed on one validated item,
+ * so all members must share that item's source. Endpoint resolution during apply is
+ * scoped to a single source file; a group spanning files could never resolve. This
+ * guards the construction contract rather than untrusted input — a violation is a bug.
+ */
+function assertSingleSourcePerGroup(group: ProposedCorrection[]): void {
+  const first = group[0];
+  if (!first) return;
+  for (const c of group) {
+    if (c.source !== first.source) {
+      throw new InvalidInputError(
+        'remediationGroupId',
+        `Remediation group "${first.remediationGroupId}" spans multiple source documents ` +
+        `("${first.source}" vs "${c.source}"); a group must originate from a single validated item.`,
+      );
+    }
+  }
 }

@@ -35,6 +35,8 @@ import { FullValidationOrchestrator } from '../validation/FullValidationOrchestr
 import { summarizeVocabularyForValidation } from '../validation/VocabularySummarizer.js';
 import type { FullValidationRunOptions, FullValidationProgressCallbacks } from '../validation/FullValidationOrchestrator.js';
 import type { FullValidationProgress, FullValidationReport, FullValidationConfig } from '../validation/full-validation-types.js';
+import { CorrectionApplier } from '../validation/CorrectionApplier.js';
+import type { ApplyCorrectionsOptions, ApplyCorrectionsResult } from '../validation/CorrectionApplier.js';
 
 /** Result from a full pipeline run */
 export interface PipelineResult {
@@ -785,6 +787,24 @@ export class IndexingOrchestrator {
 
     const gate = new VocabularyConformanceGate(vocabulary, mode);
     return gate.run(outputs);
+  }
+
+  /**
+   * Apply proposed corrections to the extraction-notes files.
+   *
+   * Deterministic and LLM-free: parses the vocabulary the applier needs for
+   * apply-side conformance enforcement, resolves the governance mode (default
+   * `managed`), then delegates selection, grouping, endpoint resolution,
+   * collision policy, backups, atomic writes, and reporting to the engine's
+   * {@link CorrectionApplier}. The MCP tool above shapes the returned report.
+   */
+  public async applyCorrections(options: ApplyCorrectionsOptions): Promise<ApplyCorrectionsResult> {
+    await this.loadVocabularyAndRules();
+    const vocabulary = parseVocabularyMarkdown(this.vocabulary ?? '');
+    const mode = this.config.governanceMode ?? 'managed';
+
+    const applier = new CorrectionApplier(this.state, vocabulary, mode);
+    return applier.apply(options);
   }
 
   /**

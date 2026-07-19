@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { LLMProvider, LLMToolUseMessage, LLMRequestOptions } from '../providers/LLMProvider.js';
+import type { ExtractedEntity, ExtractedRelationship, SourceRef } from '../types/extraction.js';
 import { ValidationToolProvider } from './ValidationToolProvider.js';
 import type {
   FullValidationWorkerConfig,
@@ -11,6 +12,8 @@ import type {
   RelationshipValidationResult,
   PropertyValidationResult,
   FullValidationVerdict,
+  RemediationStep,
+  RelationshipKey,
 } from './full-validation-types.js';
 
 /** Raw validation response structure expected from the LLM */
@@ -27,6 +30,8 @@ interface RawEntityValidation {
   properties?: Record<string, RawPropertyVerdict>;
   aliases?: Record<string, RawAliasVerdict>;
   notes?: string;
+  /** Proposed structural remodels — parsed defensively, never trusted as-is. */
+  remediations?: unknown;
 }
 
 interface RawRelationshipValidation {
@@ -39,6 +44,8 @@ interface RawRelationshipValidation {
   directionalityVerdict?: string;
   properties?: Record<string, RawPropertyVerdict>;
   notes?: string;
+  /** Proposed structural remodels — parsed defensively, never trusted as-is. */
+  remediations?: unknown;
 }
 
 interface RawPropertyVerdict {
@@ -315,6 +322,37 @@ export class FullValidationWorker {
 - Include the source evidence (quoted text) and line numbers
 - Rate your confidence in the correction (0.0-1.0)`;
 
+    const restructureInstructions = `
+## Structural remediations (optional)
+
+Some errors are not wrong values but wrong *modelling*: a value is a cross-reference or
+deferral that points at material which should be its own entity, or an edge is attached to
+the wrong endpoint. A field-level correction cannot fix these. When the correct fix is
+structural, you MAY add a "remediations" array to that item — a list of primitive steps.
+Several steps that together form one remodel are listed on the same item and are applied
+atomically (all or nothing).
+
+Only propose a remediation when you have direct evidence:
+- Quote the cross-reference / deferral text itself, AND
+- Confirm by reading the source that the referenced material actually exists.
+Keep confidence conservative. Use ONLY the entity and relationship types listed under
+"Vocabulary Types" above, spelled exactly — do not invent a type. Any created entity or
+relationship MUST carry non-empty sourceRefs; a step without them is discarded.
+
+Worked pattern (derive the real types and direction from the vocabulary and source — this
+is a shape, not a fixed recipe): a cell whose value defers to material described elsewhere
+is often best modelled as (1) create the referenced entity, choosing its type from the
+vocabulary; (2) create a correctly-typed edge to it; (3) delete the edge or property that
+mis-carried the deferral.
+
+Each remediation step is one of:
+- { "itemType":"entity","operation":"create","label":"<label>","sourceEvidence":"<quote>","evidenceLines":{"lineStart":N,"lineEnd":N},"confidence":0.0-1.0,"entity":{"entityType":"<VocabType>","label":"<label>","summary":"<optional>","properties":{...},"aliases":[],"sourceRefs":[{"description":"...","lineStart":N,"lineEnd":N}]} }
+- { "itemType":"relationship","operation":"create",...base fields...,"relationship":{"type":"<VocabType>","sourceLabel":"<label>","targetLabel":"<label>","properties":{...},"sourceRefs":[{"description":"...","lineStart":N,"lineEnd":N}]} }
+- { "itemType":"relationship","operation":"retarget",...base fields...,"relationshipKey":{"sourceLabel":"...","type":"...","targetLabel":"..."},"endpoint":"source"|"target","newLabel":"<label>" }
+- { "itemType":"relationship","operation":"delete",...base fields...,"relationshipKey":{"sourceLabel":"...","type":"...","targetLabel":"..."} }
+- { "itemType":"entity","operation":"delete",...base fields... }
+("base fields" = label, sourceEvidence, evidenceLines, confidence, as shown in the create example.)`;
+
     const vocabSection = this.vocabularySummary
       ? `\n${this.vocabularySummary}\n`
       : '';
@@ -345,7 +383,7 @@ Rules:
 - Use list_source_headings to understand document structure when needed
 - Use search_source when you can't find a value at the referenced lines
 - Classification properties (listed below) use standardized vocabulary values. Confirm them if the source context supports the categorization, even if the exact value string does not appear verbatim in the source text. Only flag a classification value as "mismatch" if a different vocabulary value would be more accurate, or "hallucinated" if the entity has no relationship to that category at all${correctionInstructions}
-${vocabSection}${domainSection}
+${vocabSection}${domainSection}${restructureInstructions}
 
 After investigating, respond with a JSON object in this exact format:
 {
@@ -366,7 +404,8 @@ After investigating, respond with a JSON object in this exact format:
       "aliases": {
         "<alias>": { "verdict": "<confirmed|mismatch|hallucinated|unverifiable>", "evidence": "..." }
       },
-      "notes": "<optional free-text explanation>"
+      "notes": "<optional free-text explanation>",
+      "remediations": [ /* optional — omit unless a structural remodel is warranted; step formats above */ ]
     }
   ],
   "relationships": [
@@ -379,7 +418,8 @@ After investigating, respond with a JSON object in this exact format:
       "typeVerdict": "<confirmed|mismatch|hallucinated|unverifiable>",
       "directionalityVerdict": "<confirmed|mismatch|hallucinated|unverifiable>",
       "properties": { ... },
-      "notes": "<optional>"
+      "notes": "<optional>",
+      "remediations": [ /* optional — omit unless a structural remodel is warranted; step formats above */ ]
     }
   ]
 }
@@ -518,6 +558,8 @@ ${sourceRefsText}`);
         propertyVerdicts,
       );
 
+      const { steps, dropNotes } = parseRemediations(raw.remediations);
+
       results.push({
         source,
         entityType: entity.entityType,
@@ -527,7 +569,8 @@ ${sourceRefsText}`);
         classificationVerdict: normalizeVerdict(raw.classificationVerdict) ?? 'unverifiable',
         propertyVerdicts,
         aliasVerdicts,
-        notes: raw.notes,
+        notes: appendDropNotes(raw.notes, dropNotes),
+        ...(steps.length > 0 ? { remediations: steps } : {}),
       });
     }
 
@@ -604,6 +647,8 @@ ${sourceRefsText}`);
       const relationshipVerdict = normalizeVerdict(raw.relationshipVerdict)
         ?? computeOverallRelationshipVerdict(propertyVerdicts);
 
+      const { steps, dropNotes } = parseRemediations(raw.remediations);
+
       results.push({
         source,
         type: relationship.type,
@@ -614,7 +659,8 @@ ${sourceRefsText}`);
         typeVerdict: normalizeVerdict(raw.typeVerdict) ?? 'unverifiable',
         directionalityVerdict: normalizeVerdict(raw.directionalityVerdict) ?? 'unverifiable',
         propertyVerdicts,
-        notes: raw.notes,
+        notes: appendDropNotes(raw.notes, dropNotes),
+        ...(steps.length > 0 ? { remediations: steps } : {}),
       });
     }
 
@@ -705,4 +751,228 @@ function parseValidationResponse(content: string): RawValidationResponse {
   }
 
   return { entities: [], relationships: [] };
+}
+
+// ── Structural remediation parsing ──────────────────────────────────────
+//
+// A worker may attach proposed structural remodels to an item. The applier is
+// deterministic and will reject anything malformed, so parsing is defensive: a
+// step that fails to parse is dropped and a note is appended to the item — a bad
+// proposal never fails the batch, and provenance is never synthesized (a created
+// item with no sourceRefs is dropped rather than fabricated).
+
+/** Parse a worker's raw remediations array, dropping malformed steps with a note. */
+function parseRemediations(raw: unknown): { steps: RemediationStep[]; dropNotes: string[] } {
+  const steps: RemediationStep[] = [];
+  const dropNotes: string[] = [];
+  if (!Array.isArray(raw)) return { steps, dropNotes };
+
+  raw.forEach((entry, i) => {
+    const result = parseRemediationStep(entry);
+    if (result.step) {
+      steps.push(result.step);
+    } else {
+      dropNotes.push(`Dropped structural remediation #${i + 1}: ${result.error}`);
+    }
+  });
+
+  return { steps, dropNotes };
+}
+
+function parseRemediationStep(entry: unknown): { step?: RemediationStep; error?: string } {
+  const rec = asRecord(entry);
+  if (!rec) return { error: 'not an object' };
+
+  const itemType = rec['itemType'];
+  if (itemType !== 'entity' && itemType !== 'relationship') return { error: 'invalid itemType' };
+
+  const operation = rec['operation'];
+  if (
+    operation !== 'update' && operation !== 'remove-property' &&
+    operation !== 'delete' && operation !== 'create' && operation !== 'retarget'
+  ) {
+    return { error: 'invalid operation' };
+  }
+
+  const base = parseStepBase(rec);
+  if (base.value === undefined) return { error: base.error };
+  const { label, sourceEvidence, evidenceLines, confidence } = base.value;
+
+  if (operation === 'create') {
+    if (itemType === 'entity') {
+      const entity = parseExtractedEntity(rec['entity']);
+      if (!entity) return { error: 'invalid or missing entity payload' };
+      if (entity.sourceRefs.length === 0) {
+        return { error: 'created entity has no sourceRefs; provenance cannot be synthesized' };
+      }
+      return { step: { itemType: 'entity', operation: 'create', label, sourceEvidence, evidenceLines, confidence, entity } };
+    }
+    const relationship = parseExtractedRelationship(rec['relationship']);
+    if (!relationship) return { error: 'invalid or missing relationship payload' };
+    if (relationship.sourceRefs.length === 0) {
+      return { error: 'created relationship has no sourceRefs; provenance cannot be synthesized' };
+    }
+    return { step: { itemType: 'relationship', operation: 'create', label, sourceEvidence, evidenceLines, confidence, relationship } };
+  }
+
+  if (operation === 'retarget') {
+    if (itemType !== 'relationship') return { error: 'retarget requires itemType "relationship"' };
+    const relationshipKey = parseRelationshipKey(rec['relationshipKey']);
+    if (!relationshipKey) return { error: 'invalid or missing relationshipKey' };
+    const endpoint = rec['endpoint'];
+    if (endpoint !== 'source' && endpoint !== 'target') return { error: 'endpoint must be "source" or "target"' };
+    const newLabel = rec['newLabel'];
+    if (typeof newLabel !== 'string' || newLabel.trim().length === 0) return { error: 'missing newLabel' };
+    return { step: { itemType: 'relationship', operation: 'retarget', label, sourceEvidence, evidenceLines, confidence, relationshipKey, endpoint, newLabel } };
+  }
+
+  if (operation === 'delete') {
+    if (itemType === 'relationship') {
+      const relationshipKey = parseRelationshipKey(rec['relationshipKey']);
+      if (!relationshipKey) return { error: 'relationship delete requires relationshipKey' };
+      return { step: { itemType: 'relationship', operation: 'delete', label, sourceEvidence, evidenceLines, confidence, relationshipKey } };
+    }
+    return { step: { itemType: 'entity', operation: 'delete', label, sourceEvidence, evidenceLines, confidence } };
+  }
+
+  // update | remove-property
+  const property = rec['property'];
+  if (typeof property !== 'string' || property.trim().length === 0) return { error: 'missing property' };
+  const relationshipKey = itemType === 'relationship' ? parseRelationshipKey(rec['relationshipKey']) : undefined;
+  if (itemType === 'relationship' && !relationshipKey) {
+    return { error: 'relationship property correction requires relationshipKey' };
+  }
+  const originalValue = rec['originalValue'];
+  if (operation === 'update') {
+    if (!('correctedValue' in rec)) return { error: 'update requires correctedValue' };
+    return {
+      step: {
+        itemType, operation: 'update', property,
+        correctedValue: rec['correctedValue'], originalValue,
+        ...(relationshipKey ? { relationshipKey } : {}),
+        label, sourceEvidence, evidenceLines, confidence,
+      },
+    };
+  }
+  return {
+    step: {
+      itemType, operation: 'remove-property', property, originalValue,
+      ...(relationshipKey ? { relationshipKey } : {}),
+      label, sourceEvidence, evidenceLines, confidence,
+    },
+  };
+}
+
+interface StepBase {
+  label: string;
+  sourceEvidence: string;
+  evidenceLines: { lineStart: number; lineEnd: number };
+  confidence: number;
+}
+
+function parseStepBase(rec: Record<string, unknown>): { value: StepBase; error?: undefined } | { value?: undefined; error: string } {
+  const label = rec['label'];
+  if (typeof label !== 'string' || label.trim().length === 0) return { error: 'missing label' };
+  const sourceEvidence = rec['sourceEvidence'];
+  if (typeof sourceEvidence !== 'string' || sourceEvidence.trim().length === 0) {
+    return { error: 'missing sourceEvidence (structural remediations require direct evidence)' };
+  }
+  const evidenceLines = parseLineRange(rec['evidenceLines']);
+  if (!evidenceLines) return { error: 'missing or invalid evidenceLines' };
+  const confidence = rec['confidence'];
+  if (typeof confidence !== 'number' || !Number.isFinite(confidence)) return { error: 'missing or invalid confidence' };
+  // Confidence must be a real probability — an out-of-range value would clear the
+  // apply-side minConfidence floor unconditionally (a group rides its weakest member),
+  // so reject rather than clamp, consistent with dropping any other malformed field.
+  if (confidence < 0 || confidence > 1) return { error: 'confidence out of range (must be between 0 and 1)' };
+  return { value: { label, sourceEvidence, evidenceLines, confidence } };
+}
+
+function parseExtractedEntity(value: unknown): ExtractedEntity | undefined {
+  const rec = asRecord(value);
+  if (!rec) return undefined;
+  const entityType = rec['entityType'];
+  const label = rec['label'];
+  if (typeof entityType !== 'string' || entityType.trim().length === 0) return undefined;
+  if (typeof label !== 'string' || label.trim().length === 0) return undefined;
+  const summary = typeof rec['summary'] === 'string' ? rec['summary'] : undefined;
+  return {
+    entityType,
+    label,
+    ...(summary !== undefined ? { summary } : {}),
+    properties: asRecord(rec['properties']) ?? {},
+    aliases: asStringArray(rec['aliases']),
+    sourceRefs: parseSourceRefs(rec['sourceRefs']),
+  };
+}
+
+function parseExtractedRelationship(value: unknown): ExtractedRelationship | undefined {
+  const rec = asRecord(value);
+  if (!rec) return undefined;
+  const type = rec['type'];
+  const sourceLabel = rec['sourceLabel'];
+  const targetLabel = rec['targetLabel'];
+  if (typeof type !== 'string' || type.trim().length === 0) return undefined;
+  if (typeof sourceLabel !== 'string' || sourceLabel.trim().length === 0) return undefined;
+  if (typeof targetLabel !== 'string' || targetLabel.trim().length === 0) return undefined;
+  return {
+    type,
+    sourceLabel,
+    targetLabel,
+    properties: asRecord(rec['properties']) ?? {},
+    sourceRefs: parseSourceRefs(rec['sourceRefs']),
+  };
+}
+
+function parseRelationshipKey(value: unknown): RelationshipKey | undefined {
+  const rec = asRecord(value);
+  if (!rec) return undefined;
+  const sourceLabel = rec['sourceLabel'];
+  const type = rec['type'];
+  const targetLabel = rec['targetLabel'];
+  if (typeof sourceLabel !== 'string' || sourceLabel.trim().length === 0) return undefined;
+  if (typeof type !== 'string' || type.trim().length === 0) return undefined;
+  if (typeof targetLabel !== 'string' || targetLabel.trim().length === 0) return undefined;
+  return { sourceLabel, type, targetLabel };
+}
+
+function parseSourceRefs(value: unknown): SourceRef[] {
+  if (!Array.isArray(value)) return [];
+  const refs: SourceRef[] = [];
+  for (const item of value) {
+    const rec = asRecord(item);
+    if (!rec) continue;
+    const range = parseLineRange(rec);
+    if (!range) continue;
+    const description = typeof rec['description'] === 'string' ? rec['description'] : '';
+    refs.push({ description, lineStart: range.lineStart, lineEnd: range.lineEnd });
+  }
+  return refs;
+}
+
+function parseLineRange(value: unknown): { lineStart: number; lineEnd: number } | undefined {
+  const rec = asRecord(value);
+  if (!rec) return undefined;
+  const lineStart = rec['lineStart'];
+  const lineEnd = rec['lineEnd'];
+  if (typeof lineStart !== 'number' || !Number.isFinite(lineStart)) return undefined;
+  if (typeof lineEnd !== 'number' || !Number.isFinite(lineEnd)) return undefined;
+  return { lineStart, lineEnd };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+/** Fold drop notes into the worker's free-text notes so the reason survives to review. */
+function appendDropNotes(notes: string | undefined, dropNotes: string[]): string | undefined {
+  if (dropNotes.length === 0) return notes;
+  const suffix = dropNotes.join(' ');
+  return notes && notes.trim().length > 0 ? `${notes} ${suffix}` : suffix;
 }

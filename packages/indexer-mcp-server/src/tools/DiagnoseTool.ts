@@ -1,6 +1,6 @@
 import { BaseToolController } from './base/BaseToolController.js';
 import { StateManager, Phase, IndexingOrchestrator } from '@utaba/deep-memory-indexer';
-import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport, ConversionReport, TableCorruptionRecommendation } from '@utaba/deep-memory-indexer';
+import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport, ConversionReport, TableCorruptionRecommendation, ProposedCorrection } from '@utaba/deep-memory-indexer';
 import { resolveStateDir, resolveConfig } from './resolveProcess.js';
 
 interface DiagnoseCheck {
@@ -518,11 +518,19 @@ export class DiagnoseTool extends BaseToolController {
     }
 
     if (report && report.corrections.length > 0) {
+      const groupCount = new Set(
+        report.corrections.map(c => c.remediationGroupId).filter((id): id is string => id != null),
+      ).size;
+      const groupNote = groupCount > 0
+        ? ` (includes ${groupCount} structural remodel group${groupCount === 1 ? '' : 's'} applied atomically)`
+        : '';
       checks.push({
         name: 'pending-corrections',
         status: 'warn',
-        detail: `${report.corrections.length} proposed corrections awaiting review`,
-        items: report.corrections.slice(0, 10),
+        detail: `${report.corrections.length} proposed corrections awaiting review${groupNote}`,
+        // Index matches the position apply-corrections selects by, so a reviewer can
+        // pick indices straight from this listing.
+        items: report.corrections.slice(0, 10).map((c, index) => summarizeCorrectionForDisplay(c, index)),
       });
     }
 
@@ -651,4 +659,42 @@ export class DiagnoseTool extends BaseToolController {
       guidance,
     };
   }
+}
+
+/**
+ * Render one proposed correction as a compact, selectable listing row. The op verbs now
+ * include structural remodels, so each operation surfaces the fields a reviewer needs to
+ * judge it: create shows the type and label being added, retarget shows the endpoint move.
+ */
+function summarizeCorrectionForDisplay(correction: ProposedCorrection, index: number): Record<string, unknown> {
+  const base = {
+    index,
+    source: correction.source,
+    operation: correction.operation,
+    itemType: correction.itemType,
+    confidence: correction.confidence,
+    ...(correction.remediationGroupId ? { group: correction.remediationGroupId } : {}),
+  };
+
+  if (correction.operation === 'update' || correction.operation === 'remove-property') {
+    return { ...base, label: correction.label, property: correction.property, correctedValue: correction.correctedValue };
+  }
+  if (correction.operation === 'delete') {
+    return { ...base, label: correction.label };
+  }
+  if (correction.operation === 'create') {
+    if (correction.itemType === 'entity') {
+      return { ...base, create: `${correction.entity.entityType}: ${correction.entity.label}` };
+    }
+    const r = correction.relationship;
+    return { ...base, create: `${r.sourceLabel} → [${r.type}] → ${r.targetLabel}` };
+  }
+  if (correction.operation === 'retarget') {
+    const rk = correction.relationshipKey;
+    const oldDisplay = `${rk.sourceLabel} → [${rk.type}] → ${rk.targetLabel}`;
+    const newSource = correction.endpoint === 'source' ? correction.newLabel : rk.sourceLabel;
+    const newTarget = correction.endpoint === 'target' ? correction.newLabel : rk.targetLabel;
+    return { ...base, retarget: `${oldDisplay}  ⇒  ${newSource} → [${rk.type}] → ${newTarget}` };
+  }
+  return base;
 }

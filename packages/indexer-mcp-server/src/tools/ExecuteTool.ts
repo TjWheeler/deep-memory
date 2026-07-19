@@ -1,12 +1,11 @@
-import { basename, dirname, join } from 'node:path';
-import { readFile, writeFile, mkdir, rename, readdir, rm, copyFile } from 'node:fs/promises';
+import { basename } from 'node:path';
 import { BaseToolController } from './base/BaseToolController.js';
 import {
   StateManager, Phase, IndexingOrchestrator, ProcessStateWriter,
   EmbeddingsOrchestrator, CheckpointManager, matchesSourceFilter,
 } from '@utaba/deep-memory-indexer';
 import type {
-  PipelinePhase, ProposedCorrection,
+  PipelinePhase, ApplyCorrectionsResult,
   EmbeddingsDependencies, EmbeddingsConfig,
 } from '@utaba/deep-memory-indexer';
 import { DeepMemory, InMemoryStorageProvider, type StorageProvider } from '@utaba/deep-memory';
@@ -725,8 +724,8 @@ export class ExecuteTool extends BaseToolController {
     } else if (phase === ('full-validation' as PipelinePhase)) {
       reviewChecklist.push(
         'Run indexing_diagnose to view validation verdicts',
-        'Review flagged items and proposed corrections',
-        'Apply corrections with indexing_execute action "apply-corrections"',
+        'Review flagged items and proposed corrections — these may include structural remodels (create/retarget), applied as atomic groups where all steps in a group succeed or none do',
+        'Apply corrections with indexing_execute action "apply-corrections" (dry run first)',
       );
       nextPhase = 'consolidation';
     } else if (phase === ('consolidation-review' as PipelinePhase)) {
@@ -762,310 +761,75 @@ export class ExecuteTool extends BaseToolController {
   }
 
   private async applyCorrections(params: Record<string, unknown>) {
-    const stateDir = resolveStateDir(params);
-    const state = new StateManager(stateDir);
-    // Apply-corrections defaults to dryRun: true — the user must opt in to mutation
-    // by passing dryRun: false. Stops accidental writes to extraction files.
+    // Apply-corrections defaults to dryRun: true — the user must opt in to
+    // mutation by passing dryRun: false. Stops accidental writes to extraction
+    // files. Selection, grouping, endpoint resolution, apply-side conformance,
+    // backups, and atomic writes all live in the engine's CorrectionApplier;
+    // this method only parses params and shapes the MCP response.
     const dryRun = (params['dryRun'] as boolean | undefined) ?? true;
     const corrections = params['corrections'] as { approveAll?: boolean; approvedIndices?: number[]; minConfidence?: number } | undefined;
 
-    const allCorrections = await state.getFullValidationCorrections<ProposedCorrection[]>();
-    if (!allCorrections || allCorrections.length === 0) {
-      return {
-        message: 'No corrections found. Run full validation first.',
-        applied: 0,
-      };
-    }
+    const { config } = await resolveConfig(params);
+    const orchestrator = new IndexingOrchestrator(config);
+    const result = await orchestrator.applyCorrections({
+      selection: {
+        approveAll: corrections?.approveAll,
+        minConfidence: corrections?.minConfidence,
+        approvedIndices: corrections?.approvedIndices,
+      },
+      dryRun,
+    });
 
-    let toApply: Array<{ index: number; correction: ProposedCorrection }> = [];
+    return this.shapeApplyCorrectionsResult(result);
+  }
 
-    if (corrections?.approveAll) {
-      const minConf = corrections.minConfidence ?? 0.8;
-      toApply = allCorrections
-        .map((c, i) => ({ index: i, correction: c }))
-        .filter(({ correction }) => correction.confidence >= minConf && !correction.approved);
-    } else if (corrections?.approvedIndices) {
-      toApply = corrections.approvedIndices
-        .filter(i => i >= 0 && i < allCorrections.length)
-        .map(i => ({ index: i, correction: allCorrections[i]! }));
-    } else {
-      return {
-        message: 'Specify corrections.approvedIndices or corrections.approveAll to apply corrections.',
-        totalCorrections: allCorrections.length,
-        byOperation: summarizeCorrectionsByOperation(allCorrections),
-        corrections: allCorrections.map((c, i) => ({
-          index: i,
-          source: c.source,
-          itemType: c.itemType,
-          operation: c.operation,
-          label: c.label,
-          property: c.property,
-          originalValue: c.originalValue,
-          correctedValue: c.correctedValue,
-          confidence: c.confidence,
-          approved: c.approved,
-        })),
-      };
-    }
-
-    if (toApply.length === 0) {
-      return { message: 'No corrections matched the selection criteria.', applied: 0 };
-    }
-
-    if (dryRun) {
-      return {
-        message: `Dry run: would apply ${toApply.length} corrections. Pass dryRun: false to mutate extraction files.`,
-        dryRun: true,
-        plan: toApply.map(({ index, correction }) => ({
-          index,
-          source: correction.source,
-          itemType: correction.itemType,
-          operation: correction.operation,
-          label: correction.label,
-          property: correction.property,
-          confidence: correction.confidence,
-        })),
-      };
-    }
-
-    const applied: Array<{ index: number; source: string; itemType: string; operation: string; label: string; property?: string }> = [];
-    const skipped: Array<{ index: number; source: string; label: string; reason: string }> = [];
-    const failed: Array<{ index: number; source: string; label: string; error: string }> = [];
-    const cascaded: Array<{ source: string; relationshipKey: string; reason: string }> = [];
-
-    // Group corrections by source file — we load, mutate in memory, and atomically
-    // write each file once per apply call.
-    const bySource = new Map<string, Array<{ index: number; correction: ProposedCorrection }>>();
-    for (const item of toApply) {
-      const key = item.correction.source;
-      let list = bySource.get(key);
-      if (!list) { list = []; bySource.set(key, list); }
-      list.push(item);
-    }
-
-    const sourceList = await state.getSourceList();
-    const sourceEntries = sourceList?.sources ?? [];
-
-    // One backup set per apply call, identified by ISO timestamp with `:` replaced
-    const backupStamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupRoot = join(stateDir, 'extraction-notes-backups', backupStamp);
-
-    for (const [source, items] of bySource) {
-      const sourceEntry = sourceEntries.find(s => s.path.endsWith(source) || s.path.includes(source));
-      const selectedPath = sourceEntry?.selectedExtraction;
-      if (!selectedPath) {
-        for (const { index, correction } of items) {
-          failed.push({
-            index,
-            source,
-            label: correction.label,
-            error: 'no selectedExtraction set for this source',
-          });
-        }
-        continue;
-      }
-      const extractionPath = join(stateDir, selectedPath);
-
-      let extraction: ExtractionFile;
-      try {
-        const content = await readFile(extractionPath, 'utf-8');
-        extraction = JSON.parse(content) as ExtractionFile;
-      } catch (error) {
-        for (const { index, correction } of items) {
-          failed.push({
-            index,
-            source,
-            label: correction.label,
-            error: `failed to read extraction: ${error instanceof Error ? error.message : String(error)}`,
-          });
-        }
-        continue;
-      }
-
-      // Back up the original file before any mutation. `selectedPath` is a path
-      // relative to stateDir (e.g. "extraction-notes/worker-a/doc.json") — preserve
-      // that structure under the timestamped backup folder.
-      const backupTarget = join(backupRoot, selectedPath);
-      try {
-        await mkdir(dirname(backupTarget), { recursive: true });
-        await copyFile(extractionPath, backupTarget);
-      } catch (error) {
-        for (const { index, correction } of items) {
-          failed.push({
-            index,
-            source,
-            label: correction.label,
-            error: `backup failed: ${error instanceof Error ? error.message : String(error)}`,
-          });
-        }
-        continue;
-      }
-
-      for (const { index, correction } of items) {
-        const key = `${correction.itemType}:${correction.operation}`;
-        try {
-          switch (key) {
-            case 'entity:update': {
-              const entity = extraction.entities.find(e => e.label === correction.label);
-              if (!entity) {
-                skipped.push({ index, source, label: correction.label, reason: 'entity not found (may have been deleted by a prior correction)' });
-                break;
-              }
-              if (!correction.property) {
-                failed.push({ index, source, label: correction.label, error: 'entity:update missing property field' });
-                break;
-              }
-              entity.properties[correction.property] = correction.correctedValue;
-              applied.push({ index, source, itemType: 'entity', operation: 'update', label: correction.label, property: correction.property });
-              break;
-            }
-            case 'entity:remove-property': {
-              const entity = extraction.entities.find(e => e.label === correction.label);
-              if (!entity) {
-                skipped.push({ index, source, label: correction.label, reason: 'entity not found' });
-                break;
-              }
-              if (!correction.property) {
-                failed.push({ index, source, label: correction.label, error: 'entity:remove-property missing property field' });
-                break;
-              }
-              delete entity.properties[correction.property];
-              applied.push({ index, source, itemType: 'entity', operation: 'remove-property', label: correction.label, property: correction.property });
-              break;
-            }
-            case 'entity:delete': {
-              const before = extraction.entities.length;
-              extraction.entities = extraction.entities.filter(e => e.label !== correction.label);
-              if (extraction.entities.length === before) {
-                skipped.push({ index, source, label: correction.label, reason: 'entity not found' });
-                break;
-              }
-              // Cascade: drop relationships where this entity appears as source or target
-              const relBefore = extraction.relationships.length;
-              const dropped = extraction.relationships.filter(r =>
-                r.sourceLabel === correction.label || r.targetLabel === correction.label,
-              );
-              extraction.relationships = extraction.relationships.filter(r =>
-                r.sourceLabel !== correction.label && r.targetLabel !== correction.label,
-              );
-              for (const r of dropped) {
-                cascaded.push({
-                  source,
-                  relationshipKey: `${r.sourceLabel} → [${r.type}] → ${r.targetLabel}`,
-                  reason: `entity deleted: ${correction.label}`,
-                });
-              }
-              applied.push({ index, source, itemType: 'entity', operation: 'delete', label: correction.label });
-              // (count is available via relBefore - extraction.relationships.length if needed later)
-              void relBefore;
-              break;
-            }
-            case 'relationship:update': {
-              if (!correction.relationshipKey) {
-                failed.push({ index, source, label: correction.label, error: 'relationship:update missing relationshipKey' });
-                break;
-              }
-              if (!correction.property) {
-                failed.push({ index, source, label: correction.label, error: 'relationship:update missing property field' });
-                break;
-              }
-              const rel = findRelationship(extraction, correction.relationshipKey);
-              if (!rel) {
-                skipped.push({ index, source, label: correction.label, reason: 'relationship not found (may have been cascaded or deleted)' });
-                break;
-              }
-              rel.properties[correction.property] = correction.correctedValue;
-              applied.push({ index, source, itemType: 'relationship', operation: 'update', label: correction.label, property: correction.property });
-              break;
-            }
-            case 'relationship:remove-property': {
-              if (!correction.relationshipKey) {
-                failed.push({ index, source, label: correction.label, error: 'relationship:remove-property missing relationshipKey' });
-                break;
-              }
-              if (!correction.property) {
-                failed.push({ index, source, label: correction.label, error: 'relationship:remove-property missing property field' });
-                break;
-              }
-              const rel = findRelationship(extraction, correction.relationshipKey);
-              if (!rel) {
-                skipped.push({ index, source, label: correction.label, reason: 'relationship not found' });
-                break;
-              }
-              delete rel.properties[correction.property];
-              applied.push({ index, source, itemType: 'relationship', operation: 'remove-property', label: correction.label, property: correction.property });
-              break;
-            }
-            case 'relationship:delete': {
-              if (!correction.relationshipKey) {
-                failed.push({ index, source, label: correction.label, error: 'relationship:delete missing relationshipKey' });
-                break;
-              }
-              const rk = correction.relationshipKey;
-              const before = extraction.relationships.length;
-              extraction.relationships = extraction.relationships.filter(r =>
-                !(r.sourceLabel === rk.sourceLabel && r.type === rk.type && r.targetLabel === rk.targetLabel),
-              );
-              if (extraction.relationships.length === before) {
-                skipped.push({ index, source, label: correction.label, reason: 'relationship not found (may have been cascaded)' });
-                break;
-              }
-              applied.push({ index, source, itemType: 'relationship', operation: 'delete', label: correction.label });
-              break;
-            }
-            default: {
-              failed.push({ index, source, label: correction.label, error: `unsupported operation: ${key}` });
-            }
-          }
-        } catch (error) {
-          failed.push({
-            index,
-            source,
-            label: correction.label,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-
-      // Atomic write: write new content to a sibling .tmp file then rename over the original.
-      // If the process crashes mid-write, the original file is still intact on disk.
-      try {
-        const tmpPath = `${extractionPath}.tmp`;
-        await writeFile(tmpPath, JSON.stringify(extraction, null, 2) + '\n', 'utf-8');
-        await rename(tmpPath, extractionPath);
-      } catch (error) {
-        for (const { index, correction } of items) {
-          failed.push({
-            index,
-            source,
-            label: correction.label,
-            error: `write failed: ${error instanceof Error ? error.message : String(error)}`,
-          });
-        }
+  private shapeApplyCorrectionsResult(result: ApplyCorrectionsResult) {
+    switch (result.outcome) {
+      case 'no-corrections':
+        return { message: 'No corrections found. Run full validation first.', applied: 0 };
+      case 'no-selection':
+        return {
+          message: 'Specify corrections.approvedIndices or corrections.approveAll to apply corrections.',
+          totalCorrections: result.totalCorrections,
+          byOperation: result.byOperation,
+          corrections: result.listing,
+        };
+      case 'no-matches':
+        return { message: 'No corrections matched the selection criteria.', applied: 0 };
+      case 'dry-run':
+        return {
+          message: `Dry run: would apply ${result.plan?.length ?? 0} corrections. Pass dryRun: false to mutate extraction files.`,
+          dryRun: true,
+          plan: result.plan,
+          warnings: result.warnings,
+          groupExpansions: result.expansions,
+        };
+      case 'applied': {
+        const applied = result.applied ?? [];
+        const parts = [`Applied ${applied.length} corrections`];
+        if (result.created) parts.push(`${result.created.length} entities created`);
+        if (result.retargeted) parts.push(`${result.retargeted.length} relationships retargeted`);
+        if (result.skipped) parts.push(`${result.skipped.length} skipped`);
+        if (result.failed) parts.push(`${result.failed.length} failed`);
+        if (result.cascaded) parts.push(`${result.cascaded.length} relationships cascaded`);
+        if (result.skippedGroups) parts.push(`${result.skippedGroups.length} groups skipped`);
+        return {
+          currentPhase: 'full-validation',
+          action: 'apply-corrections',
+          message: parts.join(', '),
+          applied,
+          created: result.created,
+          retargeted: result.retargeted,
+          skipped: result.skipped,
+          failed: result.failed,
+          cascaded: result.cascaded,
+          skippedGroups: result.skippedGroups,
+          warnings: result.warnings,
+          groupExpansions: result.expansions,
+          backupLocation: result.backupLocation,
+        };
       }
     }
-
-    // Mark only the corrections we actually applied as approved
-    const appliedIndices = new Set(applied.map(a => a.index));
-    for (const index of appliedIndices) {
-      const c = allCorrections[index];
-      if (c) c.approved = true;
-    }
-    await state.saveFullValidationCorrections(allCorrections);
-
-    // Prune old backup sets — keep the 5 most recent
-    await pruneBackupSets(join(stateDir, 'extraction-notes-backups'), 5);
-
-    return {
-      currentPhase: 'full-validation',
-      action: 'apply-corrections',
-      message: `Applied ${applied.length} corrections${skipped.length > 0 ? `, ${skipped.length} skipped` : ''}${failed.length > 0 ? `, ${failed.length} failed` : ''}${cascaded.length > 0 ? `, ${cascaded.length} relationships cascaded` : ''}`,
-      applied,
-      skipped: skipped.length > 0 ? skipped : undefined,
-      failed: failed.length > 0 ? failed : undefined,
-      cascaded: cascaded.length > 0 ? cascaded : undefined,
-      backupLocation: backupRoot,
-    };
   }
 
   private async executeResume(params: Record<string, unknown>) {
@@ -1140,62 +904,6 @@ function buildEmbedEstimate(config: EmbeddingsConfig, entityCount: number) {
     model: config.model,
     endpoint: config.endpoint,
   };
-}
-
-/** Shape of an extraction-notes JSON file — only the fields apply-corrections mutates. */
-interface ExtractionFile {
-  entities: Array<{ label: string; properties: Record<string, unknown> }>;
-  relationships: Array<{
-    sourceLabel: string;
-    type: string;
-    targetLabel: string;
-    properties: Record<string, unknown>;
-  }>;
-  [k: string]: unknown;
-}
-
-function findRelationship(
-  extraction: ExtractionFile,
-  key: { sourceLabel: string; type: string; targetLabel: string },
-): ExtractionFile['relationships'][number] | undefined {
-  return extraction.relationships.find(r =>
-    r.sourceLabel === key.sourceLabel &&
-    r.type === key.type &&
-    r.targetLabel === key.targetLabel,
-  );
-}
-
-function summarizeCorrectionsByOperation(corrections: ProposedCorrection[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const c of corrections) {
-    const key = `${c.itemType}:${c.operation}`;
-    counts[key] = (counts[key] ?? 0) + 1;
-  }
-  return counts;
-}
-
-/**
- * Keep only the `keep` most recent backup set directories; delete older ones.
- * Backup set names are ISO-8601 timestamps (colons replaced with dashes), so
- * lexicographic sort matches chronological order.
- */
-async function pruneBackupSets(backupRoot: string, keep: number): Promise<void> {
-  let entries: string[];
-  try {
-    entries = await readdir(backupRoot);
-  } catch {
-    return; // directory missing or unreadable — nothing to prune
-  }
-  if (entries.length <= keep) return;
-  const sorted = [...entries].sort(); // oldest first
-  const toDelete = sorted.slice(0, sorted.length - keep);
-  for (const name of toDelete) {
-    try {
-      await rm(join(backupRoot, name), { recursive: true, force: true });
-    } catch {
-      // Non-fatal — pruning is best-effort
-    }
-  }
 }
 
 /** Resolve a StorageProvider from import config */

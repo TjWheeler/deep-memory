@@ -4,6 +4,109 @@ Practical guidance for configuring the extraction pipeline, choosing models, tun
 
 ---
 
+## Rich-format sources need conversion first
+
+Extraction reads text. Rich formats (`.pdf`, `.docx`, `.html`, `.htm`, `.pptx`) are registered as `needs-conversion` during prepare and must be rendered to Markdown by the **convert** step before extraction will process them — extraction throws rather than feed raw binary bytes to an LLM.
+
+Start the conversion service (`docker compose -f docker-compose.indexer.yml --profile docling-worker up -d`), configure `services.docling.endpoint` in `config.json` to match its host port, then run `indexing_execute action: convert` and wait for `indexing_status` to report it complete. The converted Markdown is written to `state/converted/{slug}.md` and recorded as `derivedTextPath`; the chunk-sizing and model guidance below then applies to that derived text. Plain-text sources skip conversion entirely.
+
+---
+
+## Pre-flight: validate the config against the served model — do this BEFORE extracting
+
+**Extraction is expensive to get wrong.** A mis-sized worker config does not fail fast — it fails *minutes into generation*, per chunk, after you have already committed the run. Validate these three things against the model the endpoint actually serves before you run `indexing_execute action: extract`. Do not trust an inherited config just because it "looks configured" — the numbers are model-specific and silently wrong when copied between endpoints.
+
+### Step 1 — Confirm the real context window
+
+Query the endpoint (`curl {endpoint}/models` on an OpenAI-compatible server) or ask the operator what window the model is served at. The worker's `contextWindow` in `config.json` **must equal or be below** the window the server actually serves. A config claiming `131072` against a server that serves `108000` will pass small chunks and then overflow on large progressive-context prompts late in a big document — the worst place to discover it.
+
+### Step 2 — Budget the window so all three costs fit at once
+
+The context window must simultaneously hold the system prompt, the input chunk, the accumulated progressive context, **and** the reserved output tokens. On vLLM and most OpenAI-compatible servers the request is rejected if `prompt_tokens + maxOutputTokens > contextWindow`, so the reserved output eats directly into the prompt budget:
+
+```
+system prompt (~19K tokens)
+  + input chunk         (maxChunkSize chars ÷ ~4 = tokens)
+  + progressive context (up to maxContextChars ÷ ~4 = tokens)
+  + maxOutputTokens     (reserved, not "up to")
+  ────────────────────────────────────────────────
+  ≤ contextWindow
+```
+
+Worked example for a 108K model at `maxChunkSize: 12000`, `maxOutputTokens: 32768`:
+`19K (system) + 3K (chunk) + 2K (progressive) + 32.8K (output) ≈ 57K ≤ 108K` ✓ — comfortable headroom.
+
+The same config against a **32K** server: `19K + 3K + 2K + 32.8K ≈ 57K > 32K` ✗ — every request rejected. This is why the earlier 32K-context vLLM tests failed with context overflow.
+
+**Do not size chunks to fill the window.** Bigger is not better: three costs compete for the budget, dense middle content is extracted worse in very large chunks ("lost in the middle"), and — see Step 3 — large chunks are the direct cause of connection timeouts. The validated sweet spot is a *moderate* chunk, not the largest one that fits.
+
+### Step 3 — Survive long generations on dense chunks
+
+The failure mode most configs miss: **even when everything fits the context window, a dense (e.g. tabular) chunk can take minutes to generate, and an idle timeout drops the connection mid-generation.** This surfaces as `fetch failed` or `This operation was aborted` after several minutes with zero entities returned — it is **not** a context or truncation problem, it is wall-clock time. The trap is that the chunker bounds *input characters* while latency is driven by *output tokens*, and the two decouple on tabular content: ~8,000 characters of a zoning matrix can expand into ~30,000 near-identical JSON tokens.
+
+- **Streaming is the primary defence, and it is on by default** (the built-in openai-compat provider; `stream: true`). With streaming, response headers arrive the moment the model starts producing tokens and the transport idle timer resets on every delta — so the request no longer dies from *inter-token idle* even when total generation runs for minutes. The effective ceiling becomes the server/proxy *total* request timeout, not a hidden client idle default. Leave streaming on unless a server or proxy mishandles SSE; opt out per worker with `stream: false`.
+- **Shrinking `maxChunkSize` is no longer the timeout lever** once streaming is on. It still matters for extraction quality and for keeping `prompt + output` inside the context window (Step 2), but reducing it to "finish before the idle timeout" is the wrong reflex — half a zoning table is still a wall of near-identical edges, and streaming already removes the idle timeout that shrinking was working around.
+- **`maxOutputTokens` is a *ceiling* on an OpenAI-compatible endpoint, and on output-dense chunks it bounds worst-case request time.** It is *not* free to raise. On a chunk that stops early at EOS the ceiling is never reached and raising it costs nothing. But on an output-dense (tabular) chunk the model generates all the way to the ceiling, so `maxOutputTokens ÷ token-rate` is the worst-case duration of that request — e.g. 32,768 tokens ÷ ~100 tok/s ≈ 5.5 min. Size it to the largest legitimate output you expect, not arbitrarily high; lowering it below that only risks truncating valid output. (The Anthropic SDK is a separate case — there `max_tokens` feeds a pre-flight timeout estimate; see the Sonnet timeout note below.)
+- If a proxy in front of the endpoint *buffers* SSE (e.g. nginx `proxy_buffering on`), streaming's deltas arrive in one terminal burst and the idle-timeout protection is lost. That is an operator-owned proxy fix (`proxy_buffering off` / honour `X-Accel-Buffering: no`), not a client config change.
+
+### The three failure modes are distinct — diagnose before you retune
+
+Reacting to the wrong symptom makes the config worse. Match the error to its cause:
+
+| Symptom | Cause | Fix | Do NOT |
+|---------|-------|-----|--------|
+| `context overflow`, "prompt exceeds N tokens", rejected immediately | `contextWindow` set too high, or chunk + output exceed the real window | Correct `contextWindow` to the served value; reduce `maxChunkSize` | Don't raise `maxOutputTokens` |
+| `Unterminated string in JSON`, JSON parse failure at a position near the token limit | Output truncation — model hit `maxOutputTokens` mid-response | Raise `maxOutputTokens` (32K+ for local); reduce `maxChunkSize` | Don't lower `maxOutputTokens` |
+| `fetch failed` / `operation aborted` after minutes, 0 entities | Idle timeout — the transport saw no bytes for too long during a long generation | Keep streaming on (default); if a proxy buffers SSE, fix the proxy; only then raise the server/proxy total timeout | Don't reflexively shrink `maxChunkSize`; don't lower `maxOutputTokens` (neither helps and lowering risks truncation) |
+
+If a run fails, read the actual error string and pick the row. A `fetch failed` and a truncation demand *opposite* changes to `maxOutputTokens` — treating one as the other is how a config degrades across "fixes."
+
+---
+
+## Monitoring a long extraction — do NOT poll the status tool in a loop
+
+Extraction of a large corpus runs for tens of minutes. The instinct is to call `indexing_status` repeatedly to watch it — **do not.** Repeated status calls (or a monitoring sub-agent that has no way to sleep — foreground `sleep` is blocked in the harness, so it tight-loops) hammer the tool many times a minute for no information gain. The run's state is already written to disk; watch the file, not the tool.
+
+**The one correct mechanism: a detached file-watcher that emits a single notification at the terminal state.** Extraction status lives in `state/index-source-list.json`; a source is done when no entry is `"pending"` or `"extracting"`, and a proxy-timeout failure reverts a source to a `"failed"`/error state. Launch this as a background bash command (`run_in_background`) — it sleeps between checks and exits exactly once, producing one completion (or alert) notification:
+
+```bash
+SRC="<processDir>/state/index-source-list.json"
+while true; do
+  pend=$(grep -c '"status": "pending"' "$SRC")
+  extr=$(grep -c '"status": "extracting"' "$SRC")
+  fail=$(grep -c '"status": "failed"' "$SRC")
+  if [ "$fail" -gt 0 ]; then
+    echo "EXTRACTION_ALERT failed=$fail pending=$pend extracting=$extr"; exit 1
+  fi
+  if [ "$pend" -eq 0 ] && [ "$extr" -eq 0 ]; then
+    echo "EXTRACTION_COMPLETE"; exit 0
+  fi
+  sleep 30
+done
+```
+
+**Key the alert on the `"status"` field only — never grep for `fetch failed`/`operation aborted` text.** Those strings persist in a source's `lastError` as *history* after a `clearError` or `pending` reset, and can also appear in a `statusReason` you wrote — so a text grep false-trips on a source that has already recovered or is mid-retry. The authoritative live failure signal is `"status": "failed"` (which is what `indexing_status` counts).
+
+Rules:
+
+- **One status call per event, not per interval.** When the watcher fires, then call `indexing_status` *once* to read authoritative counts. Never confirm a mid-run guess by polling. (The file snapshot can be read mid-write and show a transient state — e.g. a source momentarily reading `pending` during a status rewrite — so the watcher decides *when* to look, and `indexing_status` decides *what is true*.)
+- **Do not spawn a sub-agent whose job is "poll status."** It cannot sleep and will tight-loop. Delegation does not fix the mechanism; the file-watcher does.
+- If you genuinely need periodic check-ins rather than a single terminal signal, space them at ≥20–30s and keep them few — but a terminal-state watcher is almost always what you actually want.
+
+The same pattern applies to the other long-running phases (validation, consolidation, import, embeddings): watch the phase's state file for a terminal condition, don't loop the status tool.
+
+---
+
+## Handling a `fetch failed` on one source mid-run
+
+A proxy-timeout `fetch failed` on a single large document does **not** automatically mean the config is wrong — especially if sibling documents of similar size completed at the same settings in the same run. That pattern points to a transient connection drop, not a systematic size problem.
+
+- **First occurrence (attempts low, siblings succeeded):** treat as transient. Extraction checkpoints per chunk to `state/extraction-checkpoints/<worker>--<source>.checkpoint.json`, so clear the error with `indexing_update clearError: true` (which preserves the checkpoint) and re-run `indexing_execute action: extract` — it **resumes** from the last completed chunk, not from zero. Confirm the resume by checking that the first `indexing_status` shows the chunk counter and entity/relationship tallies continuing from the checkpoint, not reset.
+- **Recurrence (fails again, or fails at a consistent chunk):** now reduce `maxChunkSize` per the timeout row above. Note that changing `maxChunkSize` changes chunk boundaries, which **invalidates the checkpoint** — you must reset the source to `pending` (discarding partial work) and re-extract from scratch. This is why you try a resume first: a smaller chunk size is the fix that costs you the checkpoint.
+- **Never** reset a source to `pending` to "retry" when a plain `clearError` + resume would preserve completed chunks. `sourceStatus: pending` clears extraction artifacts.
+
+---
+
 ## Hardware
 
 GPU: RTX 5090, 32 GB VRAM.

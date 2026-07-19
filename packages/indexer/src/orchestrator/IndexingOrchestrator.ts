@@ -1,4 +1,5 @@
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, readdir, stat, unlink } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join, dirname, extname, basename } from 'node:path';
 import type { DeepMemory, ExportArchive, ImportResult } from '@utaba/deep-memory';
 import type { OrchestratorConfig, WorkerConfig } from '../types/config.js';
@@ -6,8 +7,14 @@ import type { ExtractionOutput } from '../types/extraction.js';
 import type { IndexSourceList, IndexSource } from '../types/source-list.js';
 import type { EntityRegistry } from '../types/registry.js';
 import type { ValidationResult } from '../types/validation.js';
+import { InvalidInputError } from '@utaba/deep-memory';
 import { StateManager, Phase } from './StateManager.js';
 import type { PipelinePhase } from './StateManager.js';
+import { DoclingClient } from '../conversion/DoclingClient.js';
+import { convertSources, mergeConvertOptions, convertOptionsEqual, type DocumentConverterSummary } from '../conversion/DocumentConverter.js';
+import { matchesSourceFilter } from '../conversion/source-filter.js';
+import { TableStructureDetector, buildTableCorruptionRecommendation } from '../conversion/TableStructureDetector.js';
+import type { TableCorruptionRecommendation } from '../conversion/TableStructureDetector.js';
 import { ExtractionWorker } from '../extraction/ExtractionWorker.js';
 import type { LLMProvider } from '../providers/LLMProvider.js';
 import { DocumentAnalyzer, reassignFailedSource, estimateValidationCost } from './DocumentAnalyzer.js';
@@ -18,13 +25,19 @@ import { Validator } from '../validation/Validator.js';
 import { ValidationRulesLoader } from '../validation/ValidationRulesLoader.js';
 import { VerificationWorker, readSourceContent } from '../validation/VerificationWorker.js';
 import { ReviewDiagnostics } from '../review/ReviewDiagnostics.js';
+import { VocabularyConformanceGate } from '../review/VocabularyConformanceGate.js';
+import type { ConformanceReport } from '../review/VocabularyConformanceGate.js';
+import { parseVocabularyMarkdown, extractControlledValuesByEntityType } from '../consolidation/VocabularyMarkdownParser.js';
 import { ConsolidationReviewDiagnostics } from '../review/ConsolidationReviewDiagnostics.js';
 import type { ConsolidationReviewReport } from '../review/consolidation-review-types.js';
-import type { ReviewReport } from '../review/types.js';
+import type { ReviewReport, ReviewVocabularyContext } from '../review/types.js';
 import { FullValidationOrchestrator } from '../validation/FullValidationOrchestrator.js';
 import { summarizeVocabularyForValidation } from '../validation/VocabularySummarizer.js';
+import { resolveExtractionSourcePaths } from '../validation/resolve-source-paths.js';
 import type { FullValidationRunOptions, FullValidationProgressCallbacks } from '../validation/FullValidationOrchestrator.js';
 import type { FullValidationProgress, FullValidationReport, FullValidationConfig } from '../validation/full-validation-types.js';
+import { CorrectionApplier } from '../validation/CorrectionApplier.js';
+import type { ApplyCorrectionsOptions, ApplyCorrectionsResult } from '../validation/CorrectionApplier.js';
 
 /** Result from a full pipeline run */
 export interface PipelineResult {
@@ -100,6 +113,46 @@ export class IndexingOrchestrator {
       }
     }
 
+    // Re-examine already-registered binary sources for changes that invalidate
+    // their derived Markdown. The append-if-new merge above never re-reads an
+    // existing path, so an edited binary — or an unchanged binary whose convert
+    // options have since changed — would keep feeding stale derived text to
+    // extraction. Two triggers force reconversion: the on-disk bytes changed,
+    // or the effective convert options (process default merged with any
+    // per-source override) differ from those recorded at the last conversion.
+    // Only binary (convertible) sources carry a `sourceHash` and derived files,
+    // so text sources are untouched.
+    const processConvertOptions = this.config.services?.docling?.convertOptions;
+    const existingByPath = new Map(newSources.map(s => [s.path, s]));
+    for (const source of sourceList.sources) {
+      if (source.originalFormat === undefined || source.sourceHash === undefined) continue;
+      // Only re-check sources that still exist on disk in this scan.
+      if (!existingByPath.has(source.path)) continue;
+      const bytes = await readFile(source.path);
+      const currentHash = createHash('sha256').update(bytes).digest('hex');
+      const bytesChanged = currentHash !== source.sourceHash;
+
+      // Options change only re-queues an already-converted source; an unconverted
+      // one is picked up by convert regardless. Compare the effective options
+      // against what the last conversion actually used.
+      const effectiveConvertOptions = mergeConvertOptions(processConvertOptions, source.sourceConvertOptions);
+      const optionsChanged =
+        source.derivedTextPath !== undefined &&
+        !convertOptionsEqual(effectiveConvertOptions, source.convertOptionsUsed);
+
+      if (!bytesChanged && !optionsChanged) continue;
+
+      // Changed bytes, or changed convert options: drop stale derived files and
+      // reset the entry so convert reprocesses it. Clearing the pointers means a
+      // failed reconversion cannot leave the previous text masquerading as
+      // current.
+      await this.deleteDerivedFiles(source);
+      source.status = 'needs-conversion';
+      source.derivedTextPath = undefined;
+      source.derivedDoclingJsonPath = undefined;
+      source.sourceHash = undefined;
+    }
+
     await this.state.saveSourceList(sourceList);
 
     // Initialize empty registry if none exists
@@ -163,6 +216,106 @@ export class IndexingOrchestrator {
   }
 
   /**
+   * Convert: turn every `needs-conversion` source into derived Markdown via
+   * the document-conversion service, so extraction reads clean text.
+   *
+   * Requires a `services.docling` config section — a repo with binary sources
+   * but no service configured is a setup error, surfaced with an actionable
+   * message. Stuck `converting` sources from an interrupted run are reset
+   * before the batch starts. `sourceDir`, when provided, roots the derived
+   * filename slugs; otherwise the common ancestor of the source paths is used.
+   */
+  async convert(sourceDir?: string): Promise<DocumentConverterSummary> {
+    await this.state.setPipelineState(Phase.PREPARE);
+    await this.state.clearStopRequest();
+    await this.state.resetConvertingSources();
+
+    const needsConversion = await this.state.getSourcesByStatus('needs-conversion');
+    if (needsConversion.length === 0) {
+      return { converted: 0, skipped: 0, failed: 0, stoppedEarly: false, perDoc: [] };
+    }
+
+    const doclingConfig = this.config.services?.docling;
+    if (!doclingConfig) {
+      throw new InvalidInputError(
+        'services.docling',
+        `${needsConversion.length} source(s) need conversion but no document-conversion service is configured.`,
+        'Add a "services.docling" section to config.json (endpoint defaults to http://localhost:5001) and start the docling-worker docker profile.',
+      );
+    }
+
+    // The client owns per-request transport concerns (timeout, retries, auth)
+    // and the async poll backoff; the converter loop owns the sync/async mode
+    // choice and the OCR heuristic, so those are passed to convertSources.
+    const doclingClient = new DoclingClient({
+      endpoint: doclingConfig.endpoint,
+      ...(doclingConfig.timeoutMs !== undefined ? { timeoutMs: doclingConfig.timeoutMs } : {}),
+      ...(doclingConfig.maxRetries !== undefined ? { maxRetries: doclingConfig.maxRetries } : {}),
+      ...(doclingConfig.apiKey !== undefined ? { apiKey: doclingConfig.apiKey } : {}),
+      ...(doclingConfig.pollIntervalMs !== undefined ? { pollIntervalMs: doclingConfig.pollIntervalMs } : {}),
+      ...(doclingConfig.maxPollIntervalMs !== undefined ? { maxPollIntervalMs: doclingConfig.maxPollIntervalMs } : {}),
+      ...(doclingConfig.maxTotalWaitMs !== undefined ? { maxTotalWaitMs: doclingConfig.maxTotalWaitMs } : {}),
+    });
+
+    const sourceRoot = sourceDir ?? commonAncestorDir(needsConversion.map(s => s.path));
+
+    const { sourceFilter, maxItems } = this.config.extraction;
+    const summary = await convertSources(
+      { state: this.state, doclingClient, sourceRoot },
+      {
+        mode: doclingConfig.mode ?? 'async',
+        ...(sourceFilter && sourceFilter.length > 0 ? { sourceFilter } : {}),
+        ...(maxItems !== undefined ? { maxItems } : {}),
+        ...(doclingConfig.doOcr !== undefined ? { doOcr: doclingConfig.doOcr } : {}),
+        ...(doclingConfig.ocrTextYieldThreshold !== undefined
+          ? { ocrTextYieldThreshold: doclingConfig.ocrTextYieldThreshold }
+          : {}),
+        ...(doclingConfig.convertOptions !== undefined ? { convertOptions: doclingConfig.convertOptions } : {}),
+      },
+    );
+
+    return summary;
+  }
+
+  /**
+   * Inspect converted documents for table-structure corruption and return
+   * non-blocking, options-aware recommendations.
+   *
+   * Runs the static {@link TableStructureDetector} over every converted source
+   * that has a structural sidecar, then gates each suspect/corrupt finding
+   * against the options the source was last converted with: a file converted
+   * under docling's defaults earns an executable re-convert with
+   * `tableCellMatching` disabled; a file already converted with the flag earns
+   * only a note that it did not resolve, so the same advice never loops. Clean
+   * documents produce nothing. Pure computation — no LLM calls — safe to run at
+   * both `analyze` (pre-extraction) and `diagnose`.
+   */
+  public async detectTableCorruption(sourceFilter?: string[]): Promise<TableCorruptionRecommendation[]> {
+    const sourceList = await this.state.getSourceList();
+    if (!sourceList) return [];
+
+    let sources = sourceList.sources.filter(
+      s => s.status !== 'excluded' && s.derivedDoclingJsonPath !== undefined,
+    );
+    if (sourceFilter && sourceFilter.length > 0) {
+      sources = sources.filter(s => matchesSourceFilter(s.path, sourceFilter));
+    }
+
+    const detector = new TableStructureDetector();
+    const recommendations: TableCorruptionRecommendation[] = [];
+    for (const source of sources) {
+      const finding = await detector.analyzeSource({
+        path: source.path,
+        derivedTextPath: source.derivedTextPath,
+        derivedDoclingJsonPath: source.derivedDoclingJsonPath,
+      });
+      const recommendation = buildTableCorruptionRecommendation(finding, source.convertOptionsUsed);
+      if (recommendation) recommendations.push(recommendation);
+    }
+    return recommendations;
+  }
+
+  /**
    * Extract: Run extraction workers in parallel.
    * Resumes from where it left off — skips sources with status >= 'extracted'.
    * Checks for stop signals between documents and cancels in-flight HTTP
@@ -190,14 +343,11 @@ export class IndexingOrchestrator {
 
     let pendingSources = await this.state.getSourcesByStatus('pending');
 
-    // Apply sourceFilter — only process matching sources
+    // Apply sourceFilter — only process matching sources. Shares the one
+    // path-filter predicate with convert and the MCP tool surface.
     const { sourceFilter, maxItems } = this.config.extraction;
     if (sourceFilter && sourceFilter.length > 0) {
-      pendingSources = pendingSources.filter(s =>
-        sourceFilter.some(filter =>
-          s.path === filter || s.path.includes(filter),
-        ),
-      );
+      pendingSources = pendingSources.filter(s => matchesSourceFilter(s.path, sourceFilter));
     }
 
     // Apply maxItems limit
@@ -558,9 +708,104 @@ export class IndexingOrchestrator {
    * property coverage, orphan relationships, duplicates, and label quality.
    * Persists the report to state/review-diagnostics.json.
    */
-  async reviewDiagnostics(sourceFilter?: string[], workerName?: string): Promise<ReviewReport> {
-    const diagnostics = new ReviewDiagnostics(this.state, this.config.qualityThresholds.extraction);
+  public async reviewDiagnostics(sourceFilter?: string[], workerName?: string): Promise<ReviewReport> {
+    const vocabularyContext = await this.buildReviewVocabularyContext(sourceFilter);
+    const diagnostics = new ReviewDiagnostics(
+      this.state,
+      this.config.qualityThresholds.extraction,
+      vocabularyContext,
+    );
     return diagnostics.run(sourceFilter, workerName);
+  }
+
+  /**
+   * Build the optional vocabulary context that enables the review report's
+   * vocabulary-aware signals: a conformance summary and the enum-checklist
+   * fabrication smell. Returns undefined when no vocabulary is available so the
+   * structural checks still run for a repo without one.
+   *
+   * The vocabulary here is optional enrichment of the review report: if it
+   * cannot be read or parsed, the review still runs its structural checks rather
+   * than failing. This degrade only affects the enrichment fields — it does not
+   * suppress a failure of the structural checks themselves.
+   *
+   * The conformance gate is run a second time here (the diagnose tool also runs
+   * it via {@link conformanceDiagnostics} for its own richer check). The passes
+   * are kept separate deliberately: this one produces only the compact summary
+   * carried in the persisted review report, independent of the tool's check.
+   */
+  private async buildReviewVocabularyContext(
+    sourceFilter?: string[],
+  ): Promise<ReviewVocabularyContext | undefined> {
+    let vocabularyMarkdown: string;
+    try {
+      await this.loadVocabularyAndRules();
+      if (!this.vocabulary) return undefined;
+      vocabularyMarkdown = this.vocabulary;
+    } catch {
+      return undefined;
+    }
+
+    const parsed = parseVocabularyMarkdown(vocabularyMarkdown);
+    const mode = this.config.governanceMode ?? 'managed';
+
+    let outputs = await this.state.getExtractionOutputs();
+    if (sourceFilter && sourceFilter.length > 0) {
+      outputs = outputs.filter(o => matchesSourceFilter(o.sourcePath, sourceFilter));
+    }
+
+    const report = new VocabularyConformanceGate(parsed, mode).run(outputs);
+    return {
+      conformance: {
+        mode: report.mode,
+        violationCount: report.violationCount,
+        countsByClass: report.countsByClass,
+      },
+      controlledValuesByType: extractControlledValuesByEntityType(vocabularyMarkdown),
+    };
+  }
+
+  /**
+   * Vocabulary conformance: validate extraction output against the domain
+   * vocabulary before consolidation, reusing core's validator.
+   *
+   * Parses the vocabulary markdown into the same contract the live repository
+   * enforces, then runs the conformance gate over the active extraction outputs
+   * under the configured governance mode (default `managed`). Returns a report
+   * of violations grouped by class plus, under `managed`, structured
+   * vocabulary-extension recommendations for recurring closed-enum values.
+   * Pure computation — no LLM calls, no repository access.
+   */
+  public async conformanceDiagnostics(sourceFilter?: string[]): Promise<ConformanceReport> {
+    await this.loadVocabularyAndRules();
+    const vocabulary = parseVocabularyMarkdown(this.vocabulary ?? '');
+    const mode = this.config.governanceMode ?? 'managed';
+
+    let outputs = await this.state.getExtractionOutputs();
+    if (sourceFilter && sourceFilter.length > 0) {
+      outputs = outputs.filter(o => matchesSourceFilter(o.sourcePath, sourceFilter));
+    }
+
+    const gate = new VocabularyConformanceGate(vocabulary, mode);
+    return gate.run(outputs);
+  }
+
+  /**
+   * Apply proposed corrections to the extraction-notes files.
+   *
+   * Deterministic and LLM-free: parses the vocabulary the applier needs for
+   * apply-side conformance enforcement, resolves the governance mode (default
+   * `managed`), then delegates selection, grouping, endpoint resolution,
+   * collision policy, backups, atomic writes, and reporting to the engine's
+   * {@link CorrectionApplier}. The MCP tool above shapes the returned report.
+   */
+  public async applyCorrections(options: ApplyCorrectionsOptions): Promise<ApplyCorrectionsResult> {
+    await this.loadVocabularyAndRules();
+    const vocabulary = parseVocabularyMarkdown(this.vocabulary ?? '');
+    const mode = this.config.governanceMode ?? 'managed';
+
+    const applier = new CorrectionApplier(this.state, vocabulary, mode);
+    return applier.apply(options);
   }
 
   /**
@@ -602,6 +847,16 @@ export class IndexingOrchestrator {
       throw new Error('No extraction outputs found — run extract() first');
     }
 
+    // Extraction records the original source path (e.g. a binary .pdf) on every
+    // output. Validation workers read that path as UTF-8 text, so a converted
+    // source must be pointed at its derived text; otherwise the worker reads
+    // binary and mistakes real entities for hallucinations. Resolve each path to
+    // the source's derived text where one exists.
+    const sourceList = await this.state.getSourceList();
+    const resolvedExtractions = sourceList
+      ? resolveExtractionSourcePaths(extractions, sourceList.sources)
+      : extractions;
+
     // Load vocabulary and domain guidance for validation context
     await this.loadVocabularyAndRules();
     const vocabularySummary = this.vocabulary
@@ -620,7 +875,7 @@ export class IndexingOrchestrator {
     };
 
     const { progress, report } = await orchestrator.run(
-      extractions,
+      resolvedExtractions,
       null,
       options,
       wrappedCallbacks,
@@ -936,23 +1191,55 @@ export class IndexingOrchestrator {
     }
   }
 
+  /**
+   * Delete a source's derived Markdown + structural JSON, if present. Used to
+   * invalidate stale conversion output when a source changes on disk.
+   * Best-effort — a missing file is not an error.
+   */
+  private async deleteDerivedFiles(source: IndexSource): Promise<void> {
+    for (const path of [source.derivedTextPath, source.derivedDoclingJsonPath]) {
+      if (!path) continue;
+      try {
+        await unlink(path);
+      } catch {
+        // File may already be gone.
+      }
+    }
+  }
+
   /** Scan a directory recursively for indexable documents */
   private async scanSourceDirectory(dir: string): Promise<IndexSource[]> {
     const sources: IndexSource[] = [];
-    const indexableExtensions = new Set(['.md', '.txt', '.json', '.csv']);
+    // Plain-text formats the extractor reads directly.
+    const textExtensions = new Set(['.md', '.txt', '.json', '.csv']);
+    // Rich formats docling-serve converts to Markdown before extraction.
+    // Legacy binary `.doc` is intentionally excluded — docling accepts DOCX
+    // but not the Word 97-2003 binary format, so registering it would create
+    // sources that can never convert.
+    const convertExtensions = new Set(['.pdf', '.docx', '.html', '.htm', '.pptx']);
 
     const walk = async (currentDir: string): Promise<void> => {
       const entries = await readdir(currentDir, { withFileTypes: true });
       for (const entry of entries) {
         const fullPath = join(currentDir, entry.name);
+        const ext = extname(entry.name).toLowerCase();
         if (entry.isDirectory()) {
           await walk(fullPath);
-        } else if (indexableExtensions.has(extname(entry.name).toLowerCase())) {
+        } else if (textExtensions.has(ext)) {
           const stats = await stat(fullPath);
           sources.push({
             path: fullPath,
             type: inferDocumentType(entry.name),
             status: 'pending',
+            notes: `${Math.round(stats.size / 1024)} KB`,
+          });
+        } else if (convertExtensions.has(ext)) {
+          const stats = await stat(fullPath);
+          sources.push({
+            path: fullPath,
+            type: inferDocumentType(entry.name),
+            status: 'needs-conversion',
+            originalFormat: ext,
             notes: `${Math.round(stats.size / 1024)} KB`,
           });
         }
@@ -962,6 +1249,31 @@ export class IndexingOrchestrator {
     await walk(dir);
     return sources;
   }
+}
+
+/**
+ * Compute the deepest directory that contains every given path. Used to root
+ * derived-filename slugs when the caller does not supply the source directory.
+ * Falls back to an empty string (converter then uses basenames) when the paths
+ * share no common ancestor.
+ */
+function commonAncestorDir(paths: string[]): string {
+  if (paths.length === 0) return '';
+  const split = paths.map(p => p.split(/[\\/]/));
+  const first = split[0]!;
+  const common: string[] = [];
+  for (let i = 0; i < first.length; i++) {
+    const segment = first[i]!;
+    if (split.every(parts => parts[i] === segment)) {
+      common.push(segment);
+    } else {
+      break;
+    }
+  }
+  // Drop the trailing segment if it is a shared filename rather than a directory
+  // (only relevant when a single path is supplied).
+  if (paths.length === 1) common.pop();
+  return common.join('/');
 }
 
 /** Infer document type from filename patterns */

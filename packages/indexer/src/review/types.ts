@@ -5,8 +5,94 @@
  * and produces a structured report with per-document and aggregate metrics.
  */
 
+import type { GovernanceMode } from '@utaba/deep-memory';
+import type { ConformanceViolationClass } from './VocabularyConformanceGate.js';
+
 /** Quality rating based on review guide thresholds */
 export type QualityRating = 'good' | 'acceptable' | 'needs-work';
+
+/**
+ * Compact vocabulary-conformance summary carried in the review report. Lets any
+ * consumer of the persisted report see how the extraction measured against the
+ * domain vocabulary without re-running the conformance gate. Present only when
+ * the review was run with a vocabulary context.
+ */
+export interface ConformanceSummary {
+  mode: GovernanceMode;
+  violationCount: number;
+  countsByClass: Record<ConformanceViolationClass, number>;
+}
+
+/**
+ * One entity type whose instance labels coincide with the controlled-value
+ * vocabulary declared for that type (its closed-enum allowed values or open
+ * recommended values). The signal that the extractor enumerated a naming guide
+ * as entities instead of reading them from the source text.
+ */
+export interface EnumChecklistSmell {
+  entityType: string;
+  /** Distinct normalized instance labels of this type. */
+  distinctLabelCount: number;
+  /** Size of the declared controlled-value list for this type. */
+  controlledValueCount: number;
+  /** How many distinct labels matched a controlled value. */
+  matchedCount: number;
+  /** Fraction of distinct labels that are controlled values (0..1). */
+  labelDominance: number;
+  /** Fraction of the controlled-value list present as labels (0..1). */
+  enumCoverage: number;
+  /** Sample of the matched labels. */
+  examples: string[];
+}
+
+/**
+ * A group of relationships that all cite the same narrow source line range. Many
+ * relationships hanging off one short passage is the signature of cross-product
+ * fabrication — edges invented by pairing entities rather than read from text.
+ */
+export interface SharedSourceRefSmell {
+  /** Source document the citation belongs to. */
+  source: string;
+  /** The shared narrow citation, expressed as a line range (e.g. "120-124"). */
+  citation: string;
+  /** Number of relationships sharing this exact narrow citation. */
+  relationshipCount: number;
+  /** Distinct relationship types sharing the citation. */
+  relationshipTypes: string[];
+}
+
+/** Report-level fabrication smells detected across all analyzed documents. */
+export interface FabricationSmells {
+  enumChecklist: EnumChecklistSmell[];
+  sharedSourceRefs: SharedSourceRefSmell[];
+}
+
+/**
+ * Zero-property entities that are also relationship endpoints, surfaced
+ * independently of the aggregate property-coverage percentage — a small number
+ * of empty endpoint entities can hide behind an otherwise-high coverage figure.
+ */
+export interface ZeroPropertyEndpointReport {
+  count: number;
+  examples: Array<{ source: string; entityType: string; label: string }>;
+}
+
+/**
+ * Optional vocabulary-derived context enabling the vocabulary-aware review
+ * checks. Threaded in by the caller that has already parsed the vocabulary; when
+ * absent, the vocabulary-dependent fields are simply omitted from the report.
+ */
+export interface ReviewVocabularyContext {
+  /** Conformance results to surface as a summary in the report. */
+  conformance?: ConformanceSummary;
+  /**
+   * Per entity type, the controlled-value vocabulary declared for that type —
+   * the union of closed-enum allowed values and open recommended values across
+   * the type's properties, verbatim. Compared normalized against instance
+   * labels for the enum-checklist fabrication smell.
+   */
+  controlledValuesByType?: Record<string, string[]>;
+}
 
 /** Per-worker diagnostic summary used in multi-worker comparison */
 export interface WorkerSummary {
@@ -63,6 +149,12 @@ export interface ReviewReport {
   documents: DocumentDiagnostics[];
   /** Multi-worker comparison (present when no workerName was specified and sources lack selectedExtraction) */
   workerComparison?: WorkerComparison;
+  /** Vocabulary-conformance summary (present only when a vocabulary context was supplied) */
+  conformance?: ConformanceSummary;
+  /** Fabrication smells detected across all documents. Present after any run; the cross-product `sharedSourceRefs` signal needs no vocabulary, while `enumChecklist` is populated only when a vocabulary context supplied controlled values. */
+  fabricationSmells?: FabricationSmells;
+  /** Zero-property entities that are relationship endpoints, surfaced regardless of aggregate coverage */
+  zeroPropertyEndpoints?: ZeroPropertyEndpointReport;
 }
 
 /** Aggregate metrics across all analyzed documents */
@@ -143,10 +235,18 @@ export interface DocumentDiagnostics {
 
   /** Check 4: Duplicate detection */
   duplicateCheck: {
+    /** Exact duplicates under the normalized key (case, accents, whitespace, and `-`/`/` spacing folded away) */
     duplicateCount: number;
     rating: QualityRating;
-    /** The duplicate entities found */
+    /** The duplicate entities found (representative label of each normalized group) */
     duplicates: Array<{ entityType: string; label: string; count: number }>;
+    /**
+     * Softer signal: distinct same-type pairs whose normalized token set is a
+     * strict subset of another instance's (e.g. "Main Street" ⊂ "Main Street Bridge").
+     * Not counted in duplicateCount — normalization alone will not merge these.
+     */
+    tokenSubsetCount: number;
+    possibleDuplicates: Array<{ entityType: string; label: string; supersetLabel: string }>;
   };
 
   /** Check 5: Label quality */

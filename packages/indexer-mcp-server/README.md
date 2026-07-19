@@ -127,19 +127,19 @@ Phase-aware action: *"Do the next thing."* Executes the primary action for the c
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `processDir` | Yes | Path to the indexing process directory |
-| `action` | No | Override the default action. Supported: `prepare`, `analyze`, `extract`, `validate-full`, `apply-corrections`, `consolidate`, `reconsolidate`, `import`, `resume`, `embed` |
-| `maxItems` | No | Limit documents processed (extraction) |
+| `action` | No | Override the default action. Supported: `prepare`, `analyze`, `convert`, `extract`, `validate-full`, `apply-corrections`, `consolidate`, `reconsolidate`, `import`, `resume`, `embed` |
+| `maxItems` | No | Limit documents processed (extraction and conversion) |
 | `sourceFilter` | No | Filter to specific source(s) |
 | `corrections` | No | For `apply-corrections`: `{ approveAll?: boolean, approvedIndices?: number[], minConfidence?: number }`. `approveAll` applies corrections above `minConfidence` (default `0.8`). `approvedIndices` is an array of specific indices from `indexing_diagnose` output. |
 | `confirm` | No | Confirm to proceed (embed phase: start after seeing cost estimate) |
-| `dryRun` | No | Preview without running. Supported for: `extract`, `validate-full`, `consolidate`, `import`, `apply-corrections` |
+| `dryRun` | No | Preview without running. Supported for: `convert`, `extract`, `validate-full`, `consolidate`, `import`, `apply-corrections` |
 | `resolutions` | No | Import checkpoint resolutions: map of flagged item index → `"accept"` / `"reject"` / `"correct"` |
 
 **Phase-specific actions:**
 
 | Phase | Default action | Available actions |
 |-------|---------------|-------------------|
-| Prepare | Scan source directory, initialize state | `prepare`, `analyze` |
+| Prepare | Scan source directory, initialize state | `prepare`, `analyze`, `convert` |
 | Extract | Run extraction on pending sources (background) | `extract` |
 | Extraction Review | Return review guidance + checklist | — |
 | Full Validation | Run LLM validation in background | `validate-full`, `apply-corrections` |
@@ -148,6 +148,8 @@ Phase-aware action: *"Do the next thing."* Executes the primary action for the c
 | Import | Import archive into repository | `import`, `resume` |
 | Import Review | Return review guidance | — |
 | Embeddings | Generate embeddings (estimate first, confirm to proceed) | `embed` |
+
+**Converting rich-format sources.** `.pdf/.docx/.html/.htm/.pptx` sources are registered as `needs-conversion` during prepare and must be converted to Markdown before extraction. Start the conversion service — `docker compose -f docker-compose.indexer.yml --profile docling-worker up -d` — configure `services.docling.endpoint` in `config.json` to match its host port, then run `action: convert` (background, like extract). Poll `indexing_status` until conversion completes. Extraction refuses to run while any source still needs conversion.
 
 ### `indexing_update`
 

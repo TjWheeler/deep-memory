@@ -587,6 +587,59 @@ describe('ReviewDiagnostics', () => {
       expect(report.workerComparison).toBeUndefined();
     });
 
+    it('populates report-level signals on the multi-worker comparison path', async () => {
+      const controlled = ['alpha', 'beta', 'gamma', 'delta', 'epsilon'];
+      const sourceList: IndexSourceList = {
+        version: '1.0.0',
+        repositoryId: 'test-repo',
+        sources: [{
+          path: '/docs/test-doc.md',
+          type: 'general',
+          status: 'extracted' as const,
+          extractionFiles: { 'worker-a': 'x', 'worker-b': 'y' },
+          // no selectedExtraction → comparison path
+        }],
+      };
+
+      const makeWorkerOutput = (worker: string): ExtractionOutput => makeOutput({
+        source: 'test-doc.md',
+        sourcePath: '/docs/test-doc.md',
+        extractedBy: worker,
+        // Labels enumerate the controlled vocabulary — the enum-checklist smell.
+        entities: controlled.map(v => ({
+          entityType: 'Facility', label: v, properties: {}, aliases: [], sourceRefs: [],
+        })),
+      });
+
+      const state = mockMultiWorkerState(sourceList, {
+        'worker-a': [makeWorkerOutput('worker-a')],
+        'worker-b': [makeWorkerOutput('worker-b')],
+      });
+
+      const diagnostics = new ReviewDiagnostics(state, undefined, {
+        conformance: {
+          mode: 'managed',
+          violationCount: 2,
+          countsByClass: {
+            'unknown-type': 2,
+            'endpoint-type': 0,
+            'required-property-missing': 0,
+            'closed-enum-value': 0,
+            other: 0,
+          },
+        },
+        controlledValuesByType: { Facility: controlled },
+      });
+      const report = await diagnostics.run();
+
+      // The comparison path must carry the same signals as a single-worker report.
+      expect(report.workerComparison).toBeDefined();
+      expect(report.conformance?.violationCount).toBe(2);
+      expect(report.fabricationSmells?.enumChecklist).toHaveLength(1);
+      expect(report.fabricationSmells!.enumChecklist[0]!.entityType).toBe('Facility');
+      expect(report.zeroPropertyEndpoints).toBeDefined();
+    });
+
     it('recommends single worker when only one exists', async () => {
       const sourceList: IndexSourceList = {
         version: '1.0.0',
@@ -613,6 +666,233 @@ describe('ReviewDiagnostics', () => {
       expect(report.workerComparison).toBeDefined();
       expect(report.workerComparison!.recommended).toBe('solo-worker');
       expect(report.workerComparison!.reason).toContain('Only one worker');
+    });
+  });
+
+  describe('normalized duplicate detection', () => {
+    it('collapses accent, whitespace, and separator variants into one group', async () => {
+      const output = makeOutput({
+        entities: [
+          { entityType: 'Use', label: 'restaurant/café', properties: {}, aliases: [], sourceRefs: [] },
+          { entityType: 'Use', label: 'Restaurant/cafe', properties: {}, aliases: [], sourceRefs: [] },
+          { entityType: 'Use', label: 'Restaurant / Cafe', properties: {}, aliases: [], sourceRefs: [] },
+        ],
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state).run(undefined, 'test-worker');
+
+      // Three variants of the same normalized label → 2 excess duplicates.
+      expect(report.documents[0]!.duplicateCheck.duplicateCount).toBe(2);
+    });
+
+    it('reports token-subset pairs separately without counting them as duplicates', async () => {
+      const output = makeOutput({
+        entities: [
+          { entityType: 'Zone', label: 'Mixed Use', properties: {}, aliases: [], sourceRefs: [] },
+          { entityType: 'Zone', label: 'Mixed use zone', properties: {}, aliases: [], sourceRefs: [] },
+        ],
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state).run(undefined, 'test-worker');
+
+      const dup = report.documents[0]!.duplicateCheck;
+      expect(dup.duplicateCount).toBe(0);
+      expect(dup.tokenSubsetCount).toBe(1);
+      expect(dup.possibleDuplicates[0]).toMatchObject({ label: 'Mixed Use', supersetLabel: 'Mixed use zone' });
+    });
+  });
+
+  describe('conformance summary', () => {
+    it('threads a supplied conformance summary into the report', async () => {
+      const output = makeOutput({
+        entities: [{ entityType: 'E', label: 'A', properties: { p: '1' }, aliases: [], sourceRefs: [] }],
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state, undefined, {
+        conformance: {
+          mode: 'managed',
+          violationCount: 3,
+          countsByClass: {
+            'unknown-type': 1,
+            'endpoint-type': 2,
+            'required-property-missing': 0,
+            'closed-enum-value': 0,
+            other: 0,
+          },
+        },
+      }).run(undefined, 'test-worker');
+
+      expect(report.conformance).toEqual({
+        mode: 'managed',
+        violationCount: 3,
+        countsByClass: {
+          'unknown-type': 1,
+          'endpoint-type': 2,
+          'required-property-missing': 0,
+          'closed-enum-value': 0,
+          other: 0,
+        },
+      });
+    });
+
+    it('omits the conformance summary when no vocabulary context is supplied', async () => {
+      const output = makeOutput({
+        entities: [{ entityType: 'E', label: 'A', properties: { p: '1' }, aliases: [], sourceRefs: [] }],
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state).run(undefined, 'test-worker');
+      expect(report.conformance).toBeUndefined();
+    });
+  });
+
+  describe('fabrication smells', () => {
+    it('flags a type whose labels enumerate its controlled vocabulary', async () => {
+      // Five instances whose labels are exactly the type's declared controlled
+      // values — the "read the naming guide as a checklist" pattern.
+      const controlled = ['alpha', 'beta', 'gamma', 'delta', 'epsilon'];
+      const output = makeOutput({
+        entities: controlled.map(v => ({
+          entityType: 'Facility',
+          label: v,
+          properties: {},
+          aliases: [],
+          sourceRefs: [],
+        })),
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state, undefined, {
+        controlledValuesByType: { Facility: controlled },
+      }).run(undefined, 'test-worker');
+
+      const smell = report.fabricationSmells!.enumChecklist;
+      expect(smell).toHaveLength(1);
+      expect(smell[0]!.entityType).toBe('Facility');
+      expect(smell[0]!.matchedCount).toBe(5);
+      expect(smell[0]!.labelDominance).toBe(1);
+    });
+
+    it('does not flag a type whose labels are real names distinct from the guide', async () => {
+      const controlled = ['residential', 'commercial', 'industrial', 'rural', 'mixed-use'];
+      const output = makeOutput({
+        entities: [
+          { entityType: 'Zone', label: 'North Precinct', properties: { p: '1' }, aliases: [], sourceRefs: [] },
+          { entityType: 'Zone', label: 'Harbour District', properties: { p: '2' }, aliases: [], sourceRefs: [] },
+          { entityType: 'Zone', label: 'Old Town', properties: { p: '3' }, aliases: [], sourceRefs: [] },
+        ],
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state, undefined, {
+        controlledValuesByType: { Zone: controlled },
+      }).run(undefined, 'test-worker');
+
+      expect(report.fabricationSmells!.enumChecklist).toHaveLength(0);
+    });
+
+    it('flags many relationships sharing one narrow source citation', async () => {
+      // 12 relationships all cite lines 40-42 — a cross-product smell.
+      const relationships = Array.from({ length: 12 }, (_, i) => ({
+        type: 'RELATED_TO',
+        sourceLabel: `E${i}`,
+        targetLabel: `E${(i + 1) % 12}`,
+        properties: {},
+        sourceRefs: [{ description: 'table', lineStart: 40, lineEnd: 42 }],
+      }));
+      const output = makeOutput({ relationships });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state).run(undefined, 'test-worker');
+
+      const shared = report.fabricationSmells!.sharedSourceRefs;
+      expect(shared).toHaveLength(1);
+      expect(shared[0]!.citation).toBe('40-42');
+      expect(shared[0]!.relationshipCount).toBe(12);
+    });
+
+    it('does not flag relationships citing a wide span', async () => {
+      const relationships = Array.from({ length: 12 }, (_, i) => ({
+        type: 'RELATED_TO',
+        sourceLabel: `E${i}`,
+        targetLabel: `E${(i + 1) % 12}`,
+        properties: {},
+        sourceRefs: [{ description: 'section', lineStart: 10, lineEnd: 200 }],
+      }));
+      const output = makeOutput({ relationships });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state).run(undefined, 'test-worker');
+      expect(report.fabricationSmells!.sharedSourceRefs).toHaveLength(0);
+    });
+  });
+
+  describe('zero-property endpoints', () => {
+    it('flags empty entities that anchor relationships regardless of coverage', async () => {
+      // 9 rich entities + 1 empty endpoint = 90% coverage (would rate acceptable),
+      // but the empty endpoint must still be surfaced on its own.
+      const rich = Array.from({ length: 9 }, (_, i) => ({
+        entityType: 'E',
+        label: `Rich ${i}`,
+        properties: { p: '1' },
+        aliases: [] as string[],
+        sourceRefs: [],
+      }));
+      const output = makeOutput({
+        entities: [
+          ...rich,
+          { entityType: 'Artifact', label: 'Empty Endpoint', properties: {}, aliases: [], sourceRefs: [] },
+        ],
+        relationships: [
+          { type: 'REL', sourceLabel: 'Rich 0', targetLabel: 'Empty Endpoint', properties: {}, sourceRefs: [] },
+        ],
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state).run(undefined, 'test-worker');
+
+      expect(report.zeroPropertyEndpoints!.count).toBe(1);
+      expect(report.zeroPropertyEndpoints!.examples[0]).toMatchObject({
+        entityType: 'Artifact',
+        label: 'Empty Endpoint',
+      });
+    });
+
+    it('does not flag empty entities that are not endpoints', async () => {
+      const output = makeOutput({
+        entities: [
+          { entityType: 'E', label: 'Rich', properties: { p: '1' }, aliases: [], sourceRefs: [] },
+          { entityType: 'E', label: 'Empty Loner', properties: {}, aliases: [], sourceRefs: [] },
+        ],
+        relationships: [],
+      });
+      const state = mockStateManager(
+        makeSourceList([{ path: '/docs/test-doc.md', status: 'extracted' }]),
+        [output],
+      );
+      const report = await new ReviewDiagnostics(state).run(undefined, 'test-worker');
+      expect(report.zeroPropertyEndpoints!.count).toBe(0);
     });
   });
 

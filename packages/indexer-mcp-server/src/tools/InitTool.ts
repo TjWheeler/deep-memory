@@ -129,6 +129,27 @@ export class InitTool extends BaseToolController {
           ...(storageConfig ? { config: storageConfig } : {}),
         },
       },
+      // Document-conversion service for rich formats (PDF/DOCX/HTML/PPTX).
+      // Only used when the source directory contains such files. Start the
+      // docling-worker docker profile before running the convert action. The
+      // endpoint below matches the host port the compose profile publishes.
+      //
+      // mode "async" (the default) submits each conversion and polls for the
+      // result, so large documents no longer fail against the service's
+      // synchronous wait ceiling. Set mode "sync" only for an older container
+      // without the async routes.
+      //
+      // OCR is decided per document: non-PDF formats never run it, and PDFs
+      // run it only when the text yield looks too low for a born-digital file.
+      // To override, set "doOcr": true|false here (global) or on a single
+      // source. "ocrTextYieldThreshold" (chars per page, default 100) is the
+      // floor below which a PDF is reconverted with OCR.
+      services: {
+        docling: {
+          endpoint: 'http://localhost:5001',
+          mode: 'async',
+        },
+      },
       qualityThresholds: DEFAULT_QUALITY_THRESHOLDS,
     };
 
@@ -152,6 +173,9 @@ export class InitTool extends BaseToolController {
       // Validation workers reuse the same cloud workers
       secretsTemplate['validation'] = { workers: workerSecrets };
     }
+    // Slot for the document-conversion service API key. Left empty — populate
+    // only when docling-serve is deployed behind authentication.
+    secretsTemplate['docling'] = { apiKey: '' };
 
     await writeFile(
       join(processDir, 'config.secrets.json'),

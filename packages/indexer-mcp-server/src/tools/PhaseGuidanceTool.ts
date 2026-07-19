@@ -75,6 +75,30 @@ and adjusting before extraction begins.
 5. Run \`indexing_analyze\` again to confirm changes
 6. **Only after the user explicitly approves**, run \`indexing_update phase: "extract"\` to advance
 
+## Table-structure corruption (converted PDFs)
+\`indexing_analyze\` and \`indexing_diagnose\` run a static, deterministic detector over each converted
+document — comparing the rendered Markdown against the \`{slug}.docling.json\` structural grid. It never
+rewrites anything; it raises a non-blocking recommendation you verify and act on. When either tool reports
+a \`conversionRecommendations\` entry or a \`table-structure\` warn check, follow this loop:
+1. **Detect** — a document is flagged \`suspect\` or \`corrupt\` (e.g. a wide table fragmented into several
+   narrow Markdown sub-tables, a "Refer to Clause X" deferral scattered into a column of short codes, or
+   split cells that reconstruct an intact phrase).
+2. **Self-verify** — open the converted Markdown table, compare it against the source PDF region and the
+   \`{slug}.docling.json\` grid. Confirm the columns really did merge/fragment before acting.
+3. **Remediate (re-convert — this is the fix site, not extraction)** — apply the recommendation's exact
+   call: \`indexing_update source: "<file>" sourceConvertOptions: { tableCellMatching: false }\`. Setting the
+   options auto-queues that one file for re-conversion — it stops docling matching table predictions back to
+   raw PDF cells, the behaviour that fragments merged/dense columns. Extraction only consumes the Markdown
+   and cannot repair it, so re-extracting alone will not help.
+4. **Re-convert, then re-extract** — run \`indexing_execute\` (convert phase) to re-convert the file with
+   cell-matching disabled; it returns to \`pending\` automatically. Then re-run extraction scoped to that
+   file and re-run \`indexing_analyze\` to confirm the flag cleared.
+
+**Trade-off — why per-file, not global:** \`table_cell_matching=false\` wins on merged/dense tables but
+ignores real PDF text cells, so it is *not* universally better. Set it only on the documents that fragment.
+If a file was already converted with the flag and still flags, the detector says so and stops recommending
+the re-convert (it needs manual or structure-aware handling instead) — do not loop the same fix.
+
 ## 🚫 DO NOT
 - Do NOT call \`indexing_update phase: "extract"\` without user approval
 - Do NOT call \`indexing_execute\` in the extract phase without user approval
@@ -144,6 +168,13 @@ Quality gate before consolidation. Run diagnostics to catch structural and seman
    - \`indexing_update source: "file.md" sourceStatus: "pending"\` (resets to re-extract)
    - \`indexing_update source: "file.md" sourceWorkers: "cloud-sonnet"\` (reassign to better model)
    - \`indexing_update phase: "extract"\` then \`indexing_execute sourceFilter: ["file.md"]\`
+   - **Garbled tables (empty-property artifact entities, values in the wrong columns) are a *conversion*
+     defect, not an extraction one** — re-extracting the same Markdown reproduces them. Re-run
+     \`indexing_diagnose\` and check the \`table-structure\` finding. To fix: \`indexing_update source: "file.pdf"
+     sourceConvertOptions: { tableCellMatching: false }\` auto-queues that file for re-conversion (disables
+     docling matching table predictions back to raw PDF cells, which fragments merged/dense columns); run
+     \`indexing_execute\` (convert) to re-convert, then re-extract that file. \`table_cell_matching=false\` is
+     per-file, not global — it ignores real PDF text cells, so it only wins on merged/dense tables.
 
 ## Next step: choose a path
 After diagnostics pass, present BOTH options to the user:

@@ -11,6 +11,8 @@ export type {
   EmbeddingsConfig,
   EmbeddingsWorkerConfig,
   QualityThresholds,
+  ServicesConfig,
+  DoclingServiceConfig,
 } from './types/config.js';
 export { DEFAULT_QUALITY_THRESHOLDS } from './types/config.js';
 
@@ -51,6 +53,47 @@ export type { IndexProcessConfig, IndexProcessSecrets } from './orchestrator/Pro
 export { ProcessStateWriter } from './orchestrator/ProcessStateWriter.js';
 export type { ProcessPhase, ProcessIteration } from './orchestrator/ProcessStateWriter.js';
 
+// Conversion (document format gateway)
+export { DoclingClient, toDoclingDocument, toDoclingAsyncTask } from './conversion/DoclingClient.js';
+export type {
+  DoclingDocument,
+  DoclingConvertOptions,
+  DoclingConvertRequest,
+  DoclingConvertResponse,
+  DoclingClientOptions,
+  DoclingClientError,
+  DoclingExportFormat,
+  DoclingAsyncTask,
+  ConvertViaAsyncOptions,
+  PollDecision,
+} from './conversion/types.js';
+export { DoclingServiceError, DoclingTimeoutError } from './conversion/errors.js';
+export { convertSources, detectMime, deriveDocSlug, decideOcr, CONVERT_OPTION_KEYS, convertOptionsEqual } from './conversion/DocumentConverter.js';
+export type {
+  DocumentConverterDeps,
+  DocumentConverterOptions,
+  DocumentConverterSummary,
+  DocumentConverterPerDoc,
+} from './conversion/DocumentConverter.js';
+export { matchesSourceFilter } from './conversion/source-filter.js';
+export { summarize, extractDoclingDiagnostics } from './conversion/ConversionReport.js';
+export type {
+  ConversionReport,
+  ConversionReportEntry,
+  DoclingDiagnostics,
+} from './conversion/ConversionReport.js';
+export { TableStructureDetector, buildTableCorruptionRecommendation } from './conversion/TableStructureDetector.js';
+export type {
+  TableStructureCheck,
+  TableStructureRating,
+  TableStructureEvidence,
+  TableStructureFinding,
+  TableStructureSourceInput,
+  TableCorruptionRemediation,
+  TableCorruptionRecommendation,
+} from './conversion/TableStructureDetector.js';
+export type { ConversionProgress } from './conversion/ConversionProgress.js';
+
 // Extraction
 export { ExtractionWorker } from './extraction/ExtractionWorker.js';
 export { PromptBuilder } from './extraction/PromptBuilder.js';
@@ -70,7 +113,7 @@ export type { ConsolidationReport, ConsolidationPipelineContext } from './consol
 export { EntityMatcher } from './consolidation/EntityMatcher.js';
 export type { MatchResult } from './consolidation/EntityMatcher.js';
 export type { MergeEvent, MergeLog, MergeMatchType } from './consolidation/types.js';
-export { parseVocabularyMarkdown, augmentVocabularyFromData } from './consolidation/VocabularyMarkdownParser.js';
+export { parseVocabularyMarkdown, augmentVocabularyFromData, extractControlledValuesByEntityType } from './consolidation/VocabularyMarkdownParser.js';
 
 // Import
 export { BatchImporter } from './import/BatchImporter.js';
@@ -89,9 +132,18 @@ export type {
   LLMToolUseTurnResult,
 } from './providers/LLMProvider.js';
 export { OpenAIChatProvider, type OpenAIChatProviderConfig } from './providers/OpenAIChatProvider.js';
+export { LLMTransportError } from './providers/errors.js';
 
 // Review
 export { ReviewDiagnostics } from './review/ReviewDiagnostics.js';
+export { VocabularyConformanceGate } from './review/VocabularyConformanceGate.js';
+export type {
+  ConformanceReport,
+  ConformanceViolation,
+  ConformanceViolationClass,
+  ConformanceSeverity,
+  VocabularyExtensionRecommendation,
+} from './review/VocabularyConformanceGate.js';
 export { ConsolidationReviewDiagnostics } from './review/ConsolidationReviewDiagnostics.js';
 export type {
   ReviewReport,
@@ -102,6 +154,12 @@ export type {
   WorkerSummary,
   WorkerComparison,
   SourceComparison,
+  ConformanceSummary,
+  FabricationSmells,
+  EnumChecklistSmell,
+  SharedSourceRefSmell,
+  ZeroPropertyEndpointReport,
+  ReviewVocabularyContext,
 } from './review/types.js';
 export type {
   ConsolidationReviewReport,
@@ -159,7 +217,36 @@ export type {
   EntityTypeValidationSummary,
   FlaggedValidationItem,
   ProposedCorrection,
+  CorrectionBase,
+  PropertyCorrection,
+  DeleteCorrection,
+  CreateEntityCorrection,
+  CreateRelationshipCorrection,
+  RetargetRelationshipCorrection,
+  RemediationStep,
+  RelationshipKey,
   CorrectionOperation,
   FullValidationReport,
   ValidationCostEstimate,
 } from './validation/full-validation-types.js';
+
+// Correction applier
+export { CorrectionApplier } from './validation/CorrectionApplier.js';
+export type {
+  CorrectionSelection,
+  ApplyCorrectionsOptions,
+  ApplyCorrectionsResult,
+  ApplyOutcome,
+  CorrectionSummaryItem,
+  AppliedCorrectionRef,
+  CreatedEntityRef,
+  RetargetedRef,
+  SkippedCorrectionRef,
+  CorrectionSkipKind,
+  FailedCorrectionRef,
+  CascadedRef,
+  SkippedGroupRef,
+  GroupExpansionRef,
+  CorrectionWarningRef,
+  CorrectionWarningCode,
+} from './validation/CorrectionApplier.js';

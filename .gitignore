@@ -14,7 +14,8 @@ models
 plans
 local-tests
 local-*
-.claude/
+.claude/*
+!.claude/agents/
 .playwright*
 graph-viewer/data
 graph-viewer/dist

@@ -4,6 +4,7 @@ import type { EntityRegistry, RegistryEntry } from '../types/registry.js';
 import type { IndexSourceList, IndexSource, IndexSourceStatus } from '../types/source-list.js';
 import type { ExtractionOutput } from '../types/extraction.js';
 import type { ExtractionProgress, ExtractionCheckpoint } from '../extraction/ExtractionProgress.js';
+import type { ConversionProgress } from '../conversion/ConversionProgress.js';
 
 /** Pipeline phase constants */
 export const Phase = {
@@ -31,6 +32,8 @@ const CHECKPOINT_REVIEW_FILE = 'checkpoint-review.json';
 const PIPELINE_STATE_FILE = 'pipeline-state.json';
 const STOP_SIGNAL_FILE = 'stop-requested.json';
 const ANALYSIS_REPORT_FILE = 'analysis-report.json';
+const CONVERSION_REPORT_FILE = 'conversion-report.json';
+const CONVERSION_PROGRESS_DIR = 'conversion-progress';
 const REVIEW_DIAGNOSTICS_FILE = 'review-diagnostics.json';
 const MERGE_LOG_FILE = 'consolidation-merge-log.json';
 const CONSOLIDATION_REVIEW_FILE = 'consolidation-review-diagnostics.json';
@@ -96,7 +99,7 @@ export class StateManager {
   }
 
   /** Update arbitrary fields on a source document */
-  async updateSource(path: string, updates: Partial<Pick<IndexSource, 'assignedWorkers' | 'estimatedTokens' | 'actualTokens' | 'lastError' | 'attempts' | 'status' | 'extractionFiles' | 'selectedExtraction' | 'notes' | 'processingTimeMs' | 'statusReason'>>): Promise<void> {
+  async updateSource(path: string, updates: Partial<Pick<IndexSource, 'assignedWorkers' | 'estimatedTokens' | 'actualTokens' | 'lastError' | 'attempts' | 'status' | 'extractionFiles' | 'selectedExtraction' | 'notes' | 'processingTimeMs' | 'statusReason' | 'derivedTextPath' | 'originalFormat' | 'sourceHash' | 'derivedDoclingJsonPath' | 'doOcr' | 'conversion' | 'sourceConvertOptions' | 'convertOptionsUsed'>>): Promise<void> {
     const sourceList = await this.getSourceList();
     if (!sourceList) throw new Error(`Source list not found in ${this.stateDir}`);
     const source = sourceList.sources.find(s => s.path === path);
@@ -363,6 +366,59 @@ export class StateManager {
     return this.readJsonFile(join(this.stateDir, ANALYSIS_REPORT_FILE));
   }
 
+  // ── Conversion Report ────────────────────────────────────────────
+
+  /** Save a conversion report to disk */
+  async saveConversionReport(report: unknown): Promise<void> {
+    await this.writeJsonFile(join(this.stateDir, CONVERSION_REPORT_FILE), report);
+  }
+
+  /** Load conversion report from disk */
+  async getConversionReport<T = unknown>(): Promise<T | null> {
+    return this.readJsonFile<T>(join(this.stateDir, CONVERSION_REPORT_FILE));
+  }
+
+  // ── Conversion Progress ──────────────────────────────────────────
+
+  /**
+   * Write a conversion progress file for an active conversion. Keyed by the
+   * source's `docSlug` (the same collision-resistant slug the derived files
+   * use) so nested sources sharing a basename do not overwrite each other's
+   * progress.
+   */
+  async writeConversionProgress(docSlug: string, progress: ConversionProgress): Promise<void> {
+    const dir = join(this.stateDir, CONVERSION_PROGRESS_DIR);
+    await mkdir(dir, { recursive: true });
+    await this.writeJsonFile(join(dir, `${docSlug}.json`), progress);
+  }
+
+  /** Delete the conversion progress file for a source (called on completion) */
+  async deleteConversionProgress(docSlug: string): Promise<void> {
+    try {
+      await unlinkFile(join(this.stateDir, CONVERSION_PROGRESS_DIR, `${docSlug}.json`));
+    } catch {
+      // File may not exist
+    }
+  }
+
+  /** Get all active conversion progress files */
+  async getActiveConversionProgress(): Promise<ConversionProgress[]> {
+    const dir = join(this.stateDir, CONVERSION_PROGRESS_DIR);
+    let files: string[];
+    try {
+      files = await readdir(dir);
+    } catch {
+      return [];
+    }
+    const jsonFiles = files.filter(f => f.endsWith('.json'));
+    const results: ConversionProgress[] = [];
+    for (const file of jsonFiles) {
+      const progress = await this.readJsonFile<ConversionProgress>(join(dir, file));
+      if (progress) results.push(progress);
+    }
+    return results;
+  }
+
   // ── Review Diagnostics ──────────────────────────────────────────
 
   /** Save a review diagnostics report to disk */
@@ -544,6 +600,29 @@ export class StateManager {
     return count;
   }
 
+  /**
+   * Reset any source stuck in 'converting' back to 'needs-conversion'.
+   *
+   * A process killed mid-conversion leaves the source flagged as in-flight
+   * with no worker to finish it; on resume it must be re-offered to convert
+   * rather than stranded. Returns the number of sources reset.
+   */
+  async resetConvertingSources(): Promise<number> {
+    const sourceList = await this.getSourceList();
+    if (!sourceList) return 0;
+    let count = 0;
+    for (const source of sourceList.sources) {
+      if (source.status === 'converting') {
+        source.status = 'needs-conversion';
+        count++;
+      }
+    }
+    if (count > 0) {
+      await this.saveSourceList(sourceList);
+    }
+    return count;
+  }
+
   // ── Resume Detection ────────────────────────────────────────────
 
   /**
@@ -588,6 +667,15 @@ export class StateManager {
     // All sources validated — fully complete
     if (statuses.every(s => s === 'validated')) {
       return Phase.COMPLETE;
+    }
+
+    // Any source still awaiting or undergoing conversion holds the pipeline in
+    // prepare — the convert action lives in the prepare route, and extraction
+    // must never run against unconverted binary bytes. This precedes the
+    // extract check so a mixed repo (pending text + unconverted binaries)
+    // routes to prepare/convert first rather than skipping straight to extract.
+    if (statuses.some(s => s === 'needs-conversion' || s === 'converting')) {
+      return Phase.PREPARE;
     }
 
     // Any sources still pending, extracting, or deduplicating — continue extraction

@@ -1,16 +1,24 @@
 /**
  * Extraction review diagnostics engine.
  *
- * Runs 5 automated checks against extraction outputs:
- *   1. Entity type distribution per document
- *   2. Property coverage (entities with 0 properties)
- *   3. Orphan relationships (source/target label not matching any entity)
- *   4. Duplicate detection (same entityType + label, case-insensitive)
- *   5. Label quality (short, garbage, JSON artifacts)
+ * Per-document checks:
+ *   - Entity type distribution
+ *   - Property coverage (entities with 0 properties)
+ *   - Orphan relationships (source/target label not matching any entity)
+ *   - Duplicate detection (normalized label match, plus a softer token-subset signal)
+ *   - Label quality (short, garbage, JSON artifacts)
+ *   - Truncation (LLM output cut off at the token limit)
+ *
+ * Report-level signals across all documents:
+ *   - Vocabulary-conformance summary (threaded in from the caller)
+ *   - Fabrication smells (labels enumerating a controlled vocabulary; many
+ *     relationships citing one narrow passage)
+ *   - Zero-property entities that are relationship endpoints
  *
  * Pure computation — no LLM calls, no external dependencies.
  * Uses the source list to determine which extraction files are active
- * (skipping excluded sources and backup files).
+ * (skipping excluded sources and backup files). The vocabulary-dependent
+ * report-level signals are produced only when a vocabulary context is supplied.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -26,6 +34,11 @@ import type {
   WorkerSummary,
   WorkerComparison,
   SourceComparison,
+  ReviewVocabularyContext,
+  FabricationSmells,
+  EnumChecklistSmell,
+  SharedSourceRefSmell,
+  ZeroPropertyEndpointReport,
 } from './types.js';
 import type { QualityThresholds } from '../types/config.js';
 import { DEFAULT_QUALITY_THRESHOLDS } from '../types/config.js';
@@ -33,12 +46,51 @@ import { DEFAULT_QUALITY_THRESHOLDS } from '../types/config.js';
 /** Extraction review thresholds — resolved at construction time from config or defaults */
 type ExtractionThresholds = QualityThresholds['extraction'];
 
+/**
+ * A citation spanning at most this many source lines is treated as "narrow"
+ * enough that many relationships sharing it is suspicious rather than incidental
+ * (a genuinely dense table cell cites a small range).
+ */
+const NARROW_CITATION_MAX_SPAN = 5;
+
+/**
+ * Minimum number of relationships sharing one narrow citation before it is
+ * reported as a cross-product-fabrication smell.
+ */
+const SHARED_SOURCEREF_MIN_GROUP = 10;
+
+/**
+ * The enum-checklist smell only fires for a controlled-value list of at least
+ * this size — a two- or three-value list matching a couple of labels is not
+ * distinctive enough to call fabrication.
+ */
+const ENUM_CHECKLIST_MIN_CONTROLLED_VALUES = 4;
+
+/** Fraction of a type's distinct labels that must be controlled values to flag. */
+const ENUM_CHECKLIST_LABEL_DOMINANCE = 0.8;
+
+/** Fraction of the controlled-value list that must appear as labels to flag. */
+const ENUM_CHECKLIST_ENUM_COVERAGE = 0.6;
+
+/** Cap on examples carried in the softer per-document token-subset signal. */
+const TOKEN_SUBSET_EXAMPLE_CAP = 10;
+
 export class ReviewDiagnostics {
   private readonly thresholds: ExtractionThresholds;
+  private readonly vocabularyContext: ReviewVocabularyContext | undefined;
 
-  constructor(state: StateManager, thresholds?: ExtractionThresholds);
-  constructor(private readonly state: StateManager, thresholds?: ExtractionThresholds) {
+  public constructor(
+    state: StateManager,
+    thresholds?: ExtractionThresholds,
+    vocabularyContext?: ReviewVocabularyContext,
+  );
+  public constructor(
+    private readonly state: StateManager,
+    thresholds?: ExtractionThresholds,
+    vocabularyContext?: ReviewVocabularyContext,
+  ) {
     this.thresholds = thresholds ?? DEFAULT_QUALITY_THRESHOLDS.extraction;
+    this.vocabularyContext = vocabularyContext;
   }
 
   /**
@@ -123,6 +175,7 @@ export class ReviewDiagnostics {
     }
 
     const workerSummaries: WorkerSummary[] = [];
+    const outputsByWorker = new Map<string, ExtractionOutput[]>();
     for (const name of workerNames) {
       let outputs = await this.state.getExtractionOutputsByWorker(name);
 
@@ -139,6 +192,7 @@ export class ReviewDiagnostics {
           sourceFilter.some(f => o.source.includes(f) || o.sourcePath.includes(f)),
         );
       }
+      outputsByWorker.set(name, outputs);
 
       const documents: DocumentDiagnostics[] = [];
       for (const output of outputs) {
@@ -175,6 +229,11 @@ export class ReviewDiagnostics {
       workerComparison: comparison,
     };
 
+    // Attach the report-level signals from the recommended worker's outputs, so
+    // the unselected multi-worker state gets the same conformance / fabrication /
+    // endpoint signals as a selected single-worker report.
+    this.attachReportLevelSignals(report, outputsByWorker.get(best.workerName) ?? []);
+
     await this.state.saveReviewDiagnostics(report);
     return report;
   }
@@ -197,8 +256,38 @@ export class ReviewDiagnostics {
       documents,
     };
 
+    this.attachReportLevelSignals(report, outputs);
+
     await this.state.saveReviewDiagnostics(report);
     return report;
+  }
+
+  /**
+   * Attach the corpus-wide signals that need the raw outputs rather than the
+   * per-document aggregates: the conformance summary (threaded in from the
+   * caller), the fabrication smells, and the zero-property endpoint check. Runs
+   * on every report path so no exit misses them.
+   */
+  private attachReportLevelSignals(report: ReviewReport, outputs: ExtractionOutput[]): void {
+    const conformance = this.vocabularyContext?.conformance;
+    if (conformance) {
+      report.conformance = conformance;
+    }
+    if (this.vocabularyContext?.controlledValuesByType) {
+      report.fabricationSmells = this.detectFabricationSmells(
+        outputs,
+        this.vocabularyContext.controlledValuesByType,
+      );
+    } else {
+      // Even without a vocabulary the cross-product smell is computable — it
+      // reads only relationship citations. Only the enum-checklist smell needs
+      // the controlled-value vocabulary.
+      report.fabricationSmells = {
+        enumChecklist: [],
+        sharedSourceRefs: this.detectSharedSourceRefs(outputs),
+      };
+    }
+    report.zeroPropertyEndpoints = this.detectZeroPropertyEndpoints(outputs);
   }
 
   /** Pivot worker-grouped diagnostics into source-grouped comparisons */
@@ -422,10 +511,13 @@ export class ReviewDiagnostics {
   // ── Check 4: Duplicate Detection ────────────────────────────────
 
   private checkDuplicates(entities: ExtractedEntity[]): DocumentDiagnostics['duplicateCheck'] {
+    // Exact duplicates under a normalized key: case, accents, whitespace runs,
+    // and spacing around `-`/`/` are folded so variants like "Café / Bar" and
+    // "cafe/bar" collapse to one group.
     const counts = new Map<string, { entityType: string; label: string; count: number }>();
 
     for (const e of entities) {
-      const key = `${e.entityType}:${e.label}`.toLowerCase();
+      const key = `${e.entityType.toLowerCase()}:${normalizeLabel(e.label)}`;
       const existing = counts.get(key);
       if (existing) {
         existing.count++;
@@ -437,11 +529,66 @@ export class ReviewDiagnostics {
     const duplicates = [...counts.values()].filter(c => c.count > 1);
     const totalDuplicateCount = duplicates.reduce((sum, d) => sum + d.count - 1, 0);
 
+    const { count: tokenSubsetCount, examples: possibleDuplicates } =
+      this.detectTokenSubsets(entities);
+
     return {
       duplicateCount: totalDuplicateCount,
       rating: totalDuplicateCount === 0 ? 'good' : 'needs-work',
       duplicates,
+      tokenSubsetCount,
+      possibleDuplicates,
     };
+  }
+
+  /**
+   * Softer duplicate signal for variant pairs that differ by a descriptor word
+   * rather than by punctuation — one normalized label's word set is a strict
+   * subset of another same-type label's (e.g. "Main Street" vs "Main Street Bridge").
+   * Normalization alone never merges these, so they are reported separately and
+   * never folded into duplicateCount. No descriptor word is assumed; the test is
+   * purely set-theoretic on the tokens.
+   */
+  private detectTokenSubsets(
+    entities: ExtractedEntity[],
+  ): { count: number; examples: Array<{ entityType: string; label: string; supersetLabel: string }> } {
+    // Reduce to distinct normalized labels per type, keeping a representative
+    // original label, so the comparison is bounded by distinct names.
+    const byType = new Map<string, Map<string, { label: string; tokens: Set<string> }>>();
+    for (const e of entities) {
+      const normalized = normalizeLabel(e.label);
+      if (normalized.length === 0) continue;
+      let group = byType.get(e.entityType);
+      if (!group) {
+        group = new Map();
+        byType.set(e.entityType, group);
+      }
+      if (!group.has(normalized)) {
+        group.set(normalized, { label: e.label, tokens: new Set(normalized.split(' ')) });
+      }
+    }
+
+    const examples: Array<{ entityType: string; label: string; supersetLabel: string }> = [];
+    let count = 0;
+    for (const [entityType, group] of byType) {
+      const items = [...group.values()];
+      for (let i = 0; i < items.length; i++) {
+        for (let j = 0; j < items.length; j++) {
+          if (i === j) continue;
+          const sub = items[i]!;
+          const sup = items[j]!;
+          if (sub.tokens.size >= sup.tokens.size) continue;
+          if (isStrictTokenSubset(sub.tokens, sup.tokens)) {
+            count++;
+            if (examples.length < TOKEN_SUBSET_EXAMPLE_CAP) {
+              examples.push({ entityType, label: sub.label, supersetLabel: sup.label });
+            }
+          }
+        }
+      }
+    }
+
+    return { count, examples };
   }
 
   // ── Check 5: Label Quality ──────────────────────────────────────
@@ -497,6 +644,156 @@ export class ReviewDiagnostics {
       unsalvageableChunks: truncation.unsalvageableChunks,
       rating: this.rateTruncation(truncationPercent, truncation.unsalvageableChunks),
     };
+  }
+
+  // ── Report-Level Fabrication & Endpoint Signals ─────────────────
+
+  private detectFabricationSmells(
+    outputs: ExtractionOutput[],
+    controlledValuesByType: Record<string, string[]>,
+  ): FabricationSmells {
+    return {
+      enumChecklist: this.detectEnumChecklist(outputs, controlledValuesByType),
+      sharedSourceRefs: this.detectSharedSourceRefs(outputs),
+    };
+  }
+
+  /**
+   * Flag entity types whose instance labels coincide with the type's declared
+   * controlled vocabulary — the extractor read a naming guide as a checklist and
+   * instantiated one entity per listed value rather than reading them from the
+   * source. Both instance labels and controlled values are compared normalized.
+   */
+  private detectEnumChecklist(
+    outputs: ExtractionOutput[],
+    controlledValuesByType: Record<string, string[]>,
+  ): EnumChecklistSmell[] {
+    // Distinct normalized labels per entity type, keeping a representative label.
+    const labelsByType = new Map<string, Map<string, string>>();
+    for (const output of outputs) {
+      for (const entity of output.entities) {
+        const normalized = normalizeLabel(entity.label);
+        if (normalized.length === 0) continue;
+        let group = labelsByType.get(entity.entityType);
+        if (!group) {
+          group = new Map();
+          labelsByType.set(entity.entityType, group);
+        }
+        if (!group.has(normalized)) group.set(normalized, entity.label);
+      }
+    }
+
+    const smells: EnumChecklistSmell[] = [];
+    for (const [entityType, rawValues] of Object.entries(controlledValuesByType)) {
+      const controlled = new Set(rawValues.map(normalizeLabel).filter(v => v.length > 0));
+      if (controlled.size < ENUM_CHECKLIST_MIN_CONTROLLED_VALUES) continue;
+
+      const labels = labelsByType.get(entityType);
+      if (!labels || labels.size === 0) continue;
+
+      const matched: string[] = [];
+      for (const [normalized, original] of labels) {
+        if (controlled.has(normalized)) matched.push(original);
+      }
+      if (matched.length === 0) continue;
+
+      const labelDominance = matched.length / labels.size;
+      const enumCoverage = matched.length / controlled.size;
+      if (labelDominance < ENUM_CHECKLIST_LABEL_DOMINANCE) continue;
+      if (enumCoverage < ENUM_CHECKLIST_ENUM_COVERAGE) continue;
+
+      smells.push({
+        entityType,
+        distinctLabelCount: labels.size,
+        controlledValueCount: controlled.size,
+        matchedCount: matched.length,
+        labelDominance: round2(labelDominance),
+        enumCoverage: round2(enumCoverage),
+        examples: matched.slice(0, 10),
+      });
+    }
+    return smells;
+  }
+
+  /**
+   * Flag groups of relationships that all cite the same narrow source line range
+   * within one document — the cross-product-fabrication signature. A citation is
+   * "narrow" when its overall span is small; a group is a smell when enough
+   * relationships share the identical narrow citation.
+   */
+  private detectSharedSourceRefs(outputs: ExtractionOutput[]): SharedSourceRefSmell[] {
+    interface Group { count: number; types: Set<string> }
+    const groups = new Map<string, Group>();
+
+    for (const output of outputs) {
+      for (const rel of output.relationships) {
+        if (!rel.sourceRefs || rel.sourceRefs.length === 0) continue;
+        let minStart = Infinity;
+        let maxEnd = -Infinity;
+        for (const ref of rel.sourceRefs) {
+          if (ref.lineStart < minStart) minStart = ref.lineStart;
+          if (ref.lineEnd > maxEnd) maxEnd = ref.lineEnd;
+        }
+        if (!Number.isFinite(minStart) || !Number.isFinite(maxEnd)) continue;
+        if (maxEnd - minStart > NARROW_CITATION_MAX_SPAN) continue;
+
+        const citation = `${minStart}-${maxEnd}`;
+        const key = `${output.source}|${citation}`;
+        let group = groups.get(key);
+        if (!group) {
+          group = { count: 0, types: new Set() };
+          groups.set(key, group);
+        }
+        group.count++;
+        group.types.add(rel.type);
+      }
+    }
+
+    const smells: SharedSourceRefSmell[] = [];
+    for (const [key, group] of groups) {
+      if (group.count < SHARED_SOURCEREF_MIN_GROUP) continue;
+      const sep = key.indexOf('|');
+      smells.push({
+        source: key.slice(0, sep),
+        citation: key.slice(sep + 1),
+        relationshipCount: group.count,
+        relationshipTypes: [...group.types],
+      });
+    }
+    return smells.sort((a, b) => b.relationshipCount - a.relationshipCount);
+  }
+
+  /**
+   * Flag zero-property entities that appear as a relationship endpoint. These are
+   * surfaced regardless of the aggregate property-coverage percentage: a high
+   * corpus-wide coverage figure can hide a handful of empty entities that only
+   * exist to anchor relationships.
+   */
+  private detectZeroPropertyEndpoints(outputs: ExtractionOutput[]): ZeroPropertyEndpointReport {
+    const examples: ZeroPropertyEndpointReport['examples'] = [];
+    let count = 0;
+
+    for (const output of outputs) {
+      const endpoints = new Set<string>();
+      for (const rel of output.relationships) {
+        endpoints.add(normalizeLabel(rel.sourceLabel));
+        endpoints.add(normalizeLabel(rel.targetLabel));
+      }
+      for (const entity of output.entities) {
+        const hasProps = entity.properties && Object.keys(entity.properties).length > 0;
+        if (hasProps) continue;
+        const matchesEndpoint =
+          endpoints.has(normalizeLabel(entity.label)) ||
+          (entity.aliases ?? []).some(a => endpoints.has(normalizeLabel(a)));
+        if (!matchesEndpoint) continue;
+        count++;
+        if (examples.length < 20) {
+          examples.push({ source: output.source, entityType: entity.entityType, label: entity.label });
+        }
+      }
+    }
+
+    return { count, examples };
   }
 
   // ── Aggregate Computation ───────────────────────────────────────
@@ -642,6 +939,30 @@ function worstRating(ratings: QualityRating[]): QualityRating {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/**
+ * Generic label normalizer for comparison: case-fold, strip diacritics (NFD +
+ * drop combining marks), remove spacing around `-`/`/` separators, and collapse
+ * whitespace runs. Domain-agnostic — it knows nothing about any vocabulary.
+ */
+function normalizeLabel(label: string): string {
+  return label
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s*([/-])\s*/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** True when every token in `sub` is present in `sup` and `sup` has strictly more. */
+function isStrictTokenSubset(sub: Set<string>, sup: Set<string>): boolean {
+  if (sub.size >= sup.size) return false;
+  for (const token of sub) {
+    if (!sup.has(token)) return false;
+  }
+  return true;
 }
 
 /** Convert a Map<string, number> to sorted array of {label, count} descending by count */

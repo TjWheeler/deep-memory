@@ -22,6 +22,7 @@ pnpm add @utaba/deep-memory-indexer-mcp-server
 Source Documents
     |
 A.   Prepare         — scan directory, register sources
+A.5  Convert         — (rich formats only) render PDF/DOCX/HTML/PPTX to Markdown
 B.   Extract         — LLM workers extract entities + relationships (parallel)
 B.6  Review          — structural diagnostics + property accuracy spot-checks
 B.7  Full Validate   — (optional) LLM agents verify every entity against source
@@ -34,6 +35,7 @@ E.   Embeddings      — generate embedding vectors for semantic search
 | Phase | Input | Output | Resumable |
 |-------|-------|--------|-----------|
 | A — Prepare | Source directory | `index-source-list.json` | Yes — skips already-registered sources |
+| A.5 — Convert | Rich-format sources | `state/converted/{slug}.md` + `{slug}.docling.json` | Yes — content-hash skips unchanged sources |
 | B — Extract | Pending sources | `extraction-notes/{worker-name}/*.json` | Yes — skips already-extracted sources |
 | B.5 — Validate | Extraction outputs | `validation-report.json` | Yes |
 | B.6 — Extraction Review | Extraction outputs + source docs | `review-diagnostics.json` + corrections | AI runs, human approves |
@@ -44,6 +46,55 @@ E.   Embeddings      — generate embedding vectors for semantic search
 | E — Embeddings | Imported entities | Embeddings stored on entities | Yes |
 
 Pipeline states: `prepare` | `extract` | `extraction-review` | `full-validation` | `consolidate` | `consolidation-review` | `import` | `import-review` | `embeddings` | `complete`
+
+## Supported source formats
+
+| Format | Extensions | Handling |
+|--------|-----------|----------|
+| Plain text | `.md`, `.txt`, `.json`, `.csv` | Read directly by extraction |
+| Rich documents | `.pdf`, `.docx`, `.html`, `.htm`, `.pptx` | Converted to Markdown before extraction |
+
+Rich-format sources are registered with status `needs-conversion` during prepare. The **convert** step renders each to Markdown under `state/converted/{slug}.md` (recorded as `derivedTextPath` on the source), writes a structural JSON sidecar `state/converted/{slug}.docling.json`, and flips the source to `pending`; everything downstream reads the derived text. Extraction refuses to run against an unconverted rich-format source.
+
+Conversion runs against a containerised [`docling-serve`](https://github.com/docling-project/docling-serve) service. Start it before converting:
+
+```bash
+docker compose -f docker-compose.indexer.yml --profile docling-worker up -d
+```
+
+The `docling-worker` profile is gated so a repo with no rich-format sources never starts the (~4.4 GB) container. Configure the service in `config.json`:
+
+```jsonc
+{
+  "services": {
+    "docling": {
+      "endpoint": "http://localhost:5001",  // match the docling-worker host port
+      "mode": "async",                        // submit + poll; the default. "sync" is the escape hatch
+      "timeoutMs": 600000,                    // per-request ceiling (each submit/poll/result call)
+      "maxRetries": 3
+      // OCR is decided per document — omit doOcr to let the heuristic run.
+      // "doOcr": false                       // force OCR off globally (or set per source)
+      // "ocrTextYieldThreshold": 100          // chars-per-page floor below which a PDF is re-run with OCR
+    }
+  }
+}
+```
+
+Then run convert before extraction:
+
+```
+indexing_execute processDir: ./index-processes/my-knowledge action: convert
+```
+
+Poll `indexing_status` until conversion completes, then proceed to `indexing_analyze` / `indexing_execute` as usual.
+
+### How convert behaves
+
+- **Idempotent.** Each source's raw bytes are hashed (`sourceHash`). A re-run skips any source whose hash is unchanged and whose derived files still exist — no round trip — and reports it as `skipped-unchanged`. Editing a source on disk is detected at prepare: its stale derived files are deleted and it is reset to `needs-conversion` so the next convert reprocesses it.
+- **Asynchronous by default.** `mode: "async"` submits each conversion and polls for the result, so a large document no longer fails against the service's synchronous wait ceiling; there is no single-request timeout over the whole job. `indexing_status` shows the live queue position and elapsed time while polling. `mode: "sync"` keeps one request open — use it only for an older container without the async routes (an async submit that 404s says so and names the switch).
+- **OCR is decided per document.** Non-PDF formats carry text natively and never run OCR. For a PDF with no explicit `doOcr`, convert runs a fast no-OCR pass and only re-runs with OCR when the text yield per page falls below `ocrTextYieldThreshold` (default 100 chars/page) — so scanned PDFs get OCR while born-digital ones stay fast. A text-light born-digital PDF (a slide or diagram deck) can trip this; set `doOcr: false` on that source to opt out. An explicit `doOcr` (per source or global) skips the heuristic entirely.
+- **Diagnostics.** Every run writes `state/conversion-report.json` (per-document mode, OCR decision, page/table counts, warnings, timing) plus a compact mirror on each source entry. `indexing_diagnose` in the prepare phase surfaces conversion warnings, table counts, and conversions running far slower than their peers; `indexing_status` shows the run summary once it completes.
+- **The JSON sidecar** (`{slug}.docling.json`) is docling's structural representation, retained alongside the Markdown for richer downstream use.
 
 ## Quick start (via MCP — recommended)
 
@@ -181,6 +232,8 @@ interface OrchestratorConfig {
     maxTokens?: number;                // Max tokens per request (default 4096)
     temperature?: number;              // LLM temperature (default 0)
     maxChunkSize?: number;             // Max chars per chunk (default 100,000)
+    stream?: boolean;                  // Stream SSE on the built-in provider (default true); see below
+    requestTimeoutMs?: number;         // Total wall-clock cap per request on the built-in provider; see below
     extraBodyParams?: Record<string, unknown>;
     workers?: WorkerConfig[];          // Worker pool — see above
     maxItems?: number;                 // Max documents per extraction run
@@ -221,6 +274,8 @@ interface WorkerConfig {
   concurrency: number;
   capabilities: WorkerCapability[];
   temperature?: number;
+  stream?: boolean;                    // Stream SSE on the built-in provider (default true); see below
+  requestTimeoutMs?: number;           // Total wall-clock cap per request on the built-in provider; see below
   extraBodyParams?: Record<string, unknown>;
   apiKey?: string;
   llmProvider?: string;                // e.g. "anthropic" — see LLM providers below
@@ -232,6 +287,20 @@ type WorkerCapability =
   | 'reasoning'               // Judgment-heavy tasks
   | 'large-context';          // Documents requiring >32K tokens
 ```
+
+### `stream` — surviving long generations on dense chunks
+
+`stream` controls whether the **built-in openai-compat provider** consumes the completion as a Server-Sent Events stream. It applies to that provider only — a worker with `llmProvider: "anthropic"` ignores it. It defaults to `true` when unset.
+
+Streaming exists to keep long generations alive. On a non-streaming completion the endpoint sends nothing — not even headers — until generation finishes, so a dense (e.g. tabular) chunk that generates for minutes can outrun the client's idle timeout and fail as a bare `fetch failed`. With streaming, headers arrive as soon as the model starts producing tokens and the transport idle timer resets on every delta, so the request no longer dies from inter-token idle; the effective ceiling becomes the server/proxy total request timeout. The returned result (content, usage, `finish_reason`) is identical to the non-streaming path.
+
+Every OpenAI-compatible target this pipeline supports (vLLM, OpenAI, Azure, Ollama, llama.cpp) speaks SSE, so the default is safe. Set `stream: false` only for a pathological server or proxy that does not stream SSE correctly. Note that a proxy which *buffers* SSE (e.g. nginx `proxy_buffering on`) delivers all deltas in one terminal burst and defeats the protection — that is an operator-owned proxy fix, not a client setting.
+
+### `requestTimeoutMs` — a hard ceiling on a stuck request
+
+`requestTimeoutMs` sets a total wall-clock cap, in milliseconds, on a single completion request to the **built-in openai-compat provider**. Like `stream`, it applies to that provider only — a worker with `llmProvider: "anthropic"` ignores it. It is unset by default, which imposes no extra cap.
+
+It exists as defense-in-depth against a genuinely stuck request, not as a way to allow longer ones: the cap can only *shorten* a request. It does **not** extend the ~300s non-streaming time-to-first-byte limit that the transport enforces before any bytes arrive — streaming is the mechanism for surviving long generations, and `requestTimeoutMs` is the deterministic upper bound layered on top. When the cap fires it surfaces as a typed transport error distinct from a caller-initiated stop, so a timed-out request is never mistaken for a cancellation. Leave it unset unless you need a firm per-request ceiling; size it above the worst-case legitimate generation time (`maxOutputTokens ÷ token-rate`) so it only trips on a true stall.
 
 ## Validation
 

@@ -1,19 +1,31 @@
+import { parseVocabularyMarkdown } from '../consolidation/VocabularyMarkdownParser.js';
+
 /**
- * Parses a vocabulary markdown document and produces a concise summary
- * of entity types with their classification properties and recommended values.
+ * Parses a vocabulary markdown document and produces a concise summary for the
+ * full-validation prompt. Two sections are composed:
  *
- * This summary is domain-agnostic — it works with any vocabulary that follows
- * the standard format (entity type headings, property tables, and
- * "Recommended `X` values" sections).
+ * 1. **Classification Properties** — properties whose values come from a controlled
+ *    vocabulary rather than verbatim source text, so the validator does not flag a
+ *    reasonable categorization just because the exact string is absent from the source.
+ * 2. **Vocabulary Types** — the entity and relationship types (with endpoint constraints
+ *    and required properties) the validator may use when proposing a structural remodel.
+ *    Without this the validator cannot pick a valid type for a create/retarget proposal.
  *
- * The output is designed for the full validation prompt, where the validator
- * needs to understand that classification properties use standardized vocabulary
- * values rather than verbatim source text.
+ * Both sections are domain-agnostic — they are derived from whatever vocabulary the run
+ * declares, so no domain type name is ever hardcoded here.
  */
 export function summarizeVocabularyForValidation(vocabularyMarkdown: string): string {
-  const entitySections = parseEntitySections(vocabularyMarkdown);
+  const classificationSection = buildClassificationSection(vocabularyMarkdown);
+  const typesSection = buildTypesSection(vocabularyMarkdown);
 
-  if (entitySections.length === 0) {
+  const sections = [classificationSection, typesSection].filter(s => s.length > 0);
+  return sections.join('\n');
+}
+
+function buildClassificationSection(vocabularyMarkdown: string): string {
+  const entitySections = parseEntitySections(vocabularyMarkdown);
+  const withClassification = entitySections.filter(s => s.classificationProperties.length > 0);
+  if (withClassification.length === 0) {
     return '';
   }
 
@@ -31,9 +43,7 @@ export function summarizeVocabularyForValidation(vocabularyMarkdown: string): st
     '',
   ];
 
-  for (const section of entitySections) {
-    if (section.classificationProperties.length === 0) continue;
-
+  for (const section of withClassification) {
     lines.push(`### ${section.entityType}`);
     for (const prop of section.classificationProperties) {
       const values = prop.recommendedValues.join(', ');
@@ -43,6 +53,81 @@ export function summarizeVocabularyForValidation(vocabularyMarkdown: string): st
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Build the type catalogue a validator needs to ground a structural remodel: the
+ * available entity types (with a one-line description and their required properties)
+ * and relationship types (with their `Source → Target` endpoint constraint and required
+ * properties). Kept token-conscious — only required properties are listed, and closed
+ * enums surface their allowed set so a proposed create can carry a valid value.
+ */
+function buildTypesSection(vocabularyMarkdown: string): string {
+  const vocab = parseVocabularyMarkdown(vocabularyMarkdown);
+  if (vocab.entityTypes.length === 0 && vocab.relationshipTypes.length === 0) {
+    return '';
+  }
+
+  const lines: string[] = [
+    '## Vocabulary Types',
+    '',
+    'When you propose a structural remodel, every created or retargeted item must use a',
+    'type from these lists, spelled exactly as shown. Endpoint constraints and required',
+    'properties are enforced when the remodel is applied — a proposal that violates them',
+    'is rejected.',
+    '',
+  ];
+
+  if (vocab.entityTypes.length > 0) {
+    lines.push('### Entity Types');
+    for (const et of vocab.entityTypes) {
+      lines.push(`- \`${et.type}\`${describe(et.description)}${requiredPropsSuffix(et.properties)}`);
+    }
+    lines.push('');
+  }
+
+  if (vocab.relationshipTypes.length > 0) {
+    lines.push('### Relationship Types');
+    for (const rt of vocab.relationshipTypes) {
+      const sources = rt.allowedSourceTypes.length > 0 ? rt.allowedSourceTypes.join(' | ') : 'any';
+      const targets = rt.allowedTargetTypes.length > 0 ? rt.allowedTargetTypes.join(' | ') : 'any';
+      lines.push(`- \`${rt.type}\`: ${sources} → ${targets}${requiredPropsSuffix(rt.properties)}`);
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+/** A vocabulary property as produced by {@link parseVocabularyMarkdown}. */
+interface ParsedProperty {
+  name: string;
+  type: string;
+  required: boolean;
+  enumValues?: string[];
+}
+
+/** First sentence of a description, trimmed to keep the prompt compact. */
+function describe(description: string | undefined): string {
+  if (!description) return '';
+  const collapsed = description.replace(/\s+/g, ' ').trim();
+  if (collapsed.length === 0 || collapsed === 'No description available') return '';
+  const firstSentence = collapsed.split(/(?<=\.)\s/)[0] ?? collapsed;
+  const oneLine = firstSentence.length > 120 ? `${firstSentence.slice(0, 117)}...` : firstSentence;
+  return ` — ${oneLine}`;
+}
+
+/** " Required: `a`, `b (one of: x, y)`" — or "" when the type has no required properties. */
+function requiredPropsSuffix(properties: ParsedProperty[] | undefined): string {
+  const required = (properties ?? []).filter(p => p.required);
+  if (required.length === 0) return '';
+  const rendered = required.map(p => {
+    if (p.type === 'enum' && p.enumValues && p.enumValues.length > 0) {
+      return `\`${p.name}\` (one of: ${p.enumValues.join(', ')})`;
+    }
+    return `\`${p.name}\``;
+  });
+  return `. Required: ${rendered.join(', ')}`;
 }
 
 interface ClassificationProperty {

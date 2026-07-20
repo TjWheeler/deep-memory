@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-indexer-llm-anthropic",
-  "version": "0.19.1",
+  "version": "0.19.2",
   "private": true,
   "description": "Anthropic LLM provider for @utaba/deep-memory-indexer — prompt caching + Files API",
   "type": "module",
@@ -60,14 +60,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.100.1",
+    "@anthropic-ai/sdk": "^0.111.0",
     "@utaba/deep-memory": "workspace:^",
     "@utaba/deep-memory-indexer": "workspace:^"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^22.20.1",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.10"
   }
 }

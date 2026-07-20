@@ -1,8 +1,8 @@
 import { basename, resolve, join } from 'node:path';
 import { readFile, writeFile } from 'node:fs/promises';
 import { BaseToolController } from './base/BaseToolController.js';
-import { StateManager, Phase, ProcessStateWriter } from '@utaba/deep-memory-indexer';
-import type { PipelinePhase, IndexSourceStatus, ProcessPhase, IndexProcessConfig } from '@utaba/deep-memory-indexer';
+import { StateManager, Phase, ProcessStateWriter, CONVERT_OPTION_KEYS, convertOptionsEqual } from '@utaba/deep-memory-indexer';
+import type { PipelinePhase, IndexSourceStatus, ProcessPhase, IndexProcessConfig, DoclingConvertOptions, IndexSource } from '@utaba/deep-memory-indexer';
 import { resolveStateDir } from './resolveProcess.js';
 
 const VALID_PHASES: PipelinePhase[] = [
@@ -18,7 +18,10 @@ const VALID_PHASES: PipelinePhase[] = [
   Phase.COMPLETE,
 ];
 
-const VALID_STATUSES: IndexSourceStatus[] = ['pending', 'extracting', 'deduplicating', 'extracted', 'consolidated', 'imported', 'validated', 'excluded'];
+// `converting` is a transient runtime state owned by the convert loop and is
+// deliberately not operator-settable; `needs-conversion` is the escape hatch to
+// re-queue a source for conversion by hand.
+const VALID_STATUSES: IndexSourceStatus[] = ['needs-conversion', 'pending', 'extracting', 'deduplicating', 'extracted', 'consolidated', 'imported', 'validated', 'excluded'];
 
 /**
  * Control tool for navigating the indexing pipeline and updating source configuration.
@@ -47,6 +50,17 @@ export class UpdateTool extends BaseToolController {
           description: `New status for source: ${VALID_STATUSES.join(', ')}. WARNING: "excluded" permanently removes the source from the pipeline. "pending" clears extraction artifacts and requires re-extraction.`,
         },
         sourceWorkers: { type: 'string', description: 'Comma-separated worker names to assign for extraction (e.g., "cloud-haiku,qwen35-35b").' },
+        sourceConvertOptions: {
+          type: 'object',
+          description: 'Per-source document-conversion overrides that win over the process-wide services.docling.convertOptions. Allowed keys: tableCellMatching (boolean), tableMode ("fast"|"accurate"), doTableStructure (boolean), pdfBackend (string). Example: { "tableCellMatching": false } to fix merged-column table corruption. Changing this forces a re-convert of the source on the next conversion run even when its bytes are unchanged.',
+          additionalProperties: false,
+          properties: {
+            tableCellMatching: { type: 'boolean' },
+            tableMode: { type: 'string', enum: ['fast', 'accurate'] },
+            doTableStructure: { type: 'boolean' },
+            pdfBackend: { type: 'string' },
+          },
+        },
         sourceSelectedExtraction: { type: 'string', description: 'Worker name whose extraction output to select for downstream phases. Sets selectedExtraction from extractionFiles.' },
         sourceStatusReason: { type: 'string', description: 'Reason for the status change (logged in source list).' },
         clearError: { type: 'boolean', description: 'Clear error state and reset attempts on the specified source.' },
@@ -163,6 +177,7 @@ export class UpdateTool extends BaseToolController {
 
     const newStatus = params['sourceStatus'] as string | undefined;
     const newWorkers = params['sourceWorkers'] as string | undefined;
+    const convertOptions = params['sourceConvertOptions'];
     const selectedExtraction = params['sourceSelectedExtraction'] as string | undefined;
     const statusReason = params['sourceStatusReason'] as string | undefined;
     const clearError = params['clearError'] as boolean | undefined;
@@ -184,6 +199,22 @@ export class UpdateTool extends BaseToolController {
       fieldUpdates.assignedWorkers = workerList;
       changes.push(`assignedWorkers → [${workerList.join(', ')}]`);
     }
+    if (convertOptions !== undefined) {
+      const validated = validateConvertOptions(convertOptions);
+      fieldUpdates.sourceConvertOptions = validated;
+      changes.push(`sourceConvertOptions → ${JSON.stringify(validated)}`);
+      // Auto-queue an already-converted source whose options actually change, so
+      // the documented remediation (set options, then run convert) works without
+      // a separate status call. The convert loop's own idempotency is the
+      // backstop: if the effective options turn out to match what was last used,
+      // it skips the round trip. An explicit sourceStatus in the same call wins.
+      const alreadyConverted = source.derivedTextPath !== undefined;
+      const optionsChanged = !convertOptionsEqual(validated, source.convertOptionsUsed);
+      if (alreadyConverted && optionsChanged && fieldUpdates.status === undefined) {
+        fieldUpdates.status = 'needs-conversion';
+        changes.push('status → needs-conversion (queued for re-conversion)');
+      }
+    }
     if (selectedExtraction !== undefined) {
       // Look up the extraction file path from extractionFiles
       const extractionFiles = source.extractionFiles ?? {};
@@ -202,7 +233,7 @@ export class UpdateTool extends BaseToolController {
     }
 
     if (changes.length === 0 && sourceOrder === undefined) {
-      throw new Error('No source updates specified. Provide at least one of: sourceStatus, sourceWorkers, sourceSelectedExtraction, sourceStatusReason, clearError, sourceOrder.');
+      throw new Error('No source updates specified. Provide at least one of: sourceStatus, sourceWorkers, sourceConvertOptions, sourceSelectedExtraction, sourceStatusReason, clearError, sourceOrder.');
     }
 
     if (changes.length > 0) {
@@ -294,7 +325,53 @@ export class UpdateTool extends BaseToolController {
   }
 }
 
-function findSource(sources: Array<{ path: string; extractionFiles?: Record<string, string>; assignedWorkers?: string[] }>, query: string): { path: string; extractionFiles?: Record<string, string>; assignedWorkers?: string[] } {
+/**
+ * Validate a raw sourceConvertOptions object: it must be a plain object whose
+ * keys are all in the allowed set with the correct value types. Returns a typed
+ * object carrying only the recognised keys. Rejects unknown keys with a message
+ * listing what is allowed so the caller can correct the call. The allowed key
+ * list is single-sourced from the indexer package's CONVERT_OPTION_KEYS; the
+ * per-key type checks are hand-written because they cannot be derived.
+ */
+function validateConvertOptions(raw: unknown): DoclingConvertOptions {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error('sourceConvertOptions must be an object, e.g. { "tableCellMatching": false }.');
+  }
+  const result: DoclingConvertOptions = {};
+  for (const [key, value] of Object.entries(raw)) {
+    switch (key) {
+      case 'tableCellMatching':
+        if (typeof value !== 'boolean') {
+          throw new Error('sourceConvertOptions.tableCellMatching must be a boolean.');
+        }
+        result.tableCellMatching = value;
+        break;
+      case 'doTableStructure':
+        if (typeof value !== 'boolean') {
+          throw new Error('sourceConvertOptions.doTableStructure must be a boolean.');
+        }
+        result.doTableStructure = value;
+        break;
+      case 'tableMode':
+        if (value !== 'fast' && value !== 'accurate') {
+          throw new Error('sourceConvertOptions.tableMode must be "fast" or "accurate".');
+        }
+        result.tableMode = value;
+        break;
+      case 'pdfBackend':
+        if (typeof value !== 'string') {
+          throw new Error('sourceConvertOptions.pdfBackend must be a string.');
+        }
+        result.pdfBackend = value;
+        break;
+      default:
+        throw new Error(`Unknown sourceConvertOptions key "${key}". Allowed keys: ${CONVERT_OPTION_KEYS.join(', ')}.`);
+    }
+  }
+  return result;
+}
+
+function findSource(sources: IndexSource[], query: string): IndexSource {
   const exact = sources.find(s => s.path === query);
   if (exact) return exact;
 

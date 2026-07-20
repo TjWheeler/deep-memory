@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- This is a dev tool rebuilt in place; never let the browser run a stale copy against fresh data. -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+<title>Deep Memory — Graph Viewer</title>
+
+<!-- Cytoscape.js + fcose force-directed layout (CDN; the only network dependency) -->
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/layout-base@2.0.1/layout-base.js"></script>
+<script src="https://unpkg.com/cose-base@2.2.0/cose-base.js"></script>
+<script src="https://unpkg.com/cytoscape-fcose@2.2.0/cytoscape-fcose.js"></script>
+
+<style>
+  :root {
+    --page: #0F1110;
+    --card: #1A1C1B;
+    --card-2: #202322;
+    --border: #2A2E2C;
+    --text: #F1F2F1;
+    --muted: #868A88;
+    --ember: #C47A1E;
+    --ember-soft: rgba(196, 122, 30, 0.18);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--page);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+
+  #app {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* ---------- Top bar ---------- */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  header .brand {
+    font-weight: 600;
+    font-size: 15px;
+    white-space: nowrap;
+  }
+  header .brand .dot { color: var(--ember); }
+  .mode-badge {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .mode-badge.live { color: #10b981; border-color: rgba(16,185,129,0.5); }
+  .mode-badge:empty { display: none; }
+
+  select, input, button {
+    font-family: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    outline: none;
+  }
+  select:focus, input:focus { border-color: var(--ember); }
+  select { min-width: 280px; cursor: pointer; }
+
+  button {
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  button:hover { border-color: var(--ember); }
+  button.primary { background: var(--ember-soft); border-color: var(--ember); }
+  button:disabled { opacity: 0.45; cursor: default; }
+
+  .counter {
+    margin-left: auto;
+    color: var(--muted);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .counter strong { color: var(--text); }
+
+  /* ---------- Search ---------- */
+  .search-wrap { position: relative; }
+  .search-wrap input { width: 240px; }
+  .search-results {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    width: 340px;
+    max-height: 380px;
+    overflow-y: auto;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+    z-index: 50;
+    display: none;
+  }
+  .search-results.open { display: block; }
+  .search-group-label {
+    padding: 8px 12px 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+  .search-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+  }
+  .search-item:hover { background: var(--card-2); }
+  .search-item .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .search-item .type { font-size: 11px; color: var(--muted); }
+  .search-item .act { font-size: 11px; color: var(--ember); white-space: nowrap; }
+  .search-empty { padding: 12px; color: var(--muted); }
+
+  /* ---------- Type summary bar ---------- */
+  .type-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    min-height: 0;
+  }
+  .type-bar:empty { display: none; }
+  .type-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .type-chip:hover { border-color: var(--ember); }
+  .type-chip .swatch { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .type-chip .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  /* ---------- Main split ---------- */
+  .main { display: flex; flex: 1; min-height: 0; }
+  /* The stage is position:relative; the canvas fills it absolutely so Cytoscape gets real dimensions. */
+  #cy { position: absolute; inset: 0; background: var(--page); }
+
+  /* ---------- Overlay states on canvas ---------- */
+  .overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    color: var(--muted);
+    text-align: center;
+    pointer-events: none;
+    padding: 24px;
+  }
+  .overlay .big { font-size: 16px; color: var(--text); }
+  .overlay.error .big { color: #f43f5e; }
+  .cy-stage { position: relative; flex: 1; min-width: 0; }
+
+  /* ---------- Detail / list panel ---------- */
+  .panel {
+    width: 340px;
+    flex-shrink: 0;
+    background: var(--card);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px;
+  }
+  .panel.empty-panel { color: var(--muted); }
+  .panel h2 {
+    margin: 0 0 2px;
+    font-size: 17px;
+    line-height: 1.3;
+    word-break: break-word;
+  }
+  .panel .type-line {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 12px;
+  }
+  .panel .type-line .swatch { width: 11px; height: 11px; border-radius: 50%; }
+  .panel .type-line .deg { margin-left: auto; }
+  .panel .summary {
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    margin-bottom: 14px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin: 14px 0 6px;
+  }
+  table.props { width: 100%; border-collapse: collapse; }
+  table.props td {
+    padding: 5px 6px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    word-break: break-word;
+  }
+  table.props td.k { color: var(--muted); width: 38%; }
+
+  .rel-row, .list-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .rel-row .rel-type { flex: 1; font-size: 13px; }
+  .rel-row .dir { font-size: 11px; color: var(--muted); }
+  .rel-row .cnt {
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--card-2);
+    border-radius: 999px;
+    padding: 1px 7px;
+    font-variant-numeric: tabular-nums;
+  }
+  .rel-row button, .list-row button { padding: 3px 9px; font-size: 11px; }
+
+  .list-row .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .list-row.on .label { color: var(--muted); }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .panel-head .close { margin-left: auto; padding: 2px 9px; }
+  .provenance { color: var(--muted); font-size: 11px; line-height: 1.6; }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
+  code.kbd { background: var(--card-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="brand">Deep Memory <span class="dot">●</span> Graph Viewer</span>
+    <span id="mode-badge" class="mode-badge" title="Data source"></span>
+    <select id="repo-select" aria-label="Repository">
+      <option value="">Select a repository…</option>
+    </select>
+    <div class="search-wrap">
+      <input id="search" type="text" placeholder="Search entities…" autocomplete="off" disabled />
+      <div id="search-results" class="search-results"></div>
+    </div>
+    <button id="reset-btn" disabled title="Reset to top hubs">Reset view</button>
+    <span class="counter" id="counter"></span>
+  </header>
+
+  <div class="type-bar" id="type-bar"></div>
+
+  <div class="main">
+    <div class="cy-stage">
+      <div id="cy"></div>
+      <div class="overlay" id="overlay">
+        <div class="big">Select a repository to begin</div>
+        <div>Pick a knowledge graph from the dropdown above to explore it.</div>
+      </div>
+    </div>
+    <div class="panel empty-panel" id="panel">
+      <div class="hint">
+        <p>Click a node to see its details and relationships.</p>
+        <p>The graph loads the top hubs first. Expand from any node, from the type bar, or via search — everything is already loaded in memory, so there are no further network calls.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- __DEEP_MEMORY_EMBED__ -->
+<!-- The self-contained HTML exporter (scripts/export-graph-html.mjs) replaces the marker line
+     above with an inline script tag that sets window.__DEEP_MEMORY_EMBED__. In live/static mode
+     it stays a no-op comment and the viewer fetches its data instead. -->
+<script>
+"use strict";
+
+// ----- The 12-colour palette, assigned deterministically per entity type -----
+const PALETTE = [
+  "#6366f1", "#22d3ee", "#f59e0b", "#10b981", "#f43f5e", "#a855f7",
+  "#3b82f6", "#ef4444", "#14b8a6", "#e879f9", "#84cc16", "#fb923c",
+];
+
+// The initial seed is a set of star-clusters: top hubs by degree, each surrounded by a few of
+// its neighbours. Hubs alone don't work — in a code graph the highest-degree entities are centres
+// of *disjoint* stars (they rarely link to one another), so seeding hubs only yields disconnected
+// dots that force-layout can do nothing but pack into a grid. Ego-expanding each hub gives every
+// hub real edges and a legible structure from the first render.
+const SEED_HUBS = 10;    // anchor hubs fetched / ranked for the initial seed
+const SEED_PER_HUB = 6;  // neighbours shown per hub in that seed
+
+// ----- App state -----
+const state = {
+  entities: new Map(),       // id -> entity (with degree)
+  relsById: new Map(),       // relationship id -> relationship
+  relsByEntity: new Map(),   // entity id -> relationship[]
+  manifest: null,
+  colorByType: new Map(),    // entityType -> colour
+  maxDegree: 1,
+  expanded: new Set(),       // ids whose neighbours have already been pulled in (re-click just selects)
+  mode: "static",            // "live" (Node server + DB) or "static" (pre-built data/ from .dkg)
+};
+
+let cy = null;
+const $ = (id) => document.getElementById(id);
+const enc = encodeURIComponent;
+
+// ===================================================================
+// Live-mode data helpers
+// In live mode the in-memory caches (state.entities / relsByEntity) start empty and GROW as the
+// user explores — every interaction fetches a slice from the server. In embed/static mode the
+// whole graph is already in memory, so these merge helpers simply never see new data.
+// ===================================================================
+async function api(path) {
+  const res = await fetch(path, { cache: "no-store" });
+  if (!res.ok) {
+    let detail = "HTTP " + res.status;
+    try { const b = await res.json(); if (b && b.error) detail += " — " + b.error; } catch { /* not JSON */ }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+/** Merge entity records into the cache, upgrading sparse hub records as richer detail arrives. */
+function ingestEntities(list) {
+  for (const e of list) {
+    const cur = state.entities.get(e.id);
+    if (cur) {
+      if (e.summary && !cur.summary) cur.summary = e.summary;
+      if (e.properties && Object.keys(e.properties).length && !(cur.properties && Object.keys(cur.properties).length)) cur.properties = e.properties;
+      if (typeof e.degree === "number" && e.degree > (cur.degree || 0)) cur.degree = e.degree;
+    } else {
+      state.entities.set(e.id, { properties: {}, degree: 0, ...e });
+    }
+    const d = state.entities.get(e.id).degree || 0;
+    if (d > state.maxDegree) state.maxDegree = d;
+  }
+}
+
+/** Merge an edge record into the cache (dedup by id; both endpoints must be known). */
+function ingestEdgeRecord(r) {
+  if (state.relsById.has(r.id)) return;
+  const rel = { id: r.id, type: r.type, source: r.source, target: r.target, bidirectional: !!r.bidirectional };
+  state.relsById.set(rel.id, rel);
+  pushRel(rel.source, rel);
+  if (rel.target !== rel.source) pushRel(rel.target, rel);
+}
+
+/** Assign a stable colour per entity type, ordered by count desc then name. */
+function assignColours(breakdown) {
+  const b = breakdown || {};
+  const types = Object.keys(b);
+  for (const e of state.entities.values()) if (!types.includes(e.entityType)) types.push(e.entityType);
+  types.sort((x, y) => ((b[y] || 0) - (b[x] || 0)) || x.localeCompare(y));
+  state.colorByType.clear();
+  types.forEach((t, i) => state.colorByType.set(t, PALETTE[i % PALETTE.length]));
+}
+
+// ===================================================================
+// Bootstrapping
+// ===================================================================
+async function init() {
+  await loadRepoIndex();
+  $("repo-select").addEventListener("change", (e) => onSelectRepository(e.target.value));
+  $("reset-btn").addEventListener("click", renderHubs);
+  wireSearch();
+}
+
+// Decide where data comes from:
+//   embed  — a self-contained exported file inlined its data as window.__DEEP_MEMORY_EMBED__ (no network).
+//   live   — the Node server answers /api/health.
+//   static — a plain file host (python http.server, npx serve) 404s /api/health → pre-built data/.
+async function detectMode() {
+  if (window.__DEEP_MEMORY_EMBED__) return "embed";
+  try {
+    const res = await fetch("api/health", { cache: "no-store" });
+    if (res.ok) {
+      const h = await res.json();
+      if (h && h.ok) return "live";
+    }
+  } catch { /* no server here — static it is */ }
+  return "static";
+}
+
+function setModeBadge() {
+  const badge = $("mode-badge");
+  badge.textContent = state.mode === "live" ? "live" : state.mode === "embed" ? "file" : "static";
+  badge.classList.toggle("live", state.mode === "live");
+  badge.title = state.mode === "live"
+    ? "Live — querying the configured storage provider"
+    : state.mode === "embed"
+      ? "Embedded — the graph is baked into this file; no server or database needed"
+      : "Static — pre-built data from exports/ (pnpm build:graph-viewer)";
+}
+
+/** Fetch the repository index for the current mode, normalised to { key, label, entityCount, relationshipCount }. */
+async function fetchRepoIndex() {
+  if (state.mode === "embed") {
+    const embed = window.__DEEP_MEMORY_EMBED__ || {};
+    return (embed.repos || []).map((r) => ({
+      key: r.repositoryId,
+      label: r.label,
+      entityCount: r.entityCount,
+      relationshipCount: r.relationshipCount,
+    }));
+  }
+  const url = state.mode === "live" ? "api/repositories" : "data/repositories.json";
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const repos = await res.json();
+  // In live mode the key is the repositoryId; in static mode it's the data filename.
+  return repos.map((r) => ({
+    key: state.mode === "live" ? r.repositoryId : r.file,
+    label: r.label,
+    entityCount: r.entityCount,
+    relationshipCount: r.relationshipCount,
+  }));
+}
+
+/** (Re)build the dropdown from a normalised repos array, preserving the current selection if it still exists. */
+function populateRepoSelect(repos) {
+  const select = $("repo-select");
+  const current = select.value;
+  select.innerHTML = '<option value="">Select a repository…</option>';
+  for (const r of repos) {
+    const opt = document.createElement("option");
+    opt.value = r.key;
+    opt.textContent = `${r.label} — ${r.entityCount} entities, ${r.relationshipCount} relationships`;
+    select.appendChild(opt);
+  }
+  if (current && repos.some((r) => r.key === current)) select.value = current;
+}
+
+/** Initial index load: detect mode, populate the dropdown, or show a friendly overlay if it can't be read. */
+async function loadRepoIndex() {
+  state.mode = await detectMode();
+  setModeBadge();
+  try {
+    const repos = await fetchRepoIndex();
+    populateRepoSelect(repos);
+    if (repos.length === 0) {
+      showOverlay(
+        "No repositories found",
+        state.mode === "live"
+          ? "The configured storage provider has no repositories yet."
+          : state.mode === "embed"
+            ? "This file has no graph data baked in."
+            : "Run `pnpm build:graph-viewer` to generate data from exports/.",
+        true,
+      );
+      return;
+    }
+    // A self-contained file with a single graph: show it immediately, no clicking required.
+    if (state.mode === "embed" && repos.length === 1) {
+      $("repo-select").value = repos[0].key;
+      await onSelectRepository(repos[0].key);
+    }
+  } catch (err) {
+    showOverlay(
+      "Could not load repository index",
+      state.mode === "live"
+        ? "The live server reached an error talking to storage. " + err.message
+        : "Serve this folder over HTTP (e.g. `npx serve graph-viewer`). " + err.message,
+      true,
+    );
+  }
+}
+
+// ===================================================================
+// Loading a repository
+// ===================================================================
+async function onSelectRepository(key) {
+  if (!key) {
+    teardown();
+    showOverlay("Select a repository to begin", "Pick a knowledge graph from the dropdown above to explore it.");
+    return;
+  }
+  showOverlay("Loading…", "");
+  // Embedded files carry the data inline — load straight from memory, no network at all.
+  if (state.mode === "embed") {
+    const embed = window.__DEEP_MEMORY_EMBED__ || {};
+    const data = (embed.graphs || {})[key];
+    if (!data) {
+      showOverlay("Failed to load repository", "This file doesn't contain that repository's data.", true);
+      return;
+    }
+    loadDataset(data);
+    return;
+  }
+  // Live mode seeds from the server's degree-ranked hubs, then loads on demand as you explore.
+  if (state.mode === "live") {
+    try {
+      await seedLive(key);
+    } catch (err) {
+      await handleLoadFailure(key, `api/repositories/${enc(key)}/hubs`, err);
+    }
+    return;
+  }
+  // Static mode: fetch the pre-built per-repo file and load it whole.
+  const url = "data/" + enc(key);
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    loadDataset(data);
+  } catch (err) {
+    await handleLoadFailure(key, url, err);
+  }
+}
+
+// A failed load often means the dropdown is stale — in static mode the viewer was rebuilt (or
+// exports changed) while this tab stayed open; in live mode the repository was deleted. Either
+// way, re-fetch the index to self-correct the dropdown, then give an actionable message.
+async function handleLoadFailure(key, url, err) {
+  let repos = null;
+  try {
+    repos = await fetchRepoIndex();
+    populateRepoSelect(repos);
+  } catch {
+    // Index itself is now unreadable — fall through to the raw error below.
+  }
+
+  if (repos && !repos.some((r) => r.key === key)) {
+    $("repo-select").value = "";
+    teardown();
+    showOverlay(
+      "That repository is no longer in the index",
+      state.mode === "live"
+        ? "The list was refreshed and this repository is gone (it may have been deleted). Pick another from the dropdown."
+        : "The list was refreshed (the viewer was likely rebuilt while this tab was open). Pick a repository from the dropdown again.",
+      true,
+    );
+    return;
+  }
+
+  if (/HTTP 404/.test(err.message)) {
+    showOverlay(
+      "Failed to load repository",
+      state.mode === "live"
+        ? `${url} returned 404 — the repository may have just been deleted. Try reselecting.`
+        : `${url} returned 404. The data is out of sync with the index — run \`pnpm build:graph-viewer\`, then hard-reload (Ctrl/Cmd+Shift+R).`,
+      true,
+    );
+    return;
+  }
+
+  showOverlay("Failed to load repository", `${url}: ${err.message}`, true);
+}
+
+function loadDataset(data) {
+  teardown();
+
+  state.manifest = data.manifest;
+  state.maxDegree = 1;
+  for (const e of data.entities) {
+    state.entities.set(e.id, e);
+    if (e.degree > state.maxDegree) state.maxDegree = e.degree;
+  }
+  for (const r of data.relationships) {
+    // Skip relationships whose endpoints are missing (orphans).
+    if (!state.entities.has(r.source) || !state.entities.has(r.target)) continue;
+    state.relsById.set(r.id, r);
+    pushRel(r.source, r);
+    if (r.target !== r.source) pushRel(r.target, r);
+  }
+
+  // Assign colours from the manifest type breakdown (count desc, then name) for stability.
+  assignColours((state.manifest.statistics && state.manifest.statistics.entityTypeBreakdown) || {});
+
+  buildCytoscape();
+
+  if (state.entities.size === 0) {
+    showOverlay("This repository has no entities", "");
+    $("search").disabled = true;
+    $("reset-btn").disabled = true;
+    renderTypeBar();
+    updateCounter();
+    return;
+  }
+
+  hideOverlay();
+  $("search").disabled = false;
+  $("reset-btn").disabled = false;
+  renderHubs();
+  setEmptyPanel();
+}
+
+// Live seed: fetch the degree-ranked hubs (+ edges among them + type counts) and render them.
+// The rest of the graph is pulled in on demand as the user explores.
+async function seedLive(repositoryId) {
+  teardown();
+  state.mode = "live";
+  state.repositoryId = repositoryId;
+
+  const hubs = await api(`api/repositories/${enc(repositoryId)}/hubs?limit=${SEED_HUBS}`);
+  state.manifest = { statistics: { entityCount: hubs.totalEntityCount, entityTypeBreakdown: hubs.entityTypeCounts } };
+  ingestEntities(hubs.entities);
+  assignColours(hubs.entityTypeCounts);
+  for (const e of hubs.edges) ingestEdgeRecord(e);
+
+  buildCytoscape();
+
+  if (state.entities.size === 0) {
+    showOverlay("This repository has no entities", "");
+    $("search").disabled = true;
+    $("reset-btn").disabled = true;
+    renderTypeBar();
+    updateCounter();
+    return;
+  }
+
+  // Ego-expand every hub so the seed renders as connected star-clusters rather than bare dots.
+  // (Fetched in parallel; SEED_PER_HUB caps the per-type fan-out so the seed stays light. Any
+  // failure just means that hub seeds without its spokes — not a fatal error.)
+  showOverlay("Building graph…", "");
+  const hubIds = hubs.entities.map((e) => e.id);
+  await Promise.all(hubIds.map((id) => fetchAndIngestNeighbours(id, SEED_PER_HUB).catch((err) => console.error("seed expand failed for", id, err))));
+
+  hideOverlay();
+  $("search").disabled = false;
+  $("reset-btn").disabled = false;
+  renderSeedFromHubs(hubIds);
+  setEmptyPanel();
+}
+
+// Live expansion: fetch one entity's neighbourhood and merge it into the caches. Edges are
+// synthesised center→neighbour and labelled by relationship type (the neighbourhood groups by type).
+async function fetchAndIngestNeighbours(id, limitPerType = 10) {
+  const data = await api(`api/repositories/${enc(state.repositoryId)}/explore/${enc(id)}?depth=1&limitPerType=${limitPerType}`);
+  for (const layer of data.layers || []) {
+    for (const [relType, group] of Object.entries(layer)) {
+      ingestEntities(group.entities);
+      for (const ne of group.entities) {
+        ingestEdgeRecord({ id: `${id}::${relType}::${ne.id}`, type: relType, source: id, target: ne.id });
+      }
+    }
+  }
+}
+
+function pushRel(entityId, rel) {
+  let arr = state.relsByEntity.get(entityId);
+  if (!arr) { arr = []; state.relsByEntity.set(entityId, arr); }
+  arr.push(rel);
+}
+
+function teardown() {
+  state.entities.clear();
+  state.relsById.clear();
+  state.relsByEntity.clear();
+  state.colorByType.clear();
+  state.expanded.clear();
+  state.manifest = null;
+  state.maxDegree = 1;
+  if (cy) { cy.destroy(); cy = null; }
+  $("type-bar").innerHTML = "";
+  $("counter").textContent = "";
+  closeSearch();
+}
+
+// ===================================================================
+// Cytoscape setup & rendering
+// ===================================================================
+function nodeSize(degree) {
+  // sqrt scaling between 22 and 70 px so high-degree hubs stand out without dwarfing the rest.
+  const t = Math.sqrt(degree) / Math.sqrt(state.maxDegree || 1);
+  return 22 + t * 48;
+}
+
+// Label size tracks degree (9..16px) so hub labels read as primary and, via min-zoomed-font-size,
+// clear sooner when zoomed out — thinning satellite-label clutter without hiding anything outright.
+function labelFontSize(degree) {
+  const t = Math.sqrt(degree) / Math.sqrt(state.maxDegree || 1);
+  return Math.round(9 + t * 7);
+}
+
+function buildCytoscape() {
+  cy = cytoscape({
+    container: $("cy"),
+    minZoom: 0.1,
+    maxZoom: 3,
+    style: [
+      {
+        selector: "node",
+        style: {
+          "background-color": (n) => state.colorByType.get(n.data("entityType")) || "#888",
+          "width": (n) => nodeSize(n.data("degree")),
+          "height": (n) => nodeSize(n.data("degree")),
+          "label": "data(label)",
+          "color": "#F1F2F1",
+          "font-size": (n) => labelFontSize(n.data("degree")),
+          "font-weight": (n) => (nodeSize(n.data("degree")) >= 40 ? 600 : 400),
+          "text-valign": "bottom",
+          "text-halign": "center",
+          "text-margin-y": 4,
+          "text-max-width": 140,
+          "text-wrap": "ellipsis",
+          // A page-coloured outline lifts each label off the canvas, the edges and neighbouring
+          // labels so they stay readable in dense star-clusters.
+          "text-outline-width": 2.5,
+          "text-outline-color": "#0F1110",
+          "text-outline-opacity": 1,
+          "min-zoomed-font-size": 10,
+          "border-width": 0,
+          "transition-property": "border-width, border-color",
+          "transition-duration": "0.1s",
+        },
+      },
+      {
+        selector: "node.selected",
+        style: { "border-width": 3, "border-color": "#F1F2F1" },
+      },
+      {
+        selector: "node.dim",
+        style: { "opacity": 0.25 },
+      },
+      {
+        selector: "edge",
+        style: {
+          "width": 1.2,
+          "line-color": "#333836",
+          "opacity": 0.55,
+          "target-arrow-color": "#333836",
+          "target-arrow-shape": (e) => (e.data("bidirectional") ? "none" : "triangle"),
+          "arrow-scale": 0.85,
+          "curve-style": "bezier",
+        },
+      },
+      {
+        // Edge type labels are heavy clutter when every edge carries one, so they're off by default
+        // and revealed only for the selected node's own edges (set in highlight()).
+        selector: "edge.hl",
+        style: {
+          "line-color": "#C47A1E",
+          "target-arrow-color": "#C47A1E",
+          "opacity": 1,
+          "width": 2,
+          "label": "data(type)",
+          "font-size": 9,
+          "color": "#F1F2F1",
+          "text-outline-width": 2.5,
+          "text-outline-color": "#0F1110",
+          "text-rotation": "autorotate",
+          "min-zoomed-font-size": 9,
+          "z-index": 20,
+        },
+      },
+      {
+        selector: "edge.dim",
+        style: { "opacity": 0.1 },
+      },
+    ],
+  });
+
+  cy.on("tap", "node", (evt) => onNodeTap(evt.target.id()));
+  cy.on("tap", (evt) => { if (evt.target === cy) clearHighlight(); });
+  window.cy = cy; // expose for console debugging of this dev tool
+}
+
+/** Add a batch of entity ids as nodes (dedup by id), then reconcile edges. */
+function addNodes(ids) {
+  const toAdd = [];
+  for (const id of ids) {
+    if (!id || cy.getElementById(id).nonempty()) continue;
+    const e = state.entities.get(id);
+    if (!e) continue;
+    toAdd.push({
+      group: "nodes",
+      data: { id: e.id, label: e.label, entityType: e.entityType, degree: e.degree },
+    });
+  }
+  if (toAdd.length) cy.add(toAdd);
+  return toAdd.length;
+}
+
+/** Add any relationship whose endpoints are both present and that isn't on the canvas yet. */
+function syncEdges() {
+  const toAdd = [];
+  for (const [id, r] of state.relsById) {
+    if (cy.getElementById(id).nonempty()) continue;
+    if (cy.getElementById(r.source).empty() || cy.getElementById(r.target).empty()) continue;
+    toAdd.push({
+      group: "edges",
+      data: { id: r.id, source: r.source, target: r.target, type: r.type, bidirectional: r.bidirectional },
+    });
+  }
+  if (toAdd.length) cy.add(toAdd);
+}
+
+// randomize:true gives a clean force-directed spread for a fresh render; randomize:false
+// keeps already-placed nodes stable while new ones settle in during incremental expansion.
+function runLayout({ animate = true, randomize = false } = {}) {
+  cy.layout({
+    name: "fcose",
+    animate,
+    animationDuration: 500,
+    randomize,
+    fit: true,
+    padding: 50,
+    // Tuned for star-clusters: strong repulsion + generous separation fan each hub's spokes out so
+    // labels don't collide, and packComponents tiles the (genuinely disconnected) clusters tidily
+    // instead of leaving them to drift or overlap.
+    nodeRepulsion: 14000,
+    idealEdgeLength: 90,
+    nodeSeparation: 130,
+    gravity: 0.15,
+    gravityCompound: 1.0,
+    gravityRangeCompound: 1.5,
+    packComponents: true,
+    numIter: 2500,
+    quality: "proof",
+  }).run();
+}
+
+// Build a connected seed id-set: the anchor hubs plus, for each, its top `perHub` neighbours
+// (highest-degree first). Reads only the in-memory caches, so it works for both the live ego-fetch
+// (relsByEntity populated by seedLive) and embed/static (whole graph already in memory).
+function egoSeedIds(hubIds, perHub) {
+  const ids = new Set(hubIds);
+  for (const hid of hubIds) {
+    const seen = new Set();
+    const nbs = [];
+    for (const r of state.relsByEntity.get(hid) || []) {
+      const nb = r.source === hid ? r.target : r.source;
+      if (nb === hid || seen.has(nb)) continue;
+      seen.add(nb);
+      nbs.push(nb);
+    }
+    nbs.sort((a, b) => (state.entities.get(b)?.degree || 0) - (state.entities.get(a)?.degree || 0));
+    for (const nb of nbs.slice(0, perHub)) ids.add(nb);
+  }
+  return [...ids];
+}
+
+// Render the initial/reset view from a set of anchor hubs. Hubs are NOT marked expanded, so a
+// later tap still fetches (live) or pulls in (static) the hub's full neighbourhood and blooms it.
+function renderSeedFromHubs(hubIds) {
+  if (!cy) return;
+  state.expanded.clear();
+  cy.elements().remove();
+  addNodes(egoSeedIds(hubIds, SEED_PER_HUB));
+  syncEdges();
+  runLayout({ animate: false, randomize: true });
+  clearHighlight();
+  renderTypeBar();
+  updateCounter();
+}
+
+async function renderHubs() {
+  // Live mode re-seeds from the server (fresh hubs + ego-expansion); embed/static derive the
+  // anchor hubs from the in-memory set and ego-expand them locally.
+  if (state.mode === "live") {
+    if (state.repositoryId) await seedLive(state.repositoryId);
+    return;
+  }
+  if (!cy) return;
+  const hubIds = [...state.entities.values()]
+    .sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label))
+    .slice(0, SEED_HUBS)
+    .map((e) => e.id);
+  renderSeedFromHubs(hubIds);
+}
+
+// ===================================================================
+// Expansion
+// ===================================================================
+/** Add all neighbours of an entity (optionally filtered to one relationship type). */
+function expandNeighbours(id, onlyType) {
+  const rels = state.relsByEntity.get(id) || [];
+  const neighbourIds = [];
+  for (const r of rels) {
+    if (onlyType && r.type !== onlyType) continue;
+    neighbourIds.push(r.source === id ? r.target : r.source);
+  }
+  const added = addNodes(neighbourIds);
+  syncEdges();
+  if (added > 0) runLayout({ animate: true });
+  renderTypeBar();
+  updateCounter();
+  return added;
+}
+
+// ===================================================================
+// Selection, highlight & detail panel
+// ===================================================================
+// Clicking a node on the canvas expands its neighbourhood the first time, then just selects it.
+// In live mode the first expansion fetches the neighbourhood from the server.
+async function onNodeTap(id) {
+  if (!state.expanded.has(id)) {
+    state.expanded.add(id);
+    if (state.mode === "live") {
+      setExpanding(true);
+      try { await fetchAndIngestNeighbours(id); }
+      catch (err) { console.error("Failed to expand node:", err); }
+      finally { setExpanding(false); }
+    }
+    expandNeighbours(id);
+  }
+  highlight(id);
+  showDetail(id);
+}
+
+// Lightweight busy indicator on the canvas while a live fetch is in flight.
+function setExpanding(on) {
+  document.body.style.cursor = on ? "progress" : "";
+}
+
+// Bring a node onto the canvas (if absent) and select it — used by search and the type list.
+// Does not auto-expand neighbours; that is reserved for an explicit node tap.
+function selectNode(id) {
+  const node = cy.getElementById(id);
+  if (node.empty()) {
+    addNodes([id]);
+    syncEdges();
+    runLayout({ animate: true });
+  }
+  highlight(id);
+  showDetail(id);
+}
+
+function highlight(id) {
+  cy.batch(() => {
+    cy.elements().removeClass("selected dim hl");
+    const node = cy.getElementById(id);
+    if (node.empty()) return;
+    const neighborhood = node.closedNeighborhood();
+    cy.elements().not(neighborhood).addClass("dim");
+    node.connectedEdges().addClass("hl"); // reveal this node's relationship-type labels
+    node.addClass("selected");
+  });
+}
+
+function clearHighlight() {
+  if (!cy) return;
+  cy.elements().removeClass("selected dim hl");
+  setEmptyPanel();
+}
+
+function colorDot(type) {
+  const c = state.colorByType.get(type) || "#888";
+  return `<span class="swatch" style="background:${c}"></span>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+function formatValue(v) {
+  if (v === null || v === undefined) return "<em style='color:var(--muted)'>—</em>";
+  if (typeof v === "object") return escapeHtml(JSON.stringify(v));
+  return escapeHtml(String(v));
+}
+
+async function showDetail(id) {
+  const e = state.entities.get(id);
+  const panel = $("panel");
+  panel.classList.remove("empty-panel");
+  if (!e) { setEmptyPanel(); return; }
+
+  // Live mode: hub/explore records are sparse — fetch full properties/summary once on selection.
+  if (state.mode === "live" && !e._detailLoaded) {
+    try {
+      const d = await api(`api/repositories/${enc(state.repositoryId)}/entity/${enc(id)}`);
+      if (d) { e.summary = d.summary; e.properties = d.properties || {}; e.provenance = d.provenance; e.slug = d.slug; e._detailLoaded = true; }
+    } catch { /* render with whatever we already have */ }
+  }
+
+  // Group this entity's relationships by type + direction.
+  const rels = state.relsByEntity.get(id) || [];
+  const groups = new Map(); // key -> { type, dir, count, neighbourIds }
+  for (const r of rels) {
+    const dir = r.source === id ? "out" : "in";
+    const arrow = r.bidirectional ? "both" : dir;
+    const key = r.type + "|" + arrow;
+    let g = groups.get(key);
+    if (!g) { g = { type: r.type, dir: arrow, count: 0, neighbourIds: [] }; groups.set(key, g); }
+    g.count++;
+    g.neighbourIds.push(r.source === id ? r.target : r.source);
+  }
+
+  const propRows = Object.entries(e.properties || {})
+    .map(([k, v]) => `<tr><td class="k">${escapeHtml(k)}</td><td>${formatValue(v)}</td></tr>`)
+    .join("");
+
+  const dirLabel = { out: "→", in: "←", both: "↔" };
+  const relRows = [...groups.values()]
+    .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type))
+    .map((g) => {
+      const allShown = g.neighbourIds.every((nid) => cy.getElementById(nid).nonempty());
+      return `<div class="rel-row">
+        <span class="dir">${dirLabel[g.dir]}</span>
+        <span class="rel-type">${escapeHtml(g.type)}</span>
+        <span class="cnt">${g.count}</span>
+        <button data-expand-type="${escapeHtml(g.type)}" ${allShown ? "disabled" : ""}>${allShown ? "Shown" : "Expand"}</button>
+      </div>`;
+    }).join("");
+
+  const prov = e.provenance || {};
+  const provHtml = prov.createdAt
+    ? `<div class="section-title">Provenance</div>
+       <div class="provenance">
+         Created by ${escapeHtml(prov.createdBy || "?")} (${escapeHtml(prov.createdByType || "?")})<br/>
+         ${escapeHtml(prov.createdAt)}<br/>
+         Modified ${escapeHtml(prov.modifiedAt || prov.createdAt)}
+       </div>` : "";
+
+  panel.innerHTML = `
+    <h2>${escapeHtml(e.label)}</h2>
+    <div class="type-line">
+      ${colorDot(e.entityType)} <span>${escapeHtml(e.entityType)}</span>
+      ${e.degree ? `<span class="deg">degree ${e.degree}</span>` : ""}
+    </div>
+    ${e.summary ? `<div class="summary">${escapeHtml(e.summary)}</div>` : ""}
+    <div class="section-title">Properties</div>
+    ${propRows ? `<table class="props">${propRows}</table>` : `<div class="hint">No properties.</div>`}
+    <div class="section-title">Relationships (${rels.length})</div>
+    ${relRows || `<div class="hint">No relationships.</div>`}
+    ${provHtml}
+  `;
+
+  panel.querySelectorAll("button[data-expand-type]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      expandNeighbours(id, btn.getAttribute("data-expand-type"));
+      highlight(id);
+      showDetail(id); // refresh "Expand"/"Shown" states
+    });
+  });
+}
+
+function setEmptyPanel() {
+  const panel = $("panel");
+  panel.classList.add("empty-panel");
+  panel.innerHTML = `<div class="hint">
+    <p>Click a node to see its details and relationships.</p>
+    <p>The graph starts with the most-connected entities. Click any node to pull in its neighbours, or use search and the type bar to bring in more.</p>
+  </div>`;
+}
+
+// ===================================================================
+// Type summary bar
+// ===================================================================
+function shownCountByType() {
+  const counts = new Map();
+  if (!cy) return counts;
+  cy.nodes().forEach((n) => {
+    const t = n.data("entityType");
+    counts.set(t, (counts.get(t) || 0) + 1);
+  });
+  return counts;
+}
+
+function renderTypeBar() {
+  const bar = $("type-bar");
+  bar.innerHTML = "";
+  const breakdown = (state.manifest && state.manifest.statistics && state.manifest.statistics.entityTypeBreakdown) || {};
+  const shown = shownCountByType();
+  const types = [...state.colorByType.keys()];
+  for (const t of types) {
+    const total = breakdown[t] != null ? breakdown[t] : [...state.entities.values()].filter((e) => e.entityType === t).length;
+    const chip = document.createElement("button");
+    chip.className = "type-chip";
+    chip.innerHTML = `<span class="swatch" style="background:${state.colorByType.get(t)}"></span>
+      <span>${escapeHtml(t)}</span>
+      <span class="count">${shown.get(t) || 0} / ${total}</span>`;
+    chip.title = `Show hidden ${t} entities`;
+    chip.addEventListener("click", () => showTypeList(t));
+    bar.appendChild(chip);
+  }
+}
+
+async function showTypeList(type, append = false) {
+  const panel = $("panel");
+  panel.classList.remove("empty-panel");
+
+  // Live mode: the full set isn't in memory — page entities of this type from the server.
+  if (state.mode === "live") {
+    await showTypeListLive(type, append);
+    return;
+  }
+
+  const hidden = [...state.entities.values()]
+    .filter((e) => e.entityType === type && cy.getElementById(e.id).empty())
+    .sort((a, b) => b.degree - a.degree || a.label.localeCompare(b.label));
+
+  const rows = hidden.map((e) => `
+    <div class="list-row" data-id="${e.id}">
+      <span class="label" title="${escapeHtml(e.label)}">${escapeHtml(e.label)}</span>
+      <span class="cnt">${e.degree}</span>
+      <button data-add="${e.id}">Add</button>
+    </div>`).join("");
+
+  panel.innerHTML = `
+    <div class="panel-head">
+      ${colorDot(type)} <strong>${escapeHtml(type)}</strong>
+      <button class="close">Close</button>
+    </div>
+    <div class="hint">${hidden.length} not shown of ${[...state.entities.values()].filter((e) => e.entityType === type).length} total.</div>
+    ${hidden.length ? `<div style="margin:10px 0"><button class="primary" id="add-all">Add all (${hidden.length})</button></div>` : ""}
+    ${rows || `<div class="hint" style="margin-top:10px">All ${escapeHtml(type)} entities are on the canvas.</div>`}
+  `;
+
+  panel.querySelector(".close").addEventListener("click", setEmptyPanel);
+  panel.querySelectorAll("button[data-add]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-add");
+      addNodes([id]); syncEdges(); runLayout({ animate: true });
+      selectNode(id);
+    });
+  });
+  const addAll = panel.querySelector("#add-all");
+  if (addAll) addAll.addEventListener("click", () => {
+    addNodes(hidden.map((e) => e.id)); syncEdges(); runLayout({ animate: true });
+    renderTypeBar(); updateCounter();
+    showTypeList(type);
+  });
+}
+
+// Live type drill-down: page entities of a type from the server, accumulating across "Load more".
+async function showTypeListLive(type, append) {
+  const panel = $("panel");
+  if (!append || !state.typeList || state.typeList.type !== type) {
+    state.typeList = { type, offset: 0, items: [], total: 0, hasMore: false };
+  }
+  const tl = state.typeList;
+  if (!append) panel.innerHTML = `<div class="hint">Loading ${escapeHtml(type)}…</div>`;
+  let data;
+  try {
+    data = await api(`api/repositories/${enc(state.repositoryId)}/entities?type=${enc(type)}&limit=50&offset=${tl.offset}`);
+  } catch (err) {
+    panel.innerHTML = `<div class="hint">Failed to load ${escapeHtml(type)}: ${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  ingestEntities(data.items);
+  tl.items.push(...data.items);
+  tl.offset += data.items.length;
+  tl.total = data.total;
+  tl.hasMore = data.hasMore;
+  renderTypeListLive(tl);
+}
+
+function renderTypeListLive(tl) {
+  const panel = $("panel");
+  const type = tl.type;
+  const notShown = tl.items.filter((e) => cy.getElementById(e.id).empty());
+  const rows = notShown.map((e) => `
+    <div class="list-row" data-id="${e.id}">
+      <span class="label" title="${escapeHtml(e.label)}">${escapeHtml(e.label)}</span>
+      <button data-add="${e.id}">Add</button>
+    </div>`).join("");
+
+  panel.innerHTML = `
+    <div class="panel-head">
+      ${colorDot(type)} <strong>${escapeHtml(type)}</strong>
+      <button class="close">Close</button>
+    </div>
+    <div class="hint">${tl.items.length} loaded of ${tl.total} total.</div>
+    ${notShown.length ? `<div style="margin:10px 0"><button class="primary" id="add-all">Add all loaded (${notShown.length})</button></div>` : ""}
+    ${rows || `<div class="hint" style="margin-top:10px">All loaded ${escapeHtml(type)} entities are on the canvas.</div>`}
+    ${tl.hasMore ? `<div style="margin-top:8px"><button id="load-more">Load more</button></div>` : ""}
+  `;
+
+  panel.querySelector(".close").addEventListener("click", setEmptyPanel);
+  panel.querySelectorAll("button[data-add]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-add");
+      addNodes([id]); syncEdges(); runLayout({ animate: true });
+      selectNode(id);
+    });
+  });
+  const addAll = panel.querySelector("#add-all");
+  if (addAll) addAll.addEventListener("click", () => {
+    addNodes(notShown.map((e) => e.id)); syncEdges(); runLayout({ animate: true });
+    renderTypeBar(); updateCounter();
+    renderTypeListLive(tl);
+  });
+  const loadMore = panel.querySelector("#load-more");
+  if (loadMore) loadMore.addEventListener("click", () => showTypeList(type, true));
+}
+
+// ===================================================================
+// Counter
+// ===================================================================
+function updateCounter() {
+  const total = (state.manifest && state.manifest.statistics && state.manifest.statistics.entityCount) || state.entities.size;
+  const shown = cy ? cy.nodes().length : 0;
+  $("counter").innerHTML = `Showing <strong>${shown}</strong> of <strong>${total}</strong> entities`;
+}
+
+// ===================================================================
+// Search (debounced)
+// ===================================================================
+function wireSearch() {
+  const input = $("search");
+  let timer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => runSearch(input.value.trim()), 300);
+  });
+  input.addEventListener("focus", () => { if (input.value.trim()) runSearch(input.value.trim()); });
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".search-wrap")) closeSearch();
+  });
+}
+
+async function runSearch(q) {
+  const box = $("search-results");
+  if (!q || !cy) { closeSearch(); return; }
+
+  let matches;
+  if (state.mode === "live") {
+    // Server-side label search — the full set isn't in memory.
+    try {
+      const data = await api(`api/repositories/${enc(state.repositoryId)}/entities?search=${enc(q)}&limit=40`);
+      ingestEntities(data.items);
+      matches = data.items.map((e) => state.entities.get(e.id));
+    } catch (err) {
+      box.innerHTML = `<div class="search-empty">Search failed: ${escapeHtml(err.message)}</div>`;
+      box.classList.add("open");
+      return;
+    }
+  } else {
+    const needle = q.toLowerCase();
+    matches = [...state.entities.values()].filter((e) => {
+      if (e.label && e.label.toLowerCase().includes(needle)) return true;
+      if (e.summary && e.summary.toLowerCase().includes(needle)) return true;
+      return false;
+    }).sort((a, b) => b.degree - a.degree).slice(0, 40);
+  }
+
+  if (matches.length === 0) {
+    box.innerHTML = `<div class="search-empty">No matches for “${escapeHtml(q)}”.</div>`;
+    box.classList.add("open");
+    return;
+  }
+
+  const inView = matches.filter((e) => cy.getElementById(e.id).nonempty());
+  const notInView = matches.filter((e) => cy.getElementById(e.id).empty());
+
+  const renderItem = (e, action) => `
+    <div class="search-item" data-id="${e.id}" data-action="${action}">
+      ${colorDot(e.entityType)}
+      <span class="label" title="${escapeHtml(e.label)}">${escapeHtml(e.label)}</span>
+      <span class="type">${escapeHtml(e.entityType)}</span>
+      <span class="act">${action === "focus" ? "Focus" : "Add"}</span>
+    </div>`;
+
+  let html = "";
+  if (inView.length) html += `<div class="search-group-label">In view — focus</div>` + inView.map((e) => renderItem(e, "focus")).join("");
+  if (notInView.length) html += `<div class="search-group-label">Not in view — add</div>` + notInView.map((e) => renderItem(e, "add")).join("");
+  box.innerHTML = html;
+  box.classList.add("open");
+
+  box.querySelectorAll(".search-item").forEach((item) => {
+    item.addEventListener("click", () => {
+      const id = item.getAttribute("data-id");
+      if (item.getAttribute("data-action") === "add") {
+        addNodes([id]); syncEdges(); runLayout({ animate: true });
+      }
+      const node = cy.getElementById(id);
+      if (node.nonempty()) cy.animate({ center: { eles: node }, zoom: Math.max(cy.zoom(), 1) }, { duration: 350 });
+      selectNode(id);
+      closeSearch();
+    });
+  });
+}
+
+function closeSearch() {
+  const box = $("search-results");
+  if (box) { box.classList.remove("open"); box.innerHTML = ""; }
+}
+
+// ===================================================================
+// Overlay (empty / loading / error) states
+// ===================================================================
+function showOverlay(big, sub, isError = false) {
+  const o = $("overlay");
+  o.classList.toggle("error", isError);
+  o.innerHTML = `<div class="big">${escapeHtml(big)}</div>` + (sub ? `<div>${escapeHtml(sub)}</div>` : "");
+  o.style.display = "flex";
+}
+function hideOverlay() { $("overlay").style.display = "none"; }
+
+// Go.
+init();
+</script>
+</body>
+</html>

@@ -1,5 +1,23 @@
 # @utaba/deep-memory-storage-sqlserver
 
+## 0.21.1
+
+### Patch Changes
+
+- @utaba/deep-memory@0.21.1
+
+## 0.21.0
+
+### Patch Changes
+
+- @utaba/deep-memory@0.21.0
+
+## 0.20.1
+
+### Patch Changes
+
+- @utaba/deep-memory@0.20.1
+
 ## 0.20.0
 
 ### Minor Changes

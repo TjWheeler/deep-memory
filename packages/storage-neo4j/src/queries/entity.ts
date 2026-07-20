@@ -524,6 +524,33 @@ export function buildFindEntitiesWhere(
   return { cypherWhere, params };
 }
 
+// Lucene classic-query metacharacters, per `QueryParserBase.escape` in the
+// Lucene the fulltext index is built on. `db.index.fulltext.queryNodes` parses
+// `$term` as a query expression, not a literal — so any of these characters in
+// caller-supplied search text (`[`, `:`, `"`, `(`, `&`, …) is interpreted as
+// query syntax and throws `ParseException` on a malformed expression. The
+// backslash is included in the class so it is escaped before it can pair with a
+// following character. Ordering is irrelevant: a single char-class pass
+// prepends exactly one backslash to each matched character, literal backslashes
+// included.
+const LUCENE_SPECIAL_CHARS = /[+\-&|!(){}\[\]^"~*?:\\/]/g;
+
+/**
+ * Escape Lucene classic-query metacharacters so a caller's search string is
+ * matched as literal terms rather than parsed as a query expression. Escaping
+ * (not stripping) preserves every word, so relevance is unaffected — only the
+ * reserved characters lose their syntactic meaning.
+ *
+ * This lives in the provider because Lucene-query escaping is knowledge
+ * specific to the Neo4j fulltext backend: no caller of the storage surface
+ * should have to know that `findEntities` routes through a Lucene index. The
+ * Cosmos provider's substring search has no equivalent parse step and needs no
+ * escaping.
+ */
+export function escapeLuceneQuery(searchTerm: string): string {
+  return searchTerm.replace(LUCENE_SPECIAL_CHARS, '\\$&');
+}
+
 /**
  * Find entities matching a `StorageFindQuery`. Returns one page plus an exact
  * total via a `Promise.all([data, count])` round-trip pair — the parallel
@@ -590,7 +617,7 @@ export async function findEntities(
       `CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node ` +
       `${combinedWhere} ` +
       `RETURN count(node) AS total`;
-    const termParam = { term: query.searchTerm };
+    const termParam = { term: escapeLuceneQuery(query.searchTerm) };
     const [dataResult, count] = await Promise.all([
       conn.executeQuery(
         dataCypher,

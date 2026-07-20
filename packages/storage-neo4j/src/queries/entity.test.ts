@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ProviderError } from '@utaba/deep-memory';
-import { buildFindEntitiesWhere } from './entity.js';
+import { buildFindEntitiesWhere, escapeLuceneQuery } from './entity.js';
 
 describe('buildFindEntitiesWhere', () => {
   it('returns an empty WHERE fragment when only the repository predicate is requested with no filters', () => {
@@ -142,5 +142,42 @@ describe('buildFindEntitiesWhere', () => {
     expect(result.cypherWhere).toContain('node.entityType');
     expect(result.cypherWhere).toContain('node.city = $prop0');
     expect(result.cypherWhere).toContain('node.createdBy IN');
+  });
+});
+
+describe('escapeLuceneQuery', () => {
+  // Guards the fulltext branch of findEntities against the class of caller text
+  // that made `db.index.fulltext.queryNodes` throw ParseException: unbalanced
+  // range brackets, stray quotes, colons, and boolean-operator characters bound
+  // verbatim as a Lucene query.
+  it('escapes an unbalanced range bracket that would open a Lucene range query', () => {
+    expect(escapeLuceneQuery('ai-services [Services]')).toBe('ai\\-services \\[Services\\]');
+  });
+
+  it('escapes every reserved metacharacter in the classic-query set', () => {
+    const reserved = '+-&|!(){}[]^"~*?:\\/';
+    const escaped = escapeLuceneQuery(reserved);
+    // Each reserved character is preceded by exactly one backslash.
+    expect(escaped).toBe('\\+\\-\\&\\|\\!\\(\\)\\{\\}\\[\\]\\^\\"\\~\\*\\?\\:\\\\\\/');
+  });
+
+  it('escapes a bare backslash so it cannot pair with a following character', () => {
+    expect(escapeLuceneQuery('a\\b')).toBe('a\\\\b');
+  });
+
+  it('preserves plain words and whitespace untouched so relevance is unaffected', () => {
+    expect(escapeLuceneQuery('morning brief agenda')).toBe('morning brief agenda');
+  });
+
+  it('leaves unicode and emoji terms intact', () => {
+    expect(escapeLuceneQuery('café 日本語 🚀')).toBe('café 日本語 🚀');
+  });
+
+  it('escapes the individual & and | that form && and || operators', () => {
+    expect(escapeLuceneQuery('a && b || c')).toBe('a \\&\\& b \\|\\| c');
+  });
+
+  it('returns an empty string unchanged', () => {
+    expect(escapeLuceneQuery('')).toBe('');
   });
 });

@@ -159,6 +159,63 @@ export function augmentVocabularyFromData(
   };
 }
 
+/**
+ * Extract, per entity type, the flat set of controlled values declared in that
+ * type's naming guides — both the closed-enum `**Allowed `x` values:**` grids
+ * and the open `**Recommended `x` values:**` grids. Values are returned verbatim
+ * (backticks stripped); the caller normalizes for comparison.
+ *
+ * This is intentionally broader than {@link parseVocabularyMarkdown}, which only
+ * lifts closed-enum allowed values into `enumValues` and deliberately leaves the
+ * open recommended lists out. Review diagnostics need the open lists too, to
+ * detect an extractor that instantiated a naming guide as entities.
+ */
+export function extractControlledValuesByEntityType(markdown: string): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+
+  const entityTypesMatch = markdown.match(/^## Entity Types\s*$/m);
+  if (!entityTypesMatch || entityTypesMatch.index === undefined) return result;
+
+  const afterStart = entityTypesMatch.index + entityTypesMatch[0].length;
+  const nextH2Match = markdown.slice(afterStart).match(/^## [^#]/m);
+  const end = nextH2Match?.index !== undefined ? afterStart + nextH2Match.index : markdown.length;
+  const content = markdown.slice(entityTypesMatch.index, end);
+
+  const h3Pattern = /^### (.+)$/gm;
+  const h3Matches: Array<{ name: string; index: number }> = [];
+  let h3Match: RegExpExecArray | null;
+  while ((h3Match = h3Pattern.exec(content)) !== null) {
+    h3Matches.push({ name: h3Match[1]!.trim(), index: h3Match.index });
+  }
+
+  for (let i = 0; i < h3Matches.length; i++) {
+    const current = h3Matches[i]!;
+    const nextStart = i + 1 < h3Matches.length ? h3Matches[i + 1]!.index : content.length;
+    const section = content.slice(current.index, nextStart);
+
+    const values = new Set<string>();
+    // Match "**Allowed `x` values:**" and "**Recommended `x` values:**",
+    // including qualified variants like "Recommended `x` values for signs:".
+    const labelPattern = /^\*\*(?:Allowed|Recommended) `[^`]+` values[^\n]*?:\*\*/gm;
+    let labelMatch: RegExpExecArray | null;
+    while ((labelMatch = labelPattern.exec(section)) !== null) {
+      const afterLabel = section.slice(labelMatch.index + labelMatch[0].length);
+      for (const row of extractTableRows(afterLabel)) {
+        const first = row[0];
+        if (first === undefined) continue;
+        const value = stripBackticks(first);
+        if (value.length > 0) values.add(value);
+      }
+    }
+
+    if (values.size > 0) {
+      result[current.name] = [...values];
+    }
+  }
+
+  return result;
+}
+
 // ── Entity Type Parsing ──────────────────────────────────────────
 
 function parseEntityTypes(markdown: string, now: string): EntityTypeDefinition[] {
@@ -326,16 +383,59 @@ function parsePropertyTable(sectionContent: string): PropertySchema[] {
     const typeStr = row[1]!.toLowerCase().trim();
     const requiredStr = row[2]!.toLowerCase().trim();
     const description = row[3]!;
+    const type = mapPropertyType(typeStr);
 
-    properties.push({
+    const property: PropertySchema = {
       name,
-      type: mapPropertyType(typeStr),
+      type,
       required: requiredStr === 'yes',
       description: description || undefined,
-    });
+    };
+
+    // A closed enum declares its allowed set in a labelled "Allowed values"
+    // table alongside the property table. Populate enumValues from it so the
+    // closed set survives parsing and can be enforced. An open naming guide
+    // uses a "Recommended values" table instead and is deliberately not matched
+    // here, leaving such properties as open strings with no enumValues.
+    if (type === 'enum') {
+      const enumValues = extractAllowedEnumValues(sectionContent, name);
+      if (enumValues.length > 0) {
+        property.enumValues = enumValues;
+      }
+    }
+
+    properties.push(property);
   }
 
   return properties;
+}
+
+/**
+ * Extract the allowed value set for a closed-enum property from the labelled
+ * table `**Allowed \`<propName>\` values:**` that follows the property table.
+ *
+ * The table mirrors the open "Recommended values" tables (a `| Value |
+ * Description |` grid); only the first (Value) column is read. Backticks are
+ * stripped. Returns an empty array when no such table is present so the caller
+ * can leave enumValues unset.
+ */
+function extractAllowedEnumValues(sectionContent: string, propName: string): string[] {
+  const escaped = propName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const labelPattern = new RegExp('\\*\\*Allowed `' + escaped + '` values:\\*\\*', 'm');
+  const labelMatch = labelPattern.exec(sectionContent);
+  if (!labelMatch) return [];
+
+  const afterLabel = sectionContent.slice(labelMatch.index + labelMatch[0].length);
+  const rows = extractTableRows(afterLabel);
+
+  const values: string[] = [];
+  for (const row of rows) {
+    const first = row[0];
+    if (first === undefined) continue;
+    const value = stripBackticks(first);
+    if (value.length > 0) values.push(value);
+  }
+  return values;
 }
 
 /** Extract data rows from a markdown table (skipping the separator row) */

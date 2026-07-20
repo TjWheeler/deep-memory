@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-storage-cosmosdb",
-  "version": "0.20.0",
+  "version": "0.21.1",
   "description": "CosmosDB Gremlin storage provider for @utaba/deep-memory",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -62,9 +62,9 @@
     "gremlin": "^3.7.3"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^22.20.1",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.10"
   }
 }

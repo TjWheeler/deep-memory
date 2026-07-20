@@ -44,6 +44,11 @@ pnpm --filter @utaba/deep-memory-local-mcp-server build
 - [Code Graph](code-graph.md) — **Optional.** A worked example of using Deep Memory on a codebase: a script maps this repo (packages, providers, MCP tools, docs, tests, source files, and the error hierarchy) into a local graph so an AI assistant can answer "what breaks if I change this?" in one query. Not part of the build; free to run (no embeddings).
 - [Code Graph Guide](code-graph-guide.md) — **How to build a code graph for *your own* codebase.** The general method behind the example above: how to design a focused, bespoke vocabulary (not a code dump), extract it deterministically, and keep it idempotent — with starter vocabularies for web apps, microservices, and data pipelines.
 
+### Visualising & exploring
+
+- [Graph Viewer — Usage Guide](graph-viewer.md) — How to **use** the interactive graph viewer to explore any repository: the cluster seed, clicking to expand, the detail panel, search, the type bar, and tips for large graphs. Launch it with `pnpm serve:graph-viewer`.
+- [Graph Viewer — Build & Modes Reference](../graph-viewer/README.md) — How the viewer is built and run: live / embedded / static modes, the read-only HTTP API, and CLI flags.
+
 ### Storage & embeddings providers
 
 Each provider's canonical documentation lives in its package README. The `docs/` files below are short summaries that link to the same place.

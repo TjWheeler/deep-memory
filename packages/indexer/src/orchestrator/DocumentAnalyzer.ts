@@ -206,12 +206,41 @@ export class DocumentAnalyzer {
    * Analyze a single document: estimate size, assign worker, calculate cost.
    */
   private async analyzeDocument(source: IndexSource): Promise<DocumentAnalysis> {
+    // Sources awaiting conversion have no readable text yet — reading the raw
+    // binary as UTF-8 would ingest garbage and produce a meaningless estimate.
+    // Report them as pending conversion instead.
+    if (source.status === 'needs-conversion' || source.status === 'converting') {
+      let sizeBytes = 0;
+      try {
+        sizeBytes = (await stat(source.path)).size;
+      } catch {
+        const match = source.notes?.match(/(\d+)\s*KB/);
+        sizeBytes = match ? parseInt(match[1]!, 10) * 1024 : 0;
+      }
+      return {
+        source: basename(source.path),
+        path: source.path,
+        type: source.type,
+        sizeBytes,
+        sizeKB: Math.round(sizeBytes / 1024),
+        estimatedDocumentTokens: 0,
+        assignedWorkers: [],
+        estimatedTokens: { inputTokens: 0, outputTokens: 0, chunks: 0 },
+        estimatedCost: 0,
+        usedActuals: false,
+        note: 'Awaiting conversion — run the convert action before extraction to estimate this source.',
+      };
+    }
+
+    // Read the derived text when a source has been converted; the original
+    // path otherwise.
+    const readPath = source.derivedTextPath ?? source.path;
     let sizeBytes: number;
     let documentContent: string | null = null;
     try {
-      const stats = await stat(source.path);
+      const stats = await stat(readPath);
       sizeBytes = stats.size;
-      documentContent = await readFile(source.path, 'utf-8');
+      documentContent = await readFile(readPath, 'utf-8');
     } catch {
       // File may not exist yet (e.g., test scenario); use notes field if available
       const match = source.notes?.match(/(\d+)\s*KB/);

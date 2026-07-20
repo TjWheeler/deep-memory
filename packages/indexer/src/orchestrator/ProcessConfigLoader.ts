@@ -1,7 +1,9 @@
 import { readFile, access } from 'node:fs/promises';
 import { join, resolve, isAbsolute } from 'node:path';
-import type { OrchestratorConfig, WorkerConfig, ExtractionConfig, ConsolidationConfig, QualityThresholds } from '../types/config.js';
+import type { GovernanceMode } from '@utaba/deep-memory';
+import type { OrchestratorConfig, WorkerConfig, ExtractionConfig, ConsolidationConfig, QualityThresholds, ServicesConfig, DoclingServiceConfig } from '../types/config.js';
 import { DEFAULT_QUALITY_THRESHOLDS } from '../types/config.js';
+import type { DoclingConvertOptions } from '../conversion/types.js';
 import type { FullValidationConfig, FullValidationWorkerConfig } from '../validation/full-validation-types.js';
 
 const CONFIG_FILE = 'config.json';
@@ -80,11 +82,32 @@ export interface IndexProcessConfig {
       config?: Record<string, unknown>;
     };
   };
+  /** External services the pipeline can call (e.g. document conversion) */
+  services?: {
+    docling?: {
+      endpoint?: string;
+      timeoutMs?: number;
+      maxRetries?: number;
+      doOcr?: boolean;
+      apiKey?: string;
+      mode?: 'sync' | 'async';
+      pollIntervalMs?: number;
+      maxPollIntervalMs?: number;
+      maxTotalWaitMs?: number;
+      ocrTextYieldThreshold?: number;
+      convertOptions?: DoclingConvertOptions;
+    };
+  };
   /** Quality thresholds for review diagnostics (optional — defaults applied if omitted) */
   qualityThresholds?: Partial<{
     extraction: Partial<QualityThresholds['extraction']>;
     consolidation: Partial<QualityThresholds['consolidation']>;
   }>;
+  /**
+   * How the vocabulary-conformance gate treats violations. Defaults to
+   * `managed` when omitted. See OrchestratorConfig.governanceMode.
+   */
+  governanceMode?: GovernanceMode;
 }
 
 /**
@@ -104,6 +127,10 @@ export interface IndexProcessSecrets {
   };
   /** API key for embeddings endpoint */
   embeddings?: {
+    apiKey?: string;
+  };
+  /** API key for the document-conversion service */
+  docling?: {
     apiKey?: string;
   };
 }
@@ -269,6 +296,37 @@ export async function loadProcessConfig(
     },
   };
 
+  // Build services config — the document-conversion service is present only
+  // when the config declares it. Endpoint defaults to the standard docling-serve
+  // host port when the section exists but omits it. Secrets take precedence over
+  // any inline apiKey.
+  let services: ServicesConfig | undefined;
+  if (processConfig.services?.docling) {
+    const raw = processConfig.services.docling;
+    const docling: DoclingServiceConfig = {
+      endpoint: raw.endpoint ?? 'http://localhost:5001',
+      // Defaults for decision-carrying settings live here so the orchestrator
+      // and the tool surface agree; the client owns only the numeric backoff
+      // defaults for values the config leaves unset.
+      mode: raw.mode ?? 'async',
+      ocrTextYieldThreshold: raw.ocrTextYieldThreshold ?? 100,
+      ...(raw.timeoutMs !== undefined ? { timeoutMs: raw.timeoutMs } : {}),
+      ...(raw.maxRetries !== undefined ? { maxRetries: raw.maxRetries } : {}),
+      ...(raw.doOcr !== undefined ? { doOcr: raw.doOcr } : {}),
+      ...(raw.pollIntervalMs !== undefined ? { pollIntervalMs: raw.pollIntervalMs } : {}),
+      ...(raw.maxPollIntervalMs !== undefined ? { maxPollIntervalMs: raw.maxPollIntervalMs } : {}),
+      ...(raw.maxTotalWaitMs !== undefined ? { maxTotalWaitMs: raw.maxTotalWaitMs } : {}),
+      ...(raw.convertOptions !== undefined ? { convertOptions: raw.convertOptions } : {}),
+    };
+    // Treat an empty-string apiKey (the secrets-template placeholder) as absent
+    // so it does not send a blank X-Api-Key header.
+    const apiKey = secrets.docling?.apiKey || raw.apiKey;
+    if (apiKey) {
+      docling.apiKey = apiKey;
+    }
+    services = { docling };
+  }
+
   const config: OrchestratorConfig = {
     stateDir,
     vocabularyPath,
@@ -284,6 +342,8 @@ export async function loadProcessConfig(
     fullValidation,
     embeddings,
     qualityThresholds,
+    ...(services ? { services } : {}),
+    ...(processConfig.governanceMode ? { governanceMode: processConfig.governanceMode } : {}),
   };
 
   return { config, processConfig, sourceDir };

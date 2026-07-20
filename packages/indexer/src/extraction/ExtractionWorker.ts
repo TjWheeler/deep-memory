@@ -1,5 +1,6 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, basename } from 'node:path';
+import { InvalidInputError } from '@utaba/deep-memory';
 import type { ExtractionConfig, WorkerConfig } from '../types/config.js';
 import type { ExtractionOutput, ExtractedEntity, ExtractedRelationship } from '../types/extraction.js';
 import type { IndexSource } from '../types/source-list.js';
@@ -47,6 +48,10 @@ interface EffectiveWorkerConfig {
   progressiveContextWindow: number;
   logDir?: string;
   workerName?: string;
+  /** Undefined passes through; the built-in provider resolves the default (streaming on). */
+  stream?: boolean;
+  /** Undefined passes through; the built-in provider imposes no extra wall-clock cap. */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -88,6 +93,8 @@ export class ExtractionWorker {
           progressiveContextWindow: config.progressiveContextWindow ?? 6,
           logDir,
           workerName: workerOverride.name,
+          stream: workerOverride.stream,
+          requestTimeoutMs: workerOverride.requestTimeoutMs,
         }
       : {
           endpoint: config.endpoint,
@@ -99,12 +106,16 @@ export class ExtractionWorker {
           chunkingStrategy: config.chunkingStrategy ?? 'auto',
           progressiveContextWindow: config.progressiveContextWindow ?? 6,
           logDir,
+          stream: config.stream,
+          requestTimeoutMs: config.requestTimeoutMs,
         };
 
     // Use the provided LLM provider, or fall back to built-in OpenAI-compat
     this.llmProvider = llmProvider ?? new OpenAIChatProvider({
       endpoint: this.effective.endpoint,
       apiKey: this.effective.apiKey,
+      stream: this.effective.stream,
+      requestTimeoutMs: this.effective.requestTimeoutMs,
     });
   }
 
@@ -122,7 +133,20 @@ export class ExtractionWorker {
     onCheckpoint?: OnCheckpoint,
     resumeCheckpoint?: ExtractionCheckpoint,
   ): Promise<ExtractionOutput> {
-    const documentContent = await readFile(source.path, 'utf-8');
+    // A rich-format source must be converted before extraction — feeding raw
+    // binary bytes to an LLM produces garbage. Guard rather than silently
+    // reading nonsense.
+    if (source.originalFormat && !source.derivedTextPath) {
+      throw new InvalidInputError(
+        'source.derivedTextPath',
+        `Source "${source.path}" is a ${source.originalFormat} document that has not been converted to text.`,
+        'Run the convert action first so extraction reads the derived Markdown.',
+      );
+    }
+
+    // Read the derived text when the source has been converted; the original
+    // path otherwise.
+    const documentContent = await readFile(source.derivedTextPath ?? source.path, 'utf-8');
     const systemPrompt = this.promptBuilder.buildSystemPrompt();
 
     let entities: ExtractedEntity[];

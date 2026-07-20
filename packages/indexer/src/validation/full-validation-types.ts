@@ -10,6 +10,8 @@
  * - fix: proposes corrections for mismatches and hallucinations
  */
 
+import type { ExtractedEntity, ExtractedRelationship } from '../types/extraction.js';
+
 // ── Verdicts ──────────────────────────────────────────────────────────
 
 /** Verdict assigned to each validated property/entity/relationship */
@@ -201,6 +203,12 @@ export interface EntityValidationResult {
   }>;
   /** Worker notes (free-text explanation) */
   notes?: string;
+  /**
+   * Structural remodels the worker proposed for this item — e.g. a cross-reference
+   * value that should be its own entity with a correctly-typed edge. Each step is a
+   * correction primitive; the orchestrator links a result's steps into one atomic group.
+   */
+  remediations?: RemediationStep[];
 }
 
 /** Validation result for a single relationship */
@@ -225,6 +233,13 @@ export interface RelationshipValidationResult {
   propertyVerdicts: PropertyValidationResult[];
   /** Worker notes */
   notes?: string;
+  /**
+   * Structural remodels the worker proposed for this item — e.g. an edge attached to
+   * the wrong endpoint, or a deferral value that should be its own entity with a
+   * correctly-typed edge. Each step is a correction primitive; the orchestrator links a
+   * result's steps into one atomic group.
+   */
+  remediations?: RemediationStep[];
 }
 
 /** Result from validating a single batch */
@@ -376,28 +391,32 @@ export interface FlaggedValidationItem {
 
 /**
  * The kind of mutation a correction represents.
- * - `update` — replace a property value with {@link ProposedCorrection.correctedValue}
+ * - `update` — replace a property value with {@link PropertyCorrection.correctedValue}
  * - `remove-property` — delete the property entry entirely (source has no supporting value)
  * - `delete` — remove the entity (and cascade its relationships) or the relationship itself
+ * - `create` — materialise a new entity or relationship the extraction should have carried
+ * - `retarget` — reattach one endpoint of an existing relationship to a different entity
  */
-export type CorrectionOperation = 'update' | 'delete' | 'remove-property';
+export type CorrectionOperation = 'update' | 'remove-property' | 'delete' | 'create' | 'retarget';
 
-/** A proposed correction (fix mode) */
-export interface ProposedCorrection {
+/** Machine-readable relationship identity, matched against extraction JSON. */
+export interface RelationshipKey {
+  sourceLabel: string;
+  type: string;
+  targetLabel: string;
+}
+
+/**
+ * Fields common to every correction, regardless of item type or operation.
+ * The applier stamps `approved` when a correction is committed; the proposer
+ * stamps `remediationGroupId` when a correction is one primitive of a larger
+ * remodel that must apply as an atomic unit.
+ */
+export interface CorrectionBase {
   /** Source document */
   source: string;
-  /** Item type */
-  itemType: 'entity' | 'relationship';
-  /** Mutation this correction performs */
-  operation: CorrectionOperation;
   /** Entity label or "source → [type] → target" for display/debug */
   label: string;
-  /** Property being corrected — required for `update` and `remove-property`, absent for `delete` */
-  property?: string;
-  /** Original extracted value — absent when `operation` is `delete` */
-  originalValue?: unknown;
-  /** Proposed corrected value — required for `update`, absent for `remove-property` and `delete` */
-  correctedValue?: unknown;
   /** Source evidence for the correction */
   sourceEvidence: string;
   /** Line numbers of the evidence */
@@ -407,11 +426,95 @@ export interface ProposedCorrection {
   /** Whether this correction has been approved by a human */
   approved?: boolean;
   /**
-   * Machine-readable relationship identity — required for any correction where `itemType` is `relationship`.
-   * Parsing the display `label` ("source → [type] → target") is fragile; use this to match in extraction JSON.
+   * Links this correction to the other primitives of a single remodel. All
+   * corrections sharing an id are applied (or skipped) as one atomic group; a
+   * group's members must all share the same `source`.
    */
-  relationshipKey?: { sourceLabel: string; type: string; targetLabel: string };
+  remediationGroupId?: string;
 }
+
+/**
+ * Overwrite a single property (`update`) or drop it entirely (`remove-property`)
+ * on an existing entity or relationship. This is the field-level correction the
+ * validation worker has emitted since the first correction increment.
+ */
+export interface PropertyCorrection extends CorrectionBase {
+  itemType: 'entity' | 'relationship';
+  operation: 'update' | 'remove-property';
+  /** Property being corrected */
+  property: string;
+  /** Original extracted value */
+  originalValue?: unknown;
+  /** Proposed corrected value — present for `update`, absent for `remove-property` */
+  correctedValue?: unknown;
+  /** Required when `itemType` is `relationship` — the edge to mutate */
+  relationshipKey?: RelationshipKey;
+}
+
+/** Remove an entity (cascading its relationships) or a single relationship. */
+export interface DeleteCorrection extends CorrectionBase {
+  itemType: 'entity' | 'relationship';
+  operation: 'delete';
+  /** Required when `itemType` is `relationship` — the edge to remove */
+  relationshipKey?: RelationshipKey;
+}
+
+/** Materialise a new entity that the extraction failed to model on its own. */
+export interface CreateEntityCorrection extends CorrectionBase {
+  itemType: 'entity';
+  operation: 'create';
+  /** The entity to add to the extraction file */
+  entity: ExtractedEntity;
+}
+
+/** Materialise a new relationship between entities referenced by label. */
+export interface CreateRelationshipCorrection extends CorrectionBase {
+  itemType: 'relationship';
+  operation: 'create';
+  /** The relationship to add — endpoints reference entities by label */
+  relationship: ExtractedRelationship;
+}
+
+/** Reattach one endpoint of an existing relationship to a different entity. */
+export interface RetargetRelationshipCorrection extends CorrectionBase {
+  itemType: 'relationship';
+  operation: 'retarget';
+  /** Current identity of the edge to retarget */
+  relationshipKey: RelationshipKey;
+  /** Which endpoint moves */
+  endpoint: 'source' | 'target';
+  /** Label of the entity the chosen endpoint should point at instead */
+  newLabel: string;
+}
+
+/**
+ * A proposed correction (fix mode). Discriminated on `(itemType, operation)`:
+ * narrow on `operation` (and `itemType` for `create`) before reading
+ * operation-specific fields.
+ */
+export type ProposedCorrection =
+  | PropertyCorrection
+  | DeleteCorrection
+  | CreateEntityCorrection
+  | CreateRelationshipCorrection
+  | RetargetRelationshipCorrection;
+
+/** Distribute `Omit` across each member of a union so the discriminated shape survives. */
+type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * A structural fix as the validation worker emits it — one primitive of a proposed
+ * remodel. It is the {@link ProposedCorrection} union with the fields the orchestrator
+ * owns removed: `source` (stamped from the validated item), `approved` (stamped by the
+ * applier on commit), and `remediationGroupId` (stamped when the orchestrator links the
+ * remodel's primitives into one atomic group). Deriving it from the correction union
+ * keeps the payload shapes single-sourced — the worker cannot drift from what the applier
+ * consumes.
+ */
+export type RemediationStep = DistributiveOmit<
+  ProposedCorrection,
+  'source' | 'approved' | 'remediationGroupId'
+>;
 
 /** Performance and token usage summary */
 export interface ValidationPerformanceSummary {

@@ -1,6 +1,6 @@
 import { BaseToolController } from './base/BaseToolController.js';
 import { StateManager, Phase, IndexingOrchestrator } from '@utaba/deep-memory-indexer';
-import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport } from '@utaba/deep-memory-indexer';
+import type { PipelinePhase, DocumentDiagnostics, ConsolidationReviewReport, FullValidationProgress, FullValidationReport, ConversionReport, TableCorruptionRecommendation, ProposedCorrection } from '@utaba/deep-memory-indexer';
 import { resolveStateDir, resolveConfig } from './resolveProcess.js';
 
 interface DiagnoseCheck {
@@ -36,7 +36,7 @@ export class DiagnoseTool extends BaseToolController {
 
     switch (phase) {
       case Phase.PREPARE:
-        return this.diagnosePrepare(state, phase);
+        return this.diagnosePrepare(params, state, phase);
       case Phase.EXTRACT:
       case Phase.EXTRACTION_REVIEW:
         return this.diagnoseExtraction(params, state, phase, params['workerName'] as string | undefined);
@@ -61,7 +61,7 @@ export class DiagnoseTool extends BaseToolController {
     }
   }
 
-  private async diagnosePrepare(state: StateManager, phase: PipelinePhase) {
+  private async diagnosePrepare(params: Record<string, unknown>, state: StateManager, phase: PipelinePhase) {
     const checks: DiagnoseCheck[] = [];
     const sourceList = await state.getSourceList();
 
@@ -80,7 +80,114 @@ export class DiagnoseTool extends BaseToolController {
       });
     }
 
+    // Conversion diagnostics, sourced from the persisted report. No LLM work —
+    // consistent with the tool's contract. Present only after a convert run.
+    const conversionReport = await state.getConversionReport<ConversionReport>();
+    if (conversionReport && conversionReport.entries.length > 0) {
+      this.addConversionChecks(checks, conversionReport);
+      await this.addTableStructureCheck(params, checks);
+    }
+
     return this.buildResponse(phase, checks, 'Run indexing_execute to prepare sources and begin extraction.');
+  }
+
+  /**
+   * Defense-in-depth table-structure check: runs the same static detector the
+   * analyze tool uses over the persisted docling sidecars and reports `warn`
+   * when any converted document looks suspect/corrupt, `pass` when all are
+   * clean. Post-extraction-safe — it only reads the sidecars on disk. The
+   * per-file re-convert remediation rides in the check detail and items.
+   */
+  private async addTableStructureCheck(params: Record<string, unknown>, checks: DiagnoseCheck[]): Promise<void> {
+    let recommendations: TableCorruptionRecommendation[];
+    try {
+      const { config } = await resolveConfig(params);
+      const orchestrator = new IndexingOrchestrator(config);
+      recommendations = await orchestrator.detectTableCorruption();
+    } catch (error) {
+      checks.push({
+        name: 'table-structure',
+        status: 'warn',
+        detail: `Could not run table-structure detection: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+
+    if (recommendations.length === 0) {
+      checks.push({
+        name: 'table-structure',
+        status: 'pass',
+        detail: 'No table-structure corruption detected in converted documents.',
+      });
+      return;
+    }
+
+    checks.push({
+      name: 'table-structure',
+      status: 'warn',
+      detail:
+        `${recommendations.length} converted document(s) show possible table-structure corruption. ` +
+        `Re-convert each flagged file with sourceConvertOptions { tableCellMatching: false } via indexing_update, ` +
+        `then reset it to pending and re-extract. Conversion is the fix site, not extraction.`,
+      items: recommendations.map(r => ({
+        source: r.source,
+        rating: r.rating,
+        message: r.message,
+        evidence: r.evidence.slice(0, 5),
+        remediation: r.remediation,
+      })),
+    });
+  }
+
+  /**
+   * Append conversion-quality checks read from the conversion report: warnings
+   * carried per document, table counts (so a PDF that dropped all its tables is
+   * visible), and conversions running far slower than their peers (the signal
+   * that a document is OCR-bound or otherwise pathological).
+   */
+  private addConversionChecks(checks: DiagnoseCheck[], report: ConversionReport): void {
+    const converted = report.entries.filter(e => e.status === 'converted');
+
+    // 1) Warnings carried by any conversion.
+    const withWarnings = report.entries.filter(e => e.warnings.length > 0);
+    checks.push({
+      name: 'conversion-warnings',
+      status: withWarnings.length > 0 ? 'warn' : 'pass',
+      detail: withWarnings.length > 0
+        ? `${withWarnings.length} conversion(s) carried warnings. For a text-light PDF that should not run OCR (e.g. a slide or diagram deck), set "doOcr": false on that source to suppress the OCR fallback.`
+        : 'No conversion warnings.',
+      items: withWarnings.length > 0
+        ? withWarnings.map(e => ({ source: e.docSlug, warnings: e.warnings.slice(0, 5) }))
+        : undefined,
+    });
+
+    // 2) Tables recovered per document — a doc reporting zero tables may have
+    //    dropped them, which is worth an operator's eye.
+    checks.push({
+      name: 'tables-extracted',
+      status: 'pass',
+      detail: `${report.summary.totalTables} table(s) recovered across ${converted.length} converted document(s).`,
+      items: converted.length > 0
+        ? converted.map(e => ({ source: e.docSlug, tables: e.tableCount ?? 0, pages: e.pageCount }))
+        : undefined,
+    });
+
+    // 3) Conversions far slower than the median — OCR-bound or pathological.
+    const durations = converted.map(e => e.durationMs).filter(ms => ms > 0).sort((a, b) => a - b);
+    if (durations.length >= 3) {
+      const median = durations[Math.floor(durations.length / 2)]!;
+      const slow = converted.filter(e => median > 0 && e.durationMs > median * 3);
+      checks.push({
+        name: 'slow-conversions',
+        status: slow.length > 0 ? 'warn' : 'pass',
+        detail: slow.length > 0
+          ? `${slow.length} conversion(s) ran more than 3× the median (${median}ms) — likely OCR-bound. If such a document is born-digital, set "doOcr": false on it to skip the OCR pass.`
+          : `All conversions ran within a normal range of the median (${median}ms).`,
+        items: slow.length > 0
+          ? slow.map(e => ({ source: e.docSlug, durationMs: e.durationMs, ocrApplied: e.doOcr }))
+          : undefined,
+      });
+    }
   }
 
   private async diagnoseExtraction(
@@ -163,14 +270,32 @@ export class DiagnoseTool extends BaseToolController {
         ] : undefined,
       });
 
+      // Status reflects only normalized exact duplicates. Token-subset pairs are
+      // candidates, not confirmed duplicates — compound/hierarchical names
+      // legitimately nest (e.g. "Main Street" within "Main Street Bridge") — so
+      // they must not downgrade the corpus rating.
       checks.push({
         name: 'duplicates',
         status: a.duplicateRating === 'good' ? 'pass' : 'warn',
-        detail: `${a.duplicateCount} duplicate entities detected`,
+        detail: `${a.duplicateCount} normalized-duplicate entities detected`,
         items: report.documents
           .flatMap(d => d.duplicateCheck.duplicates.map(dup => ({ source: d.source, ...dup })))
           .slice(0, 20),
       });
+
+      // Separate, informational listing of token-subset pairs: candidates for the
+      // agent to verify, kept out of the pass/fail rating above.
+      const tokenSubsetTotal = report.documents.reduce((sum, d) => sum + d.duplicateCheck.tokenSubsetCount, 0);
+      if (tokenSubsetTotal > 0) {
+        const possibleDuplicateExamples = report.documents
+          .flatMap(d => d.duplicateCheck.possibleDuplicates.map(pd => ({ source: d.source, ...pd })));
+        checks.push({
+          name: 'possible-duplicates',
+          status: 'pass',
+          detail: `${tokenSubsetTotal} possible duplicate(s) by token-subset — one label's words are contained in another's (e.g. "Main Street" within "Main Street Bridge"). Candidates to verify, not counted as duplicates.`,
+          items: possibleDuplicateExamples.slice(0, 20),
+        });
+      }
 
       const badLabelExamples = report.documents
         .flatMap(d => d.labelCheck.examples.map(ex => ({ source: d.source, ...ex })));
@@ -192,6 +317,42 @@ export class DiagnoseTool extends BaseToolController {
         });
       }
 
+      // Zero-property entities that anchor relationships — surfaced regardless of
+      // the aggregate coverage rating, which can otherwise average these away.
+      const endpoints = report.zeroPropertyEndpoints;
+      if (endpoints && endpoints.count > 0) {
+        checks.push({
+          name: 'zero-property-endpoints',
+          status: 'warn',
+          detail: `${endpoints.count} zero-property entit${endpoints.count === 1 ? 'y is a' : 'ies are'} relationship endpoint(s) — placeholder nodes that exist only to anchor edges.`,
+          items: endpoints.examples.slice(0, 20),
+        });
+      }
+
+      // Fabrication smells: labels enumerating a controlled vocabulary, and many
+      // relationships hanging off one narrow source passage.
+      const smells = report.fabricationSmells;
+      if (smells && smells.enumChecklist.length > 0) {
+        checks.push({
+          name: 'controlled-vocabulary-as-entities',
+          status: 'warn',
+          detail: `${smells.enumChecklist.length} entity type(s) whose labels enumerate the type's controlled vocabulary rather than being read from source — a fabrication smell.`,
+          items: smells.enumChecklist.map(s => ({
+            entityType: s.entityType,
+            matched: `${s.matchedCount}/${s.distinctLabelCount} labels match ${s.controlledValueCount} controlled values`,
+            examples: s.examples,
+          })),
+        });
+      }
+      if (smells && smells.sharedSourceRefs.length > 0) {
+        checks.push({
+          name: 'cross-product-relationships',
+          status: 'warn',
+          detail: `${smells.sharedSourceRefs.length} narrow source passage(s) cited by many relationships — a cross-product fabrication smell.`,
+          items: smells.sharedSourceRefs.slice(0, 20),
+        });
+      }
+
       // Check 6: Truncation detection
       if (a.truncatedChunkCount > 0 || a.totalUnsalvageableChunks > 0) {
         checks.push({
@@ -206,6 +367,51 @@ export class DiagnoseTool extends BaseToolController {
           name: 'truncation',
           status: 'pass',
           detail: `No LLM output truncation detected across ${a.totalChunkCount} calls.`,
+        });
+      }
+
+      // Vocabulary conformance — validate extraction output against the domain
+      // vocabulary via core's validator (unknown/endpoint types, required
+      // properties, closed-enum values). Honours the configured governance
+      // mode: locked violations fail, managed/open violations warn. A bad input
+      // (e.g. an unreadable vocabulary file) degrades only this check to a warn,
+      // never the whole diagnose tool.
+      try {
+        const conformance = await orchestrator.conformanceDiagnostics(sourceFilter);
+        const conformanceStatus: DiagnoseCheck['status'] =
+          conformance.violationCount === 0
+            ? 'pass'
+            : conformance.severity === 'fail'
+              ? 'fail'
+              : 'warn';
+        checks.push({
+          name: 'vocabulary-conformance',
+          status: conformanceStatus,
+          detail: conformance.violationCount === 0
+            ? `Extraction output conforms to the vocabulary (${conformance.mode} mode).`
+            : `${conformance.violationCount} vocabulary conformance violation(s) under ${conformance.mode} mode — ` +
+              `${conformance.countsByClass['unknown-type']} unknown-type, ` +
+              `${conformance.countsByClass['endpoint-type']} endpoint-type, ` +
+              `${conformance.countsByClass['required-property-missing']} required-property-missing, ` +
+              `${conformance.countsByClass['closed-enum-value']} closed-enum-value` +
+              (conformance.recommendations.length > 0
+                ? `; ${conformance.recommendations.length} vocabulary-extension recommendation(s).`
+                : '.'),
+          items: conformance.violationCount > 0
+            ? [
+                { kind: 'countsByClass', counts: conformance.countsByClass },
+                { kind: 'examples', violations: conformance.examples },
+                ...(conformance.recommendations.length > 0
+                  ? [{ kind: 'recommendations', recommendations: conformance.recommendations }]
+                  : []),
+              ]
+            : undefined,
+        });
+      } catch (error) {
+        checks.push({
+          name: 'vocabulary-conformance',
+          status: 'warn',
+          detail: `Could not run vocabulary conformance: ${error instanceof Error ? error.message : String(error)}`,
         });
       }
 
@@ -312,11 +518,19 @@ export class DiagnoseTool extends BaseToolController {
     }
 
     if (report && report.corrections.length > 0) {
+      const groupCount = new Set(
+        report.corrections.map(c => c.remediationGroupId).filter((id): id is string => id != null),
+      ).size;
+      const groupNote = groupCount > 0
+        ? ` (includes ${groupCount} structural remodel group${groupCount === 1 ? '' : 's'} applied atomically)`
+        : '';
       checks.push({
         name: 'pending-corrections',
         status: 'warn',
-        detail: `${report.corrections.length} proposed corrections awaiting review`,
-        items: report.corrections.slice(0, 10),
+        detail: `${report.corrections.length} proposed corrections awaiting review${groupNote}`,
+        // Index matches the position apply-corrections selects by, so a reviewer can
+        // pick indices straight from this listing.
+        items: report.corrections.slice(0, 10).map((c, index) => summarizeCorrectionForDisplay(c, index)),
       });
     }
 
@@ -445,4 +659,42 @@ export class DiagnoseTool extends BaseToolController {
       guidance,
     };
   }
+}
+
+/**
+ * Render one proposed correction as a compact, selectable listing row. The op verbs now
+ * include structural remodels, so each operation surfaces the fields a reviewer needs to
+ * judge it: create shows the type and label being added, retarget shows the endpoint move.
+ */
+function summarizeCorrectionForDisplay(correction: ProposedCorrection, index: number): Record<string, unknown> {
+  const base = {
+    index,
+    source: correction.source,
+    operation: correction.operation,
+    itemType: correction.itemType,
+    confidence: correction.confidence,
+    ...(correction.remediationGroupId ? { group: correction.remediationGroupId } : {}),
+  };
+
+  if (correction.operation === 'update' || correction.operation === 'remove-property') {
+    return { ...base, label: correction.label, property: correction.property, correctedValue: correction.correctedValue };
+  }
+  if (correction.operation === 'delete') {
+    return { ...base, label: correction.label };
+  }
+  if (correction.operation === 'create') {
+    if (correction.itemType === 'entity') {
+      return { ...base, create: `${correction.entity.entityType}: ${correction.entity.label}` };
+    }
+    const r = correction.relationship;
+    return { ...base, create: `${r.sourceLabel} → [${r.type}] → ${r.targetLabel}` };
+  }
+  if (correction.operation === 'retarget') {
+    const rk = correction.relationshipKey;
+    const oldDisplay = `${rk.sourceLabel} → [${rk.type}] → ${rk.targetLabel}`;
+    const newSource = correction.endpoint === 'source' ? correction.newLabel : rk.sourceLabel;
+    const newTarget = correction.endpoint === 'target' ? correction.newLabel : rk.targetLabel;
+    return { ...base, retarget: `${oldDisplay}  ⇒  ${newSource} → [${rk.type}] → ${newTarget}` };
+  }
+  return base;
 }

@@ -138,6 +138,102 @@ describe('OpenAIEmbeddingProvider', () => {
     expect(provider.dimensions()).toBe(4);
   });
 
+  it('embed() never sends an auto-detected native dimension on later calls', async () => {
+    // Regression: a server that rejects `dimensions` must keep working across a
+    // session. The native size learned from response #1 must not be echoed back.
+    const vector = Array.from({ length: 4096 }, () => 0.1);
+    fetchSpy.mockImplementation(async () =>
+      new Response(JSON.stringify(mockEmbeddingsResponse([vector])), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new OpenAIEmbeddingProvider({
+      baseUrl: 'http://localhost:8010',
+      model: 'Qwen/Qwen3-Embedding-8B',
+    });
+
+    await provider.embed('first');
+    expect(provider.dimensions()).toBe(4096);
+    await provider.embed('second');
+
+    for (const call of fetchSpy.mock.calls) {
+      const body = JSON.parse(call[1]?.body as string);
+      expect(body.dimensions).toBeUndefined();
+    }
+  });
+
+  it('embed() sends configured dimensions on every call', async () => {
+    const vector = Array.from({ length: 1024 }, () => 0.1);
+    fetchSpy.mockImplementation(async () =>
+      new Response(JSON.stringify(mockEmbeddingsResponse([vector])), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new OpenAIEmbeddingProvider({
+      baseUrl: 'http://localhost:8010',
+      model: 'Qwen/Qwen3-Embedding-8B',
+      dimensions: 1024,
+    });
+
+    await provider.embed('first');
+    await provider.embed('second');
+
+    for (const call of fetchSpy.mock.calls) {
+      const body = JSON.parse(call[1]?.body as string);
+      expect(body.dimensions).toBe(1024);
+    }
+  });
+
+  it('embed() throws when the server returns a vector of unexpected length', async () => {
+    // Caller requested 1024 (truncation opt-in) but the server ignored it.
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(mockEmbeddingsResponse([[0.1, 0.2, 0.3]])), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new OpenAIEmbeddingProvider({
+      baseUrl: 'http://localhost:8010',
+      model: 'test-model',
+      dimensions: 1024,
+    });
+
+    await expect(provider.embed('hello')).rejects.toThrow(
+      '3-dimension vector but 1024 was expected',
+    );
+  });
+
+  it('embed() throws when native vector length changes mid-session', async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(mockEmbeddingsResponse([[0.1, 0.2, 0.3, 0.4]])), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(mockEmbeddingsResponse([[0.1, 0.2]])), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+
+    const provider = new OpenAIEmbeddingProvider({
+      baseUrl: 'http://localhost:8010',
+      model: 'test-model',
+    });
+
+    await provider.embed('first');
+    await expect(provider.embed('second')).rejects.toThrow(
+      '2-dimension vector but 4 was expected',
+    );
+  });
+
   it('embed() sends Authorization header when apiKey provided', async () => {
     fetchSpy.mockResolvedValueOnce(
       new Response(JSON.stringify(mockEmbeddingsResponse([[0.1]])), {
@@ -156,6 +252,85 @@ describe('OpenAIEmbeddingProvider', () => {
 
     const [, options] = fetchSpy.mock.calls[0]!;
     const headers = options?.headers as Record<string, string>;
+    expect(headers['Authorization']).toBe('Bearer sk-test-key');
+  });
+
+  it('embed() sends custom headers alongside the built-in headers', async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(mockEmbeddingsResponse([[0.1]])), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new OpenAIEmbeddingProvider({
+      baseUrl: 'http://localhost:8010',
+      model: 'test-model',
+      apiKey: 'sk-test-key',
+      headers: {
+        'CF-Access-Client-Id': 'client-id',
+        'CF-Access-Client-Secret': 'client-secret',
+      },
+    });
+
+    await provider.embed('test');
+
+    const [, options] = fetchSpy.mock.calls[0]!;
+    const headers = options?.headers as Record<string, string>;
+    expect(headers['CF-Access-Client-Id']).toBe('client-id');
+    expect(headers['CF-Access-Client-Secret']).toBe('client-secret');
+    // Built-ins remain intact alongside the custom headers.
+    expect(headers['Content-Type']).toBe('application/json');
+    expect(headers['Authorization']).toBe('Bearer sk-test-key');
+  });
+
+  it('embed() authenticates via a custom header with no apiKey', async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(mockEmbeddingsResponse([[0.1]])), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new OpenAIEmbeddingProvider({
+      baseUrl: 'http://localhost:8010',
+      model: 'test-model',
+      headers: { 'x-api-key': 'gateway-token' },
+    });
+
+    await provider.embed('test');
+
+    const [, options] = fetchSpy.mock.calls[0]!;
+    const headers = options?.headers as Record<string, string>;
+    expect(headers['x-api-key']).toBe('gateway-token');
+    // No apiKey → no Bearer, but the JSON contract still holds.
+    expect(headers['Authorization']).toBeUndefined();
+    expect(headers['Content-Type']).toBe('application/json');
+  });
+
+  it('embed() never lets custom headers clobber Content-Type or the Bearer token', async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(mockEmbeddingsResponse([[0.1]])), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const provider = new OpenAIEmbeddingProvider({
+      baseUrl: 'http://localhost:8010',
+      model: 'test-model',
+      apiKey: 'sk-test-key',
+      headers: {
+        'Content-Type': 'text/plain',
+        Authorization: 'Bearer hijacked',
+      },
+    });
+
+    await provider.embed('test');
+
+    const [, options] = fetchSpy.mock.calls[0]!;
+    const headers = options?.headers as Record<string, string>;
+    expect(headers['Content-Type']).toBe('application/json');
     expect(headers['Authorization']).toBe('Bearer sk-test-key');
   });
 

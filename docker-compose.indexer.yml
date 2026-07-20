@@ -225,6 +225,37 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # --- Document conversion (docling-serve) ---
+  # Converts PDF/DOCX/HTML/PPTX sources to Markdown before extraction. CPU-only:
+  # the layout and table models are baked into the image, so no model-cache
+  # volume is needed. Gated behind its own profile so a repo with no rich-format
+  # sources never starts this ~4.4 GB container.
+  docling-worker:
+    build: ./services/docling
+    container_name: deep-memory-docling
+    profiles:
+      - docling-worker
+    ports:
+      - "5001:5001"
+    environment:
+      # Conversion is CPU-bound on layout/table inference. The upstream image
+      # bakes in OMP_NUM_THREADS=4, which throttles a single large document to
+      # 4 cores no matter how big the host is. Override it high so one document
+      # converts as fast as the host allows (the pipeline converts serially, so
+      # threads-per-conversion, not worker count, drives single-doc speed).
+      # Lower these via the env vars to stop conversion starving other work on
+      # a shared host.
+      - OMP_NUM_THREADS=${DOCLING_OMP_NUM_THREADS:-24}
+      - MKL_NUM_THREADS=${DOCLING_MKL_NUM_THREADS:-24}
+      - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=${DOCLING_NUM_WORKERS:-4}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: "no"
+
 volumes:
   huggingface_cache:
     # Reuses the 93 GB Huggingface model cache previously populated under the

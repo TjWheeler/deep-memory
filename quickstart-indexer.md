@@ -70,6 +70,8 @@ Claude will:
 
 > If you'd rather skip cloud models, replace the "Anthropic worker" sentence with: *"Configure one local worker pointing at my llama.cpp server on `http://localhost:8020/v1` running Qwen3.5-35B."* You don't need an API key for that path.
 
+> **Indexing rich documents (PDF/DOCX/HTML/PPTX)?** Those sources are registered as `needs-conversion` during prepare and must be converted to Markdown before extraction. Start the conversion service first — `docker compose -f docker-compose.indexer.yml --profile docling-worker up -d` — then have Claude run `indexing_execute action: convert` and poll `indexing_status` until it finishes. Conversion runs asynchronously by default, so large documents convert reliably without a raised timeout, and `indexing_status` shows the live queue position while it works. Re-running convert skips any source that has not changed, and OCR is decided per document (scanned PDFs get it, born-digital ones stay fast). Plain-text sources (`.md/.txt/.json/.csv`) skip this step entirely.
+
 ## 5. Review and advance through phases
 
 Use these follow-up prompts as you progress. Claude will already know to call the right `indexing_*` tools.

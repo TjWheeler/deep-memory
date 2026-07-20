@@ -1,6 +1,6 @@
 {
   "name": "@utaba/deep-memory-embeddings-openai",
-  "version": "0.20.0",
+  "version": "0.21.1",
   "description": "OpenAI-compatible embeddings provider for @utaba/deep-memory",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -61,9 +61,9 @@
     "@utaba/deep-memory": "workspace:^"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^22.20.1",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.10"
   }
 }

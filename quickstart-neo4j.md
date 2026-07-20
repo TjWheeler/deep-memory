@@ -42,7 +42,7 @@ docker compose -f docker-compose.neo4j.yml ps
 
 Once the `STATUS` column shows `healthy`, you're ready. The `neo4j` database exists by default — no creation step needed.
 
-> **Default password.** `DeepMem-Dev-1234` is the publicly known development default in the bundled compose. Change `NEO4J_AUTH` in `docker-compose.neo4j.yml` (and the matching `DEEP_MEMORY_NEO4J_PASSWORD` in the MCP config below) before exposing the instance to anything other than localhost.
+> **Default password.** `DeepMem-Dev-1234` is the publicly known development default in the bundled compose — it's only a fallback. Set `NEO4J_PASSWORD` in a gitignored `.env` file at the repo root (see `.env.example`) to override it without ever committing a real password, and update the matching `DEEP_MEMORY_NEO4J_PASSWORD` in the MCP config below. If the container's data volume already exists, also rotate the live credential with `ALTER CURRENT USER SET PASSWORD FROM '<old>' TO '<new>';` via `cypher-shell` — the env var only seeds a brand-new empty volume.
 
 ### Option B — AuraDB or your own Neo4j server
 

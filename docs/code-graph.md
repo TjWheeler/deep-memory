@@ -56,7 +56,7 @@ docker compose -f docker-compose.neo4j.yml ps   # wait for STATUS: healthy
 ```
 
 That gives you Neo4j on `bolt://localhost:7687`, a browser at <http://localhost:7474>, and the
-development credentials `neo4j` / `DeepMem-Dev-1234`.
+development credentials `neo4j` / `DeepMem-Dev-1234` (or whatever you set via `NEO4J_PASSWORD` in a local `.env` — see `.env.example`).
 
 ### 2. Build the graph
 

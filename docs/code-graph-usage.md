@@ -66,7 +66,7 @@ ErrorType    ─EXTENDS→            ErrorType        (subclass → superclass;
 
 ## Raw Cypher (analytics the tools don't expose)
 
-`docker exec deep-memory-neo4j cypher-shell -u neo4j -p DeepMem-Dev-1234 "<query>"`. Always scope by `repositoryId` (`$rid = d33c0de0-9a1b-4c2d-8e3f-1a2b3c4d5e6f`). **Edge properties live in a JSON-string blob** (`r.properties`) — match them with `CONTAINS`, not native keys (`{depType:'…'}` won't work in Cypher; the MCP tools return them parsed).
+`docker exec deep-memory-neo4j cypher-shell -u neo4j -p DeepMem-Dev-1234 "<query>"` (swap in your own value if you've overridden `NEO4J_PASSWORD` in `.env`). Always scope by `repositoryId` (`$rid = d33c0de0-9a1b-4c2d-8e3f-1a2b3c4d5e6f`). **Edge properties live in a JSON-string blob** (`r.properties`) — match them with `CONTAINS`, not native keys (`{depType:'…'}` won't work in Cypher; the MCP tools return them parsed).
 
 ```cypher
 // core zero-runtime-dependency invariant — expect 0 rows

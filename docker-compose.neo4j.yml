@@ -5,7 +5,7 @@ services:
     image: neo4j:5.26-community
     container_name: deep-memory-neo4j
     environment:
-      - NEO4J_AUTH=neo4j/DeepMem-Dev-1234
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-DeepMem-Dev-1234}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
       - NEO4J_dbms_security_procedures_allowlist=apoc.*,db.*
@@ -17,7 +17,7 @@ services:
       - neo4j_logs:/logs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "cypher-shell -u neo4j -p DeepMem-Dev-1234 'RETURN 1' || exit 1"]
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-DeepMem-Dev-1234} 'RETURN 1' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10

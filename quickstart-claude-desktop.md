@@ -86,7 +86,7 @@ docker exec deep-memory-sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U 
 
 You should see output ending with something like `Changed database context to 'master'.` That means it worked.
 
-> **Security note:** the default password `DeepMem@Dev1234` is fine for a local-only database that nothing outside your machine can reach. Don't expose this database to the internet without changing the password in `docker-compose.sqlserver.yml` first.
+> **Security note:** the default password `DeepMem@Dev1234` is fine for a local-only database that nothing outside your machine can reach. Don't expose this database to the internet without overriding it first — set `SA_PASSWORD` in a gitignored `.env` file at the repo root (see `.env.example`) rather than editing `docker-compose.sqlserver.yml` directly, and update the matching `DEEP_MEMORY_SQL_PASSWORD` in the MCP config. If the container's data volume already exists, also rotate the live credential with `ALTER LOGIN sa WITH PASSWORD = '<new>';` via `sqlcmd` — the env var only seeds a brand-new empty volume.
 
 The database will now restart automatically every time Docker Desktop starts. You only need to do Step 3 once.
 

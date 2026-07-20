@@ -19,7 +19,7 @@
     "version:major": "node scripts/version-bump.mjs major"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.31.0",
+    "@changesets/cli": "^2.31.1",
     "@utaba/deep-memory": "workspace:*",
     "@utaba/deep-memory-storage-cosmosdb": "workspace:*",
     "@utaba/deep-memory-storage-neo4j": "workspace:*",

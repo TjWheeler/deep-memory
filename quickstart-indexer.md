@@ -49,7 +49,7 @@ The default `.mcp.json.example` already wires both servers. Open `.mcp.json` and
 }
 ```
 
-This uses the in-memory storage for the resulting graph. If you'd rather import the pipeline output into SQL Server or CosmosDB, follow the env-var blocks in [quickstart-sqlserver.md](quickstart-sqlserver.md) or [quickstart-cosmosdb.md](quickstart-cosmosdb.md) — the indexer doesn't care which storage you use; it imports into whichever repository you point it at.
+This uses the in-memory storage for the resulting graph. If you'd rather import the pipeline output into SQL Server, CosmosDB, or Neo4j, follow the env-var blocks in [quickstart-sqlserver.md](quickstart-sqlserver.md), [quickstart-cosmosdb.md](quickstart-cosmosdb.md), or [quickstart-neo4j.md](quickstart-neo4j.md) — the indexer doesn't care which storage you use; it imports into whichever repository you point it at.
 
 ## 3. Restart Claude Code
 
@@ -138,7 +138,7 @@ The indexer MCP server has the same JSON shape as the memory server — see the 
 
 ## What's next
 
-- **Persist the output.** Run the same pipeline but with SQL Server or CosmosDB wired for the memory server. See [quickstart-sqlserver.md](quickstart-sqlserver.md) or [quickstart-cosmosdb.md](quickstart-cosmosdb.md).
+- **Persist the output.** Run the same pipeline but with SQL Server, CosmosDB, or Neo4j wired for the memory server. See [quickstart-sqlserver.md](quickstart-sqlserver.md), [quickstart-cosmosdb.md](quickstart-cosmosdb.md), or [quickstart-neo4j.md](quickstart-neo4j.md).
 - **Tune for your domain.** [docs/indexer-validation.md](docs/indexer-validation.md), [docs/indexer-extraction-guide.md](docs/indexer-extraction-guide.md), and [docs/indexer-review-guide.md](docs/indexer-review-guide.md) cover quality scoring, chunk sizing, and post-extraction review.
 - **Build a custom starter kit.** [docs/indexer-starterkit-guide.md](docs/indexer-starterkit-guide.md) walks through creating a new vocabulary + domain guidance for a domain not covered by the bundled kits.
 - **Full pipeline reference.** [packages/indexer/README.md](packages/indexer/README.md) covers worker configuration, multi-worker routing, AI–human collaboration loops, and the orchestrator/worker types.

@@ -40,7 +40,7 @@ Entry points by task:
 |------|------------|
 | Understand the components and dependency flow | [docs/architecture.md](docs/architecture.md) |
 | Add or change an MCP tool | [packages/mcp-server/README.md](packages/mcp-server/README.md) then the tool file under `packages/mcp-server/src/` |
-| Touch storage (SQL Server / CosmosDB) | The provider's README under `packages/storage-*/README.md` |
+| Touch storage (SQL Server / CosmosDB / Neo4j) | The provider's README under `packages/storage-*/README.md` |
 | Touch embeddings | [packages/embeddings-openai/README.md](packages/embeddings-openai/README.md) |
 | Touch the indexer pipeline | [packages/indexer/README.md](packages/indexer/README.md) plus the phase-specific guide under `docs/indexer-*.md` |
 | Identity / dedup / labels / slugs | [docs/identity-pattern.md](docs/identity-pattern.md) |

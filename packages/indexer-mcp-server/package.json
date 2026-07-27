@@ -38,7 +38,7 @@
     "@utaba/deep-memory-indexer-llm-anthropic": "workspace:*",
     "@utaba/deep-memory-storage-sqlserver": "workspace:*",
     "@utaba/deep-memory-storage-cosmosdb": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.28.0"
+    "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",

@@ -60,7 +60,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.111.0",
+    "@anthropic-ai/sdk": "^0.120.0",
     "@utaba/deep-memory": "workspace:^",
     "@utaba/deep-memory-indexer": "workspace:^"
   },
@@ -68,6 +68,6 @@
     "@types/node": "^22.20.1",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }

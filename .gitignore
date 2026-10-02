@@ -135,3 +135,6 @@ dist
 
 # Turborepo
 .turbo
+
+# Editor settings are per-developer
+.vscode/

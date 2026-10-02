@@ -1,5 +1,52 @@
 # @utaba/deep-memory
 
+## 0.22.0
+
+### Minor Changes
+
+- 20459b5: Enforce the domain vocabulary as a contract during indexing: validate extraction output against the vocabulary before consolidation (reusing core's validator), discourage instance fabrication in the base extraction prompt, and harden extraction-review diagnostics so corrupt or fabricated output is no longer rated "good".
+
+  ## @utaba/deep-memory
+
+  - Added root exports of `validateEntity` and `validateRelationship` (plus `getEntityTypeDef` / `getRelationshipTypeDef`) so downstream packages can reuse core's vocabulary validator instead of duplicating it. Purely additive — no change to existing consumers. (This bump propagates across the fixed group.)
+
+  ## @utaba/deep-memory-indexer
+
+  - Vocabulary conformance gate: `VocabularyMarkdownParser` now populates `enumValues` from closed-enum "Allowed values" tables (a `Type: enum` row with no such table degrades to no check rather than rejecting every value); the new `VocabularyConformanceGate` validates extraction output against the vocabulary — unknown types, endpoint types, required properties, and closed-enum values — by calling core's validator, and is governance-mode aware (`locked` fails, `managed`/`open` warn; `managed` emits vocabulary-extension recommendations for recurring non-conforming closed-enum values). Conformance examples are capped per violation class so endpoint/enum classes are no longer starved.
+  - Base-prompt anti-fabrication: `PromptBuilder`'s system prompt states two domain-neutral rules — an enumerated list of recommended/allowed values on an open property is a naming vocabulary, not a checklist of entities to instantiate; and a cross-reference/deferral cell ("Refer to Clause X") is not a property value and should be modelled as its own entity.
+  - Review diagnostics hardening (`ReviewDiagnostics`): label normalization (diacritic strip, case-fold, separator/whitespace fold) so dedup catches accent/spacing variants; a decoupled token-subset "possible duplicates" signal (informational, never changes the exact-duplicate rating); `controlled-vocabulary-as-entities` and `cross-product-relationships` fabrication smells; zero-property-endpoint detection independent of aggregate coverage; and a conformance summary threaded into the review report.
+  - Convert-trigger fix: an already-converted, byte-unchanged source re-queues to `needs-conversion` when its `sourceConvertOptions` change, so a per-source conversion override actually takes effect.
+  - Removed the unused `mergeConvertOptions` re-export from the package entrypoint (the function remains available internally; it was never consumed via the public surface).
+
+  ## @utaba/deep-memory-indexer-mcp-server
+
+  - `indexing_diagnose` surfaces vocabulary-conformance counts by violation class and the new dedup/fabrication/zero-property-endpoint checks.
+  - `indexing_getting_started` documents `full-validation` with a stronger model as the recommended verification backstop for fabrication-prone corpora, paired with the base-prompt guardrail.
+
+### Patch Changes
+
+- e81471f: Vocabulary changes are now compare-and-set with a bounded retry, so concurrent proposals no longer silently overwrite each other, and writes to a deleted repository are rejected.
+
+  ## Vocabulary compare-and-set (`@utaba/deep-memory`)
+
+  - `StorageProvider.saveVocabulary(repositoryId, vocabulary, expectedVersion)` now requires the version the update was derived from. A mismatch throws the new `VocabularyVersionConflictError` (code `VOCABULARY_VERSION_CONFLICT`, carrying `repositoryId`, `expectedVersion`, `actualVersion`) and leaves the stored vocabulary unchanged. It never creates a vocabulary; a missing repository or vocabulary throws `RepositoryNotFoundError`.
+  - `StorageProvider.getVocabulary(repositoryId, options?)` accepts `{ fresh: true }` to bypass provider caches.
+  - `StorageRepositoryConfig.vocabulary` seeds the initial vocabulary in `createRepository`; providers seed `createEmptyVocabulary(createdBy)` when it is omitted. `createEmptyVocabulary` is now exported.
+  - `VocabularyEngine.proposeChange` reads fresh, re-runs deduplication, property validation and governance, and retries up to three times on a conflict. After the third conflict the error reaches the caller. Delete proposals write the vocabulary before cascade-deleting data.
+  - The engine refuses to save a vocabulary whose version did not change. `incrementVersion` throws `InvalidInputError` on non-numeric version components. Import archives with a malformed vocabulary version are rejected. A create-mode import into an existing repository bumps the version past the stored one.
+  - `memory_propose_vocabulary_extension` (`@utaba/deep-memory-local-mcp-server`) documents the conflict error.
+
+  ## Providers
+
+  - `@utaba/deep-memory-storage-sqlserver`: `saveVocabulary` is a single conditional `UPDATE` on the JSON version under a binary collation. `createRepository` seeds the supplied vocabulary. No schema change.
+  - `@utaba/deep-memory-storage-neo4j`: the version is also stored as a `_Vocabulary.version` property and compared under the node's write lock. `createEntity` and `createRelationship` throw `RepositoryNotFoundError` once the repository marker is gone. `deleteRepository` removes the marker first, a retry finishes an interrupted delete, and it throws `RepositoryNotFoundError` for an id with no data. `createRepository` refuses while a delete is unfinished.
+  - `@utaba/deep-memory-storage-cosmosdb`: the same contract. The version is stored as a vertex property, and a lost optimistic-concurrency write (412) is reported as a version conflict. Creates are gated on the repository vertex, and delete and create recovery work the same way as Neo4j.
+
+  ## Upgrading
+
+  - Run `ensureSchema()` once after every process is on this release (the local MCP server does this at startup). On Neo4j and CosmosDB it adds or repairs the stored version property. Until it runs, proposals on existing repositories fail with a `ProviderError` that names this remedy.
+  - Running an earlier release against the same database is unsupported: it writes vocabularies without compare-and-set.
+
 ## 0.21.1
 
 ## 0.21.0

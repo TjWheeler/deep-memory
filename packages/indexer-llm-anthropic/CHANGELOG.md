@@ -1,5 +1,17 @@
 # @utaba/deep-memory-indexer-llm-anthropic
 
+## 0.19.3
+
+### Patch Changes
+
+- Updated dependencies [b0be551]
+- Updated dependencies [ea83cd5]
+- Updated dependencies [ea83cd5]
+- Updated dependencies [e81471f]
+- Updated dependencies [20459b5]
+  - @utaba/deep-memory-indexer@0.20.0
+  - @utaba/deep-memory@0.22.0
+
 ## 0.19.2
 
 ### Patch Changes

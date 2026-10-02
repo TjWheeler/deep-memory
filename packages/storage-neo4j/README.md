@@ -65,7 +65,7 @@ const dm = new DeepMemory({ storage: provider, graphTraversal: provider });
 await provider.dispose();      // closes the Bolt driver
 ```
 
-`ensureSchema()` runs constraint and index DDL idempotently against the configured database and writes a `_Meta` schema-version handshake. Subsequent calls detect the existing schema and return early. It does **not** create the database itself — Neo4j Community Edition has a single user database; the operator is responsible for the target database existing before the provider connects.
+`ensureSchema()` runs constraint and index DDL idempotently against the configured database and writes a `_Meta` schema-version handshake. Subsequent calls skip the DDL when the schema version is current. Every call also repairs the `version` property on `_Vocabulary` nodes: it adds the property where it is missing and corrects it where it no longer matches the version in the JSON blob. Compare-and-set in `saveVocabulary` depends on that property (see [Vocabulary writes](#vocabulary-writes)). It does **not** create the database itself — Neo4j Community Edition has a single user database; the operator is responsible for the target database existing before the provider connects.
 
 ## Data Model
 
@@ -132,7 +132,19 @@ const statements = getSchemaCypher(); // string[]
 
 ### Vocabulary cache
 
-`getVocabulary` reads through a 60-second in-process cache (per `repositoryId`). Vocabulary is compile-time context for graph traversal and changes rarely; the cache turns the hot path into zero round-trips. Cross-process staleness is bounded by the 60 s TTL; writes inside this process invalidate immediately.
+`getVocabulary` reads through a 60-second in-process cache (per `repositoryId`). Vocabulary is compile-time context for graph traversal and changes rarely; the cache turns the hot path into zero round-trips. Cross-process staleness is bounded by the 60 s TTL. Writes inside this process invalidate the entry immediately, and so does a version conflict. `getVocabulary(id, { fresh: true })` skips the cache, reads the node (one round-trip) and replaces the cache entry with the result.
+
+### Vocabulary writes
+
+The vocabulary version is stored twice: inside the JSON blob and as a `version` property on the `_Vocabulary` node, so the database can compare it. `saveVocabulary(id, vocabulary, expectedVersion)` is compare-and-set. It takes the node's write lock before it checks the version, so two concurrent writers against the same base version cannot both land. A mismatch throws `VocabularyVersionConflictError`. `saveVocabulary` never creates the node, because `createRepository` writes it together with the `_Repository` node. When neither exists, it throws `RepositoryNotFoundError`. A node with a missing or stale `version` property throws `ProviderError`, and the message says to run `ensureSchema()`.
+
+### Repository delete
+
+`deleteRepository` deletes the `_Repository` marker first. Entity and relationship creates match the marker in the same statement as their write, so they fail with `RepositoryNotFoundError` from that point on. The delete then drains relationships, entities, the change log and any other node carrying the `repositoryId`. The `_Vocabulary` node goes last. A delete that is interrupted part-way can be finished by calling `deleteRepository` again. It throws `RepositoryNotFoundError` only when nothing at all was left to delete. While a delete is unfinished (a `_Vocabulary` node or `_Entity` nodes remain with no marker), `createRepository` refuses with a `ProviderError` that tells you to finish the delete first.
+
+### Upgrading
+
+After upgrading this package, run `ensureSchema()` once, after **every** process that writes to the database has moved to the new release. This repairs the `version` property on vocabularies written by earlier releases. The local MCP server runs `ensureSchema()` at startup, and the indexer runs it before each import. Running old and new releases against one database at the same time is unsupported, because an older release rewrites the vocabulary blob without updating the `version` property.
 
 ## Search behaviour (`findEntities`)
 

@@ -24,6 +24,7 @@ describe('FallbackTraversalExecutor', () => {
     });
 
     // Save vocabulary
+    const current = await storage.getVocabulary(repoId);
     await storage.saveVocabulary(repoId, {
       version: '1.0.0',
       lastModified: new Date().toISOString(),
@@ -37,7 +38,7 @@ describe('FallbackTraversalExecutor', () => {
         { type: 'HAS_COMPONENT', description: '', version: '1.0', allowedSourceTypes: ['Equipment'], allowedTargetTypes: ['Component'], bidirectional: false, createdAt: '', createdBy: '', modifiedAt: '', modifiedBy: '' },
         { type: 'REQUIRES_FLUID', description: '', version: '1.0', allowedSourceTypes: ['Component'], allowedTargetTypes: ['Fluid'], bidirectional: false, createdAt: '', createdBy: '', modifiedAt: '', modifiedBy: '' },
       ],
-    });
+    }, current.version);
 
     const provenance = { actorId: 'test', timestamp: new Date().toISOString(), conversationId: 'test' };
 
@@ -443,6 +444,7 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
       createdBy: 'test',
     });
 
+    const current = await storage.getVocabulary(repoId);
     await storage.saveVocabulary(repoId, {
       version: '1.0.0',
       lastModified: new Date().toISOString(),
@@ -454,7 +456,7 @@ describe('FallbackTraversalExecutor — Nexus/Orion shared-target regression', (
       relationshipTypes: [
         { type: 'WORKS_AT', description: '', version: '1.0', allowedSourceTypes: ['Person'], allowedTargetTypes: ['Organization'], bidirectional: false, createdAt: '', createdBy: '', modifiedAt: '', modifiedBy: '' },
       ],
-    });
+    }, current.version);
 
     const provenance = { actorId: 'test', timestamp: new Date().toISOString(), conversationId: 'test' };
 

@@ -29,7 +29,9 @@
 //     A `MERGE`-with-discriminator alternative is marginally faster on the
 //     happy path but mutates the existing node on every collision (writes a
 //     discriminator property onto durable graph state that the caller never
-//     requested) — correctness wins over the marginal perf delta.
+//     requested) — correctness wins over the marginal perf delta. The same
+//     statement matches the `_Repository` node first, so a create against a
+//     deleted repository writes nothing and surfaces `RepositoryNotFoundError`.
 //   - `getEntity` / `getEntityBySlug` / `getEntities` use explicit projection
 //     via `buildEntityProjection` so embedding stays off the wire unless the
 //     caller opts in via `EntityReadOptions.loadEmbeddings`. User-property
@@ -67,7 +69,7 @@ import {
   RESERVED_ENTITY_PROPERTY_KEYS,
 } from '../mapping.js';
 import { mapDriverError } from '../errors.js';
-import { EntityNotFoundError, ProviderError } from '@utaba/deep-memory';
+import { EntityNotFoundError, ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
 
 /**
  * Fixed-shape `CREATE` template — same Cypher string for every entity create
@@ -84,8 +86,18 @@ import { EntityNotFoundError, ProviderError } from '@utaba/deep-memory';
  *
  * Returns `n.id AS id` only — the caller already holds the `StoredEntity` it
  * passed in and does not need the round-trip to re-materialise it.
+ *
+ * The leading `MATCH` on the `_Repository` node guards the write: when the
+ * repository marker is absent the `MATCH` yields no row and nothing is
+ * created. `deleteRepository` removes the marker before its chunked wipe, and
+ * the wipe is not one transaction, so without this guard a create racing the
+ * wipe could land after the chunk that would have removed it and leave an
+ * orphaned entity behind. Reading the marker does not lock it, so a create
+ * already executing when the marker is deleted can still commit after the
+ * wipe; re-running deleteRepository removes it.
  */
 const ENTITY_CREATE_QUERY = `
+MATCH (r:_Repository {repositoryId: $rid})
 CREATE (n:_Entity {
   repositoryId: $rid,
   id: $id,
@@ -148,12 +160,14 @@ export async function createEntity(
   // round-trip. A reserved-key collision or a malformed identifier throws
   // `ProviderError` here so the surface never reaches the server.
   const userProperties = entityUserPropertyParams(entity.properties);
+  let nodesCreated = 0;
   try {
-    await conn.executeQuery(
+    const result = await conn.executeQuery(
       ENTITY_CREATE_QUERY,
       { ...entityToParams(entity), userProperties },
       { repositoryId },
     );
+    nodesCreated = result.summary.counters.updates()['nodesCreated'] ?? 0;
   } catch (err) {
     mapDriverError(err, {
       kind: 'entity',
@@ -161,6 +175,8 @@ export async function createEntity(
       operation: 'createEntity',
     });
   }
+  // The repository-marker MATCH matched nothing, so the CREATE never ran.
+  if (nodesCreated === 0) throw new RepositoryNotFoundError(repositoryId);
   return entity;
 }
 

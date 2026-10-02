@@ -185,7 +185,12 @@ export class DeepMemory {
       metadata.embeddingDimensions = this.defaultEmbeddingDimensions;
     }
 
-    // Create the repository in storage
+    // The initial vocabulary is persisted by createRepository itself, so the
+    // repository never exists without one and saveVocabulary only ever updates.
+    const vocabulary = config.vocabulary
+      ? buildVocabulary(config.vocabulary, context.actorId)
+      : createEmptyVocabulary(context.actorId);
+
     await this.storage.createRepository({
       repositoryId,
       type: config.type,
@@ -195,16 +200,10 @@ export class DeepMemory {
       owner: config.owner,
       governanceConfig,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+      vocabulary,
       createdAt: now,
       createdBy: context.actorId,
     });
-
-    // Build and save initial vocabulary
-    const vocabulary = config.vocabulary
-      ? buildVocabulary(config.vocabulary, context.actorId)
-      : createEmptyVocabulary(context.actorId);
-
-    await this.storage.saveVocabulary(repositoryId, vocabulary);
 
     // Build per-repository embedding provider from the repo's stored model + dimensions
     const embedding = this.buildEmbeddingForRepository(

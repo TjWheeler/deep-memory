@@ -3,6 +3,7 @@
 import type {
   GovernanceConfig,
   GovernanceMode,
+  MemoryVocabulary,
   VocabularyInput,
 } from './vocabulary.js';
 
@@ -117,6 +118,11 @@ export interface StorageRepositoryConfig {
   governanceConfig: GovernanceConfig;
   /** Extensible metadata bag */
   metadata?: RepositoryMetadata;
+  /**
+   * Initial vocabulary. Providers seed an empty vocabulary when omitted.
+   * `saveVocabulary` never creates, so this is the only way to set the first version.
+   */
+  vocabulary?: MemoryVocabulary;
   createdAt: string;
   createdBy: string;
 }

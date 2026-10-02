@@ -10,6 +10,24 @@ import type { StorageProvider } from '../providers/StorageProvider.js';
 import type { StoredEntity } from '../types/entities.js';
 import type { StoredRelationship } from '../types/relationships.js';
 import type { Provenance } from '../types/provenance.js';
+import type { MemoryVocabulary } from '../types/vocabulary.js';
+import type { DeepMemoryErrorCode } from '../core/errors.js';
+
+/**
+ * Error shape asserted for typed provider errors.
+ *
+ * The suite is published as its own bundle (`@utaba/deep-memory/testing`),
+ * which carries a separate copy of the error classes from the one a provider
+ * imports from `@utaba/deep-memory`. `instanceof` therefore cannot be relied
+ * on across that boundary; `name` and `code` are the stable contract.
+ */
+function typedError(
+  name: string,
+  code: DeepMemoryErrorCode,
+  fields: Record<string, string> = {},
+): Record<string, string> {
+  return { name, code, ...fields };
+}
 
 function makeProvenance(): Provenance {
   const now = new Date().toISOString();
@@ -127,6 +145,54 @@ export function runStorageProviderConformanceTests(
         expect(await provider.getRepository(repoId)).toBeNull();
       });
 
+      it('deleteRepository throws RepositoryNotFoundError for an unknown repository', async () => {
+        await expect(
+          provider.deleteRepository('ffffffff-ffff-4fff-afff-ffffffffffff'),
+        ).rejects.toMatchObject(typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'));
+      });
+
+      it('createRepository seeds the provided vocabulary', async () => {
+        // Recreate the stable repository so per-test cleanup by id still covers it.
+        await provider.deleteRepository(repoId);
+        const now = new Date().toISOString();
+        const seeded: MemoryVocabulary = {
+          version: '2.0.0',
+          lastModified: now,
+          modifiedBy: 'conformance-test',
+          entityTypes: [
+            {
+              type: 'seeded-type',
+              description: 'Entity type supplied at repository creation',
+              version: '1.0.0',
+              properties: [],
+              createdAt: now,
+              createdBy: 'conformance-test',
+              modifiedAt: now,
+              modifiedBy: 'conformance-test',
+            },
+          ],
+          relationshipTypes: [],
+        };
+        await provider.createRepository({
+          repositoryId: repoId,
+          label: 'Conformance Test',
+          governanceConfig: { mode: 'open' },
+          vocabulary: seeded,
+          createdAt: now,
+          createdBy: 'conformance-test',
+        });
+
+        const vocab = await provider.getVocabulary(repoId);
+        expect(vocab.version).toBe('2.0.0');
+        expect(vocab.entityTypes.map((t) => t.type)).toEqual(['seeded-type']);
+      });
+
+      it('createRepository seeds an empty vocabulary when omitted', async () => {
+        const vocab = await provider.getVocabulary(repoId);
+        expect(typeof vocab.version).toBe('string');
+        expect(vocab.entityTypes).toEqual([]);
+      });
+
       it('returns repository stats', async () => {
         const stats = await provider.getRepositoryStats(repoId);
         expect(stats.entityCount).toBe(0);
@@ -144,9 +210,46 @@ export function runStorageProviderConformanceTests(
         expect(typeof vocab.version).toBe('string');
 
         const updated = { ...vocab, version: '1.0.0' };
-        await provider.saveVocabulary(repoId, updated);
+        await provider.saveVocabulary(repoId, updated, vocab.version);
 
         const fetched = await provider.getVocabulary(repoId);
+        expect(fetched.version).toBe('1.0.0');
+      });
+
+      it('saveVocabulary rejects a stale version', async () => {
+        const v0 = await provider.getVocabulary(repoId);
+        await provider.saveVocabulary(repoId, { ...v0, version: '1.0.0' }, v0.version);
+
+        // A second writer that also read v0 must not overwrite the first write.
+        const stale = provider.saveVocabulary(repoId, { ...v0, version: '1.0.1' }, v0.version);
+        await expect(stale).rejects.toMatchObject(
+          typedError('VocabularyVersionConflictError', 'VOCABULARY_VERSION_CONFLICT', {
+            repositoryId: repoId,
+            expectedVersion: v0.version,
+            actualVersion: '1.0.0',
+          }),
+        );
+
+        const fetched = await provider.getVocabulary(repoId, { fresh: true });
+        expect(fetched.version).toBe('1.0.0');
+      });
+
+      it('saveVocabulary throws RepositoryNotFoundError for a deleted repository', async () => {
+        const vocab = await provider.getVocabulary(repoId);
+        await provider.deleteRepository(repoId);
+
+        await expect(
+          provider.saveVocabulary(repoId, { ...vocab, version: '1.0.0' }, vocab.version),
+        ).rejects.toMatchObject(typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'));
+        expect(await provider.getRepository(repoId)).toBeNull();
+      });
+
+      it('getVocabulary with { fresh: true } returns the stored value', async () => {
+        // The plain read may populate a provider-side cache; the fresh read must not be served from it.
+        const v0 = await provider.getVocabulary(repoId);
+        await provider.saveVocabulary(repoId, { ...v0, version: '1.0.0' }, v0.version);
+
+        const fetched = await provider.getVocabulary(repoId, { fresh: true });
         expect(fetched.version).toBe('1.0.0');
       });
 
@@ -315,6 +418,15 @@ export function runStorageProviderConformanceTests(
         expect(page2.items).toHaveLength(1);
         expect(page2.hasMore).toBe(false);
       });
+
+      it('createEntity throws RepositoryNotFoundError after the repository is deleted', async () => {
+        await provider.deleteRepository(repoId);
+
+        await expect(provider.createEntity(repoId, makeEntity('e1'))).rejects.toMatchObject(
+          typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'),
+        );
+        expect(await provider.getRepository(repoId)).toBeNull();
+      });
     });
 
     // ─── Relationships ──────────────────────────────────────
@@ -365,6 +477,16 @@ export function runStorageProviderConformanceTests(
         await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
         await provider.deleteRelationship(repoId, 'r1');
         expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
+      });
+
+      it('createRelationship throws RepositoryNotFoundError after the repository is deleted', async () => {
+        // Entities "a" and "b" were created by beforeEach while the repository existed.
+        await provider.deleteRepository(repoId);
+
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b')),
+        ).rejects.toMatchObject(typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'));
+        expect(await provider.getRepository(repoId)).toBeNull();
       });
     });
 

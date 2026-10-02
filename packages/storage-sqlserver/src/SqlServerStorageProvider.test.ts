@@ -13,6 +13,10 @@ import { SqlServerStorageProvider } from './SqlServerStorageProvider.js';
 
 const connectionString = process.env['MSSQL_CONNECTION_STRING'];
 
+// The repository id the shared conformance suite creates before every test.
+// The suite has no teardown, so each factory call must remove it first.
+const CONFORMANCE_REPO_ID = '40000000-0000-4000-a000-000000000001';
+
 function parseConnectionString(cs: string): Record<string, string> {
   const pairs: Record<string, string> = {};
   for (const part of cs.split(';')) {
@@ -47,7 +51,7 @@ if (connectionString) {
 
     // Clean up only the conformance test repo from previous runs
     const pool = (provider as unknown as { pool: ConnectionPool }).pool;
-    await pool.request().input('repoId', mssql.UniqueIdentifier, '00000000-0000-0000-0000-000000000001').query(`
+    await pool.request().input('repoId', mssql.UniqueIdentifier, CONFORMANCE_REPO_ID).query(`
       DELETE FROM [dbo].[dm_relationships] WHERE [repository_id] = @repoId;
       DELETE FROM [dbo].[dm_entities] WHERE [repository_id] = @repoId;
       DELETE FROM [dbo].[dm_vocabulary_change_log] WHERE [repository_id] = @repoId;

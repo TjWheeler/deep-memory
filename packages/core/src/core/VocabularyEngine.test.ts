@@ -1,26 +1,69 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { VocabularyEngine } from './VocabularyEngine.js';
-import { buildVocabulary, createEmptyVocabulary } from '../vocabulary/VocabularySchema.js';
-import type { MemoryVocabulary, GovernanceConfig } from '../types/vocabulary.js';
-import type { StorageProvider } from '../providers/StorageProvider.js';
+import {
+  buildVocabulary,
+  createEntityTypeDefinition,
+  incrementVersion,
+} from '../vocabulary/VocabularySchema.js';
+import type { MemoryVocabulary } from '../types/vocabulary.js';
+import type { StorageProvider, VocabularyReadOptions } from '../providers/StorageProvider.js';
+import { InvalidInputError, VocabularyVersionConflictError } from './errors.js';
 
-/** Minimal mock StorageProvider — only implements vocabulary methods */
-function createMockStorage(initialVocab: MemoryVocabulary): Partial<StorageProvider> {
+interface MockStorageHooks {
+  /** Ordered log of storage method names, for asserting call order and attempt counts */
+  calls?: string[];
+  /**
+   * Simulates another process writing between this engine's read and its write.
+   * Called after each `getVocabulary` snapshot is taken, with the 1-based read
+   * number and the stored vocabulary; a returned vocabulary replaces the stored one.
+   */
+  concurrentWrite?: (readNumber: number, stored: MemoryVocabulary) => MemoryVocabulary | undefined;
+}
+
+/** Minimal mock StorageProvider — only implements vocabulary methods, with compare-and-set saves */
+function createMockStorage(
+  initialVocab: MemoryVocabulary,
+  hooks: MockStorageHooks = {},
+): Partial<StorageProvider> {
   let vocab = initialVocab;
+  let reads = 0;
+  const calls = hooks.calls;
   return {
-    async getVocabulary(_repositoryId: string) {
+    async getVocabulary(_repositoryId: string, _options?: VocabularyReadOptions) {
+      calls?.push('getVocabulary');
+      reads++;
       // Return a copy to simulate a real storage provider
-      return { ...vocab };
+      const snapshot = { ...vocab };
+      const injected = hooks.concurrentWrite?.(reads, vocab);
+      if (injected) vocab = injected;
+      return snapshot;
     },
-    async saveVocabulary(_repositoryId: string, vocabulary: MemoryVocabulary) {
+    async saveVocabulary(repositoryId: string, vocabulary: MemoryVocabulary, expectedVersion: string) {
+      calls?.push('saveVocabulary');
+      if (vocab.version !== expectedVersion) {
+        throw new VocabularyVersionConflictError(repositoryId, expectedVersion, vocab.version);
+      }
       vocab = vocabulary;
     },
     async deleteEntitiesByType(_repositoryId: string, _entityType: string) {
+      calls?.push('deleteEntitiesByType');
       return { deletedEntities: 3, deletedRelationships: 5 };
     },
     async deleteRelationshipsByType(_repositoryId: string, _relationshipType: string) {
+      calls?.push('deleteRelationshipsByType');
       return { deletedRelationships: 2 };
     },
+  };
+}
+
+/** A concurrent writer's change: bumps the version and optionally adds an entity type */
+function concurrentChange(stored: MemoryVocabulary, addType?: { type: string; description: string }): MemoryVocabulary {
+  return {
+    ...stored,
+    version: incrementVersion(stored.version, 'patch'),
+    entityTypes: addType
+      ? [...stored.entityTypes, createEntityTypeDefinition(addType, 'other-process')]
+      : stored.entityTypes,
   };
 }
 
@@ -478,6 +521,205 @@ describe('VocabularyEngine', () => {
       );
       expect(result.status).toBe('rejected');
       expect(result.reason).toContain('locked');
+    });
+  });
+
+  describe('proposeChange — concurrent writers', () => {
+    const repositoryId = '20000000-0000-4000-a000-000000000001';
+
+    function engineOn(sharedStorage: Partial<StorageProvider>): VocabularyEngine {
+      return new VocabularyEngine({
+        repositoryId,
+        storageProvider: sharedStorage as StorageProvider,
+        governanceConfig: { mode: 'open' },
+      });
+    }
+
+    function countOf(calls: string[], name: string): number {
+      return calls.filter((c) => c === name).length;
+    }
+
+    it('two engines on the same storage both get their type in', async () => {
+      const shared = createMockStorage(testVocab);
+      const engineA = engineOn(shared);
+      const engineB = engineOn(shared);
+
+      // Prime B's cache before A writes, so B's cached copy is stale.
+      await engineB.getVocabulary();
+
+      const resultA = await engineA.proposeChange(
+        { proposalType: 'entity_type', entityType: { type: 'alpha', description: 'First concurrently proposed type' }, justification: 'A' },
+        'agent-a',
+      );
+      const resultB = await engineB.proposeChange(
+        { proposalType: 'entity_type', entityType: { type: 'beta', description: 'Second concurrently proposed type' }, justification: 'B' },
+        'agent-b',
+      );
+
+      expect(resultA.status).toBe('approved');
+      expect(resultB.status).toBe('approved');
+      expect(resultA.vocabularyVersion).toBeDefined();
+      expect(resultB.vocabularyVersion).not.toBe(resultA.vocabularyVersion);
+
+      const stored = await shared.getVocabulary!(repositoryId, { fresh: true });
+      const types = stored.entityTypes.map((et) => et.type);
+      expect(types).toContain('alpha');
+      expect(types).toContain('beta');
+    });
+
+    it('retries once after a conflict injected between read and write', async () => {
+      const calls: string[] = [];
+      const shared = createMockStorage(testVocab, {
+        calls,
+        concurrentWrite: (readNumber, stored) =>
+          readNumber === 1
+            ? concurrentChange(stored, { type: 'gamma', description: 'Type written by another process' })
+            : undefined,
+      });
+
+      const result = await engineOn(shared).proposeChange(
+        { proposalType: 'entity_type', entityType: { type: 'team', description: 'A team of people' }, justification: 'Need teams' },
+        'agent',
+      );
+
+      expect(result.status).toBe('approved');
+      expect(countOf(calls, 'saveVocabulary')).toBe(2);
+
+      const stored = await shared.getVocabulary!(repositoryId, { fresh: true });
+      const types = stored.entityTypes.map((et) => et.type);
+      expect(types).toContain('gamma');
+      expect(types).toContain('team');
+    });
+
+    it('gives up after three conflicts', async () => {
+      const calls: string[] = [];
+      const shared = createMockStorage(testVocab, {
+        calls,
+        concurrentWrite: (_readNumber, stored) => concurrentChange(stored),
+      });
+
+      await expect(
+        engineOn(shared).proposeChange(
+          { proposalType: 'entity_type', entityType: { type: 'team', description: 'A team of people' }, justification: 'Need teams' },
+          'agent',
+        ),
+      ).rejects.toThrow(VocabularyVersionConflictError);
+      expect(countOf(calls, 'saveVocabulary')).toBe(3);
+    });
+
+    it('re-evaluates dedup on retry', async () => {
+      const shared = createMockStorage(testVocab, {
+        concurrentWrite: (readNumber, stored) =>
+          readNumber === 1
+            ? concurrentChange(stored, { type: 'alpha', description: 'An alpha grouping' })
+            : undefined,
+      });
+
+      const result = await engineOn(shared).proposeChange(
+        { proposalType: 'entity_type', entityType: { type: 'alpha', description: 'An alpha grouping' }, justification: 'Need alpha' },
+        'agent',
+      );
+
+      expect(result.status).toBe('rejected');
+      expect(result.duplicates).toBeDefined();
+      expect(result.duplicates!.map((d) => d.type)).toContain('alpha');
+    });
+
+    it('delete proposal writes the vocabulary before cascading', async () => {
+      const calls: string[] = [];
+      const shared = createMockStorage(testVocab, { calls });
+
+      const result = await engineOn(shared).proposeChange(
+        { proposalType: 'delete_entity_type', deleteEntityType: { type: 'project' }, justification: 'No longer needed' },
+        'agent',
+      );
+
+      expect(result.status).toBe('approved');
+      const saveIndex = calls.indexOf('saveVocabulary');
+      const cascadeIndex = calls.indexOf('deleteEntitiesByType');
+      expect(saveIndex).toBeGreaterThanOrEqual(0);
+      expect(cascadeIndex).toBeGreaterThan(saveIndex);
+    });
+
+    it('a failed CAS does not cascade-delete', async () => {
+      const calls: string[] = [];
+      const shared = createMockStorage(testVocab, {
+        calls,
+        concurrentWrite: (_readNumber, stored) => concurrentChange(stored),
+      });
+
+      await expect(
+        engineOn(shared).proposeChange(
+          { proposalType: 'delete_entity_type', deleteEntityType: { type: 'project' }, justification: 'No longer needed' },
+          'agent',
+        ),
+      ).rejects.toThrow(VocabularyVersionConflictError);
+      expect(calls).not.toContain('deleteEntitiesByType');
+    });
+
+    /** Stands in for a conflict error thrown by a different copy of this package. */
+    class ForeignCodedError extends Error {
+      public readonly code: string;
+      constructor(code: string) {
+        super(`foreign ${code}`);
+        this.code = code;
+      }
+    }
+
+    function storageFailingFirstSaveWith(error: Error, calls: string[]): Partial<StorageProvider> {
+      const inner = createMockStorage(testVocab, { calls });
+      let saves = 0;
+      return {
+        ...inner,
+        async saveVocabulary(repoId: string, vocabulary: MemoryVocabulary, expectedVersion: string) {
+          saves++;
+          if (saves === 1) {
+            calls.push('saveVocabulary');
+            throw error;
+          }
+          return inner.saveVocabulary!(repoId, vocabulary, expectedVersion);
+        },
+      };
+    }
+
+    it('retries a conflict that is not an instance of this copy of the error class', async () => {
+      const calls: string[] = [];
+      const shared = storageFailingFirstSaveWith(new ForeignCodedError('VOCABULARY_VERSION_CONFLICT'), calls);
+
+      const result = await engineOn(shared).proposeChange(
+        { proposalType: 'entity_type', entityType: { type: 'team', description: 'A team of people' }, justification: 'Need teams' },
+        'agent',
+      );
+
+      expect(result.status).toBe('approved');
+      expect(countOf(calls, 'saveVocabulary')).toBe(2);
+    });
+
+    it('does not retry errors with other codes', async () => {
+      const calls: string[] = [];
+      const failure = new ForeignCodedError('PROVIDER_ERROR');
+      const shared = storageFailingFirstSaveWith(failure, calls);
+
+      await expect(
+        engineOn(shared).proposeChange(
+          { proposalType: 'entity_type', entityType: { type: 'team', description: 'A team of people' }, justification: 'Need teams' },
+          'agent',
+        ),
+      ).rejects.toBe(failure);
+      expect(countOf(calls, 'saveVocabulary')).toBe(1);
+    });
+
+    it('refuses to write when the stored version cannot be advanced', async () => {
+      const calls: string[] = [];
+      const shared = createMockStorage({ ...testVocab, version: '1.x.0' }, { calls });
+
+      await expect(
+        engineOn(shared).proposeChange(
+          { proposalType: 'entity_type', entityType: { type: 'team', description: 'A team of people' }, justification: 'Need teams' },
+          'agent',
+        ),
+      ).rejects.toThrow(InvalidInputError);
+      expect(calls).not.toContain('saveVocabulary');
     });
   });
 });

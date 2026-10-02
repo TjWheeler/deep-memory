@@ -1,7 +1,12 @@
 // SqlServerStorageProvider — SQL Server implementation of StorageProvider
 
 import sql from 'mssql';
-import type { StorageProvider, EnsureSchemaResult, EntityReadOptions } from '@utaba/deep-memory/providers';
+import type {
+  StorageProvider,
+  EnsureSchemaResult,
+  EntityReadOptions,
+  VocabularyReadOptions,
+} from '@utaba/deep-memory/providers';
 import type {
   StoredEntity,
   StoredEntityUpdate,
@@ -38,6 +43,8 @@ import {
   RelationshipNotFoundError,
   DuplicateRelationshipError,
   ProviderError,
+  VocabularyVersionConflictError,
+  createEmptyVocabulary,
   matchesPropertyFilters,
   createSafeSink,
 } from '@utaba/deep-memory';
@@ -431,7 +438,7 @@ export class SqlServerStorageProvider implements StorageProvider {
 
   // ─── Repository ──────────────────────────────────────────────────
 
-  async createRepository(config: StorageRepositoryConfig): Promise<StoredRepository> {
+  public async createRepository(config: StorageRepositoryConfig): Promise<StoredRepository> {
     const pool = this.getPool();
 
     // Check for duplicate
@@ -462,18 +469,13 @@ export class SqlServerStorageProvider implements StorageProvider {
         VALUES (@id, @type, @label, @description, @legal, @owner, @governanceConfig, @metadata, @createdAt, @createdBy)
       `);
 
-    // Create empty vocabulary
-    const emptyVocabulary: MemoryVocabulary = {
-      version: '0.0.0',
-      lastModified: config.createdAt,
-      modifiedBy: config.createdBy,
-      entityTypes: [],
-      relationshipTypes: [],
-    };
+    // Seed the repository's only vocabulary row. saveVocabulary never inserts,
+    // so this is where the first stored version comes from.
+    const initialVocabulary = config.vocabulary ?? createEmptyVocabulary(config.createdBy);
 
     await pool.request()
       .input('id', sql.UniqueIdentifier, config.repositoryId)
-      .input('vocabulary', sql.NVarChar, JSON.stringify(emptyVocabulary))
+      .input('vocabulary', sql.NVarChar, JSON.stringify(initialVocabulary))
       .query(`
         INSERT INTO ${this.t('dm_vocabularies')} ([repository_id], [vocabulary])
         VALUES (@id, @vocabulary)
@@ -706,7 +708,14 @@ export class SqlServerStorageProvider implements StorageProvider {
 
   // ─── Vocabulary ──────────────────────────────────────────────────
 
-  async getVocabulary(repositoryId: string): Promise<MemoryVocabulary> {
+  /**
+   * Read the stored vocabulary. This provider keeps no vocabulary cache, so
+   * every read already goes to the database and `fresh` needs no handling.
+   */
+  public async getVocabulary(
+    repositoryId: string,
+    _options?: VocabularyReadOptions,
+  ): Promise<MemoryVocabulary> {
     await this.assertRepository(repositoryId);
     const pool = this.getPool();
 
@@ -718,31 +727,79 @@ export class SqlServerStorageProvider implements StorageProvider {
 
     const row = result.recordset[0];
     if (!row) {
-      // Should not happen if repository exists, but handle gracefully
-      return {
-        version: '0.0.0',
-        lastModified: new Date().toISOString(),
-        modifiedBy: 'system',
-        entityTypes: [],
-        relationshipTypes: [],
-      };
+      // createRepository inserts the vocabulary row together with the
+      // repository row, so an existing repository without one is corrupt
+      // state. Returning a synthetic empty vocabulary would hand callers a
+      // version that saveVocabulary can never match.
+      throw new ProviderError(
+        `Repository "${repositoryId}" exists but has no stored vocabulary`,
+        'The vocabulary is created with the repository; re-create or re-import the repository to restore it.',
+      );
     }
 
     return JSON.parse(row.vocabulary) as MemoryVocabulary;
   }
 
-  async saveVocabulary(repositoryId: string, vocabulary: MemoryVocabulary): Promise<void> {
-    await this.assertRepository(repositoryId);
+  /**
+   * Compare-and-set write of the vocabulary.
+   *
+   * The version check and the write are one UPDATE, so two writers that read
+   * the same base version cannot both land — the second matches zero rows.
+   * The stored version is read out of the JSON document with JSON_VALUE
+   * rather than kept in a dedicated column, so the table schema is unchanged.
+   * The comparison uses a binary collation so it is exact: the default
+   * collations ignore case and trailing spaces, which would let a different
+   * version string match.
+   *
+   * Zero rows affected means either the repository is gone or the version is
+   * stale; only on that path does a follow-up read decide which typed error to
+   * throw. The success path is a single round-trip — no up-front repository
+   * check, because the UPDATE's WHERE clause already covers a missing row.
+   */
+  public async saveVocabulary(
+    repositoryId: string,
+    vocabulary: MemoryVocabulary,
+    expectedVersion: string,
+  ): Promise<void> {
     const pool = this.getPool();
 
-    await pool.request()
+    const update = await pool.request()
       .input('id', sql.UniqueIdentifier, repositoryId)
       .input('vocabulary', sql.NVarChar, JSON.stringify(vocabulary))
+      .input('expectedVersion', sql.NVarChar, expectedVersion)
       .query(`
         UPDATE ${this.t('dm_vocabularies')}
         SET [vocabulary] = @vocabulary
         WHERE [repository_id] = @id
+          AND JSON_VALUE([vocabulary], '$.version') COLLATE Latin1_General_100_BIN2 = @expectedVersion
       `);
+
+    if ((update.rowsAffected[0] ?? 0) > 0) {
+      return;
+    }
+
+    const current = await pool.request()
+      .input('id', sql.UniqueIdentifier, repositoryId)
+      .query<{ version: string | null }>(`
+        SELECT JSON_VALUE([vocabulary], '$.version') AS [version]
+        FROM ${this.t('dm_vocabularies')}
+        WHERE [repository_id] = @id
+      `);
+
+    const row = current.recordset[0];
+    if (!row) {
+      throw new RepositoryNotFoundError(repositoryId);
+    }
+    if (row.version === null) {
+      // JSON_VALUE yields NULL when $.version is missing, not a scalar, or
+      // longer than 4000 characters. No expectedVersion can ever match such a
+      // row, so reporting a conflict would send callers into a futile retry.
+      throw new ProviderError(
+        `Stored vocabulary for repository "${repositoryId}" has no readable version`,
+        'The stored vocabulary document is malformed; its "version" must be a "major.minor.patch" string.',
+      );
+    }
+    throw new VocabularyVersionConflictError(repositoryId, expectedVersion, row.version);
   }
 
   async getVocabularyChangeLog(

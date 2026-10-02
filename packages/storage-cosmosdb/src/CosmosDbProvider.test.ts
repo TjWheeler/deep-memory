@@ -9,8 +9,9 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { CosmosDbProvider } from './CosmosDbProvider.js';
-import type { GremlinResult } from './CosmosDbConnection.js';
+import type { CosmosDbConnection, GremlinResult } from './CosmosDbConnection.js';
 import type {
+  MemoryVocabulary,
   StoredEntity,
   StoredEntityUpdate,
   StoredRelationship,
@@ -19,14 +20,30 @@ import type {
 import {
   DuplicateEntityError,
   DuplicateRelationshipError,
+  DuplicateRepositoryError,
   EntityNotFoundError,
   ProviderError,
+  RepositoryNotFoundError,
+  VocabularyVersionConflictError,
 } from '@utaba/deep-memory';
 import { ENTITY_CREATE_QUERY } from './queries/entity.js';
 import { RELATIONSHIP_CREATE_QUERY } from './queries/relationship.js';
-import type { CosmosQueryParameter, CosmosQueryResult } from './CosmosDocumentClient.js';
+import { DELETE_INDEX_ENTRY_QUERY, DELETE_VERTEX_BATCH_QUERY } from './queries/repository.js';
+import {
+  VOCABULARY_BACKFILL_SCAN_SQL,
+  VOCABULARY_BACKFILL_WRITE_QUERY,
+  VOCABULARY_SAVE_QUERY,
+  VOCABULARY_STATE_QUERY,
+  backfillVocabularyVersions,
+} from './queries/vocabulary.js';
+import type { CosmosDocumentClient, CosmosQueryParameter, CosmosQueryResult } from './CosmosDocumentClient.js';
 
 const TEST_REPO = '40000000-0000-4000-a000-000000000099';
+
+// Every entity-create query opens with the partition-scoped gate on the
+// repository's `_repository` marker vertex.
+const ENTITY_CREATE_START =
+  "g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(";
 
 interface SubmitCall {
   query: string;
@@ -44,12 +61,18 @@ function makeProvider(): { provider: CosmosDbProvider; stub: SubmitStub } {
 
   const stub: SubmitStub = {
     calls,
+    // The vocabulary read issued by getVocabulary and by traversal compilation
+    // (not the compare-and-set miss follow-up, which projects version + blob).
     isVocabRead: (call) =>
-      call.query.includes("hasLabel('_vocabulary')") && call.query.includes("values('vocabulary')"),
+      call.query.includes("hasLabel('_vocabulary')") && call.query.includes(".values('vocabulary').limit(1)"),
     submit: async (query, params) => {
       calls.push({ query, params });
       // Default: empty result. Tests override per-call by inspecting the
       // query string and returning shaped data.
+      if (query === VOCABULARY_SAVE_QUERY) {
+        // Compare-and-set lands: one vertex written.
+        return { items: [1] };
+      }
       if (query.includes("hasLabel('_vocabulary')")) {
         // The vocabulary read uses `.values('vocabulary').limit(1)` — return
         // a JSON-stringified vocabulary so the parse path succeeds.
@@ -87,6 +110,16 @@ function makeProvider(): { provider: CosmosDbProvider; stub: SubmitStub } {
   return { provider, stub };
 }
 
+function makeVocabulary(version: string): MemoryVocabulary {
+  return {
+    version,
+    lastModified: '2026-05-26T00:00:00.000Z',
+    modifiedBy: 'test',
+    entityTypes: [],
+    relationshipTypes: [],
+  };
+}
+
 const SIMPLE_TRAVERSAL: TraversalSpec = {
   start: { entityId: '40000000-0000-4000-a000-deadbeef0001' },
   steps: [{ direction: 'both' }],
@@ -108,17 +141,68 @@ describe('vocabulary cache', () => {
     const { provider, stub } = makeProvider();
 
     await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
-    await provider.saveVocabulary(TEST_REPO, {
-      version: '1.0.1',
-      lastModified: '2026-05-25T00:00:01.000Z',
-      modifiedBy: 'test',
-      entityTypes: [],
-      relationshipTypes: [],
-    });
+    await provider.saveVocabulary(
+      TEST_REPO,
+      {
+        version: '1.0.1',
+        lastModified: '2026-05-25T00:00:01.000Z',
+        modifiedBy: 'test',
+        entityTypes: [],
+        relationshipTypes: [],
+      },
+      '1.0.0',
+    );
     await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
 
     const vocabReads = stub.calls.filter((c) => stub.isVocabRead(c));
     expect(vocabReads).toHaveLength(2);
+  });
+
+  it('a saveVocabulary version conflict invalidates the cache', async () => {
+    const { provider, stub } = makeProvider();
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query === VOCABULARY_SAVE_QUERY) {
+        stub.calls.push({ query, params });
+        return { items: [0] };
+      }
+      if (query === VOCABULARY_STATE_QUERY) {
+        stub.calls.push({ query, params });
+        return { items: [{ version: '1.0.5', json: JSON.stringify(makeVocabulary('1.0.5')) }] };
+      }
+      return defaultSubmit(query, params);
+    };
+
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    await expect(
+      provider.saveVocabulary(TEST_REPO, makeVocabulary('1.0.1'), '1.0.0'),
+    ).rejects.toBeInstanceOf(VocabularyVersionConflictError);
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('getVocabulary({ fresh: true }) always reads and refreshes the traversal cache', async () => {
+    const { provider, stub } = makeProvider();
+
+    const vocab = await provider.getVocabulary(TEST_REPO, { fresh: true });
+    expect(vocab.version).toBe('1.0.0');
+    // The fresh result is now the cache entry, so the traversal compiles
+    // against it without another read.
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+
+    // A fresh read with a warm cache still goes to the database.
+    await provider.getVocabulary(TEST_REPO, { fresh: true });
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('getVocabulary without fresh reads the database but leaves the traversal cache alone', async () => {
+    const { provider, stub } = makeProvider();
+
+    await provider.getVocabulary(TEST_REPO);
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
   });
 
   it('expired entry lazily refetches without an explicit clear', async () => {
@@ -264,7 +348,7 @@ describe('single-round-trip create / update', () => {
     // returning a vertex-shaped result for the create query.
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+      if (query.startsWith(ENTITY_CREATE_START)) {
         return { items: [{ id: 'created-vertex' }] };
       }
       return { items: [] };
@@ -287,7 +371,7 @@ describe('single-round-trip create / update', () => {
     const { provider, stub } = makeProvider();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+      if (query.startsWith(ENTITY_CREATE_START)) {
         return { items: ['__duplicate'] };
       }
       return { items: [] };
@@ -347,6 +431,100 @@ describe('single-round-trip create / update', () => {
     const after = stub.calls.length;
 
     expect(after - before).toBe(1);
+  });
+
+  it('createEntity is gated on the repository marker in the same query', async () => {
+    const { provider, getCreateCall } = captureCreateQuery();
+    await provider.createEntity(TEST_REPO, makeEntity('40000000-0000-4000-a000-000000006010'));
+
+    const call = getCreateCall();
+    // Outer gate: partition predicate first, then the marker id and label.
+    expect(call.query.startsWith(ENTITY_CREATE_START)).toBe(true);
+    // Inner duplicate check: the lookup runs inside map(), so it only runs
+    // for a marker that exists (a bare fold() would emit [] without one).
+    expect(call.query).toContain(
+      "coalesce(unfold().map(__.V().has('repositoryId', rid).hasId(vid).fold()).coalesce(unfold().constant('__duplicate'),addV(vertexLabel)",
+    );
+    expect(call.query.endsWith("),constant('__no_repository'))")).toBe(true);
+    expect(call.params!['repoVid']).toBe(`repo:${TEST_REPO}`);
+    expect(call.params!['rid']).toBe(TEST_REPO);
+  });
+
+  it('createEntity throws RepositoryNotFoundError when the marker is gone, in one call', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith(ENTITY_CREATE_START)) return { items: ['__no_repository'] };
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    await expect(
+      provider.createEntity(TEST_REPO, makeEntity('40000000-0000-4000-a000-000000006011')),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.length - before).toBe(1);
+  });
+
+  it('createRelationship gates the create branch on the repository marker', async () => {
+    const { provider, getCreateCall } = captureRelationshipCreateQuery();
+    await provider.createRelationship(
+      TEST_REPO,
+      makeRelationship(
+        '40000000-0000-4000-a000-000000006012',
+        '40000000-0000-4000-a000-deadbeef0001',
+        '40000000-0000-4000-a000-deadbeef0002',
+      ),
+    );
+
+    const call = getCreateCall();
+    expect(call.query).toContain(
+      "unfold().constant('__duplicate'),g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(" +
+        "unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)",
+    );
+    expect(
+      call.query.endsWith(",unfold().constant('__no_endpoint'),constant('__no_repository')))"),
+    ).toBe(true);
+    expect(call.params!['repoVid']).toBe(`repo:${TEST_REPO}`);
+  });
+
+  it('createRelationship throws RepositoryNotFoundError when the marker is gone, in one call', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+        return { items: ['__no_repository'] };
+      }
+      return { items: [] };
+    };
+
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006013',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0002',
+    );
+    const before = stub.calls.length;
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    expect(stub.calls.length - before).toBe(1);
+  });
+
+  it('createRelationship with a missing endpoint writes nothing and does not report a missing repository', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+        return { items: ['__no_endpoint'] };
+      }
+      return { items: [] };
+    };
+
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006014',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0009',
+    );
+    await expect(provider.createRelationship(TEST_REPO, rel)).resolves.toEqual(rel);
   });
 
   it('updateEntity issues exactly one storage call and parses the projected result', async () => {
@@ -455,7 +633,7 @@ function captureCreateQuery(): {
   const { provider, stub } = makeProvider();
   stub.submit = async (query, params) => {
     stub.calls.push({ query, params });
-    if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+    if (query.startsWith(ENTITY_CREATE_START)) {
       return { items: [{ id: 'created-vertex' }] };
     }
     return { items: [] };
@@ -465,7 +643,7 @@ function captureCreateQuery(): {
     stub,
     getCreateCall: () => {
       const call = stub.calls.find((c) =>
-        c.query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce('),
+        c.query.startsWith(ENTITY_CREATE_START),
       );
       if (!call) throw new Error('no create call captured');
       return call;
@@ -573,7 +751,7 @@ describe('createEntity user-property scalars', () => {
     const createCalls = stub.calls
       .slice(before, after)
       .filter((c) =>
-        c.query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce('),
+        c.query.startsWith(ENTITY_CREATE_START),
       );
     expect(createCalls).toHaveLength(0);
   });
@@ -593,7 +771,7 @@ describe('createEntity user-property scalars', () => {
     const createCalls = stub.calls
       .slice(before, after)
       .filter((c) =>
-        c.query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce('),
+        c.query.startsWith(ENTITY_CREATE_START),
       );
     expect(createCalls).toHaveLength(0);
   });
@@ -602,7 +780,7 @@ describe('createEntity user-property scalars', () => {
     const { provider, stub } = makeProvider();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith('g.V().has(\'repositoryId\', rid).hasId(vid).fold().coalesce(')) {
+      if (query.startsWith(ENTITY_CREATE_START)) {
         return { items: ['__duplicate'] };
       }
       return { items: [] };
@@ -2504,70 +2682,442 @@ describe('system-vertex queries scope by partition before hasId', () => {
     expect(last.params!['vid']).toBe(`vocab:${TEST_REPO}`);
   });
 
-  it('saveVocabulary existence check and update branch both scope by partition first', async () => {
+  it('saveVocabulary is one compare-and-set query, partition-scoped, filtered on the expected version', async () => {
+    const { provider, stub } = makeProvider();
+    const next = makeVocabulary('1.1.0');
+
+    await provider.saveVocabulary(TEST_REPO, next, '1.0.0');
+
+    expect(stub.calls).toHaveLength(1);
+    const write = stub.calls[0]!;
+    expect(write.query).toBe(VOCABULARY_SAVE_QUERY);
+    expect(partitionPredicateBeforeHasId(write.query)).toBe(true);
+    // The version filter precedes the writes, so a stale version writes nothing.
+    expect(write.query.indexOf("has('version', expectedVersion)")).toBeLessThan(
+      write.query.indexOf('.property('),
+    );
+    expect(write.params).toEqual({
+      rid: TEST_REPO,
+      vid: `vocab:${TEST_REPO}`,
+      expectedVersion: '1.0.0',
+      newVersion: '1.1.0',
+      vocabJson: JSON.stringify(next),
+    });
+  });
+
+  it('saveVocabulary never creates the vocabulary vertex', async () => {
     const { provider, stub } = makeProvider();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      // Force the existence-check to report "exists" so the update branch runs.
-      if (query.includes("hasLabel('_vocabulary').count()")) return { items: [1] };
+      if (query === VOCABULARY_SAVE_QUERY) return { items: [0] };
       return { items: [] };
     };
 
-    await provider.saveVocabulary(TEST_REPO, {
-      version: '1.0.0',
-      lastModified: '2026-05-26T00:00:00.000Z',
-      modifiedBy: 'test',
-      entityTypes: [],
-      relationshipTypes: [],
-    });
-
-    const existence = stub.calls.find((c) => c.query.includes("hasLabel('_vocabulary').count()"));
-    const update = stub.calls.find((c) => c.query.includes(".property('vocabulary', vocabJson)"));
-    expect(existence).toBeDefined();
-    expect(update).toBeDefined();
-    expect(partitionPredicateBeforeHasId(existence!.query)).toBe(true);
-    expect(partitionPredicateBeforeHasId(update!.query)).toBe(true);
-    expect(existence!.params!['rid']).toBe(TEST_REPO);
-    expect(update!.params!['rid']).toBe(TEST_REPO);
+    await expect(
+      provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0'),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.some((c) => c.query.includes('addV('))).toBe(false);
   });
 
-  it('saveVocabulary create branch keeps repositoryId on the addV (already correct)', async () => {
-    const { provider, stub } = makeProvider();
-    // Default stub returns { items: [] } for the existence check → addV fires.
+  describe('saveVocabulary miss classification', () => {
+    function stubMiss(state: { version: string; json: string } | null): {
+      provider: CosmosDbProvider;
+      stub: SubmitStub;
+    } {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === VOCABULARY_SAVE_QUERY) return { items: [0] };
+        if (query === VOCABULARY_STATE_QUERY) return { items: state === null ? [] : [state] };
+        return { items: [] };
+      };
+      return { provider, stub };
+    }
 
-    await provider.saveVocabulary(TEST_REPO, {
-      version: '1.0.0',
-      lastModified: '2026-05-26T00:00:00.000Z',
-      modifiedBy: 'test',
-      entityTypes: [],
-      relationshipTypes: [],
+    it('no vertex → RepositoryNotFoundError', async () => {
+      const { provider } = stubMiss(null);
+      await expect(
+        provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0'),
+      ).rejects.toBeInstanceOf(RepositoryNotFoundError);
     });
 
-    const addv = stub.calls.find((c) => c.query.startsWith("g.addV('_vocabulary')"));
-    expect(addv).toBeDefined();
-    expect(addv!.query).toContain(".property('repositoryId', rid)");
-    expect(addv!.params!['rid']).toBe(TEST_REPO);
+    it('version property matching the blob → VocabularyVersionConflictError with both versions', async () => {
+      const { provider, stub } = stubMiss({
+        version: '1.4.0',
+        json: JSON.stringify(makeVocabulary('1.4.0')),
+      });
+      const save = provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0');
+      await expect(save).rejects.toBeInstanceOf(VocabularyVersionConflictError);
+      await expect(save).rejects.toMatchObject({
+        repositoryId: TEST_REPO,
+        expectedVersion: '1.0.0',
+        actualVersion: '1.4.0',
+      });
+
+      // The follow-up reads version and blob together, partition-scoped.
+      expect(stub.calls).toHaveLength(2);
+      const followUp = stub.calls[1]!;
+      expect(followUp.query).toBe(VOCABULARY_STATE_QUERY);
+      expect(followUp.query).toContain("coalesce(values('version'), constant(''))");
+      expect(partitionPredicateBeforeHasId(followUp.query)).toBe(true);
+      expect(followUp.params).toEqual({ rid: TEST_REPO, vid: `vocab:${TEST_REPO}` });
+    });
+
+    function stubThrowingWrite(
+      status: number,
+      state: { version: string; json: string } | null,
+    ): { provider: CosmosDbProvider; stub: SubmitStub } {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === VOCABULARY_SAVE_QUERY) {
+          // Shape of the gremlin driver's ResponseError: the protocol status
+          // is a generic server error, the Cosmos status is in the attributes.
+          throw Object.assign(
+            new Error('Server error: {"ActivityId":"0000","StatusCode":' + status + '} (500)'),
+            { statusCode: 500, statusAttributes: { 'x-ms-status-code': status } },
+          );
+        }
+        if (query === VOCABULARY_STATE_QUERY) return { items: state === null ? [] : [state] };
+        return { items: [] };
+      };
+      return { provider, stub };
+    }
+
+    it('a 412 from a lost optimistic-concurrency race is classified as a version conflict', async () => {
+      const { provider, stub } = stubThrowingWrite(412, {
+        version: '1.7.0',
+        json: JSON.stringify(makeVocabulary('1.7.0')),
+      });
+
+      const save = provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0');
+      await expect(save).rejects.toBeInstanceOf(VocabularyVersionConflictError);
+      await expect(save).rejects.toMatchObject({ expectedVersion: '1.0.0', actualVersion: '1.7.0' });
+      // No retry of the write: one attempt, then the classification read.
+      expect(stub.calls.map((c) => c.query)).toEqual([VOCABULARY_SAVE_QUERY, VOCABULARY_STATE_QUERY]);
+    });
+
+    it('a 404 from a write racing a drop is classified as a missing repository', async () => {
+      const { provider } = stubThrowingWrite(404, null);
+
+      await expect(
+        provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0'),
+      ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    });
+
+    it('any other write failure propagates unchanged, without the classification read', async () => {
+      const { provider, stub } = stubThrowingWrite(400, null);
+
+      await expect(
+        provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0'),
+      ).rejects.toThrow(/Server error/);
+      expect(stub.calls.map((c) => c.query)).toEqual([VOCABULARY_SAVE_QUERY]);
+    });
+
+    it('vertex already holding exactly this write (a retried submit that landed) → success', async () => {
+      const next = makeVocabulary('1.1.0');
+      const { provider, stub } = stubMiss({ version: '1.1.0', json: JSON.stringify(next) });
+
+      await expect(provider.saveVocabulary(TEST_REPO, next, '1.0.0')).resolves.toBeUndefined();
+      expect(stub.calls).toHaveLength(2);
+    });
+
+    it('same version but a different blob is still a conflict', async () => {
+      const ours = makeVocabulary('1.1.0');
+      const theirs = { ...makeVocabulary('1.1.0'), modifiedBy: 'someone-else' };
+      const { provider } = stubMiss({ version: '1.1.0', json: JSON.stringify(theirs) });
+
+      await expect(provider.saveVocabulary(TEST_REPO, ours, '1.0.0')).rejects.toBeInstanceOf(
+        VocabularyVersionConflictError,
+      );
+    });
+
+    it('legacy vertex with no version property → ProviderError naming ensureSchema', async () => {
+      const { provider } = stubMiss({ version: '', json: JSON.stringify(makeVocabulary('1.0.0')) });
+      const save = provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0');
+      await expect(save).rejects.toBeInstanceOf(ProviderError);
+      await expect(save).rejects.toThrow(/missing or stale version property.*run ensureSchema\(\)/);
+    });
+
+    it('version property out of step with the blob → ProviderError naming ensureSchema', async () => {
+      const { provider } = stubMiss({ version: '1.0.0', json: JSON.stringify(makeVocabulary('1.2.0')) });
+      const save = provider.saveVocabulary(TEST_REPO, makeVocabulary('1.3.0'), '1.2.0');
+      await expect(save).rejects.toBeInstanceOf(ProviderError);
+      await expect(save).rejects.toThrow(/run ensureSchema\(\)/);
+    });
   });
 
-  it('createRepository existence check scopes by partition before hasId', async () => {
-    const { provider, stub } = makeProvider();
-    // Default stub returns { items: [] } for every query — existence check
-    // returns 0 (no duplicate), index read returns [], addV+sideEffect submits
-    // succeed silently.
-    await provider.createRepository({
+  describe('createRepository', () => {
+    const config = {
       repositoryId: TEST_REPO,
       label: 'Test',
-      governanceConfig: { mode: 'open' },
+      governanceConfig: { mode: 'open' as const },
       createdAt: '2026-05-26T00:00:00.000Z',
-      createdBy: 'test',
+      createdBy: 'creator',
+    };
+    const PROBE = "g.V().has('repositoryId', rid).limit(1).count()";
+
+    function stubCreate(probe: number, markerExists: number): {
+      provider: CosmosDbProvider;
+      stub: SubmitStub;
+    } {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === PROBE) return { items: [probe] };
+        if (query.includes(".has('label', lbl).count()")) return { items: [markerExists] };
+        return { items: [] };
+      };
+      return { provider, stub };
+    }
+
+    it('probes the whole partition first, then writes the vocabulary and then the repository', async () => {
+      const { provider, stub } = stubCreate(0, 0);
+      const vocabulary = makeVocabulary('2.0.0');
+
+      await provider.createRepository({ ...config, vocabulary });
+
+      expect(stub.calls[0]!.query).toBe(PROBE);
+      expect(stub.calls[0]!.params).toEqual({ rid: TEST_REPO });
+      // An empty partition skips the marker lookup entirely.
+      expect(stub.calls.some((c) => c.query.includes(".has('label', lbl).count()"))).toBe(false);
+
+      const repoIdx = stub.calls.findIndex((c) => c.query.startsWith("g.addV('_repository')"));
+      const vocabIdx = stub.calls.findIndex((c) => c.query.startsWith("g.addV('_vocabulary')"));
+      // Vocabulary first: a create that stops between the two submits leaves
+      // an unmarked partition, which the probe refuses and delete clears.
+      expect(vocabIdx).toBeGreaterThan(0);
+      expect(repoIdx).toBeGreaterThan(vocabIdx);
+
+      const vocabWrite = stub.calls[vocabIdx]!;
+      expect(vocabWrite.query).toBe(
+        "g.addV('_vocabulary').property('id', vid).property('repositoryId', rid)" +
+          ".property('version', vocabVersion).property('vocabulary', vocabJson)",
+      );
+      expect(vocabWrite.params).toEqual({
+        vid: `vocab:${TEST_REPO}`,
+        rid: TEST_REPO,
+        vocabVersion: '2.0.0',
+        vocabJson: JSON.stringify(vocabulary),
+      });
     });
 
-    const existence = stub.calls.find(
-      (c) => c.query.includes(".has('label', lbl).count()"),
-    );
-    expect(existence).toBeDefined();
-    expect(partitionPredicateBeforeHasId(existence!.query)).toBe(true);
-    expect(existence!.params!['rid']).toBe(TEST_REPO);
+    it('seeds an empty vocabulary attributed to the creator when none is supplied', async () => {
+      const { provider, stub } = stubCreate(0, 0);
+
+      await provider.createRepository(config);
+
+      const vocabWrite = stub.calls.find((c) => c.query.startsWith("g.addV('_vocabulary')"))!;
+      const seeded = JSON.parse(vocabWrite.params!['vocabJson'] as string) as MemoryVocabulary;
+      expect(seeded.entityTypes).toEqual([]);
+      expect(seeded.relationshipTypes).toEqual([]);
+      expect(seeded.modifiedBy).toBe('creator');
+      expect(vocabWrite.params!['vocabVersion']).toBe(seeded.version);
+    });
+
+    it('an occupied partition with a marker → DuplicateRepositoryError, nothing written', async () => {
+      const { provider, stub } = stubCreate(1, 1);
+
+      await expect(provider.createRepository(config)).rejects.toBeInstanceOf(DuplicateRepositoryError);
+
+      const existence = stub.calls.find((c) => c.query.includes(".has('label', lbl).count()"));
+      expect(existence).toBeDefined();
+      expect(partitionPredicateBeforeHasId(existence!.query)).toBe(true);
+      expect(existence!.params!['rid']).toBe(TEST_REPO);
+      expect(stub.calls.some((c) => c.query.includes('addV('))).toBe(false);
+    });
+
+    it('an occupied partition with no marker → ProviderError naming deleteRepository, nothing written', async () => {
+      const { provider, stub } = stubCreate(1, 0);
+
+      const create = provider.createRepository(config);
+      await expect(create).rejects.toBeInstanceOf(ProviderError);
+      await expect(create).rejects.toThrow(
+        `Repository "${TEST_REPO}" still holds data from a delete that did not finish; call deleteRepository("${TEST_REPO}") to finish it, then create it again`,
+      );
+      expect(stub.calls.some((c) => c.query.includes('addV('))).toBe(false);
+    });
+  });
+
+  describe('deleteRepository', () => {
+    const MARKER_DROP =
+      "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository')" +
+      ".aggregate('found').by('id').drop().cap('found')";
+    const PROBE = "g.V().has('repositoryId', rid).limit(1).count()";
+    const SENTINEL_READ = "g.V().has('repositoryId', pk).hasId(sid).values('repositoryIds')";
+
+    function stubDelete(options: {
+      markerDropped: boolean;
+      remaining: number;
+      indexed: string[];
+      /** A re-create lands after this many vertex batches have run. */
+      recreatedAfterBatches?: number;
+      /** A re-create lands just before the sentinel cleanup. */
+      recreatedBeforeCleanup?: boolean;
+    }): { provider: CosmosDbProvider; stub: SubmitStub } {
+      const { provider, stub } = makeProvider();
+      const defaultSubmit = stub.submit;
+      // The vertex drain's remaining-count check is the same query as the
+      // partition probe; once a drain batch has run, the partition is empty
+      // unless a re-create has landed.
+      let batches = 0;
+      const recreated = (): boolean =>
+        options.recreatedAfterBatches !== undefined && batches >= options.recreatedAfterBatches;
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === MARKER_DROP) {
+          return { items: [options.markerDropped ? [`repo:${TEST_REPO}`] : []] };
+        }
+        if (query === DELETE_VERTEX_BATCH_QUERY) {
+          if (recreated()) return { items: ['__recreated'] };
+          batches++;
+          return { items: [] };
+        }
+        if (query === PROBE) {
+          if (batches === 0) return { items: [options.remaining] };
+          return { items: [recreated() ? 1 : 0] };
+        }
+        if (query === SENTINEL_READ) return { items: [JSON.stringify(options.indexed)] };
+        if (query === DELETE_INDEX_ENTRY_QUERY) {
+          return { items: options.recreatedBeforeCleanup === true ? ['__recreated'] : [] };
+        }
+        // Everything else (edge batches, counts, vocabulary reads for
+        // traversal compilation) gets the default stub's answer; the default
+        // stub records the call itself, so drop the duplicate entry.
+        stub.calls.pop();
+        return defaultSubmit(query, params);
+      };
+      return { provider, stub };
+    }
+
+    it('vertex batches and the sentinel cleanup are gated on the marker being absent', () => {
+      const gate =
+        "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').fold()" +
+        ".coalesce(unfold().constant('__recreated'),";
+      expect(DELETE_VERTEX_BATCH_QUERY).toBe(
+        `${gate}__.V().has('repositoryId', rid).limit(batchSize).drop())`,
+      );
+      expect(DELETE_INDEX_ENTRY_QUERY).toBe(
+        `${gate}__.V().has('repositoryId', pk).hasId(sid).property('repositoryIds', updatedIndex))`,
+      );
+    });
+
+    it('drops the repository marker first, partition-scoped, then probes, then drains', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: true, remaining: 1, indexed: [TEST_REPO] });
+
+      await provider.deleteRepository(TEST_REPO);
+
+      expect(stub.calls[0]!.query).toBe(MARKER_DROP);
+      expect(partitionPredicateBeforeHasId(stub.calls[0]!.query)).toBe(true);
+      expect(stub.calls[0]!.params).toEqual({ rid: TEST_REPO, vid: `repo:${TEST_REPO}` });
+      expect(stub.calls[1]!.query).toBe(PROBE);
+      expect(stub.calls[1]!.params).toEqual({ rid: TEST_REPO });
+      const firstEdgeBatch = stub.calls.findIndex(
+        (c) => c.query === "g.E().has('repositoryId', rid).limit(batchSize).drop()",
+      );
+      const firstBatch = stub.calls.findIndex((c) => c.query === DELETE_VERTEX_BATCH_QUERY);
+      expect(firstEdgeBatch).toBeGreaterThan(1);
+      expect(firstBatch).toBeGreaterThan(firstEdgeBatch);
+      expect(stub.calls[firstBatch]!.params).toEqual({
+        rid: TEST_REPO,
+        vid: `repo:${TEST_REPO}`,
+        batchSize: 500,
+      });
+      // The sentinel entry is removed last.
+      const cleanup = stub.calls[stub.calls.length - 1]!;
+      expect(cleanup.query).toBe(DELETE_INDEX_ENTRY_QUERY);
+      expect(cleanup.params).toEqual({
+        rid: TEST_REPO,
+        vid: `repo:${TEST_REPO}`,
+        pk: '_index',
+        sid: '_repository_index',
+        updatedIndex: JSON.stringify([]),
+      });
+    });
+
+    it('nothing at all for the id → RepositoryNotFoundError, no drain', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: false, remaining: 0, indexed: [] });
+
+      await expect(provider.deleteRepository(TEST_REPO)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+
+      const probe = stub.calls.find((c) => c.query === PROBE);
+      expect(probe!.params).toEqual({ rid: TEST_REPO });
+      expect(stub.calls.some((c) => c.query.includes('drop()') && c.query !== MARKER_DROP)).toBe(false);
+      expect(stub.calls.some((c) => c.query === DELETE_INDEX_ENTRY_QUERY)).toBe(false);
+    });
+
+    it('an interrupted delete (no marker, vertices remain) is finished by a retry', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: false, remaining: 1, indexed: [TEST_REPO] });
+
+      await provider.deleteRepository(TEST_REPO);
+
+      expect(stub.calls.some((c) => c.query === DELETE_VERTEX_BATCH_QUERY)).toBe(true);
+      const cleanup = stub.calls.find((c) => c.query === DELETE_INDEX_ENTRY_QUERY);
+      expect(JSON.parse(cleanup!.params!['updatedIndex'] as string)).toEqual([]);
+    });
+
+    it('an empty partition still listed in the sentinel is cleaned up without draining', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: false, remaining: 0, indexed: [TEST_REPO] });
+
+      await provider.deleteRepository(TEST_REPO);
+
+      expect(stub.calls.some((c) => c.query.includes('.limit(batchSize).drop()'))).toBe(false);
+      const cleanup = stub.calls.find((c) => c.query === DELETE_INDEX_ENTRY_QUERY);
+      expect(cleanup).toBeDefined();
+      expect(JSON.parse(cleanup!.params!['updatedIndex'] as string)).toEqual([]);
+    });
+
+    it('a dropped marker over an otherwise empty partition skips both drains', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: true, remaining: 0, indexed: [TEST_REPO] });
+
+      await provider.deleteRepository(TEST_REPO);
+
+      expect(stub.calls.map((c) => c.query)).toEqual([
+        MARKER_DROP,
+        PROBE,
+        SENTINEL_READ,
+        DELETE_INDEX_ENTRY_QUERY,
+      ]);
+    });
+
+    it('stops draining and skips the sentinel cleanup once a re-create has landed', async () => {
+      const { provider, stub } = stubDelete({
+        markerDropped: true,
+        remaining: 1,
+        indexed: [TEST_REPO],
+        recreatedAfterBatches: 1,
+      });
+
+      await expect(provider.deleteRepository(TEST_REPO)).resolves.toBeUndefined();
+
+      // Batch 1 drained the old vertices; the remaining check saw the
+      // re-created ones; batch 2 found the new marker and did nothing.
+      expect(stub.calls.filter((c) => c.query === DELETE_VERTEX_BATCH_QUERY)).toHaveLength(2);
+      expect(stub.calls.some((c) => c.query === DELETE_INDEX_ENTRY_QUERY)).toBe(false);
+    });
+
+    it('a sentinel cleanup that finds a re-created marker leaves the sentinel alone', async () => {
+      const { provider } = stubDelete({
+        markerDropped: true,
+        remaining: 0,
+        indexed: [TEST_REPO],
+        recreatedBeforeCleanup: true,
+      });
+
+      // The gated write emits the re-create sentinel and writes nothing; the
+      // delete itself is complete.
+      await expect(provider.deleteRepository(TEST_REPO)).resolves.toBeUndefined();
+    });
+
+    it('drops the cached vocabulary even when the repository is not found', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: false, remaining: 0, indexed: [] });
+
+      await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+      await expect(provider.deleteRepository(TEST_REPO)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+      await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+
+      expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+    });
   });
 
   it('getRepository scopes by partition before hasId', async () => {
@@ -2710,5 +3260,229 @@ describe('_repository_index sentinel', () => {
     expect(addv!.query).toContain("has('repositoryId', pk).hasId(sid).property('repositoryIds', updatedIndex)");
     const updated = JSON.parse(addv!.params!['updatedIndex'] as string);
     expect(updated).toEqual([TEST_REPO]);
+  });
+});
+
+// ─── Vocabulary version backfill ─────────────────────────────────────
+//
+// ensureSchema repairs the native `version` property on `_vocabulary`
+// vertices so compare-and-set can match. The scan reads every vertex; only
+// inconsistent ones are written, each with a partition-scoped write guarded
+// on the exact blob that was decoded.
+
+describe('backfillVocabularyVersions', () => {
+  const RID_CONSISTENT = '40000000-0000-4000-a000-00000000b001';
+  const RID_LEGACY = '40000000-0000-4000-a000-00000000b002';
+  const RID_STALE = '40000000-0000-4000-a000-00000000b003';
+  const RID_UNPARSEABLE = '40000000-0000-4000-a000-00000000b004';
+  const RID_FAILING = '40000000-0000-4000-a000-00000000b005';
+
+  interface ScanCall {
+    sql: string;
+    parameters: CosmosQueryParameter[];
+    continuationToken: string | null | undefined;
+  }
+
+  /**
+   * A vocabulary vertex as the document endpoint returns it: `repositoryId`
+   * flat, every other Gremlin property an array of `{ _value, id }`, and a
+   * missing property simply absent.
+   */
+  function vocabDoc(rid: string, version: string | null, json: string | null): Record<string, unknown> {
+    const doc: Record<string, unknown> = { repositoryId: rid };
+    if (version !== null) doc['version'] = [{ _value: version, id: 'p-version' }];
+    if (json !== null) doc['vocabulary'] = [{ _value: json, id: 'p-vocabulary' }];
+    return doc;
+  }
+
+  function stubBackfill(
+    pages: unknown[][],
+    onWrite: (params: Record<string, unknown> | undefined) => GremlinResult = () => ({ items: [1] }),
+  ): {
+    conn: CosmosDbConnection;
+    docClient: CosmosDocumentClient;
+    writes: SubmitCall[];
+    scans: ScanCall[];
+  } {
+    const writes: SubmitCall[] = [];
+    const scans: ScanCall[] = [];
+    const conn = {
+      submit: async (query: string, params?: Record<string, unknown>): Promise<GremlinResult> => {
+        writes.push({ query, params });
+        return onWrite(params);
+      },
+    } as unknown as CosmosDbConnection;
+    const docClient = {
+      query: async (
+        sql: string,
+        parameters: CosmosQueryParameter[],
+        options: { continuationToken?: string | null },
+      ): Promise<CosmosQueryResult<unknown>> => {
+        const index = scans.length;
+        scans.push({ sql, parameters, continuationToken: options.continuationToken });
+        return {
+          documents: pages[index] ?? [],
+          requestCharge: 0,
+          queryMetrics: null,
+          continuationToken: index + 1 < pages.length ? `token-${index + 1}` : null,
+        };
+      },
+    } as unknown as CosmosDocumentClient;
+    return { conn, docClient, writes, scans };
+  }
+
+  function lostRace(status: number): Error {
+    return Object.assign(new Error(`Server error: ActivityId : 1234 (500)`), {
+      statusCode: 500,
+      statusAttributes: { 'x-ms-status-code': status },
+    });
+  }
+
+  it('scans system vocabulary vertices only, through the document endpoint, cross-partition', async () => {
+    const { conn, docClient, scans } = stubBackfill([[]]);
+
+    await backfillVocabularyVersions(conn, docClient);
+
+    expect(scans).toHaveLength(1);
+    expect(scans[0]!.sql).toBe(VOCABULARY_BACKFILL_SCAN_SQL);
+    // Tenant entities of type `_vocabulary` carry `entityType`; the system
+    // vertex never does.
+    expect(VOCABULARY_BACKFILL_SCAN_SQL).toContain('NOT IS_DEFINED(c.entityType)');
+    expect(scans[0]!.parameters).toEqual([{ name: '@label', value: '_vocabulary' }]);
+    expect(scans[0]!.continuationToken).toBeNull();
+  });
+
+  it('pages the scan with continuation tokens until exhausted', async () => {
+    const { conn, docClient, scans, writes } = stubBackfill([
+      [vocabDoc(RID_LEGACY, null, JSON.stringify(makeVocabulary('1.0.0')))],
+      [vocabDoc(RID_STALE, '1.0.0', JSON.stringify(makeVocabulary('1.1.0')))],
+    ]);
+
+    const result = await backfillVocabularyVersions(conn, docClient);
+
+    expect(scans.map((s) => s.continuationToken)).toEqual([null, 'token-1']);
+    expect(result).toEqual({ scanned: 2, repaired: 2, failures: [] });
+    expect(writes.map((w) => w.params!['rid'])).toEqual([RID_LEGACY, RID_STALE]);
+  });
+
+  it('repairs only inconsistent vertices, each guarded on its exact blob, partition first', async () => {
+    const legacyJson = JSON.stringify(makeVocabulary('1.3.0'));
+    const staleJson = JSON.stringify(makeVocabulary('2.1.0'));
+    const { conn, docClient, writes } = stubBackfill([
+      [
+        vocabDoc(RID_CONSISTENT, '1.0.0', JSON.stringify(makeVocabulary('1.0.0'))),
+        vocabDoc(RID_LEGACY, null, legacyJson),
+        vocabDoc(RID_STALE, '2.0.0', staleJson),
+      ],
+    ]);
+
+    const result = await backfillVocabularyVersions(conn, docClient);
+
+    expect(result).toEqual({ scanned: 3, repaired: 2, failures: [] });
+    expect(writes.map((w) => w.query)).toEqual([
+      VOCABULARY_BACKFILL_WRITE_QUERY,
+      VOCABULARY_BACKFILL_WRITE_QUERY,
+    ]);
+    expect(writes.map((w) => w.params)).toEqual([
+      { rid: RID_LEGACY, vid: `vocab:${RID_LEGACY}`, vocabJson: legacyJson, vocabVersion: '1.3.0' },
+      { rid: RID_STALE, vid: `vocab:${RID_STALE}`, vocabJson: staleJson, vocabVersion: '2.1.0' },
+    ]);
+    const write = VOCABULARY_BACKFILL_WRITE_QUERY;
+    expect(write.startsWith("g.V().has('repositoryId', rid).hasId(vid)")).toBe(true);
+    expect(write).toContain("hasNot('entityType')");
+    expect(write.indexOf("has('vocabulary', vocabJson)")).toBeLessThan(write.indexOf('.property('));
+  });
+
+  it('writes nothing when every vertex is consistent', async () => {
+    const { conn, docClient, writes } = stubBackfill([
+      [vocabDoc(RID_CONSISTENT, '1.0.0', JSON.stringify(makeVocabulary('1.0.0')))],
+    ]);
+
+    expect(await backfillVocabularyVersions(conn, docClient)).toEqual({ scanned: 1, repaired: 0, failures: [] });
+    expect(writes).toHaveLength(0);
+  });
+
+  it('a blob guard that misses (concurrent rewrite) is neither repaired nor a failure', async () => {
+    const { conn, docClient } = stubBackfill(
+      [[vocabDoc(RID_LEGACY, null, JSON.stringify(makeVocabulary('1.0.0')))]],
+      () => ({ items: [0] }),
+    );
+
+    expect(await backfillVocabularyVersions(conn, docClient)).toEqual({ scanned: 1, repaired: 0, failures: [] });
+  });
+
+  it.each([412, 404])('a repair write that loses a race (%i) is skipped, not a failure', async (status) => {
+    const { conn, docClient } = stubBackfill(
+      [[vocabDoc(RID_LEGACY, null, JSON.stringify(makeVocabulary('1.0.0')))]],
+      () => {
+        throw lostRace(status);
+      },
+    );
+
+    expect(await backfillVocabularyVersions(conn, docClient)).toEqual({ scanned: 1, repaired: 0, failures: [] });
+  });
+
+  it('never writes a version the blob does not state, and records the vertex instead', async () => {
+    const { conn, docClient, writes } = stubBackfill([
+      [
+        vocabDoc(RID_UNPARSEABLE, null, '{not json'),
+        vocabDoc(RID_UNPARSEABLE, null, 'null'),
+        vocabDoc(RID_UNPARSEABLE, null, '[1,2]'),
+        vocabDoc(RID_UNPARSEABLE, null, JSON.stringify({ entityTypes: [] })),
+        vocabDoc(RID_UNPARSEABLE, null, JSON.stringify({ version: '' })),
+        vocabDoc(RID_UNPARSEABLE, null, null),
+      ],
+    ]);
+
+    const result = await backfillVocabularyVersions(conn, docClient);
+
+    expect(writes).toHaveLength(0);
+    expect(result.repaired).toBe(0);
+    expect(result.failures).toHaveLength(6);
+    expect(result.failures.every((f) => f.repositoryId === RID_UNPARSEABLE)).toBe(true);
+  });
+
+  it('one bad vertex never aborts the pass', async () => {
+    const goodJson = JSON.stringify(makeVocabulary('3.0.0'));
+    const { conn, docClient, writes } = stubBackfill(
+      [
+        [
+          null,
+          'not-a-document',
+          vocabDoc('', null, JSON.stringify(makeVocabulary('1.0.0'))),
+          vocabDoc(RID_FAILING, null, JSON.stringify(makeVocabulary('1.0.0'))),
+          vocabDoc(RID_LEGACY, null, goodJson),
+        ],
+      ],
+      (params) => {
+        if (params?.['rid'] === RID_FAILING) throw new ProviderError('write failed', 'retry');
+        return { items: [1] };
+      },
+    );
+
+    const result = await backfillVocabularyVersions(conn, docClient);
+
+    expect(result.scanned).toBe(5);
+    expect(result.repaired).toBe(1);
+    expect(result.failures).toEqual([
+      { repositoryId: '', reason: 'the vertex has no repositoryId' },
+      { repositoryId: '', reason: 'the vertex has no repositoryId' },
+      { repositoryId: '', reason: 'the vertex has no repositoryId' },
+      { repositoryId: RID_FAILING, reason: 'write failed' },
+    ]);
+    const last = writes[writes.length - 1]!;
+    expect(last.params!['rid']).toBe(RID_LEGACY);
+    expect(last.params!['vocabVersion']).toBe('3.0.0');
+  });
+
+  it('propagates a failure to read a page of the scan', async () => {
+    const conn = {} as unknown as CosmosDbConnection;
+    const docClient = {
+      query: async (): Promise<CosmosQueryResult<unknown>> => {
+        throw new ProviderError('scan failed', 'retry');
+      },
+    } as unknown as CosmosDocumentClient;
+
+    await expect(backfillVocabularyVersions(conn, docClient)).rejects.toThrow('scan failed');
   });
 });

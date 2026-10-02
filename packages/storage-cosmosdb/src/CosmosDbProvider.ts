@@ -1,6 +1,11 @@
 // CosmosDbProvider — CosmosDB Gremlin implementation of StorageProvider + GraphTraversalProvider
 
-import type { StorageProvider, EnsureSchemaResult, EntityReadOptions } from '@utaba/deep-memory/providers';
+import type {
+  StorageProvider,
+  EnsureSchemaResult,
+  EntityReadOptions,
+  VocabularyReadOptions,
+} from '@utaba/deep-memory/providers';
 import type { GraphTraversalProvider, GraphTraversalCapabilities } from '@utaba/deep-memory/providers';
 import type {
   StoredEntity,
@@ -39,6 +44,7 @@ import {
   GremlinCompiler,
   ProviderError,
   InvalidInputError,
+  VocabularyVersionConflictError,
   isValidUuid,
   projectEntity,
   createSafeSink,
@@ -173,7 +179,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   private readonly reportUsage: UsageSink | undefined;
   /**
    * Per-process vocabulary cache, keyed by repositoryId. Read lazily by
-   * `traverseImpl` via `getVocabularyCached`; invalidated on `saveVocabulary`.
+   * `traverseImpl` via `getVocabularyCached`; refreshed by
+   * `getVocabulary({ fresh: true })`; invalidated by `saveVocabulary` (on
+   * success and on a version conflict), `createRepository` and
+   * `deleteRepository`.
    * Each provider instance owns its own cache so isolated test providers do
    * not share state.
    */
@@ -345,7 +354,30 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       // subsequent run is a single cheap doc-fetch that returns null.
       await repoQueries.ensureRepositoryIndex(this.conn);
 
-      // 6. Step E — indexing-policy diagnostic. Always runs (operators may
+      // 6. Repair the `version` property on `_vocabulary` vertices — missing
+      // on vertices written by earlier releases, or stale where an earlier
+      // release rewrote the blob — which compare-and-set in `saveVocabulary`
+      // depends on. Runs on every call, because it fixes data rather than
+      // schema: a container already at the current schema version can still
+      // hold such vertices. Vertices already consistent are skipped, so a
+      // container with nothing to repair costs the one scan. A vertex that
+      // cannot be repaired is reported here rather than failing the whole
+      // call; saves against it keep failing with a ProviderError until it
+      // is fixed.
+      const backfill = await vocabQueries.backfillVocabularyVersions(this.conn, this.docClient);
+      if (backfill.failures.length > 0) {
+        const lines = backfill.failures.map(
+          (f) => `${f.repositoryId === '' ? '(no repositoryId)' : f.repositoryId}: ${f.reason}`,
+        );
+        console.warn(
+          `[CosmosDbProvider] could not repair the version property on ` +
+            `${backfill.failures.length} of ${backfill.scanned} _vocabulary vertices in container ` +
+            `${this.config.container}; saveVocabulary will fail for these repositories until ` +
+            `they are repaired:\n  ${lines.join('\n  ')}`,
+        );
+      }
+
+      // 7. Step E — indexing-policy diagnostic. Always runs (operators may
       // drift policy between calls). Never fails ensureSchema — see helper.
       await this.runIndexingPolicyDiagnostic();
 
@@ -426,11 +458,20 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
   // ─── Repository ────────────────────────────────────────────────────
 
-  async createRepository(config: StorageRepositoryConfig): Promise<StoredRepository> {
+  /**
+   * Create the repository and seed its vocabulary — see
+   * `repoQueries.createRepository` for the refusal rules and the two-submit
+   * write. Drops any cached vocabulary left for an earlier repository with
+   * the same id (deleted by another process); the stored vocabulary is now
+   * the one just seeded.
+   */
+  public async createRepository(config: StorageRepositoryConfig): Promise<StoredRepository> {
     this.assertValidRepositoryId(config.repositoryId);
-    return this.track('createRepository', config.repositoryId, () =>
-      repoQueries.createRepository(this.conn, config),
-    );
+    return this.track('createRepository', config.repositoryId, async () => {
+      const created = await repoQueries.createRepository(this.conn, config);
+      this.invalidateVocabularyCache(config.repositoryId);
+      return created;
+    });
   }
 
   async getRepository(repositoryId: string): Promise<StoredRepository | null> {
@@ -453,11 +494,22 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async deleteRepository(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<void> {
+  /**
+   * Delete the repository — see `repoQueries.deleteRepository` for the
+   * marker-first ordering and how a retry finishes an interrupted delete.
+   * The cached vocabulary belongs to the repository being removed; a
+   * repository later re-created under the same id must not be served it, so
+   * the entry is dropped whether or not the delete succeeds.
+   */
+  public async deleteRepository(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<void> {
     this.assertValidRepositoryId(repositoryId);
-    return this.track('deleteRepository', repositoryId, () =>
-      repoQueries.deleteRepository(this.conn, repositoryId, onProgress),
-    );
+    return this.track('deleteRepository', repositoryId, async () => {
+      try {
+        await repoQueries.deleteRepository(this.conn, repositoryId, onProgress);
+      } finally {
+        this.invalidateVocabularyCache(repositoryId);
+      }
+    });
   }
 
   async deleteAllContents(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
@@ -476,11 +528,29 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
   // ─── Vocabulary ────────────────────────────────────────────────────
 
-  async getVocabulary(repositoryId: string): Promise<MemoryVocabulary> {
+  /**
+   * Read the stored vocabulary. Always a round-trip: the per-process cache
+   * serves traversal compilation only, never this method, so `options.fresh`
+   * changes nothing about what is returned. It does refresh the traversal
+   * cache entry with the result, because a caller that asks for a fresh read
+   * is about to act on the stored version and traversal compilation should
+   * see it too.
+   */
+  public async getVocabulary(
+    repositoryId: string,
+    options?: VocabularyReadOptions,
+  ): Promise<MemoryVocabulary> {
     this.assertValidRepositoryId(repositoryId);
-    return this.track('getVocabulary', repositoryId, () =>
-      vocabQueries.getVocabulary(this.conn, repositoryId),
-    );
+    return this.track('getVocabulary', repositoryId, async () => {
+      const vocab = await vocabQueries.getVocabulary(this.conn, repositoryId);
+      if (options?.fresh === true) {
+        this.vocabularyCache.set(repositoryId, {
+          vocab,
+          expiresAt: Date.now() + VOCABULARY_CACHE_TTL_MS,
+        });
+      }
+      return vocab;
+    });
   }
 
   /**
@@ -511,10 +581,32 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     this.vocabularyCache.delete(repositoryId);
   }
 
-  async saveVocabulary(repositoryId: string, vocabulary: MemoryVocabulary): Promise<void> {
+  /**
+   * Compare-and-set write of the vocabulary — lands only when the stored
+   * version equals `expectedVersion`. Throws `VocabularyVersionConflictError`
+   * on a mismatch and `RepositoryNotFoundError` when the repository's
+   * vocabulary vertex does not exist; never creates the vertex.
+   *
+   * Invalidates the traversal cache on success, so later traversals compile
+   * against the new state within this process, and on a conflict, because
+   * the conflict proves the cached copy is stale (cross-process staleness is
+   * otherwise bounded by the 60 s TTL).
+   */
+  public async saveVocabulary(
+    repositoryId: string,
+    vocabulary: MemoryVocabulary,
+    expectedVersion: string,
+  ): Promise<void> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('saveVocabulary', repositoryId, async () => {
-      await vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary);
+      try {
+        await vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary, expectedVersion);
+      } catch (err) {
+        if (err instanceof VocabularyVersionConflictError) {
+          this.invalidateVocabularyCache(repositoryId);
+        }
+        throw err;
+      }
       this.invalidateVocabularyCache(repositoryId);
     });
   }

@@ -2,7 +2,11 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { DeepMemory } from '../core/DeepMemory.js';
-import { DuplicateRelationshipError, OperationAbortedError } from '../core/errors.js';
+import {
+  DuplicateRelationshipError,
+  InvalidInputError,
+  OperationAbortedError,
+} from '../core/errors.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
 import type { MemoryRepository } from '../core/MemoryRepository.js';
 import type { ExportArchive, ExportStreamItem, ImportChunk } from '../types/portability.js';
@@ -197,6 +201,59 @@ describe('Portability', () => {
           target: { mode: 'merge', repositoryId: 'person-test' },
         }),
       ).rejects.toThrow('not a valid UUID');
+    });
+  });
+
+  describe('create-mode import into an existing repository', () => {
+    const targetId = '10000000-0000-4000-a000-000000000009';
+
+    async function emptyArchive(version: string): Promise<ExportArchive> {
+      const archive = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
+      return {
+        ...archive,
+        vocabulary: { ...archive.vocabulary, version },
+        entities: [],
+        relationships: [],
+      };
+    }
+
+    async function storedVersion(): Promise<string> {
+      const target = await memory.openRepository(targetId);
+      return (await target.getVocabulary()).vocabulary.version;
+    }
+
+    beforeEach(async () => {
+      await memory.createRepository({ repositoryId: targetId, label: 'Existing', vocabulary });
+    });
+
+    it('advances the version past the stored one when the archive version is not newer', async () => {
+      // Stored and archive versions are both 1.0.0. Re-writing 1.0.0 would let a
+      // concurrent writer that read the pre-import vocabulary pass its compare-and-set.
+      expect(await storedVersion()).toBe('1.0.0');
+
+      const result = await memory.importRepository(await emptyArchive('1.0.0'), {
+        target: { mode: 'create', repositoryId: targetId, config: { label: 'Existing' } },
+      });
+
+      expect(result.success).toBe(true);
+      expect(await storedVersion()).toBe('2.0.0');
+    });
+
+    it('keeps the archive version when it is newer than a major bump of the stored one', async () => {
+      await memory.importRepository(await emptyArchive('7.3.1'), {
+        target: { mode: 'create', repositoryId: targetId, config: { label: 'Existing' } },
+      });
+
+      expect(await storedVersion()).toBe('7.3.1');
+    });
+
+    it('rejects an archive whose vocabulary version is malformed', async () => {
+      await expect(
+        memory.importRepository(await emptyArchive('1.x.0'), {
+          target: { mode: 'create', repositoryId: targetId, config: { label: 'Existing' } },
+        }),
+      ).rejects.toThrow(InvalidInputError);
+      expect(await storedVersion()).toBe('1.0.0');
     });
   });
 

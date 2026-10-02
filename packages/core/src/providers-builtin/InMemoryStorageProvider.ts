@@ -1,6 +1,6 @@
 // InMemoryStorageProvider — reference implementation of StorageProvider using Maps
 
-import type { StorageProvider, EntityReadOptions } from '../providers/StorageProvider.js';
+import type { StorageProvider, EntityReadOptions, VocabularyReadOptions } from '../providers/StorageProvider.js';
 import type {
   StoredEntity,
   StoredEntityUpdate,
@@ -44,6 +44,7 @@ import {
   DuplicateEntityError,
   RelationshipNotFoundError,
   DuplicateRelationshipError,
+  VocabularyVersionConflictError,
 } from '../core/errors.js';
 
 /** Per-repository data store */
@@ -100,7 +101,7 @@ export class InMemoryStorageProvider implements StorageProvider {
 
     this.stores.set(config.repositoryId, {
       repository,
-      vocabulary: createEmptyVocabulary(config.createdBy),
+      vocabulary: config.vocabulary ?? createEmptyVocabulary(config.createdBy),
       vocabularyChangeLog: [],
       entities: new Map(),
       slugIndex: new Map(),
@@ -201,13 +202,22 @@ export class InMemoryStorageProvider implements StorageProvider {
 
   // ─── Vocabulary ────────────────────────────────────────────────────
 
-  async getVocabulary(repositoryId: string): Promise<MemoryVocabulary> {
+  async getVocabulary(repositoryId: string, _options?: VocabularyReadOptions): Promise<MemoryVocabulary> {
     const store = this.getStore(repositoryId);
     return store.vocabulary;
   }
 
-  async saveVocabulary(repositoryId: string, vocabulary: MemoryVocabulary): Promise<void> {
+  async saveVocabulary(
+    repositoryId: string,
+    vocabulary: MemoryVocabulary,
+    expectedVersion: string,
+  ): Promise<void> {
     const store = this.getStore(repositoryId);
+    // Check and assign run without an intervening await, so the
+    // compare-and-set is atomic on the single JS thread.
+    if (store.vocabulary.version !== expectedVersion) {
+      throw new VocabularyVersionConflictError(repositoryId, expectedVersion, store.vocabulary.version);
+    }
     store.vocabulary = vocabulary;
   }
 

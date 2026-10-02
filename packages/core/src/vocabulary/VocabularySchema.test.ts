@@ -5,7 +5,10 @@ import {
   createRelationshipTypeDefinition,
   buildVocabulary,
   incrementVersion,
+  compareVersions,
+  isValidVocabularyVersion,
 } from './VocabularySchema.js';
+import { InvalidInputError } from '../core/errors.js';
 
 describe('createEmptyVocabulary', () => {
   it('creates a vocabulary with version 0.0.0', () => {
@@ -131,5 +134,35 @@ describe('incrementVersion', () => {
 
   it('handles 0.0.0', () => {
     expect(incrementVersion('0.0.0', 'minor')).toBe('0.1.0');
+  });
+
+  it('treats missing trailing components as 0', () => {
+    expect(incrementVersion('1.2', 'patch')).toBe('1.2.1');
+  });
+
+  it.each(['1.x.0', '1.-1.0', '1.2.3-beta', '', '1..0', ' 1.0.0', '1.0.9007199254740993'])(
+    'throws InvalidInputError for malformed version %j',
+    (version) => {
+      expect(() => incrementVersion(version, 'minor')).toThrow(InvalidInputError);
+    },
+  );
+});
+
+describe('compareVersions', () => {
+  it('orders by major, then minor, then patch', () => {
+    expect(compareVersions('2.0.0', '1.9.9')).toBeGreaterThan(0);
+    expect(compareVersions('1.2.0', '1.10.0')).toBeLessThan(0);
+    expect(compareVersions('1.2.3', '1.2.3')).toBe(0);
+  });
+});
+
+describe('isValidVocabularyVersion', () => {
+  it('accepts major.minor.patch', () => {
+    expect(isValidVocabularyVersion('0.0.0')).toBe(true);
+    expect(isValidVocabularyVersion('12.4.100')).toBe(true);
+  });
+
+  it.each(['1.0', '1.0.0.0', '1.x.0', 'v1.0.0', '1.0.0-beta', ''])('rejects %j', (version) => {
+    expect(isValidVocabularyVersion(version)).toBe(false);
   });
 });

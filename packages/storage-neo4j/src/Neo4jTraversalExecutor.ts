@@ -21,7 +21,13 @@ import type {
   TraversalAggregation,
   TraversalSpec,
 } from '@utaba/deep-memory/types';
-import { CypherCompiler, ProviderError } from '@utaba/deep-memory';
+import {
+  CypherCompiler,
+  DeepMemoryError,
+  ProviderError,
+  QueryTimeoutError,
+  TraversalTimeoutError,
+} from '@utaba/deep-memory';
 import type { Neo4jConnection } from './Neo4jConnection.js';
 import { entityFromProperties, relationshipFromProperties } from './mapping.js';
 
@@ -155,9 +161,17 @@ export class Neo4jTraversalExecutor {
         { repositoryId, routing: 'READ' },
       );
     } catch (err: unknown) {
+      // A server-side timeout means the traversal was too large, not that the
+      // store is down: report TRAVERSAL_TIMEOUT so hosts tell callers to narrow
+      // the query instead of retrying it. `cause` stays the driver error.
+      if (err instanceof QueryTimeoutError) {
+        throw new TraversalTimeoutError(err.elapsedMs, { cause: err.cause });
+      }
+      if (err instanceof DeepMemoryError) throw err;
       throw new ProviderError(
         `Neo4j traversal failed: ${err instanceof Error ? err.message : String(err)}`,
         'Inspect the compiled Cypher in queryMetadata.compiledQuery and confirm the spec passed validation.',
+        { cause: err },
       );
     }
 

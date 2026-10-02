@@ -24,6 +24,7 @@ export type DeepMemoryErrorCode =
   | 'TRAVERSAL_VALIDATION_FAILED'
   | 'TRAVERSAL_VOCABULARY_ERROR'
   | 'TRAVERSAL_TIMEOUT'
+  | 'QUERY_TIMEOUT'
   | 'UNSUPPORTED_QUERY';
 
 /** Base error class for all Deep Memory errors */
@@ -31,8 +32,13 @@ export class DeepMemoryError extends Error {
   readonly code: DeepMemoryErrorCode;
   readonly suggestion?: string;
 
-  constructor(code: DeepMemoryErrorCode, message: string, suggestion?: string) {
-    super(message);
+  constructor(
+    code: DeepMemoryErrorCode,
+    message: string,
+    suggestion?: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
     this.name = 'DeepMemoryError';
     this.code = code;
     this.suggestion = suggestion;
@@ -341,13 +347,18 @@ export class ExportError extends DeepMemoryError {
   }
 }
 
-/** Generic provider-level error */
+/**
+ * Generic provider-level error. A provider that builds one from a backend
+ * error passes that error as `options.cause`, so hosts can inspect the
+ * backend's own code without parsing `message`.
+ */
 export class ProviderError extends DeepMemoryError {
-  constructor(message: string, suggestion?: string) {
+  constructor(message: string, suggestion?: string, options?: ErrorOptions) {
     super(
       'PROVIDER_ERROR',
       message,
       suggestion ?? `Check provider configuration and connectivity.`,
+      options,
     );
     this.name = 'ProviderError';
   }
@@ -395,18 +406,46 @@ export class TraversalVocabularyError extends DeepMemoryError {
   }
 }
 
-/** Thrown when a native query times out. */
+/**
+ * Thrown when a traversal (traverse, exploreNeighborhood, findPaths) runs
+ * past its time limit: a client-side limit, or the storage
+ * server's own transaction timeout. `timeoutMs` is the configured limit when
+ * the provider knows it, otherwise the elapsed time observed before the server
+ * ended the query. The backend error, when there is one, is `cause`.
+ */
 export class TraversalTimeoutError extends DeepMemoryError {
   readonly timeoutMs: number;
 
-  constructor(timeoutMs: number) {
+  constructor(timeoutMs: number, options?: ErrorOptions) {
     super(
       'TRAVERSAL_TIMEOUT',
       `Traversal timed out after ${timeoutMs}ms`,
-      `Try reducing the traversal depth, adding more specific filters, or increasing the timeout on your GraphTraversalProvider.`,
+      `The traversal was too large to finish in time; retrying it unchanged will time out again. Reduce the depth, add more specific filters, or lower the result limit.`,
+      options,
     );
     this.name = 'TraversalTimeoutError';
     this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * Thrown when a non-traversal storage operation runs past the storage
+ * server's transaction timeout. The server ends the query and rolls back its
+ * transaction, so a timed-out write did not commit. The store itself is
+ * healthy; the request was too large. The backend error is `cause`.
+ */
+export class QueryTimeoutError extends DeepMemoryError {
+  readonly elapsedMs: number;
+
+  constructor(elapsedMs: number, options?: ErrorOptions) {
+    super(
+      'QUERY_TIMEOUT',
+      `Storage query timed out after ${elapsedMs}ms; the server ended it and rolled back its transaction`,
+      `The request was too large to finish in time; retrying it unchanged will time out again. Narrow it with more specific filters, a smaller limit, or a smaller batch.`,
+      options,
+    );
+    this.name = 'QueryTimeoutError';
+    this.elapsedMs = elapsedMs;
   }
 }
 

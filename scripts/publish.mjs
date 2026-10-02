@@ -53,12 +53,23 @@ function getLocalVersion(pkgPath) {
   return json.version;
 }
 
+// Returns null only when npm reports the package does not exist (E404). Any
+// other failure aborts: treating it as "never published" makes the script try
+// to republish an existing version. Output is captured through `stdio` rather
+// than a shell redirect, because execSync runs under cmd.exe on Windows, where
+// `2>/dev/null` is an invalid path and fails the command.
 function getPublishedVersion(name) {
   try {
-    const result = execSync(`npm view ${name} version 2>/dev/null`, { encoding: 'utf8' }).trim();
+    const result = execSync(`npm view ${name} version`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
     return result || null;
-  } catch {
-    return null;
+  } catch (err) {
+    const stderr = String(err.stderr ?? '');
+    if (stderr.includes('E404')) return null;
+    console.error(`  ✖ Could not look up the published version of ${name}:\n${stderr || err.message}`);
+    process.exit(1);
   }
 }
 

@@ -59,12 +59,12 @@
   "dependencies": {
     "@utaba/deep-memory": "workspace:^",
     "bufferutil": "^4.0.8",
-    "gremlin": "^3.7.3"
+    "gremlin": "^3.8.2"
   },
   "devDependencies": {
-    "@types/node": "^22.20.1",
+    "@types/node": "^22.20.4",
     "tsup": "^8.5.1",
     "typescript": "^6.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }

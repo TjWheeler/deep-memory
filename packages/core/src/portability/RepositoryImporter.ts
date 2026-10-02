@@ -13,7 +13,16 @@ import type {
 import type { RepositoryConfig } from '../types/repositories.js';
 import { MigrationEngine } from './MigrationEngine.js';
 import { generateId } from '../core/DeepMemory.js';
-import { DuplicateRelationshipError, OperationAbortedError } from '../core/errors.js';
+import {
+  DuplicateRelationshipError,
+  InvalidInputError,
+  OperationAbortedError,
+} from '../core/errors.js';
+import {
+  compareVersions,
+  incrementVersion,
+  isValidVocabularyVersion,
+} from '../vocabulary/VocabularySchema.js';
 
 /** Progress info emitted after each chunk is processed */
 export interface ImportProgress {
@@ -138,6 +147,14 @@ export class RepositoryImporter {
     }
     if (!header.vocabulary) {
       warnings.push({ code: 'invalid_archive', message: 'Header is missing vocabulary' });
+    } else if (!isValidVocabularyVersion(header.vocabulary.version)) {
+      // The version is stored as-is and later compared and bumped by
+      // compare-and-set writes; a malformed one would make it unadvanceable.
+      throw new InvalidInputError(
+        'vocabulary.version',
+        `Archive vocabulary version "${String(header.vocabulary.version)}" is not a valid version`,
+        'Vocabulary versions must be in "major.minor.patch" form, e.g. "1.2.0".',
+      );
     }
 
     if (options.target.mode === 'create') {
@@ -156,7 +173,9 @@ export class RepositoryImporter {
   ): Promise<ImportResult> {
     const target = options.target as { mode: 'create'; repositoryId: string; config: RepositoryConfig };
 
-    // Create the repository if it doesn't already exist
+    // Create the repository with the header's vocabulary, or replace the
+    // vocabulary of an existing repository. saveVocabulary never creates and
+    // is compare-and-set, so the existing case reads the stored version fresh.
     const existing = await this.storage.getRepository(target.repositoryId);
     if (!existing) {
       const now = new Date().toISOString();
@@ -169,13 +188,27 @@ export class RepositoryImporter {
         owner: target.config.owner,
         governanceConfig: target.config.governance ?? { mode: 'open' },
         metadata: target.config.metadata,
+        vocabulary: header.vocabulary,
         createdAt: now,
         createdBy: this.actorId,
       });
+    } else {
+      const current = await this.storage.getVocabulary(target.repositoryId, { fresh: true });
+      // Replacing the vocabulary must move its version forward. Writing the
+      // archive's own version could restore one the repository already had,
+      // and a concurrent writer that read that earlier version would then pass
+      // its compare-and-set and overwrite the import. Take the higher of the
+      // archive version and a major bump of the stored one (a full replacement
+      // is a breaking change for anything relying on the old types).
+      const bumped = incrementVersion(current.version, 'major');
+      const version =
+        compareVersions(header.vocabulary.version, bumped) > 0 ? header.vocabulary.version : bumped;
+      await this.storage.saveVocabulary(
+        target.repositoryId,
+        { ...header.vocabulary, version },
+        current.version,
+      );
     }
-
-    // Save the vocabulary from the header
-    await this.storage.saveVocabulary(target.repositoryId, header.vocabulary);
 
     // Process chunks incrementally — skip existence checks since the repo is freshly created
     const totalEntities = header.manifest?.statistics?.entityCount ?? 0;
@@ -266,7 +299,8 @@ export class RepositoryImporter {
     }
 
     // Handle vocabulary migration
-    const targetVocabulary = await this.storage.getVocabulary(repositoryId);
+    // Fresh read: the merged result is written with compare-and-set against this version.
+    const targetVocabulary = await this.storage.getVocabulary(repositoryId, { fresh: true });
     const conflictMode = options.vocabularyConflict ?? 'reject';
     const migrationResult = this.migrationEngine.migrate(
       header.vocabulary,
@@ -287,7 +321,11 @@ export class RepositoryImporter {
     }
 
     if (migrationResult.mergedVocabulary && migrationResult.mergedVocabulary !== targetVocabulary) {
-      await this.storage.saveVocabulary(repositoryId, migrationResult.mergedVocabulary);
+      await this.storage.saveVocabulary(
+        repositoryId,
+        migrationResult.mergedVocabulary,
+        targetVocabulary.version,
+      );
     }
 
     // Process chunks incrementally with conflict resolution

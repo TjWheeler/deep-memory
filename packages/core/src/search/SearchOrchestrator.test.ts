@@ -57,12 +57,13 @@ describe('SearchOrchestrator', () => {
       createdAt: new Date().toISOString(),
       createdBy: 'test',
     });
+    const current = await storage.getVocabulary(repoId);
     await storage.saveVocabulary(repoId, buildVocabulary({
       entityTypes: [
         { type: 'note', description: 'A note' },
         { type: 'person', description: 'A person' },
       ],
-    }, 'test'));
+    }, 'test'), current.version);
 
     await storage.createEntity(repoId, makeEntity('note:meeting', 'note', 'Meeting Notes', 'Discussed project timeline and deliverables'));
     await storage.createEntity(repoId, makeEntity('note:code-review', 'note', 'Code Review', 'Reviewed pull request for auth module'));

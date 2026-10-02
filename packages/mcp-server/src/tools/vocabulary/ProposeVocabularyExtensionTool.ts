@@ -3,7 +3,7 @@ import { BaseToolController } from '../base/BaseToolController.js';
 
 export class ProposeVocabularyExtensionTool extends BaseToolController {
   get name() { return 'memory_propose_vocabulary_extension'; }
-  get description() { return 'Propose a new entity type or relationship type. Only needed when the vocabulary doesn\'t already include the type you need — check memory_open_repository response first.'; }
+  get description() { return 'Propose a new entity type or relationship type. Only needed when the vocabulary doesn\'t already include the type you need — check memory_open_repository response first. An error saying the vocabulary was changed concurrently (VOCABULARY_VERSION_CONFLICT) means it changed underneath this proposal three times in a row; re-read the vocabulary and resubmit.'; }
   get inputSchema() {
     return {
       type: 'object',

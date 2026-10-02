@@ -66,7 +66,7 @@ const dm = new DeepMemory({ storage: provider, graphTraversal: provider });
 await provider.dispose();        // closes WebSocket
 ```
 
-`ensureSchema()` uses the CosmosDB REST API to create the database and container if they don't exist, then writes a `_meta` schema version vertex. Subsequent calls detect the existing schema and return early.
+`ensureSchema()` uses the CosmosDB REST API to create the database and container if they don't exist, then writes a `_meta` schema version vertex. Subsequent calls leave existing resources and an up-to-date `_meta` vertex unchanged. Every call also repairs the `version` property on `_vocabulary` vertices: it adds the property where it is missing and corrects it where it no longer matches the version in the JSON blob. Compare-and-set in `saveVocabulary` depends on that property (see [Vocabulary writes](#vocabulary-writes)). The repair finds `_vocabulary` vertices with a paged cross-partition SQL query through the document (REST) client, excluding entity vertices, and repairs each one with a partition-scoped Gremlin write. A vertex it cannot repair is reported with `console.warn` and does not fail the call.
 
 ## Data Model
 
@@ -99,7 +99,19 @@ User-supplied properties on entities and relationships are **dual-written**: the
 | Entity / relationship user properties | JSON blob in `properties` + per-key native vertex/edge scalars for native-storable values | Blob is authoritative on read. The scalars are a write-only mirror that powers server-side predicates and aggregation; the read path never consumes them. |
 | Embeddings | JSON string in `embedding` vertex property | Stored for export/import fidelity; not searchable via Gremlin |
 | Governance config | JSON string in `governanceConfig` vertex property | On `_repository` vertices |
-| Vocabulary | JSON string in `vocabulary` vertex property | On `_vocabulary` vertices |
+| Vocabulary | JSON string in `vocabulary` vertex property, plus a `version` copy | On `_vocabulary` vertices |
+
+### Vocabulary writes
+
+The vocabulary version is stored twice: inside the JSON blob and as a `version` property on the `_vocabulary` vertex, so the database can compare it. `saveVocabulary(id, vocabulary, expectedVersion)` is compare-and-set in a single partition-scoped traversal, and a mismatch throws `VocabularyVersionConflictError`. `saveVocabulary` never creates the vertex. `createRepository` writes it before the `_repository` vertex and its index entry, and a missing vertex throws `RepositoryNotFoundError`. A vertex with a missing or stale `version` property throws `ProviderError`, and the message says to run `ensureSchema()`. `getVocabulary` always reads from the database. The in-process cache serves only traversal compilation, and `getVocabulary(id, { fresh: true })` refreshes that cache with the stored value.
+
+### Repository delete
+
+`deleteRepository` drops the `_repository` marker vertex first, in its own submit. Entity and relationship creates check for the marker in the same traversal as their write, so they fail with `RepositoryNotFoundError` from that point on. The delete then probes the partition. Unless the partition is already empty, it drains edges and vertices (including `_vocabulary` and the change log) in batches. Finally it removes the id from the repository index. A delete that is interrupted part-way can be finished by calling `deleteRepository` again. It throws `RepositoryNotFoundError` only when the partition is empty and the index does not list the id. `createRepository` refuses with a `ProviderError` while anything is left in the partition with no marker, and the message tells you to finish the delete first. That state also covers a create that wrote its vocabulary but not its marker, and `deleteRepository` clears it the same way.
+
+### Upgrading
+
+After upgrading this package, run `ensureSchema()` once, after **every** process that writes to the container has moved to the new release. This repairs the `version` property on vocabularies written by earlier releases. The local MCP server runs `ensureSchema()` at startup, and the indexer runs it before each import. Running old and new releases against one container at the same time is unsupported, because an older release rewrites the vocabulary blob without updating the `version` property.
 
 ## Capabilities
 
@@ -217,7 +229,7 @@ const provider = new CosmosDbProvider({
 1. Create a CosmosDB account with **Apache Gremlin** API in the Azure portal.
 2. Note the Gremlin endpoint (e.g. `wss://your-account.gremlin.cosmos.azure.com:443/`).
 3. Get the primary key from the Keys blade.
-4. Call `ensureSchema()` once on first deployment — it creates the database and container.
+4. Call `ensureSchema()` once on first deployment — it creates the database and container — and again after each upgrade (see [Upgrading](#upgrading)).
 
 ```typescript
 const provider = new CosmosDbProvider({

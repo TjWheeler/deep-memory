@@ -173,6 +173,11 @@ The primary persistence interface. Every read and write goes through this provid
 - Timeline queries
 - Bulk export/import
 
+**Vocabulary contract for implementers:**
+- `createRepository(config)` must also persist the repository's vocabulary — `config.vocabulary` when supplied, otherwise `createEmptyVocabulary(config.createdBy)`. This is the only place a vocabulary is created.
+- `getVocabulary(repositoryId, options?: { fresh?: boolean })` — `fresh: true` bypasses any provider-side cache. Providers without a cache ignore it.
+- `saveVocabulary(repositoryId, vocabulary, expectedVersion)` is compare-and-set. The write lands only if the stored version equals `expectedVersion`, and the check and the write must be atomic. A mismatch throws `VocabularyVersionConflictError` (code `VOCABULARY_VERSION_CONFLICT`, carrying `repositoryId`, `expectedVersion` and `actualVersion`) and leaves the stored vocabulary unchanged. It never creates: when the repository or its vocabulary does not exist it throws `RepositoryNotFoundError`.
+
 **Included implementation:** `InMemoryStorageProvider` — uses `Map`s, no persistence across process restarts. A conformance test suite (`runStorageProviderConformanceTests`) validates any implementation.
 
 ### SearchProvider (optional)
@@ -224,20 +229,28 @@ EntityManager.create(input)
 Client
   │
   ▼
-MemoryRepository.proposeVocabularyExtension(proposal)
+MemoryRepository.proposeVocabularyChange(proposal)
   │
   ▼
-VocabularyEngine.proposeExtension(proposal, actorId)
-  ├── SemanticDeduplicator.checkDuplicate(...)
-  │     ├── EmbeddingProvider?.embed(...)          ← if available
-  │     └── jaroWinklerSimilarity(...)             ← fallback
-  ├── VocabularyGovernor.processProposal(...)
-  │     ├── canPropose(governance, proposal)
-  │     └── apply or queue based on mode
-  ├── StorageProvider.saveVocabulary(updated)
-  ├── EventBus.emit('vocabulary:extension:approved', ...)
-  └── return VocabularyProposalResult
+VocabularyEngine.proposeChange(proposal, actorId)
+  └── up to 3 attempts:
+        ├── StorageProvider.getVocabulary({ fresh: true })   ← bypasses caches
+        ├── SemanticDeduplicator.checkDuplicate(...)         ← add proposals
+        │     ├── EmbeddingProvider?.embed(...)              ← if available
+        │     └── jaroWinklerSimilarity(...)                 ← fallback
+        ├── property-schema validation
+        ├── VocabularyGovernor.processProposal(...)
+        │     ├── canPropose(governance, proposal)
+        │     └── apply or queue based on mode
+        ├── if approved:
+        │     ├── StorageProvider.saveVocabulary(updated, readVersion)   ← compare-and-set
+        │     └── cascade-delete data                    ← delete proposals, after the write
+        ├── VocabularyVersionConflictError → next attempt (re-evaluates everything)
+        └── return VocabularyProposalResult
+  after the 3rd conflict → VocabularyVersionConflictError to the caller
 ```
+
+The read is fresh so the version passed to `saveVocabulary` is the stored one, not a cached copy another process has superseded. A conflict means another writer changed the vocabulary between the read and the write; the retry re-runs deduplication, validation and governance against the vocabulary that won. The vocabulary is written before a delete proposal's data is removed: the vocabulary is the source of truth, and data left under a removed type can be deleted again, whereas data deleted for a type whose removal then failed to persist cannot be recovered.
 
 ## Module Dependency Graph
 

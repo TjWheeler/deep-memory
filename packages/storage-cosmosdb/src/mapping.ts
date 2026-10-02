@@ -187,7 +187,7 @@ export function entityFromGremlin(props: Record<string, unknown>): StoredEntity 
 // local-tests/baseline/phase-cosmos-sql-shape-probe-results.md.
 
 /** Pluck the underlying value of a Gremlin-managed property from a Document-endpoint doc. */
-function pluckDocValue(doc: Record<string, unknown>, key: string): unknown {
+export function pluckDocValue(doc: Record<string, unknown>, key: string): unknown {
   const arr = doc[key];
   if (Array.isArray(arr) && arr.length > 0) {
     const entry = arr[0] as Record<string, unknown> | undefined;

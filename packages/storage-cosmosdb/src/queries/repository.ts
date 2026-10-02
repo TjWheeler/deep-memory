@@ -16,7 +16,13 @@ import {
   repositoryConfigToLadderBindings,
   repositoryFromGremlin,
 } from '../mapping.js';
-import { DuplicateRepositoryError, RepositoryNotFoundError } from '@utaba/deep-memory';
+import {
+  DuplicateRepositoryError,
+  ProviderError,
+  RepositoryNotFoundError,
+  createEmptyVocabulary,
+} from '@utaba/deep-memory';
+import { repoVertexId, vocabVertexId } from './ids.js';
 
 const REPO_LABEL = '_repository';
 
@@ -24,8 +30,9 @@ const REPO_LABEL = '_repository';
 // every repository id in the container so `listRepositories` can be a single
 // partition-scoped read rather than a cross-partition scan over every
 // `_repository` vertex. ensureSchema bootstraps the sentinel; createRepository
-// and deleteRepository keep it in sync atomically via single-submit
-// cross-partition `sideEffect` updates.
+// adds the id in the same submit as the `_repository` vertex (a cross-
+// partition `sideEffect`), and deleteRepository removes it as its last step,
+// once the repository's partition is empty.
 //
 // Shape: `repositoryIds: string[]` — flat ids. listRepositories hydrates each
 // id via partition-scoped getRepository in parallel. Pagination and any
@@ -33,10 +40,6 @@ const REPO_LABEL = '_repository';
 export const REPOSITORY_INDEX_VERTEX_ID = '_repository_index';
 export const REPOSITORY_INDEX_PARTITION = '_index';
 const REPOSITORY_INDEX_LABEL = '_repository_index';
-
-function repoVertexId(repositoryId: string): string {
-  return `repo:${repositoryId}`;
-}
 
 /**
  * Bootstrap the `_repository_index` sentinel vertex.
@@ -131,21 +134,83 @@ const REPOSITORY_CREATE_QUERY =
   `g.addV('${REPO_LABEL}').property('id', vid).property('repositoryId', rid)${buildRepositoryPropertyLadder()}` +
   ".sideEffect(__.V().has('repositoryId', pk).hasId(sid).property('repositoryIds', updatedIndex))";
 
+// Seeds the repository's `_vocabulary` vertex. The `version` copy is written
+// with the blob so compare-and-set in `saveVocabulary` can match from the
+// very first write.
+const VOCABULARY_CREATE_QUERY =
+  "g.addV('_vocabulary').property('id', vid).property('repositoryId', rid)" +
+  ".property('version', vocabVersion).property('vocabulary', vocabJson)";
+
+/**
+ * Create the `_repository` vertex (plus its sentinel entry) and the
+ * repository's `_vocabulary` vertex, seeded from `config.vocabulary` or an
+ * empty vocabulary. `saveVocabulary` only ever updates that vertex, so this
+ * is where the first stored version comes from.
+ *
+ * The create is refused unless the repository's partition is empty:
+ *
+ *   - an existing `_repository` vertex → `DuplicateRepositoryError`;
+ *   - anything else in the partition with no `_repository` vertex →
+ *     `ProviderError`. That state means a `deleteRepository` dropped the
+ *     marker but did not finish its chunked drain; creating on top of it
+ *     would leave the old repository's vertices (including a second
+ *     vocabulary) under the new one. Re-running `deleteRepository` finishes
+ *     the drain, and the message says so because tool surfaces may drop the
+ *     suggestion.
+ *
+ * The vocabulary vertex is written first, then the `_repository` vertex and
+ * its sentinel entry, in two submits. If the second fails or never lands
+ * (the process dies, or the sentinel `sideEffect` fails on a busy
+ * container), the partition holds a vocabulary and no marker: the repository
+ * does not exist for any caller (entity / relationship creates are gated on
+ * the marker, and `getRepository` finds nothing), a retried create is
+ * refused with the "delete did not finish" `ProviderError` above, and
+ * `deleteRepository` clears the partition, after which the create succeeds.
+ * The opposite order would leave a marker with no vocabulary, which looks
+ * like a live repository whose every `saveVocabulary` fails.
+ *
+ * A create racing a concurrent `deleteRepository` of the same id can land
+ * after that delete's drain has passed; re-running `deleteRepository`
+ * removes what it left.
+ */
 export async function createRepository(
   conn: CosmosDbConnection,
   config: StorageRepositoryConfig,
 ): Promise<StoredRepository> {
   const vertexId = repoVertexId(config.repositoryId);
 
-  // Existence check — partition-scoped via `has('repositoryId', rid)` before
-  // `hasId(vid)`. hasId alone is post-routing and fans out across partitions.
-  const existing = await conn.submit(
-    "g.V().has('repositoryId', rid).hasId(vid).has('label', lbl).count()",
-    { vid: vertexId, rid: config.repositoryId, lbl: REPO_LABEL },
+  // Partition-wide probe: one document read from the repository's own
+  // partition (the partition key is the first predicate). Only when it finds
+  // something does the marker lookup run to decide which error applies, so
+  // the common create pays one round-trip here, as before.
+  const occupied = await conn.submit(
+    "g.V().has('repositoryId', rid).limit(1).count()",
+    { rid: config.repositoryId },
   );
-  if (existing.items.length > 0 && Number(existing.items[0]) > 0) {
-    throw new DuplicateRepositoryError(config.repositoryId);
+  if (Number(occupied.items[0] ?? 0) > 0) {
+    // Partition-scoped via `has('repositoryId', rid)` before `hasId(vid)`;
+    // hasId alone is post-routing and fans out across partitions.
+    const existing = await conn.submit(
+      "g.V().has('repositoryId', rid).hasId(vid).has('label', lbl).count()",
+      { vid: vertexId, rid: config.repositoryId, lbl: REPO_LABEL },
+    );
+    if (Number(existing.items[0] ?? 0) > 0) {
+      throw new DuplicateRepositoryError(config.repositoryId);
+    }
+    throw new ProviderError(
+      `Repository "${config.repositoryId}" still holds data from a delete that did not finish; call deleteRepository("${config.repositoryId}") to finish it, then create it again`,
+      `Call deleteRepository("${config.repositoryId}") to finish the interrupted delete, then retry createRepository.`,
+    );
   }
+
+  // Vocabulary first — see the ordering note above.
+  const initialVocabulary = config.vocabulary ?? createEmptyVocabulary(config.createdBy);
+  await conn.submit(VOCABULARY_CREATE_QUERY, {
+    vid: vocabVertexId(config.repositoryId),
+    rid: config.repositoryId,
+    vocabVersion: initialVocabulary.version,
+    vocabJson: JSON.stringify(initialVocabulary),
+  });
 
   // Compute the updated sentinel array client-side before the atomic write.
   // One extra round-trip (the sentinel read), but it lets the actual create
@@ -295,12 +360,142 @@ export async function updateRepository(
 
 const DELETE_BATCH_SIZE = 500;
 
+// Returned by a delete step that found a `_repository` marker for the id it is
+// deleting — the repository was re-created under the same id after this
+// delete dropped the old marker (see deleteRepository).
+const RECREATED_SENTINEL = '__recreated';
+
+// Opens a delete step that only runs while the repository has no marker: when
+// a marker exists the step emits RECREATED_SENTINEL and does nothing else;
+// otherwise the second branch does the work. That branch starts its own
+// lookup with `__.V()`: Cosmos does not resolve a bare `V()` as the first
+// step of a coalesce branch, only after another step (`unfold().V()`). The
+// check and the work are one traversal.
+const UNLESS_RECREATED =
+  "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').fold()" +
+  `.coalesce(unfold().constant('${RECREATED_SENTINEL}'),`;
+
+// One vertex-drain batch, skipped once a re-create has landed.
+export const DELETE_VERTEX_BATCH_QUERY =
+  `${UNLESS_RECREATED}__.V().has('repositoryId', rid).limit(batchSize).drop())`;
+
+// Sentinel cleanup, skipped once a re-create has landed. The marker check runs
+// in the repository's partition; the write targets the sentinel in the
+// `_index` partition (a cross-partition mutation in one submit, as in
+// REPOSITORY_CREATE_QUERY).
+export const DELETE_INDEX_ENTRY_QUERY =
+  `${UNLESS_RECREATED}__.V().has('repositoryId', pk).hasId(sid).property('repositoryIds', updatedIndex))`;
+
+/**
+ * Drop every vertex and edge in the repository's partition, then remove the
+ * id from the `_repository_index` sentinel:
+ *
+ *   1. Drop the `_repository` marker vertex in its own submit. The drain
+ *      below spans many submits, and entity / relationship creates are gated
+ *      on the marker in the same traversal as their write, so removing it
+ *      first makes every later create fail with `RepositoryNotFoundError`
+ *      instead of landing after the batch that would have removed it.
+ *   2. Probe the partition. If no marker was dropped, decide whether there is
+ *      anything to finish: an earlier delete that was interrupted after
+ *      step 1 leaves vertices in the partition and/or the id in the
+ *      sentinel, and a create interrupted before its marker write leaves its
+ *      vocabulary vertex. Only when the partition is empty and the sentinel
+ *      does not list the id did the repository never exist: throw
+ *      `RepositoryNotFoundError`. Otherwise carry on, so a retry finishes
+ *      the interrupted delete.
+ *   3. Unless the probe found the partition empty, drain edges, then
+ *      vertices (entities plus the `_vocabulary` / change-log system
+ *      vertices), in batches.
+ *   4. Remove the id from the sentinel.
+ *
+ * Steps 3 (vertex batches) and 4 stand down if the repository is re-created
+ * under the same id while they run. `createRepository` only proceeds once
+ * the partition is empty, which first happens after the last vertex batch,
+ * so a re-create can land between that batch and the drain's final
+ * remaining-count check, or before the sentinel cleanup. Without a guard the
+ * drain would see the new vertices and drop them, and the cleanup would
+ * remove the new repository from the sentinel. Each vertex batch and the
+ * cleanup therefore check for a marker in the same traversal as their write
+ * and do nothing when one exists: everything in the partition at that point
+ * belongs to the new repository, so the delete is complete. The check and the
+ * write are one submit but not a transaction; a re-create landing inside a
+ * single batch traversal is not excluded. Edge batches need no guard: they
+ * run while the old repository's vertices still occupy the partition, so no
+ * re-create can have started.
+ *
+ * A create already executing when the marker is dropped can still land after
+ * the drain has passed it; re-running `deleteRepository` removes it.
+ */
 export async function deleteRepository(
   conn: CosmosDbConnection,
   repositoryId: string,
   onProgress?: DeleteProgressCallback,
 ): Promise<void> {
-  // Get totals for progress reporting
+  // Same aggregate-then-drop shape as deleteEntities: the bucket holds the id
+  // of the marker actually dropped, so an empty bucket means there was none.
+  const marker = await conn.submit(
+    "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository')" +
+      ".aggregate('found').by('id').drop().cap('found')",
+    { rid: repositoryId, vid: repoVertexId(repositoryId) },
+  );
+  const markerBucket = marker.items[0];
+  const markerDropped = Array.isArray(markerBucket) && markerBucket.length > 0;
+
+  // Probe the partition once, whichever way the marker step went. An empty
+  // partition has nothing to drain (edges live with their source vertex, so
+  // no vertices means no edges): skip straight to the sentinel cleanup.
+  const probe = await conn.submit("g.V().has('repositoryId', rid).limit(1).count()", {
+    rid: repositoryId,
+  });
+  const partitionEmpty = Number(probe.items[0] ?? 0) === 0;
+
+  let indexedIds: string[] | null = null;
+  if (!markerDropped && partitionEmpty) {
+    indexedIds = await readRepositoryIndex(conn);
+    if (!indexedIds.includes(repositoryId)) {
+      throw new RepositoryNotFoundError(repositoryId);
+    }
+  }
+
+  const markerVid = repoVertexId(repositoryId);
+  if (!partitionEmpty) {
+    const outcome = await drainPartition(conn, repositoryId, markerVid, onProgress);
+    // Re-created under the same id: what is left belongs to the new
+    // repository, and the new create has already listed it in the sentinel.
+    if (outcome === 'recreated') return;
+  }
+
+  // Remove this repo's id from the sentinel — a property update on the
+  // sentinel in the `_index` partition. It runs last: the `_repository`
+  // vertex was dropped up front and the drain has emptied the partition, so
+  // while any of the repository remains the sentinel still lists it and a
+  // retried delete knows there is work left.
+  const currentIds = indexedIds ?? (await readRepositoryIndex(conn));
+  const updatedIds = currentIds.filter((id) => id !== repositoryId);
+  if (updatedIds.length !== currentIds.length) {
+    await conn.submit(DELETE_INDEX_ENTRY_QUERY, {
+      rid: repositoryId,
+      vid: markerVid,
+      pk: REPOSITORY_INDEX_PARTITION,
+      sid: REPOSITORY_INDEX_VERTEX_ID,
+      updatedIndex: JSON.stringify(updatedIds),
+    });
+  }
+}
+
+/**
+ * Drain a repository's partition: edges first (avoids orphan-edge errors),
+ * then vertices, in batches — a single unbounded drop() times out on large
+ * repositories. Each vertex batch stands down when a re-created marker is
+ * present (see deleteRepository), reported as `'recreated'`.
+ */
+async function drainPartition(
+  conn: CosmosDbConnection,
+  repositoryId: string,
+  markerVid: string,
+  onProgress?: DeleteProgressCallback,
+): Promise<'drained' | 'recreated'> {
+  // Totals for progress reporting.
   const entityCountResult = await conn.submit(
     "g.V().has('repositoryId', rid).has('entityType').count()",
     { rid: repositoryId },
@@ -316,8 +511,6 @@ export async function deleteRepository(
   let relationshipsDeleted = 0;
   let entitiesDeleted = 0;
 
-  // Drop edges first (avoids orphan-edge errors), then all vertices, in batches.
-  // A single unbounded drop() times out on large repositories.
   while (true) {
     await conn.submit(
       "g.E().has('repositoryId', rid).limit(batchSize).drop()",
@@ -334,10 +527,12 @@ export async function deleteRepository(
   }
 
   while (true) {
-    await conn.submit(
-      "g.V().has('repositoryId', rid).limit(batchSize).drop()",
-      { rid: repositoryId, batchSize: DELETE_BATCH_SIZE },
-    );
+    const batch = await conn.submit(DELETE_VERTEX_BATCH_QUERY, {
+      rid: repositoryId,
+      vid: markerVid,
+      batchSize: DELETE_BATCH_SIZE,
+    });
+    if (batch.items[0] === RECREATED_SENTINEL) return 'recreated';
     const remaining = await conn.submit(
       "g.V().has('repositoryId', rid).limit(1).count()",
       { rid: repositoryId },
@@ -345,24 +540,7 @@ export async function deleteRepository(
     const remainingCount = Number(remaining.items[0] ?? 0);
     entitiesDeleted = totalEntities - remainingCount;
     await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
-    if (remainingCount === 0) break;
-  }
-
-  // Remove this repo's id from the sentinel. The drain above already dropped
-  // the `_repository` vertex (it lives in the repo's partition), so this is
-  // the only remaining cross-partition write — a property update on the
-  // sentinel in the `_index` partition.
-  const currentIds = await readRepositoryIndex(conn);
-  const updatedIds = currentIds.filter((id) => id !== repositoryId);
-  if (updatedIds.length !== currentIds.length) {
-    await conn.submit(
-      "g.V().has('repositoryId', pk).hasId(sid).property('repositoryIds', updatedIndex)",
-      {
-        pk: REPOSITORY_INDEX_PARTITION,
-        sid: REPOSITORY_INDEX_VERTEX_ID,
-        updatedIndex: JSON.stringify(updatedIds),
-      },
-    );
+    if (remainingCount === 0) return 'drained';
   }
 }
 

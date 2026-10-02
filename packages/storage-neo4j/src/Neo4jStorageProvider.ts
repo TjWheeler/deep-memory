@@ -6,6 +6,7 @@ import type {
   EnsureSchemaResult,
   EntityReadOptions,
   GraphTraversalCapabilities,
+  VocabularyReadOptions,
 } from '@utaba/deep-memory/providers';
 import type {
   BulkImportOptions,
@@ -43,8 +44,11 @@ import type {
   VocabularyChangeRecord,
 } from '@utaba/deep-memory/types';
 import {
+  DuplicateRepositoryError,
   ProviderError,
   RepositoryNotFoundError,
+  VocabularyVersionConflictError,
+  createEmptyVocabulary,
   createSafeSink,
   matchesPropertyFilters,
   projectEntity,
@@ -287,6 +291,15 @@ export class Neo4jStorageProvider {
    * Neo4j Community has no per-tenant database concept — `databaseCreated`
    * is always `false`. Operators are responsible for the target database
    * existing before the provider connects.
+   *
+   * Also repairs the `version` property on `_Vocabulary` nodes — missing on
+   * nodes written by earlier releases, or stale where an earlier release
+   * rewrote the blob — which compare-and-set in `saveVocabulary` depends on.
+   * The repair runs on every call, including when the DDL is already up to
+   * date, because it fixes data rather than schema and databases already at
+   * the current schema version can still hold such nodes. It reads one node
+   * per repository and writes only the inconsistent ones, so a database with
+   * nothing to repair costs a single read.
    */
   public async ensureSchema(): Promise<EnsureSchemaResult> {
     const currentVersion = await this.readSchemaVersion();
@@ -299,6 +312,7 @@ export class Neo4jStorageProvider {
     }
 
     if (currentVersion === SCHEMA_VERSION) {
+      await vocabQueries.backfillVocabularyVersions(this.connection);
       return {
         databaseCreated: false,
         schemaCreated: false,
@@ -311,6 +325,7 @@ export class Neo4jStorageProvider {
       await this.connection.executeSystemDdl(statement);
     }
     await this.writeSchemaVersion(SCHEMA_VERSION);
+    await vocabQueries.backfillVocabularyVersions(this.connection);
 
     return {
       databaseCreated: false,
@@ -364,29 +379,75 @@ export class Neo4jStorageProvider {
    * all repository creates. Optional fields bound as `null` are not persisted
    * (Cypher drops null property values on write — symmetric with read).
    *
-   * The `(:_Repository) REQUIRE n.repositoryId IS UNIQUE` constraint surfaces
-   * duplicates as `Neo.ClientError.Schema.ConstraintValidationFailed`, which
-   * `mapDriverError({ kind: 'repository', ... })` routes to
-   * `DuplicateRepositoryError`.
+   * The same statement creates the repository's `_Vocabulary` node, seeded
+   * from `config.vocabulary` or an empty vocabulary. `saveVocabulary` only
+   * ever updates that node, so this is where the first stored version comes
+   * from; creating both in one statement means a repository never exists
+   * without its vocabulary.
+   *
+   * Both nodes are created only when no `_Repository`, `_Vocabulary` or
+   * `_Entity` node exists for the id:
+   *
+   *   - an existing `_Repository` → `DuplicateRepositoryError`;
+   *   - a `_Vocabulary` or any `_Entity` with no `_Repository` →
+   *     `ProviderError`. That state means a `deleteRepository` removed the
+   *     marker but did not finish its chunked wipe (or a create racing the
+   *     wipe committed after it); creating on top of it would leave two
+   *     vocabularies or the old repository's data under the new one.
+   *     Re-running `deleteRepository` finishes the wipe, and the message says
+   *     so because tool surfaces may drop the suggestion. The entity check is
+   *     an `EXISTS` subquery, which stops at the first match.
+   *
+   * Two concurrent creates can both pass the existence check; the
+   * `(:_Repository) REQUIRE n.repositoryId IS UNIQUE` constraint then fails
+   * the second with `Neo.ClientError.Schema.ConstraintValidationFailed`,
+   * which `mapDriverError({ kind: 'repository', ... })` routes to
+   * `DuplicateRepositoryError`, rolling back both of its nodes.
    */
   public async createRepository(config: StorageRepositoryConfig): Promise<StoredRepository> {
+    const initialVocabulary = config.vocabulary ?? createEmptyVocabulary(config.createdBy);
+    let alreadyExists = false;
+    let staleVocabularies = 0;
+    let leftoverEntities = false;
     try {
-      await this.connection.executeQuery(
-        `CREATE (r:_Repository {
-          repositoryId: $rid,
-          type: $type,
-          label: $label,
-          description: $description,
-          legal: $legal,
-          owner: $owner,
-          governanceConfig: $governanceConfig,
-          metadata: $metadata,
-          createdAt: $createdAt,
-          createdBy: $createdBy
-        })`,
-        repositoryCreateParams(config),
+      const result = await this.connection.executeQuery(
+        `OPTIONAL MATCH (live:_Repository {repositoryId: $rid})
+        OPTIONAL MATCH (stale:_Vocabulary {repositoryId: $rid})
+        WITH live, count(stale) AS vocabularies
+        WITH live, vocabularies,
+          EXISTS { MATCH (:_Entity {repositoryId: $rid}) } AS leftoverEntities
+        FOREACH (_ IN CASE WHEN live IS NULL AND vocabularies = 0 AND NOT leftoverEntities THEN [1] ELSE [] END |
+          CREATE (:_Repository {
+            repositoryId: $rid,
+            type: $type,
+            label: $label,
+            description: $description,
+            legal: $legal,
+            owner: $owner,
+            governanceConfig: $governanceConfig,
+            metadata: $metadata,
+            createdAt: $createdAt,
+            createdBy: $createdBy
+          })
+          CREATE (:_Vocabulary {
+            repositoryId: $rid,
+            vocabulary: $vocabularyJson,
+            version: $vocabularyVersion
+          })
+        )
+        RETURN live IS NOT NULL AS alreadyExists, vocabularies, leftoverEntities`,
+        {
+          ...repositoryCreateParams(config),
+          vocabularyJson: JSON.stringify(initialVocabulary),
+          vocabularyVersion: initialVocabulary.version,
+        },
         { repositoryId: config.repositoryId },
       );
+      const record = result.records[0];
+      alreadyExists = record?.get('alreadyExists') === true;
+      // `count()` is a Cypher INTEGER — a BigInt under `useBigInt: true`.
+      staleVocabularies = bigintToSafeNumber(record?.get('vocabularies') ?? 0);
+      leftoverEntities = record?.get('leftoverEntities') === true;
     } catch (err) {
       mapDriverError(err, {
         kind: 'repository',
@@ -394,6 +455,18 @@ export class Neo4jStorageProvider {
         operation: 'createRepository',
       });
     }
+    if (alreadyExists) {
+      throw new DuplicateRepositoryError(config.repositoryId);
+    }
+    if (staleVocabularies > 0 || leftoverEntities) {
+      throw new ProviderError(
+        `Repository "${config.repositoryId}" still holds data from a delete that did not finish; call deleteRepository("${config.repositoryId}") to finish it, then create it again`,
+        `Call deleteRepository("${config.repositoryId}") to finish the interrupted delete, then retry createRepository.`,
+      );
+    }
+    // Drop any entry cached for an earlier repository with the same id that
+    // another process deleted; the stored vocabulary is now the one just seeded.
+    this.invalidateVocabularyCache(config.repositoryId);
 
     const result: StoredRepository = {
       repositoryId: config.repositoryId,
@@ -532,22 +605,66 @@ export class Neo4jStorageProvider {
 
   /**
    * Drop every node and relationship scoped to `repositoryId`, including the
-   * `_Repository` node itself. Two-stage chunked wipe driven by app-side loops
-   * so the progress callback fires at a useful cadence:
+   * `_Repository` node itself:
    *
-   *   1. Drain relationships in batches via `CALL ( ) { ... } IN TRANSACTIONS`.
-   *   2. Drain nodes (entities + system) in batches via the same form with
+   *   1. Delete the `_Repository` marker node in its own statement. The
+   *      chunked wipe below spans many transactions, and entity /
+   *      relationship creates are guarded on the marker in the same
+   *      statement, so removing it first makes later creates fail with
+   *      `RepositoryNotFoundError` instead of landing an orphan after the
+   *      chunk that would have removed it. A create already executing when
+   *      the marker is deleted can still commit after the wipe; re-running
+   *      deleteRepository removes it.
+   *   2. Drain relationships in batches via `CALL ( ) { ... } IN TRANSACTIONS`.
+   *   3. Drain `_Entity` nodes in batches via the same form with
    *      `DETACH DELETE` (catches any straggler edges).
+   *   4. Drain `_VocabularyChangeLog` nodes in batches.
+   *   5. Drain any other node carrying the `repositoryId`, excluding
+   *      `_Repository` and `_Vocabulary`. `executeNativeQuery` can write
+   *      nodes under any label; this sweep keeps the delete complete.
+   *   6. Delete the `_Vocabulary` node last, in one statement guarded on the
+   *      marker still being absent, so a repository re-created under the id
+   *      in the meantime keeps its vocabulary.
+   *
+   * `_Entity`, `_VocabularyChangeLog` and `_Vocabulary` (plus the
+   * `_Repository` marker) are the only node labels this provider writes with
+   * a `repositoryId`, so they get labelled drains. After stage 1 no stage
+   * matches a `_Repository`, and only the marker-guarded stage 6 matches a
+   * `_Vocabulary`, so a concurrently re-created repository keeps its system
+   * nodes.
+   *
+   * Because the vocabulary is deleted last, a `_Vocabulary` node with no
+   * `_Repository` marker means a delete is in progress or was interrupted;
+   * `createRepository` relies on that (together with leftover `_Entity`
+   * nodes) and refuses to create over it. A retry after an interruption at
+   * any point still finds something to delete and finishes the wipe. Only when the marker and every drain
+   * removed nothing does the repository count as missing:
+   * `RepositoryNotFoundError`.
+   *
+   * Stages 2 and 3 are app-side loops so the progress callback fires at a
+   * useful cadence.
    *
    * `IN TRANSACTIONS` can only run on auto-commit sessions — `executeWrite`
-   * fails with `Neo.DatabaseError.Transaction.TransactionStartFailed` per
-   * probe P13. The chokepoint's `executeImplicitInTransactions` is the only
-   * legitimate entry point for this pattern.
+   * fails with `Neo.DatabaseError.Transaction.TransactionStartFailed`. The
+   * chokepoint's `executeImplicitInTransactions` is the only legitimate entry
+   * point for this pattern.
    */
   public async deleteRepository(
     repositoryId: string,
     onProgress?: DeleteProgressCallback,
   ): Promise<void> {
+    const marker = await this.connection.executeQuery(
+      'MATCH (r:_Repository {repositoryId: $rid}) DETACH DELETE r',
+      {},
+      { repositoryId },
+    );
+    // The cached vocabulary belongs to the repository being removed; a
+    // repository later re-created under the same id must not be served it.
+    this.invalidateVocabularyCache(repositoryId);
+    // Raw count of everything this call removed, system nodes included —
+    // zero means there was no repository to delete.
+    let rawDeleted = marker.summary.counters.updates()['nodesDeleted'] ?? 0;
+
     const { totalEntities, totalRelationships } = await this.countRepositoryContents(repositoryId);
 
     let relationshipsDeleted = 0;
@@ -567,6 +684,7 @@ export class Neo4jStorageProvider {
       const stats = summary.counters.updates();
       const deletedThisBatch = stats['relationshipsDeleted'] ?? 0;
       if (deletedThisBatch === 0) break;
+      rawDeleted += deletedThisBatch;
       relationshipsDeleted = Math.min(relationshipsDeleted + deletedThisBatch, totalRelationships);
       await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
     }
@@ -574,7 +692,7 @@ export class Neo4jStorageProvider {
     while (true) {
       const summary = await this.connection.executeImplicitInTransactions(
         `CALL () {
-           MATCH (n {repositoryId: $rid})
+           MATCH (n:_Entity {repositoryId: $rid})
            WITH n LIMIT $batchSize
            DETACH DELETE n
          } IN TRANSACTIONS OF $batchSize ROWS`,
@@ -585,12 +703,66 @@ export class Neo4jStorageProvider {
       const stats = summary.counters.updates();
       const deletedThisBatch = stats['nodesDeleted'] ?? 0;
       if (deletedThisBatch === 0) break;
-      // The match drains _Entity, _Vocabulary, _VocabularyChangeLog AND the
-      // _Repository node itself — system nodes inflate the raw counter past
-      // the user-facing entity total. Cap so the callback never reports more
-      // than it promised.
+      rawDeleted += deletedThisBatch;
+      // Cap so the callback never reports more than it promised — an entity
+      // created after the pre-count would otherwise push the total past it.
       entitiesDeleted = Math.min(entitiesDeleted + deletedThisBatch, totalEntities);
       await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
+    }
+
+    while (true) {
+      const summary = await this.connection.executeImplicitInTransactions(
+        `CALL () {
+           MATCH (n:_VocabularyChangeLog {repositoryId: $rid})
+           WITH n LIMIT $batchSize
+           DETACH DELETE n
+         } IN TRANSACTIONS OF $batchSize ROWS`,
+        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
+        { batchSize: BigInt(DELETE_BATCH_SIZE) },
+        { repositoryId },
+      );
+      const deletedThisBatch = summary.counters.updates()['nodesDeleted'] ?? 0;
+      if (deletedThisBatch === 0) break;
+      rawDeleted += deletedThisBatch;
+    }
+
+    // Anything else carrying this repositoryId — nodes written through
+    // executeNativeQuery can have any label. The marker and the vocabulary
+    // are excluded, so a repository re-created under this id in the meantime
+    // keeps both. This pattern has no label to seek on, so each batch scans
+    // every node in the database; it runs once per delete after the labelled
+    // drains have removed the bulk of the data.
+    while (true) {
+      const summary = await this.connection.executeImplicitInTransactions(
+        `CALL () {
+           MATCH (n {repositoryId: $rid})
+           WHERE NOT n:_Repository AND NOT n:_Vocabulary
+           WITH n LIMIT $batchSize
+           DETACH DELETE n
+         } IN TRANSACTIONS OF $batchSize ROWS`,
+        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
+        { batchSize: BigInt(DELETE_BATCH_SIZE) },
+        { repositoryId },
+      );
+      const deletedThisBatch = summary.counters.updates()['nodesDeleted'] ?? 0;
+      if (deletedThisBatch === 0) break;
+      rawDeleted += deletedThisBatch;
+    }
+
+    // The vocabulary goes last and only while no marker exists: once it is
+    // gone createRepository may run again, and a repository re-created under
+    // this id must not lose its fresh vocabulary to a straggling delete.
+    const vocabulary = await this.connection.executeQuery(
+      `MATCH (v:_Vocabulary {repositoryId: $rid})
+       WHERE NOT EXISTS { MATCH (:_Repository {repositoryId: $rid}) }
+       DETACH DELETE v`,
+      {},
+      { repositoryId },
+    );
+    rawDeleted += vocabulary.summary.counters.updates()['nodesDeleted'] ?? 0;
+
+    if (rawDeleted === 0) {
+      throw new RepositoryNotFoundError(repositoryId);
     }
   }
 
@@ -688,8 +860,25 @@ export class Neo4jStorageProvider {
    * fires for every call — the sink record on a cache hit carries
    * `details.calls === 0` and `value === 0`, which is the contract the sink
    * expects to express "this operation ran but did no server work".
+   *
+   * `{ fresh: true }` skips the cache lookup and always reads the stored
+   * node (one round-trip). Callers about to modify the vocabulary need this:
+   * the version they pass to `saveVocabulary` must be the stored one, and a
+   * cached copy can be up to the TTL behind another process's write. The
+   * fresh result replaces the cache entry so later cached reads see it too.
    */
-  public async getVocabulary(repositoryId: string): Promise<MemoryVocabulary> {
+  public async getVocabulary(
+    repositoryId: string,
+    options?: VocabularyReadOptions,
+  ): Promise<MemoryVocabulary> {
+    if (options?.fresh === true) {
+      const vocab = await vocabQueries.getVocabulary(this.connection, repositoryId);
+      this.vocabularyCache.set(repositoryId, {
+        vocab,
+        expiresAt: Date.now() + VOCABULARY_CACHE_TTL_MS,
+      });
+      return vocab;
+    }
     return this.getVocabularyCached(repositoryId);
   }
 
@@ -724,15 +913,29 @@ export class Neo4jStorageProvider {
   }
 
   /**
-   * Upsert the vocabulary for a repository. Invalidates the in-process cache
-   * on success so subsequent reads observe the new state immediately within
-   * this process (cross-process staleness is bounded by the 60 s TTL).
+   * Compare-and-set write of the vocabulary — lands only when the stored
+   * version equals `expectedVersion`. Throws `VocabularyVersionConflictError`
+   * on a mismatch and `RepositoryNotFoundError` when the repository's
+   * vocabulary node does not exist; never creates the node.
+   *
+   * Invalidates the in-process cache on success, so subsequent reads observe
+   * the new state immediately within this process, and on a conflict, because
+   * the conflict proves the cached copy is stale (cross-process staleness is
+   * otherwise bounded by the 60 s TTL).
    */
   public async saveVocabulary(
     repositoryId: string,
     vocabulary: MemoryVocabulary,
+    expectedVersion: string,
   ): Promise<void> {
-    await vocabQueries.saveVocabulary(this.connection, repositoryId, vocabulary);
+    try {
+      await vocabQueries.saveVocabulary(this.connection, repositoryId, vocabulary, expectedVersion);
+    } catch (err) {
+      if (err instanceof VocabularyVersionConflictError) {
+        this.invalidateVocabularyCache(repositoryId);
+      }
+      throw err;
+    }
     this.invalidateVocabularyCache(repositoryId);
   }
 
@@ -756,7 +959,9 @@ export class Neo4jStorageProvider {
    * constraint. A `MERGE`-with-discriminator alternative is marginally faster
    * on the happy path but mutates the existing node on collisions, writing
    * a discriminator property onto durable graph state the caller never
-   * requested — correctness wins over the marginal perf delta.
+   * requested — correctness wins over the marginal perf delta. The create is
+   * guarded on the `_Repository` node in the same statement and throws
+   * `RepositoryNotFoundError` once the repository is deleted.
    */
   public async createEntity(
     repositoryId: string,
@@ -861,10 +1066,12 @@ export class Neo4jStorageProvider {
   // ─── Relationships ─────────────────────────────────────────────────
 
   /**
-   * Create a relationship. Both endpoint entities are matched under the
-   * repository scope before the edge is created, so cross-repository edges
-   * are structurally impossible to write (D3b layer 3). A missing endpoint
-   * surfaces as `EntityNotFoundError` carrying the absent id.
+   * Create a relationship. The `_Repository` node and both endpoint entities
+   * are matched under the repository scope before the edge is created, so
+   * cross-repository edges are structurally impossible to write (D3b layer 3)
+   * and nothing lands once the repository is deleted. A missing repository
+   * surfaces as `RepositoryNotFoundError`; a missing endpoint as
+   * `EntityNotFoundError` carrying the absent id.
    */
   public async createRelationship(
     repositoryId: string,

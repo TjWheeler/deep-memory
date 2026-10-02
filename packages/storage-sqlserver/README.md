@@ -176,6 +176,10 @@ Largest PK: `(repository_id, entity_id)` = 856 bytes (under 900 limit).
 
 Deleting a repository cascades to vocabularies, vocabulary change log, entities, and relationships. Entity deletion explicitly removes related relationships before removing the entity.
 
+### Vocabulary writes
+
+`createRepository` inserts the repository's `dm_vocabularies` row, seeded from `config.vocabulary` or an empty vocabulary. `saveVocabulary(id, vocabulary, expectedVersion)` only updates that row, and is compare-and-set. It is a single `UPDATE` whose `WHERE` clause compares `JSON_VALUE([vocabulary], '$.version')` with `expectedVersion` using a binary collation. A stale version throws `VocabularyVersionConflictError`, and a missing row throws `RepositoryNotFoundError`. The version is read from the JSON document, so this needs no schema change and no upgrade step. The provider has no vocabulary cache, so `getVocabulary`'s `{ fresh: true }` option has no effect.
+
 ## Schema Management
 
 ### Automatic (default)

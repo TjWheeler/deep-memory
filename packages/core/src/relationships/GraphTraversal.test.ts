@@ -41,6 +41,7 @@ describe('GraphTraversal', () => {
       createdAt: new Date().toISOString(),
       createdBy: 'test',
     });
+    const current = await storage.getVocabulary(repoId);
     await storage.saveVocabulary(repoId, buildVocabulary({
       entityTypes: [
         { type: 'person', description: 'A person' },
@@ -52,7 +53,7 @@ describe('GraphTraversal', () => {
         { type: 'works_at', description: 'Works at', allowedSourceTypes: ['person'], allowedTargetTypes: ['company'] },
         { type: 'leads', description: 'Leads', allowedSourceTypes: ['person'], allowedTargetTypes: ['project'] },
       ],
-    }, 'test'));
+    }, 'test'), current.version);
 
     traversal = new GraphTraversal(repoId, storage);
 

@@ -84,6 +84,7 @@ if (connectionString) {
         governanceConfig: {
           mode: 'open',
         },
+        createdAt: new Date().toISOString(),
         createdBy: 'test-runner',
       });
 

@@ -9,32 +9,70 @@ import {
   relationshipToLadderBindings,
   relationshipUserPropertyParams,
 } from '../mapping.js';
-import { DuplicateRelationshipError, matchesPropertyFilters, buildEdgeProjectChain } from '@utaba/deep-memory';
+import {
+  DuplicateRelationshipError,
+  RepositoryNotFoundError,
+  matchesPropertyFilters,
+  buildEdgeProjectChain,
+} from '@utaba/deep-memory';
+import { repoVertexId } from './ids.js';
 
-// Sentinel returned by the duplicate-detection branch of the coalesce upsert
-// pattern. Mirrors entity.ts — single round-trip create.
+// Sentinels the create query returns in place of the new edge; the caller
+// translates them — single round-trip either way. Mirrors entity.ts:
+//   - DUPLICATE_SENTINEL: an edge with the requested id already exists.
+//   - NO_REPOSITORY_SENTINEL: the repository's `_repository` marker vertex is
+//     absent, so nothing was written.
+//   - NO_ENDPOINT_SENTINEL: the marker exists but the source or target entity
+//     does not, so `addE` had nothing to attach to. This branch exists so a
+//     missing endpoint is not misread as a missing repository; the outcome is
+//     unchanged from the ungated query (nothing written, no error).
 const DUPLICATE_SENTINEL = '__duplicate';
+const NO_REPOSITORY_SENTINEL = '__no_repository';
+const NO_ENDPOINT_SENTINEL = '__no_endpoint';
 
-// Prefix shared by every relationship-create query: existence-check coalesce
-// wrapper + schema-managed edge property ladder. Per-call user-property scalars
-// append after the ladder (between the prefix and the closing `)` of the
-// coalesce). When the caller has no native-storable user properties, the empty
-// suffix collapses the emitted string to the canonical
-// `RELATIONSHIP_CREATE_QUERY` value below — same Gremlin string the provider
-// has always issued for that case, so the plan cache keeps its single warm
-// entry for the dominant shape.
+// Prefix shared by every relationship-create query:
+//
+//   1. Duplicate check on the edge id. The edge lookup cannot be started from
+//      a vertex traverser (there is no mid-traversal `E()`), so it stays the
+//      outermost step.
+//   2. Gate on the repository marker, inside the create branch.
+//      `deleteRepository` drops the `_repository` vertex before its chunked
+//      drain, so a create that runs after that point finds no marker and
+//      writes nothing. Checking the marker in the same traversal as the
+//      `addE`, rather than in a separate round-trip, leaves no gap between
+//      the check and the write for the drop to land in.
+//   3. Create: from the marker traverser, a mid-traversal `V()` finds the
+//      source entity and `addE` attaches the edge to the target entity, with
+//      the schema-managed edge property ladder.
+//
+// Per-call user-property scalars append after the ladder (between the prefix
+// and `RELATIONSHIP_CREATE_CLOSE`). When the caller has no native-storable
+// user properties, the empty suffix collapses the emitted string to the
+// canonical `RELATIONSHIP_CREATE_QUERY` value below, so the plan cache keeps a
+// single warm entry for the dominant shape.
+//
+// A create already executing when `deleteRepository` drops the marker can
+// still land after the drain has passed it; re-running `deleteRepository`
+// removes such a straggler.
 const RELATIONSHIP_CREATE_PREFIX =
   `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
   `unfold().constant('${DUPLICATE_SENTINEL}'),` +
-  `g.V().has('repositoryId', rid).hasId(srcId).has('entityType')` +
+  `g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(` +
+  `unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType')` +
   `.addE(edgeLabel)` +
   `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
   `.property('id', relId).property('repositoryId', rid)${buildRelationshipPropertyLadder()}`;
 
+// Closes the create branch, then supplies the gate's two fallbacks: the
+// marker exists but an endpoint is missing (`unfold()` still emits the
+// marker), or the marker itself is absent (nothing to unfold).
+const RELATIONSHIP_CREATE_CLOSE =
+  `,unfold().constant('${NO_ENDPOINT_SENTINEL}'),constant('${NO_REPOSITORY_SENTINEL}')))`;
+
 // Canonical empty-user-properties form. Exported so the unit test can pin the
-// zero-regression invariant (this string is byte-identical to the historical
-// fixed-shape query).
-export const RELATIONSHIP_CREATE_QUERY = `${RELATIONSHIP_CREATE_PREFIX})`;
+// invariant that every create without native-storable user properties emits
+// this one string.
+export const RELATIONSHIP_CREATE_QUERY = `${RELATIONSHIP_CREATE_PREFIX}${RELATIONSHIP_CREATE_CLOSE}`;
 
 export async function createRelationship(
   conn: CosmosDbConnection,
@@ -43,6 +81,7 @@ export async function createRelationship(
 ): Promise<StoredRelationship> {
   const bindings: Record<string, unknown> = {
     rid: repositoryId,
+    repoVid: repoVertexId(repositoryId),
     relId: relationship.id,
     srcId: relationship.sourceEntityId,
     tgtId: relationship.targetEntityId,
@@ -67,11 +106,14 @@ export async function createRelationship(
       suffix += `.property('${key}', p_user_${i})`;
       bindings[`p_user_${i}`] = value;
     }
-    query = `${RELATIONSHIP_CREATE_PREFIX}${suffix})`;
+    query = `${RELATIONSHIP_CREATE_PREFIX}${suffix}${RELATIONSHIP_CREATE_CLOSE}`;
   }
 
   const result = await conn.submit(query, bindings);
 
+  if (result.items[0] === NO_REPOSITORY_SENTINEL) {
+    throw new RepositoryNotFoundError(repositoryId);
+  }
   if (result.items[0] === DUPLICATE_SENTINEL) {
     throw new DuplicateRelationshipError(relationship.id);
   }

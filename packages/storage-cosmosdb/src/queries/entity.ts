@@ -19,32 +19,66 @@ import {
 import {
   DuplicateEntityError,
   EntityNotFoundError,
+  RepositoryNotFoundError,
   buildVertexProjectChain,
   matchesPropertyFilters,
 } from '@utaba/deep-memory';
+import { repoVertexId } from './ids.js';
 
-// Sentinel returned by the duplicate-detection branch of the
-// fold().coalesce(unfold().constant('__duplicate'), addV/addE) pattern. The
-// create succeeds inline or the duplicate path returns this string, which we
-// translate into the typed error — single round-trip either way.
+// Sentinels the create query returns in place of the new vertex; the caller
+// translates them into typed errors — single round-trip either way:
+//   - DUPLICATE_SENTINEL: a vertex with the requested id already exists in
+//     the repository's partition.
+//   - NO_REPOSITORY_SENTINEL: the repository's `_repository` marker vertex is
+//     absent, so nothing was written.
 const DUPLICATE_SENTINEL = '__duplicate';
+const NO_REPOSITORY_SENTINEL = '__no_repository';
 
-// Prefix shared by every entity-create query: existence-check coalesce wrapper
-// + schema-managed property ladder. Per-call user-property scalars append after
-// the ladder (between the prefix and the closing `)` of the coalesce). When
-// the caller has no native-storable user properties, the empty suffix collapses
-// the emitted string to the canonical `ENTITY_CREATE_QUERY` value below — same
-// Gremlin string the provider has always issued for that case, so the plan
-// cache keeps its single warm entry for the dominant shape.
+// Prefix shared by every entity-create query, built as two nested coalesces:
+//
+//   1. Outer gate on the repository marker. `deleteRepository` drops the
+//      `_repository` vertex before its chunked drain, so a create that runs
+//      after that point finds no marker, takes the `constant(...)` branch and
+//      writes nothing. Checking the marker in the same traversal as the
+//      `addV`, rather than in a separate round-trip, leaves no gap between
+//      the check and the write for the drop to land in.
+//   2. Inner duplicate check + create, run once per marker traverser. The
+//      `map(__.V()…fold())` step looks the entity id up (partition-scoped)
+//      and hands the inner coalesce a list: an existing vertex yields the
+//      duplicate sentinel, otherwise `addV` writes the vertex with the
+//      schema-managed property ladder.
+//
+//      The lookup must sit inside `map()`. Written as a plain chain,
+//      `unfold().V()…fold()`, the `fold()` is a barrier that emits an empty
+//      list even when `unfold()` emitted nothing — so with no marker the
+//      inner coalesce would still reach `addV` and the gate would never
+//      refuse. `map()` runs only for a traverser that exists, so with no
+//      marker the first branch is empty and the outer coalesce falls through
+//      to the no-repository sentinel.
+//
+// Per-call user-property scalars append after the ladder (between the prefix
+// and `ENTITY_CREATE_CLOSE`). When the caller has no native-storable user
+// properties, the empty suffix collapses the emitted string to the canonical
+// `ENTITY_CREATE_QUERY` value below, so the plan cache keeps a single warm
+// entry for the dominant shape.
+//
+// A create already executing when `deleteRepository` drops the marker can
+// still land after the drain has passed it; re-running `deleteRepository`
+// removes such a straggler.
 const ENTITY_CREATE_PREFIX =
-  `g.V().has('repositoryId', rid).hasId(vid).fold().coalesce(` +
+  `g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(` +
+  `unfold().map(__.V().has('repositoryId', rid).hasId(vid).fold()).coalesce(` +
   `unfold().constant('${DUPLICATE_SENTINEL}'),` +
   `addV(vertexLabel).property('id', vid).property('repositoryId', rid)${buildEntityPropertyLadder()}`;
 
+// Closes the inner (duplicate / create) coalesce, then supplies the outer
+// gate's no-repository branch.
+const ENTITY_CREATE_CLOSE = `),constant('${NO_REPOSITORY_SENTINEL}'))`;
+
 // Canonical empty-user-properties form. Exported so the unit test can pin the
-// zero-regression invariant (this string is byte-identical to the historical
-// fixed-shape query).
-export const ENTITY_CREATE_QUERY = `${ENTITY_CREATE_PREFIX})`;
+// invariant that every create without native-storable user properties emits
+// this one string.
+export const ENTITY_CREATE_QUERY = `${ENTITY_CREATE_PREFIX}${ENTITY_CREATE_CLOSE}`;
 
 export async function createEntity(
   conn: CosmosDbConnection,
@@ -53,6 +87,7 @@ export async function createEntity(
 ): Promise<StoredEntity> {
   const bindings: Record<string, unknown> = {
     rid: repositoryId,
+    repoVid: repoVertexId(repositoryId),
     vid: entity.id,
     vertexLabel: entity.entityType,
     ...entityToLadderBindings(entity),
@@ -74,11 +109,14 @@ export async function createEntity(
       suffix += `.property('${key}', p_user_${i})`;
       bindings[`p_user_${i}`] = value;
     }
-    query = `${ENTITY_CREATE_PREFIX}${suffix})`;
+    query = `${ENTITY_CREATE_PREFIX}${suffix}${ENTITY_CREATE_CLOSE}`;
   }
 
   const result = await conn.submit(query, bindings);
 
+  if (result.items[0] === NO_REPOSITORY_SENTINEL) {
+    throw new RepositoryNotFoundError(repositoryId);
+  }
   if (result.items[0] === DUPLICATE_SENTINEL) {
     throw new DuplicateEntityError(entity.id);
   }

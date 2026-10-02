@@ -38,6 +38,7 @@ import type {
 } from '@utaba/deep-memory/types';
 import {
   EntityNotFoundError,
+  RepositoryNotFoundError,
   matchesPropertyFilters,
 } from '@utaba/deep-memory';
 import {
@@ -53,10 +54,19 @@ import {
 const RELATIONSHIP_PROJECTION = buildRelationshipProjection();
 
 /**
- * Create a relationship. Single-round-trip pattern: `OPTIONAL MATCH` both
- * endpoints under the repository scope, then `FOREACH` the `CREATE` only when
- * both are present, finally `RETURN` existence flags so the caller can
- * discriminate missing-source vs missing-target without a follow-up query.
+ * Create a relationship. Single-round-trip pattern: `OPTIONAL MATCH` the
+ * `_Repository` node and both endpoints under the repository scope, then
+ * `FOREACH` the `CREATE` only when all three are present, finally `RETURN`
+ * existence flags so the caller can discriminate missing-repository vs
+ * missing-source vs missing-target without a follow-up query.
+ *
+ * The repository match guards against a create racing `deleteRepository`:
+ * the wipe removes the repository marker first and then deletes in chunks
+ * across several transactions, so an edge must not be writable once the
+ * marker is gone. A missing repository reports `RepositoryNotFoundError`
+ * ahead of any missing endpoint. A create already executing when the marker
+ * is deleted can still commit after the wipe; re-running deleteRepository
+ * removes it.
  *
  * The relationship-type slot is interpolated into the Cypher string after
  * validation by `assertSafeRelationshipType` — Cypher 25 cannot parameterise
@@ -76,10 +86,11 @@ export async function createRelationship(
   const relType = assertSafeRelationshipType(relationship.relationshipType);
 
   const cypher = `
+OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
 OPTIONAL MATCH (s:_Entity {repositoryId: $rid, id: $sourceEntityId})
 OPTIONAL MATCH (t:_Entity {repositoryId: $rid, id: $targetEntityId})
-WITH s, t
-FOREACH (_ IN CASE WHEN s IS NOT NULL AND t IS NOT NULL THEN [1] ELSE [] END |
+WITH repo, s, t
+FOREACH (_ IN CASE WHEN repo IS NOT NULL AND s IS NOT NULL AND t IS NOT NULL THEN [1] ELSE [] END |
   CREATE (s)-[r:${relType} {
     repositoryId: $rid,
     id: $id,
@@ -100,7 +111,7 @@ FOREACH (_ IN CASE WHEN s IS NOT NULL AND t IS NOT NULL THEN [1] ELSE [] END |
     modifiedFromMessage: $modifiedFromMessage
   }]->(t)
 )
-RETURN s IS NULL AS sMissing, t IS NULL AS tMissing
+RETURN repo IS NULL AS repoMissing, s IS NULL AS sMissing, t IS NULL AS tMissing
 `;
 
   const result = await conn.executeQuery(
@@ -116,6 +127,9 @@ RETURN s IS NULL AS sMissing, t IS NULL AS tMissing
     // would be a driver-layer fault rather than a data-model condition.
     throw new EntityNotFoundError(relationship.sourceEntityId);
   }
+  // Repository first: once the repository is gone its entities are being
+  // wiped too, so a missing endpoint is a symptom, not the cause.
+  if (record.get('repoMissing') === true) throw new RepositoryNotFoundError(repositoryId);
   const sMissing = record.get('sMissing') === true;
   const tMissing = record.get('tMissing') === true;
   if (sMissing) throw new EntityNotFoundError(relationship.sourceEntityId);

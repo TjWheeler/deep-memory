@@ -15,6 +15,7 @@ export {
   RepositoryNotFoundError,
   DuplicateRepositoryError,
   VocabularyValidationError,
+  VocabularyVersionConflictError,
   RelationshipConstraintError,
   SelfReferentialRelationshipError,
   GovernanceDeniedError,
@@ -56,6 +57,10 @@ export {
   getRelationshipTypeDef,
 } from './vocabulary/VocabularyValidator.js';
 export type { ValidationResult, ValidationError } from './vocabulary/VocabularyValidator.js';
+
+// Storage providers seed this in createRepository when no initial vocabulary is
+// supplied, so every provider stores the same well-formed empty vocabulary.
+export { createEmptyVocabulary } from './vocabulary/VocabularySchema.js';
 
 // Compilers (for provider authors who want to reuse them)
 export {

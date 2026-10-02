@@ -28,6 +28,33 @@ import {
   type ValidationResult,
 } from '../vocabulary/VocabularyValidator.js';
 import type { PropertySchema } from '../types/vocabulary.js';
+import { VocabularyValidationError, type DeepMemoryErrorCode } from './errors.js';
+
+const VOCABULARY_VERSION_CONFLICT: DeepMemoryErrorCode = 'VOCABULARY_VERSION_CONFLICT';
+
+/**
+ * True when `err` is a vocabulary compare-and-set conflict.
+ *
+ * Matches on the error code rather than `instanceof`: the conflict is thrown
+ * by a storage provider, which may resolve its own copy of this package (a
+ * duplicated install, or a bundled build), and an error from another copy is
+ * not an instance of this copy's class.
+ */
+function isVocabularyVersionConflict(err: unknown): boolean {
+  return err instanceof Error && 'code' in err && err.code === VOCABULARY_VERSION_CONFLICT;
+}
+
+/**
+ * Maximum read → evaluate → compare-and-set cycles for one proposal.
+ *
+ * A conflict means another writer changed the vocabulary between this
+ * engine's read and its write. Each retry re-runs deduplication, property
+ * validation and governance against the vocabulary that actually won, so the
+ * outcome is a fresh verdict rather than a blind re-apply. The bound keeps a
+ * persistently contended vocabulary from looping forever; after the last
+ * attempt the conflict is surfaced to the caller.
+ */
+const VOCABULARY_WRITE_ATTEMPTS = 3;
 
 export interface VocabularyEngineConfig {
   repositoryId: string;
@@ -132,12 +159,40 @@ export class VocabularyEngine {
    * Propose a vocabulary change (add, edit, or delete).
    * Runs deduplication for add proposals, then governance rules.
    * For delete proposals, cascades data deletion if approved.
+   *
+   * The write is compare-and-set against the version that was read. When a
+   * concurrent writer changed the vocabulary in between, the whole proposal is
+   * re-evaluated against the vocabulary that won, up to
+   * `VOCABULARY_WRITE_ATTEMPTS` times. If every attempt conflicts, the
+   * `VocabularyVersionConflictError` propagates to the caller.
    */
   async proposeChange(
     proposal: VocabularyProposal,
     proposedBy: string,
   ): Promise<VocabularyProposalResult> {
-    const vocabulary = await this.getVocabulary();
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.attemptProposal(proposal, proposedBy);
+      } catch (err) {
+        if (!isVocabularyVersionConflict(err) || attempt >= VOCABULARY_WRITE_ATTEMPTS) {
+          throw err;
+        }
+      }
+    }
+  }
+
+  /**
+   * One read → evaluate → compare-and-set write cycle for a proposal.
+   *
+   * Reads the stored vocabulary fresh (bypassing both this engine's cache and
+   * any provider cache) so the version passed to `saveVocabulary` is the one
+   * actually stored, not a copy another process may have superseded.
+   */
+  private async attemptProposal(
+    proposal: VocabularyProposal,
+    proposedBy: string,
+  ): Promise<VocabularyProposalResult> {
+    const vocabulary = await this.storage.getVocabulary(this.repositoryId, { fresh: true });
 
     // Only run deduplication for add proposals
     const isAddProposal =
@@ -182,7 +237,26 @@ export class VocabularyEngine {
 
     // Persist if approved
     if (result.status === 'approved' && updatedVocabulary) {
-      // For delete proposals, cascade-delete data before updating vocabulary
+      // Compare-and-set only detects a concurrent writer if every successful
+      // write moves the version. Writing the same version would let a second
+      // writer that read the old vocabulary still match, and overwrite this one.
+      if (updatedVocabulary.version === vocabulary.version) {
+        throw new VocabularyValidationError([
+          {
+            field: 'version',
+            message: `Approved vocabulary change did not advance the version (still "${vocabulary.version}")`,
+            suggestion: 'Every vocabulary write must produce a new version; this indicates a defect in the governance step.',
+          },
+        ]);
+      }
+      await this.storage.saveVocabulary(this.repositoryId, updatedVocabulary, vocabulary.version);
+      this.cachedVocabulary = updatedVocabulary;
+
+      // Delete proposals cascade only after the vocabulary write has landed.
+      // The vocabulary is the source of truth: data left behind under a type
+      // that no longer exists is detectable and can be deleted again, whereas
+      // data deleted for a type whose removal then failed to persist (e.g. a
+      // version conflict) is lost while the type remains in the vocabulary.
       const isDeleteProposal =
         proposal.proposalType === 'delete_entity_type' ||
         proposal.proposalType === 'delete_relationship_type';
@@ -190,9 +264,6 @@ export class VocabularyEngine {
       if (isDeleteProposal) {
         await this.cascadeDeleteData(proposal);
       }
-
-      await this.storage.saveVocabulary(this.repositoryId, updatedVocabulary);
-      this.cachedVocabulary = updatedVocabulary;
     }
 
     return result;

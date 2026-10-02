@@ -10,6 +10,7 @@ export type DeepMemoryErrorCode =
   | 'REPOSITORY_NOT_FOUND'
   | 'REPOSITORY_ALREADY_EXISTS'
   | 'VOCABULARY_VALIDATION_FAILED'
+  | 'VOCABULARY_VERSION_CONFLICT'
   | 'RELATIONSHIP_CONSTRAINT_FAILED'
   | 'SELF_REFERENTIAL_RELATIONSHIP'
   | 'GOVERNANCE_DENIED'
@@ -166,6 +167,25 @@ export class VocabularyValidationError extends DeepMemoryError {
     );
     this.name = 'VocabularyValidationError';
     this.errors = errors;
+  }
+}
+
+/** A vocabulary write expected a stored version that no longer matches (compare-and-set failed) */
+export class VocabularyVersionConflictError extends DeepMemoryError {
+  readonly repositoryId: string;
+  readonly expectedVersion: string;
+  readonly actualVersion: string;
+
+  constructor(repositoryId: string, expectedVersion: string, actualVersion: string) {
+    super(
+      'VOCABULARY_VERSION_CONFLICT',
+      `Vocabulary for repository "${repositoryId}" was changed concurrently: expected version "${expectedVersion}" but the stored version is "${actualVersion}"`,
+      `Re-read the vocabulary with getVocabulary() and re-submit the proposal against the current version.`,
+    );
+    this.name = 'VocabularyVersionConflictError';
+    this.repositoryId = repositoryId;
+    this.expectedVersion = expectedVersion;
+    this.actualVersion = actualVersion;
   }
 }
 

@@ -63,6 +63,18 @@ export interface EntityReadOptions {
 }
 
 /**
+ * Vocabulary-read options for `getVocabulary`.
+ *
+ * `fresh` bypasses any provider-side cache and reads the stored vocabulary
+ * directly. Callers that are about to modify the vocabulary use it so the
+ * `expectedVersion` they pass to `saveVocabulary` reflects what is actually
+ * stored. Providers without a cache ignore it.
+ */
+export interface VocabularyReadOptions {
+  fresh?: boolean;
+}
+
+/**
  * StorageProvider — the primary persistence interface.
  *
  * Must be supplied when creating a DeepMemory instance. Handles all
@@ -86,6 +98,12 @@ export interface StorageProvider {
 
   // ─── Repository ────────────────────────────────────────────────────
 
+  /**
+   * Create a repository. Also persists its initial vocabulary —
+   * `config.vocabulary` when supplied, otherwise an empty vocabulary — so
+   * that every repository has exactly one stored vocabulary from the moment
+   * it exists. `saveVocabulary` relies on this: it only ever updates.
+   */
   createRepository(config: StorageRepositoryConfig): Promise<StoredRepository>;
   getRepository(repositoryId: string): Promise<StoredRepository | null>;
   listRepositories(
@@ -99,10 +117,28 @@ export interface StorageProvider {
 
   // ─── Vocabulary ────────────────────────────────────────────────────
 
-  getVocabulary(repositoryId: string): Promise<MemoryVocabulary>;
+  /**
+   * Read the repository's vocabulary. Pass `{ fresh: true }` to bypass any
+   * provider-side cache; providers without a cache ignore `options`.
+   */
+  getVocabulary(repositoryId: string, options?: VocabularyReadOptions): Promise<MemoryVocabulary>;
+  /**
+   * Replace the repository's vocabulary using compare-and-set on its version.
+   *
+   * The write lands only when the stored vocabulary's version equals
+   * `expectedVersion`; the check and the write must be atomic so two
+   * concurrent writers cannot both succeed against the same base version.
+   *
+   * - Throws `VocabularyVersionConflictError` when the stored version differs
+   *   from `expectedVersion`; the stored vocabulary is left unchanged.
+   * - Throws `RepositoryNotFoundError` when the repository or its vocabulary
+   *   does not exist.
+   * - Never creates a vocabulary — `createRepository` seeds it.
+   */
   saveVocabulary(
     repositoryId: string,
     vocabulary: MemoryVocabulary,
+    expectedVersion: string,
   ): Promise<void>;
   getVocabularyChangeLog(
     repositoryId: string,

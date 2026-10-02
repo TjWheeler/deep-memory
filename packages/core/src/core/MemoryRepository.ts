@@ -146,6 +146,18 @@ export class MemoryRepository {
     return this.vocabularyEngine.getResolvedVocabulary();
   }
 
+  /**
+   * Propose a vocabulary change (add, edit, or delete a type).
+   *
+   * Safe against concurrent proposals on the same repository, including from
+   * other processes or other handles: the proposal is evaluated against a fresh
+   * read and written with compare-and-set, and on a conflicting write it is
+   * re-evaluated (deduplication and governance included) against the
+   * vocabulary that won, up to three attempts. If all attempts conflict, a
+   * `VocabularyVersionConflictError` is thrown — re-read the vocabulary and
+   * resubmit. For approved delete proposals, data of the removed type is
+   * deleted only after the vocabulary write succeeds.
+   */
   async proposeVocabularyChange(
     proposal: VocabularyProposal,
   ): Promise<VocabularyProposalResult> {

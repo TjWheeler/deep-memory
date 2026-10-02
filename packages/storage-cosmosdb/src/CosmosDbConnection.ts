@@ -120,28 +120,84 @@ export class CosmosDbConnection {
   }
 }
 
-/** Check if an error is a transient CosmosDB error (429 or 503). */
-function isTransientError(err: unknown): boolean {
+/**
+ * Read one Cosmos status attribute from a Gremlin driver error. The driver's
+ * `ResponseError` carries the server's status attributes in
+ * `statusAttributes` — a plain object under the GraphSON JSON serializer
+ * this connection uses, a `Map` under others.
+ */
+function statusAttribute(err: unknown, key: string): unknown {
+  if (err == null || typeof err !== 'object') return undefined;
+  const attributes = (err as { statusAttributes?: unknown }).statusAttributes;
+  if (attributes instanceof Map) return attributes.get(key);
+  if (attributes != null && typeof attributes === 'object') {
+    return (attributes as Record<string, unknown>)[key];
+  }
+  return undefined;
+}
+
+/**
+ * The Cosmos HTTP-style status code of a failed submit
+ * (`x-ms-status-code`), or `undefined` when the error does not carry one.
+ * This is the code that distinguishes throttling (429), optimistic-
+ * concurrency failures (412), and writes against a document deleted
+ * mid-traversal (404); the driver's own `statusCode` is the Gremlin protocol
+ * code, which is a generic server error for all of them.
+ */
+export function cosmosStatusCode(err: unknown): number | undefined {
+  const raw = statusAttribute(err, 'x-ms-status-code');
+  const code = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+  return Number.isInteger(code) ? code : undefined;
+}
+
+/**
+ * Whether a failed submit is a transient CosmosDB error (429 or 503) worth
+ * retrying. The `x-ms-status-code` attribute is authoritative when present;
+ * the message and `statusCode` checks only apply to errors without it. A 412
+ * is never transient: it reports a lost optimistic-concurrency race, which
+ * the caller must see so it can re-read and classify the outcome.
+ */
+export function isTransientError(err: unknown): boolean {
+  const status = cosmosStatusCode(err);
+  if (status !== undefined) return status === 429 || status === 503;
   if (err instanceof Error) {
     const msg = err.message;
-    // CosmosDB returns status codes in error messages
     if (msg.includes('429') || msg.includes('RequestRateTooLarge')) return true;
     if (msg.includes('503') || msg.includes('ServiceUnavailable')) return true;
   }
-  // Check statusCode property if present
-  const statusCode = (err as Record<string, unknown>)?.['statusCode'];
-  if (statusCode === 429 || statusCode === 503) return true;
-  return false;
+  const statusCode = (err as Record<string, unknown> | null)?.['statusCode'];
+  return statusCode === 429 || statusCode === 503;
 }
 
-/** Extract retry-after from error or use exponential backoff. */
-function getRetryAfterMs(err: unknown, attempt: number): number {
-  // CosmosDB may include x-ms-retry-after-ms in error attributes
-  const retryAfter = (err as Record<string, unknown>)?.['retryAfterMs'];
-  if (typeof retryAfter === 'number' && retryAfter > 0) {
-    return retryAfter;
-  }
-  // Exponential backoff: 500ms, 1s, 2s, 4s, ...
+/**
+ * Parse a .NET TimeSpan string (`[d.]hh:mm:ss[.fffffff]`), the format Cosmos
+ * uses for `x-ms-retry-after-ms`, into milliseconds. A plain number (string
+ * or numeric) is taken as milliseconds. Returns `undefined` when unparseable.
+ */
+export function parseTimeSpanMs(raw: unknown): number | undefined {
+  if (typeof raw === 'number') return Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined;
+  const value = raw.trim();
+  if (/^\d+(\.\d+)?$/.test(value)) return Number(value);
+  const match = /^(?:(\d+)\.)?(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(value);
+  if (!match) return undefined;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2]);
+  const minutes = Number(match[3]);
+  const seconds = Number(match[4]);
+  const fraction = Number(`0.${match[5] ?? '0'}`);
+  return ((days * 24 + hours) * 60 + minutes) * 60_000 + (seconds + fraction) * 1000;
+}
+
+/**
+ * Wait before retrying: the server's `x-ms-retry-after-ms` when present,
+ * otherwise exponential backoff (500 ms, 1 s, 2 s, … capped at 10 s).
+ */
+export function getRetryAfterMs(err: unknown, attempt: number): number {
+  const fromAttributes = parseTimeSpanMs(statusAttribute(err, 'x-ms-retry-after-ms'));
+  if (fromAttributes !== undefined && fromAttributes > 0) return fromAttributes;
+  const retryAfter = (err as Record<string, unknown> | null)?.['retryAfterMs'];
+  if (typeof retryAfter === 'number' && retryAfter > 0) return retryAfter;
   return Math.min(500 * Math.pow(2, attempt), 10000);
 }
 

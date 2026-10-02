@@ -14,7 +14,8 @@ import type {
   RoutingControl,
   ServerInfo,
 } from 'neo4j-driver';
-import { ProviderError } from '@utaba/deep-memory';
+import { ProviderError, QueryTimeoutError } from '@utaba/deep-memory';
+import { isTransactionTimeout } from './errors.js';
 import { recordRoundTrip } from './usageScope.js';
 
 /**
@@ -119,13 +120,15 @@ export class Neo4jConnection {
   ): Promise<EagerResult<T>> {
     this.assertRepositoryId(options.repositoryId);
     this.assertScoped(cypher);
-    const result = await this.driver.executeQuery<EagerResult<T>>(
-      cypher,
-      { ...params, rid: options.repositoryId },
-      {
-        database: this.database,
-        ...(options.routing !== undefined ? { routing: options.routing } : {}),
-      },
+    const result = await translateTimeout(() =>
+      this.driver.executeQuery<EagerResult<T>>(
+        cypher,
+        { ...params, rid: options.repositoryId },
+        {
+          database: this.database,
+          ...(options.routing !== undefined ? { routing: options.routing } : {}),
+        },
+      ),
     );
     recordRoundTrip(result.summary, result.records.length);
     this.surfaceNotifications(cypher, result.summary);
@@ -179,10 +182,12 @@ export class Neo4jConnection {
         'executeSystemQuery requires crossRepository: true — use executeQuery for repository-scoped Cypher.',
       );
     }
-    const result = await this.driver.executeQuery<EagerResult<T>>(cypher, params, {
-      database: this.database,
-      ...(options.routing !== undefined ? { routing: options.routing } : {}),
-    });
+    const result = await translateTimeout(() =>
+      this.driver.executeQuery<EagerResult<T>>(cypher, params, {
+        database: this.database,
+        ...(options.routing !== undefined ? { routing: options.routing } : {}),
+      }),
+    );
     recordRoundTrip(result.summary, result.records.length);
     this.surfaceNotifications(cypher, result.summary);
     return result;
@@ -197,7 +202,7 @@ export class Neo4jConnection {
   public async executeSystemDdl(cypher: string): Promise<ResultSummary> {
     const session = this.driver.session({ database: this.database });
     try {
-      const result = await session.run(cypher);
+      const result = await translateTimeout(() => session.run(cypher));
       recordRoundTrip(result.summary, result.records.length);
       this.surfaceNotifications(cypher, result.summary);
       return result.summary;
@@ -232,7 +237,9 @@ export class Neo4jConnection {
     this.assertScoped(cypher);
     const session = this.driver.session({ database: this.database });
     try {
-      const result = await session.run(cypher, { ...params, rid: options.repositoryId });
+      const result = await translateTimeout(() =>
+        session.run(cypher, { ...params, rid: options.repositoryId }),
+      );
       recordRoundTrip(result.summary, result.records.length);
       this.surfaceNotifications(cypher, result.summary);
       return result.summary;
@@ -251,9 +258,9 @@ export class Neo4jConnection {
     try {
       const wrapped = (managed: ManagedTransaction): Promise<T> =>
         txFn(new ScopedTransaction(managed, repositoryId, this.surfaceNotifications.bind(this)));
-      return mode === 'write'
-        ? await session.executeWrite(wrapped)
-        : await session.executeRead(wrapped);
+      return await translateTimeout(() =>
+        mode === 'write' ? session.executeWrite(wrapped) : session.executeRead(wrapped),
+      );
     } finally {
       await session.close();
     }
@@ -323,6 +330,26 @@ export class ScopedTransaction {
     recordRoundTrip(summary, records.length);
     this.notify(cypher, summary);
     return { records, summary };
+  }
+}
+
+/**
+ * Run one driver round-trip and turn a server-side transaction timeout into
+ * `QueryTimeoutError`, keeping the driver error as `cause`. Translating at
+ * the chokepoint gives every operation the same timeout shape; without it a
+ * timeout surfaced as a raw `Neo4jError` on some paths and as a generic
+ * `ProviderError` on others, which hosts read as an outage and retried.
+ * Every other error passes through unchanged.
+ */
+async function translateTimeout<T>(run: () => Promise<T>): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    return await run();
+  } catch (err: unknown) {
+    if (isTransactionTimeout(err)) {
+      throw new QueryTimeoutError(Date.now() - startedAt, { cause: err });
+    }
+    throw err;
   }
 }
 

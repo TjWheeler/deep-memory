@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ProviderError } from '@utaba/deep-memory';
+import { ProviderError, QueryTimeoutError } from '@utaba/deep-memory';
 import { Neo4jConnection } from './Neo4jConnection.js';
 
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
@@ -329,6 +329,62 @@ describe('Neo4jConnection notifications surface', () => {
       } finally {
         warnSpy.mockRestore();
       }
+    } finally {
+      await connection.close().catch(() => {});
+    }
+  });
+});
+
+// ─── 5. Server-side transaction timeout → QueryTimeoutError ──────────────
+
+describe('Neo4jConnection transaction timeout translation', () => {
+  const URI = 'bolt://localhost:7687';
+  const timeoutError = {
+    name: 'Neo4jError',
+    code: 'Neo.ClientError.Transaction.TransactionTimedOut',
+    gqlStatus: '25N14',
+    message: 'The transaction has been terminated.',
+  };
+
+  it('rejects with QueryTimeoutError carrying the driver error as cause', async () => {
+    const connection = new Neo4jConnection({ uri: URI, username: 'neo4j', password: 'unused' });
+    try {
+      const stubDriver = {
+        executeQuery: async () => {
+          throw timeoutError;
+        },
+      };
+      (connection as unknown as { driver: typeof stubDriver }).driver = stubDriver;
+
+      const rejection = await connection
+        .executeQuery('MATCH (n {repositoryId: $rid}) RETURN n', {}, { repositoryId: 'repo-t' })
+        .catch((err: unknown) => err);
+      expect(rejection).toBeInstanceOf(QueryTimeoutError);
+      expect((rejection as QueryTimeoutError).code).toBe('QUERY_TIMEOUT');
+      expect((rejection as QueryTimeoutError).cause).toBe(timeoutError);
+    } finally {
+      await connection.close().catch(() => {});
+    }
+  });
+
+  it('passes other driver errors through unchanged', async () => {
+    const connection = new Neo4jConnection({ uri: URI, username: 'neo4j', password: 'unused' });
+    try {
+      const otherError = {
+        name: 'Neo4jError',
+        code: 'Neo.TransientError.General.DatabaseUnavailable',
+        message: 'down',
+      };
+      const stubDriver = {
+        executeQuery: async () => {
+          throw otherError;
+        },
+      };
+      (connection as unknown as { driver: typeof stubDriver }).driver = stubDriver;
+
+      await expect(
+        connection.executeSystemQuery('RETURN 1', {}, { crossRepository: true }),
+      ).rejects.toBe(otherError);
     } finally {
       await connection.close().catch(() => {});
     }

@@ -8,6 +8,7 @@
 // returns zero rows). This helper only translates driver-level error codes.
 
 import {
+  DeepMemoryError,
   DuplicateEntityError,
   DuplicateRelationshipError,
   DuplicateRepositoryError,
@@ -16,6 +17,35 @@ import {
 
 const CONSTRAINT_VIOLATION_CODE = 'Neo.ClientError.Schema.ConstraintValidationFailed';
 const SYNTAX_ERROR_CODE = 'Neo.ClientError.Statement.SyntaxError';
+/** GQL status the server reports when it ends a transaction at its timeout. */
+const TRANSACTION_TIMEOUT_GQL_STATUS = '25N14';
+/**
+ * Fragment shared by the legacy status codes for a timed-out transaction
+ * (`…Transaction.TransactionTimedOut` for the server's `db.transaction.timeout`,
+ * `…TransactionTimedOutClientConfiguration` for a client-set timeout).
+ */
+const TRANSACTION_TIMEOUT_CODE_FRAGMENT = 'TransactionTimedOut';
+
+/**
+ * True when a driver error (or any error in its `cause` chain) reports that
+ * the transaction was ended at its timeout. Matched structurally on
+ * `gqlStatus` / `code` because only `Neo4jConnection` may import the driver.
+ */
+export function isTransactionTimeout(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8 && typeof current === 'object' && current !== null; depth++) {
+    const candidate = current as { gqlStatus?: unknown; code?: unknown; cause?: unknown };
+    if (candidate.gqlStatus === TRANSACTION_TIMEOUT_GQL_STATUS) return true;
+    if (
+      typeof candidate.code === 'string' &&
+      candidate.code.includes(TRANSACTION_TIMEOUT_CODE_FRAGMENT)
+    ) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
 
 /**
  * Context describing what the caller was trying to do when the driver error
@@ -61,15 +91,11 @@ interface DriverError {
  *   `cause` so root-cause analysis still works.
  *
  * Re-throws inputs that are already instances of the project's typed error
- * hierarchy unchanged.
+ * hierarchy unchanged — including the `QueryTimeoutError` that
+ * `Neo4jConnection` raises for a server-side transaction timeout.
  */
 export function mapDriverError(error: unknown, context: DriverErrorContext = {}): never {
-  if (
-    error instanceof DuplicateEntityError ||
-    error instanceof DuplicateRelationshipError ||
-    error instanceof DuplicateRepositoryError ||
-    error instanceof ProviderError
-  ) {
+  if (error instanceof DeepMemoryError) {
     throw error;
   }
 
@@ -91,6 +117,7 @@ export function mapDriverError(error: unknown, context: DriverErrorContext = {})
     throw new ProviderError(
       `Neo4j constraint violation${formatOperation(context)}: ${message || code}`,
       'Inspect the failing Cypher and the schema constraints — the affected unique key already exists.',
+      { cause: error },
     );
   }
 
@@ -98,13 +125,14 @@ export function mapDriverError(error: unknown, context: DriverErrorContext = {})
     throw new ProviderError(
       `Neo4j syntax error${formatOperation(context)}: ${message || code}`,
       'This is a programming error inside @utaba/deep-memory-storage-neo4j — please file an issue.',
+      { cause: error },
     );
   }
 
   const prefix = `Neo4j driver error${formatOperation(context)}`;
   const codeSuffix = code ? ` [${code}]` : '';
   const messageSuffix = message ? `: ${message}` : '';
-  throw new ProviderError(`${prefix}${codeSuffix}${messageSuffix}`);
+  throw new ProviderError(`${prefix}${codeSuffix}${messageSuffix}`, undefined, { cause: error });
 }
 
 function inferConstraintKind(

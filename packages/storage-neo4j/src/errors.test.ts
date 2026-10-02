@@ -4,8 +4,9 @@ import {
   DuplicateRelationshipError,
   DuplicateRepositoryError,
   ProviderError,
+  QueryTimeoutError,
 } from '@utaba/deep-memory';
-import { mapDriverError } from './errors.js';
+import { isTransactionTimeout, mapDriverError } from './errors.js';
 
 function fakeDriverError(code: string, message: string): unknown {
   // Mirror the surface used by `neo4j-driver`'s Neo4jError: an object with
@@ -92,9 +93,58 @@ describe('mapDriverError', () => {
     expect(() => mapDriverError(repoErr)).toThrowError(repoErr);
   });
 
+  it('keeps the driver error as cause on every ProviderError it builds', () => {
+    const errors = [
+      fakeDriverError('Neo.ClientError.Schema.ConstraintValidationFailed', 'Node(0) already exists'),
+      fakeDriverError('Neo.ClientError.Statement.SyntaxError', 'bad'),
+      fakeDriverError('Neo.TransientError.General.DatabaseUnavailable', 'down'),
+    ];
+    for (const err of errors) {
+      let thrown: unknown;
+      try {
+        mapDriverError(err, { operation: 'createEntity' });
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(ProviderError);
+      expect((thrown as ProviderError).cause).toBe(err);
+    }
+  });
+
+  it('rethrows QueryTimeoutError unchanged', () => {
+    const timeout = new QueryTimeoutError(1000);
+    expect(() => mapDriverError(timeout, { operation: 'createEntity' })).toThrowError(timeout);
+  });
+
   it('handles errors that lack a code or message gracefully', () => {
     expect(() => mapDriverError({})).toThrowError(ProviderError);
     expect(() => mapDriverError(null)).toThrowError(ProviderError);
     expect(() => mapDriverError(undefined)).toThrowError(ProviderError);
+  });
+});
+
+describe('isTransactionTimeout', () => {
+  it('matches the GQL status 25N14', () => {
+    expect(isTransactionTimeout({ gqlStatus: '25N14', code: 'Neo.ClientError.Transaction.Terminated' })).toBe(true);
+  });
+
+  it('matches the legacy TransactionTimedOut codes', () => {
+    expect(isTransactionTimeout(fakeDriverError('Neo.ClientError.Transaction.TransactionTimedOut', 'x'))).toBe(true);
+    expect(
+      isTransactionTimeout(
+        fakeDriverError('Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration', 'x'),
+      ),
+    ).toBe(true);
+  });
+
+  it('matches a timeout nested in the cause chain', () => {
+    expect(isTransactionTimeout({ code: 'Wrapper', cause: { gqlStatus: '25N14' } })).toBe(true);
+  });
+
+  it('does not match other errors', () => {
+    expect(isTransactionTimeout(fakeDriverError('Neo.TransientError.General.DatabaseUnavailable', 'x'))).toBe(false);
+    expect(isTransactionTimeout(new Error('TransactionTimedOut in text only'))).toBe(false);
+    expect(isTransactionTimeout(null)).toBe(false);
+    expect(isTransactionTimeout(undefined)).toBe(false);
   });
 });

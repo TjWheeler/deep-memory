@@ -484,9 +484,7 @@ describe('single-round-trip create / update', () => {
       "unfold().constant('__duplicate'),g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(" +
         "unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)",
     );
-    expect(
-      call.query.endsWith(",unfold().constant('__no_endpoint'),constant('__no_repository')))"),
-    ).toBe(true);
+    expect(call.query.endsWith(",unfold().constant('__no_source'),constant('__no_repository')))")).toBe(true);
     expect(call.params!['repoVid']).toBe(`repo:${TEST_REPO}`);
   });
 
@@ -512,22 +510,54 @@ describe('single-round-trip create / update', () => {
     expect(stub.calls.length - before).toBe(1);
   });
 
-  it('createRelationship with a missing endpoint writes nothing and does not report a missing repository', async () => {
-    const { provider, stub } = makeProvider();
-    stub.submit = async (query, params) => {
-      stub.calls.push({ query, params });
-      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
-        return { items: ['__no_endpoint'] };
-      }
-      return { items: [] };
-    };
+  it.each([
+    ['__no_source', 'source', '40000000-0000-4000-a000-deadbeef0001'],
+    ['__no_target', 'target', '40000000-0000-4000-a000-deadbeef0009'],
+  ])(
+    'createRelationship maps %s to EntityNotFoundError naming the %s, in one call',
+    async (sentinel, _endpoint, missingId) => {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+          return { items: [sentinel] };
+        }
+        return { items: [] };
+      };
 
-    const rel = makeRelationship(
-      '40000000-0000-4000-a000-000000006014',
-      '40000000-0000-4000-a000-deadbeef0001',
-      '40000000-0000-4000-a000-deadbeef0009',
+      const rel = makeRelationship(
+        '40000000-0000-4000-a000-000000006014',
+        '40000000-0000-4000-a000-deadbeef0001',
+        '40000000-0000-4000-a000-deadbeef0009',
+      );
+      const before = stub.calls.length;
+      const create = provider.createRelationship(TEST_REPO, rel);
+      await expect(create).rejects.toBeInstanceOf(EntityNotFoundError);
+      await expect(create).rejects.toMatchObject({ code: 'ENTITY_NOT_FOUND', id: missingId });
+      expect(stub.calls.length - before).toBe(1);
+    },
+  );
+
+  it('createRelationship tells a missing target from a missing source with a partition-scoped lookup of the source', async () => {
+    const { provider, getCreateCall } = captureRelationshipCreateQuery();
+    await provider.createRelationship(
+      TEST_REPO,
+      makeRelationship(
+        '40000000-0000-4000-a000-000000006015',
+        '40000000-0000-4000-a000-deadbeef0001',
+        '40000000-0000-4000-a000-deadbeef0002',
+      ),
     );
-    await expect(provider.createRelationship(TEST_REPO, rel)).resolves.toEqual(rel);
+
+    const { query } = getCreateCall();
+    // Fallbacks in order: the source exists (so the target is missing), the
+    // marker exists (so the source is missing), no marker.
+    expect(
+      query.endsWith(
+        ",unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').constant('__no_target')" +
+          ",unfold().constant('__no_source'),constant('__no_repository')))",
+      ),
+    ).toBe(true);
   });
 
   it('updateEntity issues exactly one storage call and parses the projected result', async () => {

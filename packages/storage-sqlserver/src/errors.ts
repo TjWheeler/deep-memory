@@ -63,13 +63,31 @@ export interface UniqueViolation {
   key?: string;
 }
 
-/** The unique-key violation a SQL Server error reports, or `undefined` for any other error. */
-export function readUniqueViolation(error: unknown): UniqueViolation | undefined {
+/** Number and message of a SQL Server error, from whichever shape carries them. */
+function readSqlError(error: unknown): { number?: unknown; message?: unknown } | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
   const shape = error as SqlErrorShape;
   // `mssql` copies the server's number and message onto its RequestError;
   // read the driver's own `info` when the error was not built that way.
-  const source = typeof shape.number === 'number' ? shape : shape.originalError?.info;
+  return typeof shape.number === 'number' ? shape : shape.originalError?.info;
+}
+
+/** A FOREIGN KEY (or CHECK / REFERENCE) constraint conflict. */
+const FOREIGN_KEY_VIOLATION = 547;
+
+/**
+ * True when a write conflicted with a foreign-key constraint. The number is
+ * shared by every foreign key on the table (and by CHECK constraints), and
+ * the message that names the key may be localised, so the caller re-reads
+ * the referenced rows to name the cause rather than trusting the message.
+ */
+export function isForeignKeyViolation(error: unknown): boolean {
+  return readSqlError(error)?.number === FOREIGN_KEY_VIOLATION;
+}
+
+/** The unique-key violation a SQL Server error reports, or `undefined` for any other error. */
+export function readUniqueViolation(error: unknown): UniqueViolation | undefined {
+  const source = readSqlError(error);
   const number = source?.number;
   if (number !== UNIQUE_CONSTRAINT_VIOLATION && number !== UNIQUE_INDEX_VIOLATION) return undefined;
   const message = typeof source?.message === 'string' ? source.message : '';

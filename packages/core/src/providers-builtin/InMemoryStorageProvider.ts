@@ -446,13 +446,19 @@ export class InMemoryStorageProvider implements StorageProvider {
 
   // ─── Relationships ─────────────────────────────────────────────────
 
-  async createRelationship(
+  public async createRelationship(
     repositoryId: string,
     relationship: StoredRelationship,
   ): Promise<StoredRelationship> {
     const store = this.getStore(repositoryId);
     if (store.relationships.has(relationship.id)) {
       throw new DuplicateRelationshipError(relationship.id);
+    }
+    if (!store.entities.has(relationship.sourceEntityId)) {
+      throw new EntityNotFoundError(relationship.sourceEntityId);
+    }
+    if (!store.entities.has(relationship.targetEntityId)) {
+      throw new EntityNotFoundError(relationship.targetEntityId);
     }
     store.relationships.set(relationship.id, relationship);
     return relationship;

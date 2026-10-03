@@ -70,7 +70,8 @@ import {
   isNativeStorableValue,
   RESERVED_ENTITY_PROPERTY_KEYS,
 } from '../mapping.js';
-import { mapDriverError } from '../errors.js';
+import { isDeletedEntityFailure, mapDriverError } from '../errors.js';
+import { LOCK_REPOSITORY_MARKER } from './repositoryLock.js';
 import { EntityNotFoundError, ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
 
 /**
@@ -89,17 +90,15 @@ import { EntityNotFoundError, ProviderError, RepositoryNotFoundError } from '@ut
  * Returns `n.id AS id` only — the caller already holds the `StoredEntity` it
  * passed in and does not need the round-trip to re-materialise it.
  *
- * The leading `MATCH` on the `_Repository` node guards the write: when the
- * repository marker is absent the `MATCH` yields no row and nothing is
- * created. `deleteRepository` removes the marker before its chunked wipe, and
- * the wipe is not one transaction, so without this guard a create racing the
- * wipe could land after the chunk that would have removed it and leave an
- * orphaned entity behind. Reading the marker does not lock it, so a create
- * already executing when the marker is deleted can still commit after the
- * wipe; re-running deleteRepository removes it.
+ * The statement opens with `LOCK_REPOSITORY_MARKER`: it write-locks the
+ * `_Repository` marker and continues only while the marker still exists.
+ * When the marker is absent, or `deleteRepository` deleted it while this
+ * statement waited for the lock, no row reaches the `CREATE` and nothing is
+ * written. Otherwise the lock is held to commit, so a concurrent
+ * `deleteRepository` waits for this create and its drain then removes the
+ * entity. Either way no entity outlives its repository.
  */
-const ENTITY_CREATE_QUERY = `
-MATCH (r:_Repository {repositoryId: $rid})
+const ENTITY_CREATE_QUERY = `${LOCK_REPOSITORY_MARKER}
 CREATE (n:_Entity {
   repositoryId: $rid,
   id: $id,
@@ -171,6 +170,12 @@ export async function createEntity(
     );
     nodesCreated = result.summary.counters.updates()['nodesCreated'] ?? 0;
   } catch (err) {
+    // The only node this statement locks or writes before its CREATE is the
+    // repository marker, so a server that refuses the lock on a marker
+    // deleted while the statement waited is reporting a deleted repository.
+    if (isDeletedEntityFailure(err)) {
+      throw new RepositoryNotFoundError(repositoryId);
+    }
     mapDriverError(err, {
       kind: 'entity',
       entityId: entity.id,
@@ -180,7 +185,8 @@ export async function createEntity(
       operation: 'createEntity',
     });
   }
-  // The repository-marker MATCH matched nothing, so the CREATE never ran.
+  // The repository marker is missing, or was deleted while the statement
+  // waited for its lock, so the CREATE never ran.
   if (nodesCreated === 0) throw new RepositoryNotFoundError(repositoryId);
   return entity;
 }

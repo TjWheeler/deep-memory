@@ -11,6 +11,7 @@ import {
 } from '../mapping.js';
 import {
   DuplicateRelationshipError,
+  EntityNotFoundError,
   RepositoryNotFoundError,
   matchesPropertyFilters,
   buildEdgeProjectChain,
@@ -23,19 +24,27 @@ import { submitCreate } from './create.js';
 //   - DUPLICATE_SENTINEL: an edge with the requested id already exists.
 //   - NO_REPOSITORY_SENTINEL: the repository's `_repository` marker vertex is
 //     absent, so nothing was written.
-//   - NO_ENDPOINT_SENTINEL: the marker exists but the source or target entity
-//     does not, so `addE` had nothing to attach to. This branch exists so a
-//     missing endpoint is not misread as a missing repository; the outcome is
-//     unchanged from the ungated query (nothing written, no error).
+//   - NO_SOURCE_SENTINEL: the marker exists but the source entity does not,
+//     so nothing was written.
+//   - NO_TARGET_SENTINEL: the marker and the source exist but the target
+//     entity does not, so `addE` had nothing to attach to and nothing was
+//     written.
+// Each missing endpoint throws `EntityNotFoundError` naming it, the source
+// ahead of the target when both are missing.
 const DUPLICATE_SENTINEL = '__duplicate';
 const NO_REPOSITORY_SENTINEL = '__no_repository';
-const NO_ENDPOINT_SENTINEL = '__no_endpoint';
+const NO_SOURCE_SENTINEL = '__no_source';
+const NO_TARGET_SENTINEL = '__no_target';
 
 // Prefix shared by every relationship-create query:
 //
 //   1. Duplicate check on the edge id. The edge lookup cannot be started from
 //      a vertex traverser (there is no mid-traversal `E()`), so it stays the
-//      outermost step.
+//      outermost step. That puts the id check ahead of the repository check,
+//      where the other storage providers check repository → id → source →
+//      target. The two orders give different errors only when a reused id
+//      meets a repository that is being deleted: here
+//      `DuplicateRelationshipError`, elsewhere `RepositoryNotFoundError`.
 //   2. Gate on the repository marker, inside the create branch.
 //      `deleteRepository` drops the `_repository` vertex before its chunked
 //      drain, so a create that runs after that point finds no marker and
@@ -64,11 +73,17 @@ const RELATIONSHIP_CREATE_PREFIX =
   `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
   `.property('id', relId).property('repositoryId', rid)${buildRelationshipPropertyLadder()}`;
 
-// Closes the create branch, then supplies the gate's two fallbacks: the
-// marker exists but an endpoint is missing (`unfold()` still emits the
-// marker), or the marker itself is absent (nothing to unfold).
+// Closes the create branch, then supplies the gate's fallbacks, tried in
+// order once the create branch has written nothing:
+//   - from the marker (`unfold()` still emits it), the source exists, so the
+//     target is what was missing;
+//   - the marker exists, so the source is what was missing;
+//   - the marker itself is absent (nothing to unfold).
+// The source lookup is partition-scoped like every other lookup here, and
+// runs only on this failure path.
 const RELATIONSHIP_CREATE_CLOSE =
-  `,unfold().constant('${NO_ENDPOINT_SENTINEL}'),constant('${NO_REPOSITORY_SENTINEL}')))`;
+  `,unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').constant('${NO_TARGET_SENTINEL}')` +
+  `,unfold().constant('${NO_SOURCE_SENTINEL}'),constant('${NO_REPOSITORY_SENTINEL}')))`;
 
 // Canonical empty-user-properties form. Exported so the unit test can pin the
 // invariant that every create without native-storable user properties emits
@@ -122,6 +137,12 @@ export async function createRelationship(
   }
   if (result.items[0] === DUPLICATE_SENTINEL) {
     throw new DuplicateRelationshipError(relationship.id);
+  }
+  if (result.items[0] === NO_SOURCE_SENTINEL) {
+    throw new EntityNotFoundError(relationship.sourceEntityId);
+  }
+  if (result.items[0] === NO_TARGET_SENTINEL) {
+    throw new EntityNotFoundError(relationship.targetEntityId);
   }
 
   return relationship;

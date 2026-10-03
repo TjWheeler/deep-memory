@@ -20,12 +20,13 @@
 //     `total` is reported as `undefined` in that case, matching the Cosmos
 //     contract for the same pattern.
 //
-// Isolation invariant (D3b layer 3):
-//   - `createRelationship` MATCHes both endpoint nodes under the scoping
+// Isolation invariant — the repository scope is enforced inside each
+// statement, so no caller can write or read across repositories:
+//   - `createRelationship` matches both endpoint nodes under the scoping
 //     `$rid` predicate before issuing `CREATE`. A cross-repository edge is
-//     therefore structurally unwritable: the endpoint MATCH for the
-//     out-of-scope side returns zero rows and the `FOREACH` conditional
-//     skips the CREATE.
+//     therefore structurally unwritable: the endpoint match for the
+//     out-of-scope side finds nothing and the `FOREACH` conditional skips
+//     the CREATE.
 //   - Every read / delete carries the `$rid` predicate on the relationship
 //     property map so reachability is bounded by the scope discriminator,
 //     not the graph topology.
@@ -37,7 +38,9 @@ import type {
   StoredRelationship,
 } from '@utaba/deep-memory/types';
 import {
+  DuplicateRelationshipError,
   EntityNotFoundError,
+  ProviderError,
   RepositoryNotFoundError,
   matchesPropertyFilters,
 } from '@utaba/deep-memory';
@@ -48,49 +51,113 @@ import {
   relationshipFromRecord,
   relationshipToParams,
 } from '../mapping.js';
+import { LOCK_REPOSITORY_MARKER_OPTIONAL } from './repositoryLock.js';
+import { isDeletedEntityFailure, mapDriverError } from '../errors.js';
+
+type QueryResult = Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
 
 // Shared projections — computed once at module load so the planner keys off
 // byte-identical strings regardless of which read path emits the query.
 const RELATIONSHIP_PROJECTION = buildRelationshipProjection();
 
 /**
- * Create a relationship. Single-round-trip pattern: `OPTIONAL MATCH` the
- * `_Repository` node and both endpoints under the repository scope, then
- * `FOREACH` the `CREATE` only when all three are present, finally `RETURN`
- * existence flags so the caller can discriminate missing-repository vs
- * missing-source vs missing-target without a follow-up query.
+ * What a `createRelationship` statement did. The statement reports it, so
+ * the caller names the cause without a follow-up read.
+ */
+export const RELATIONSHIP_CREATE_OUTCOME = {
+  created: 'created',
+  repositoryMissing: 'repository-missing',
+  sourceMissing: 'source-missing',
+  targetMissing: 'target-missing',
+  idExists: 'id-exists',
+} as const;
+
+export type RelationshipCreateOutcome =
+  (typeof RELATIONSHIP_CREATE_OUTCOME)[keyof typeof RELATIONSHIP_CREATE_OUTCOME];
+
+const RELATIONSHIP_CREATE_OUTCOMES: ReadonlySet<string> = new Set(
+  Object.values(RELATIONSHIP_CREATE_OUTCOME),
+);
+
+function isRelationshipCreateOutcome(value: unknown): value is RelationshipCreateOutcome {
+  return typeof value === 'string' && RELATIONSHIP_CREATE_OUTCOMES.has(value);
+}
+
+/**
+ * Build the `createRelationship` Cypher for one relationship type. One
+ * statement, one round-trip:
  *
- * The repository match guards against a create racing `deleteRepository`:
- * the wipe removes the repository marker first and then deletes in chunks
- * across several transactions, so an edge must not be writable once the
- * marker is gone. A missing repository reports `RepositoryNotFoundError`
- * ahead of any missing endpoint. A create already executing when the marker
- * is deleted can still commit after the wipe; re-running deleteRepository
- * removes it.
+ *   1. `LOCK_REPOSITORY_MARKER_OPTIONAL` write-locks the `_Repository`
+ *      marker and binds `live` to it while it still exists.
+ *   2. Match both endpoints under the repository scope, and check whether
+ *      any edge in the repository already carries the id.
+ *   3. Decide the outcome, in this order of precedence — repository
+ *      missing, id already in use, source missing, target missing, or
+ *      created — and `CREATE` the edge only when it is `created`. SQL Server
+ *      and the in-memory provider check in the same order. CosmosDB checks
+ *      the id before the repository marker, because its id lookup has to
+ *      start the traversal; the two orders differ only when a reused id
+ *      meets a repository that is being deleted.
+ *   4. Return the outcome.
  *
- * The relationship-type slot is interpolated into the Cypher string after
- * validation by `assertSafeRelationshipType` — Cypher 25 cannot parameterise
- * the type slot, and unbounded values would widen the injection surface. The
- * vocabulary's bounded cardinality keeps the plan cache footprint linear in
- * the type count.
+ * Ordering is what makes the id check race-free. The lock step is an
+ * updating clause, and an updating clause ends a query part, so the planner
+ * places every read in the later clauses — the endpoint matches and the
+ * `EXISTS` id check — after the lock is granted, and those reads see the
+ * latest committed state. The lock is held until commit, so a second create
+ * of the same id in the same repository waits for this one and then sees its
+ * edge. The `WITH` that closes the lock fragment is the barrier; a `CALL`
+ * subquery would add a scope without changing the order.
+ *
+ * The id check cannot use a relationship index: Neo4j relationship indexes
+ * and constraints cover one relationship type, and an id must be unique
+ * across every type in the repository. It is anchored on the repository's
+ * entities instead. Naming the anchor and requiring `e.id IS NOT NULL` lets
+ * the planner seek the `(repositoryId, id)` unique index for the
+ * repository's entities instead of scanning every `_Entity` in the
+ * database, and `repositoryId` on the edge pattern admits only the
+ * repository's own edges. From there the check expands every outgoing edge
+ * of those entities, so its cost is linear in the repository's relationship
+ * count. It runs under the marker lock, so other creates in the same
+ * repository queue behind it for that time. The check is projected in its
+ * own `WITH` rather than inside the `CASE`, so the planner places it in the
+ * main plan as a semi-apply. The creating clause is `CREATE`, not `MERGE`:
+ * reusing an id is an error, never a silent match.
+ *
+ * The lock also closes the race with `deleteRepository` (see
+ * `repositoryLock.ts`): no edge commits after the repository's drain has
+ * passed it. A missing repository is reported ahead of everything else,
+ * because once the repository is gone its entities are being wiped too.
+ *
+ * The relationship-type slot is interpolated after `assertSafeRelationshipType`
+ * — Cypher cannot parameterise it, and the vocabulary's bounded cardinality
+ * keeps the plan cache footprint linear in the type count. Every other value
+ * is a parameter; the outcome names are this module's constants.
  *
  * Cross-repository edges are structurally impossible: an endpoint in a
- * different repository fails its `(repositoryId, id)` MATCH and lands in the
- * `sMissing`/`tMissing` branch as if the entity did not exist at all.
+ * different repository fails its `(repositoryId, id)` match and reports as
+ * missing.
  */
-export async function createRelationship(
-  conn: Neo4jConnection,
-  repositoryId: string,
-  relationship: StoredRelationship,
-): Promise<StoredRelationship> {
-  const relType = assertSafeRelationshipType(relationship.relationshipType);
-
-  const cypher = `
-OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+export function buildCreateRelationshipQuery(relationshipType: string): string {
+  const relType = assertSafeRelationshipType(relationshipType);
+  const o = RELATIONSHIP_CREATE_OUTCOME;
+  return `${LOCK_REPOSITORY_MARKER_OPTIONAL}
 OPTIONAL MATCH (s:_Entity {repositoryId: $rid, id: $sourceEntityId})
 OPTIONAL MATCH (t:_Entity {repositoryId: $rid, id: $targetEntityId})
-WITH repo, s, t
-FOREACH (_ IN CASE WHEN repo IS NOT NULL AND s IS NOT NULL AND t IS NOT NULL THEN [1] ELSE [] END |
+WITH live, s, t,
+  EXISTS {
+    MATCH (e:_Entity {repositoryId: $rid})-[{repositoryId: $rid, id: $id}]->()
+    WHERE e.id IS NOT NULL
+  } AS idTaken
+WITH s, t,
+  CASE
+    WHEN live IS NULL THEN '${o.repositoryMissing}'
+    WHEN idTaken THEN '${o.idExists}'
+    WHEN s IS NULL THEN '${o.sourceMissing}'
+    WHEN t IS NULL THEN '${o.targetMissing}'
+    ELSE '${o.created}'
+  END AS outcome
+FOREACH (_ IN CASE WHEN outcome = '${o.created}' THEN [1] ELSE [] END |
   CREATE (s)-[r:${relType} {
     repositoryId: $rid,
     id: $id,
@@ -111,30 +178,118 @@ FOREACH (_ IN CASE WHEN repo IS NOT NULL AND s IS NOT NULL AND t IS NOT NULL THE
     modifiedFromMessage: $modifiedFromMessage
   }]->(t)
 )
-RETURN repo IS NULL AS repoMissing, s IS NULL AS sMissing, t IS NULL AS tMissing
+RETURN outcome
+`;
+}
+
+/**
+ * Reads whether the repository marker and both endpoints exist, after a
+ * create statement failed on a node a concurrent transaction deleted. It
+ * runs on the write route so it sees the delete that failed the statement.
+ */
+const CREATE_PRECONDITIONS_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+OPTIONAL MATCH (s:_Entity {repositoryId: $rid, id: $sourceEntityId})
+OPTIONAL MATCH (t:_Entity {repositoryId: $rid, id: $targetEntityId})
+RETURN repo IS NOT NULL AS repositoryExists,
+  s IS NOT NULL AS sourceExists,
+  t IS NOT NULL AS targetExists
 `;
 
-  const result = await conn.executeQuery(
-    cypher,
-    relationshipToParams(relationship),
-    { repositoryId },
-  );
-
-  const record = result.records[0];
-  if (record === undefined) {
-    // The OPTIONAL MATCH + FOREACH path always emits exactly one row.
-    // Reaching this branch indicates the driver dropped the row, which
-    // would be a driver-layer fault rather than a data-model condition.
-    throw new EntityNotFoundError(relationship.sourceEntityId);
+/**
+ * Create a relationship in one statement (see `buildCreateRelationshipQuery`)
+ * and translate its outcome: a missing repository →
+ * `RepositoryNotFoundError`, a missing source or target →
+ * `EntityNotFoundError` carrying that endpoint's id, an id already in use in
+ * the repository → `DuplicateRelationshipError`.
+ *
+ * A server may instead refuse the statement with
+ * `Neo.ClientError.Statement.EntityNotFound` when a node it locked or
+ * matched was deleted while it waited. That can be the repository marker
+ * (`deleteRepository` takes the marker lock) or an endpoint (entity deletes
+ * do not), so the error alone does not name the cause: one follow-up read
+ * looks at all three and the same precedence picks the typed error. When
+ * all three exist the original error is the answer, mapped like any other
+ * driver error.
+ */
+export async function createRelationship(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  relationship: StoredRelationship,
+): Promise<StoredRelationship> {
+  const cypher = buildCreateRelationshipQuery(relationship.relationshipType);
+  const params = relationshipToParams(relationship);
+  let result: QueryResult;
+  try {
+    result = await conn.executeQuery(cypher, params, { repositoryId });
+  } catch (err) {
+    if (isDeletedEntityFailure(err)) {
+      await throwForMissingPrecondition(conn, repositoryId, relationship);
+    }
+    mapDriverError(err, {
+      kind: 'relationship',
+      relationshipId: relationship.id,
+      operation: 'createRelationship',
+    });
   }
-  // Repository first: once the repository is gone its entities are being
-  // wiped too, so a missing endpoint is a symptom, not the cause.
-  if (record.get('repoMissing') === true) throw new RepositoryNotFoundError(repositoryId);
-  const sMissing = record.get('sMissing') === true;
-  const tMissing = record.get('tMissing') === true;
-  if (sMissing) throw new EntityNotFoundError(relationship.sourceEntityId);
-  if (tMissing) throw new EntityNotFoundError(relationship.targetEntityId);
-  return relationship;
+
+  // The statement emits exactly one row whatever the outcome; anything else
+  // is a fault below the data model.
+  const outcome: unknown = result.records[0]?.get('outcome');
+  if (!isRelationshipCreateOutcome(outcome)) {
+    throw new ProviderError(
+      `Neo4j createRelationship returned no recognised outcome (got ${JSON.stringify(outcome ?? null)}).`,
+    );
+  }
+  switch (outcome) {
+    case RELATIONSHIP_CREATE_OUTCOME.repositoryMissing:
+      throw new RepositoryNotFoundError(repositoryId);
+    case RELATIONSHIP_CREATE_OUTCOME.sourceMissing:
+      throw new EntityNotFoundError(relationship.sourceEntityId);
+    case RELATIONSHIP_CREATE_OUTCOME.targetMissing:
+      throw new EntityNotFoundError(relationship.targetEntityId);
+    case RELATIONSHIP_CREATE_OUTCOME.idExists:
+      throw new DuplicateRelationshipError(relationship.id);
+    case RELATIONSHIP_CREATE_OUTCOME.created:
+      return relationship;
+  }
+}
+
+/**
+ * Throw the typed error for the first missing precondition of a
+ * relationship create — repository, then source, then target — and return
+ * when all three exist.
+ */
+async function throwForMissingPrecondition(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  relationship: StoredRelationship,
+): Promise<void> {
+  let check: QueryResult;
+  try {
+    check = await conn.executeQuery(
+      CREATE_PRECONDITIONS_QUERY,
+      {
+        sourceEntityId: relationship.sourceEntityId,
+        targetEntityId: relationship.targetEntityId,
+      },
+      { repositoryId },
+    );
+  } catch (err) {
+    // The follow-up read can fail on its own (connection loss, timeout); the
+    // caller still gets a typed error rather than a raw driver error.
+    mapDriverError(err, {
+      kind: 'relationship',
+      relationshipId: relationship.id,
+      operation: 'createRelationship',
+    });
+  }
+  const record = check.records[0];
+  if (record === undefined) {
+    throw new ProviderError('Neo4j createRelationship precondition check returned no row.');
+  }
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  if (record.get('sourceExists') !== true) throw new EntityNotFoundError(relationship.sourceEntityId);
+  if (record.get('targetExists') !== true) throw new EntityNotFoundError(relationship.targetEntityId);
 }
 
 /**

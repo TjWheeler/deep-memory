@@ -538,6 +538,85 @@ export function runStorageProviderConformanceTests(
         expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
       });
 
+      it('creating a relationship with an explicit id already in use throws DuplicateRelationshipError', async () => {
+        await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+
+        // Same type, different endpoints.
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'b', 'c')),
+        ).rejects.toMatchObject(
+          typedError('DuplicateRelationshipError', 'RELATIONSHIP_ALREADY_EXISTS', { relationshipId: 'r1' }),
+        );
+        // A different type: the id is unique across every type in the repository.
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('r1', 'mentions', 'a', 'b')),
+        ).rejects.toMatchObject(
+          typedError('DuplicateRelationshipError', 'RELATIONSHIP_ALREADY_EXISTS', { relationshipId: 'r1' }),
+        );
+
+        const original = await provider.getRelationship(repoId, 'r1');
+        expect(original).toMatchObject({ relationshipType: 'connects', sourceEntityId: 'a', targetEntityId: 'b' });
+        const fromB = await provider.getEntityRelationships(repoId, 'b');
+        expect(fromB.items.map((rel) => rel.id)).toEqual(['r1']);
+      });
+
+      it('createRelationship throws EntityNotFoundError naming a missing source', async () => {
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'missing-source', 'b')),
+        ).rejects.toMatchObject(typedError('EntityNotFoundError', 'ENTITY_NOT_FOUND', { id: 'missing-source' }));
+        expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
+      });
+
+      it('createRelationship throws EntityNotFoundError naming a missing target', async () => {
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'missing-target')),
+        ).rejects.toMatchObject(typedError('EntityNotFoundError', 'ENTITY_NOT_FOUND', { id: 'missing-target' }));
+        expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
+      });
+
+      it('the same relationship id can be used in two repositories', async () => {
+        // A second repository with its own entities "a" and "b". The suite
+        // has no teardown and live stores persist, so remove it on both sides.
+        const otherRepoId = '40000000-0000-4000-a000-000000000002';
+        const removeOther = async (): Promise<void> => {
+          if ((await provider.getRepository(otherRepoId)) !== null) {
+            await provider.deleteRepository(otherRepoId);
+          }
+        };
+        await removeOther();
+        try {
+          await provider.createRepository({
+            repositoryId: otherRepoId,
+            label: 'Conformance Test (second repository)',
+            governanceConfig: { mode: 'open' },
+            createdAt: new Date().toISOString(),
+            createdBy: 'conformance-test',
+          });
+          await provider.createEntity(otherRepoId, makeEntity('a'));
+          await provider.createEntity(otherRepoId, makeEntity('b'));
+
+          await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+          await provider.createRelationship(otherRepoId, makeRelationship('r1', 'mentions', 'b', 'a'));
+
+          expect(await provider.getRelationship(repoId, 'r1')).toMatchObject({
+            relationshipType: 'connects',
+            sourceEntityId: 'a',
+            targetEntityId: 'b',
+          });
+          expect(await provider.getRelationship(otherRepoId, 'r1')).toMatchObject({
+            relationshipType: 'mentions',
+            sourceEntityId: 'b',
+            targetEntityId: 'a',
+          });
+          const inFirst = await provider.getEntityRelationships(repoId, 'a');
+          expect(inFirst.items.map((rel) => rel.relationshipType)).toEqual(['connects']);
+          const inOther = await provider.getEntityRelationships(otherRepoId, 'a');
+          expect(inOther.items.map((rel) => rel.relationshipType)).toEqual(['mentions']);
+        } finally {
+          await removeOther();
+        }
+      });
+
       it('createRelationship throws RepositoryNotFoundError after the repository is deleted', async () => {
         // Entities "a" and "b" were created by beforeEach while the repository existed.
         await provider.deleteRepository(repoId);

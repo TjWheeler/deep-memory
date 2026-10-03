@@ -19,6 +19,7 @@ import type { MemoryVocabulary, OperationUsage, StoredEntity, StoredRelationship
 import {
   DuplicateEntityError,
   DuplicateRelationshipError,
+  EntityNotFoundError,
   ProviderError,
   RepositoryNotFoundError,
   VocabularyVersionConflictError,
@@ -223,10 +224,13 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
       provider.createRelationship(RID.gate, makeRelationship('gate-r1', 'gate-a', 'gate-b')),
     ).rejects.toBeInstanceOf(DuplicateRelationshipError);
 
-    // A missing endpoint writes nothing and is not reported as a missing repository.
-    await expect(
-      provider.createRelationship(RID.gate, makeRelationship('gate-r2', 'gate-a', 'gate-missing')),
-    ).resolves.toBeDefined();
+    // A missing endpoint is reported as that entity, not as a missing repository, and writes nothing.
+    const missingEndpoint = provider.createRelationship(
+      RID.gate,
+      makeRelationship('gate-r2', 'gate-a', 'gate-missing'),
+    );
+    await expect(missingEndpoint).rejects.toBeInstanceOf(EntityNotFoundError);
+    await expect(missingEndpoint).rejects.toMatchObject({ code: 'ENTITY_NOT_FOUND', id: 'gate-missing' });
     expect(await provider.getRelationship(RID.gate, 'gate-r2')).toBeNull();
   });
 

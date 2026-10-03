@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderError, SlugConflictError } from '@utaba/deep-memory';
+import { ProviderError, RepositoryNotFoundError, SlugConflictError } from '@utaba/deep-memory';
+import type { StoredEntity } from '@utaba/deep-memory/types';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
-import { buildFindEntitiesWhere, escapeLuceneQuery, updateEntity } from './entity.js';
+import { buildFindEntitiesWhere, createEntity, escapeLuceneQuery, updateEntity } from './entity.js';
 
 describe('buildFindEntitiesWhere', () => {
   it('returns an empty WHERE fragment when only the repository predicate is requested with no filters', () => {
@@ -231,5 +232,56 @@ describe('updateEntity error mapping', () => {
 
     await expect(rejection).rejects.toBeInstanceOf(ProviderError);
     await expect(rejection).rejects.toMatchObject({ cause: driverError });
+  });
+});
+
+describe('createEntity error mapping', () => {
+  const now = '2026-01-01T00:00:00.000Z';
+  const entity: StoredEntity = {
+    id: 'e1',
+    slug: 'Thing:e1',
+    entityType: 'Thing',
+    label: 'e1',
+    summary: '',
+    properties: {},
+    provenance: {
+      createdBy: 't',
+      createdByType: 'agent',
+      createdAt: now,
+      modifiedBy: 't',
+      modifiedByType: 'agent',
+      modifiedAt: now,
+    },
+  };
+
+  function failingConnection(error: unknown): { conn: Neo4jConnection; calls: () => number } {
+    let count = 0;
+    const fake = {
+      async executeQuery(): Promise<never> {
+        count++;
+        throw error;
+      },
+    };
+    return { conn: fake as unknown as Neo4jConnection, calls: () => count };
+  }
+
+  it('maps a deleted repository marker to RepositoryNotFoundError without a follow-up read', async () => {
+    const driverError = Object.assign(new Error('Node with id 3 has been deleted in this transaction'), {
+      code: 'Neo.ClientError.Statement.EntityNotFound',
+    });
+    const { conn, calls } = failingConnection(driverError);
+
+    await expect(createEntity(conn, 'r1', entity)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(createEntity(conn, 'r1', entity)).rejects.toMatchObject({ repositoryId: 'r1' });
+    expect(calls()).toBe(2);
+  });
+
+  it('maps any other driver error as before', async () => {
+    const driverError = Object.assign(new Error('boom'), { code: 'Neo.DatabaseError.General.UnknownError' });
+
+    await expect(createEntity(failingConnection(driverError).conn, 'r1', entity)).rejects.toMatchObject({
+      name: 'ProviderError',
+      cause: driverError,
+    });
   });
 });

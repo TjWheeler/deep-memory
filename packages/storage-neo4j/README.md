@@ -140,7 +140,7 @@ The vocabulary version is stored twice: inside the JSON blob and as a `version` 
 
 ### Repository delete
 
-`deleteRepository` deletes the `_Repository` marker first. Entity and relationship creates match the marker in the same statement as their write, so they fail with `RepositoryNotFoundError` from that point on. The delete then drains relationships, entities, the change log and any other node carrying the `repositoryId`. The `_Vocabulary` node goes last. A delete that is interrupted part-way can be finished by calling `deleteRepository` again. It throws `RepositoryNotFoundError` only when nothing at all was left to delete. While a delete is unfinished (a `_Vocabulary` node or `_Entity` nodes remain with no marker), `createRepository` refuses with a `ProviderError` that tells you to finish the delete first.
+`deleteRepository` deletes the `_Repository` marker first. Every create statement — `createEntity`, `createRelationship` and each `importBulk` chunk — write-locks the marker in the same statement as its write, then matches it again and writes only while it still exists. Deleting the marker takes the same lock, so a delete waits for a create that holds it, and its drain then removes what that create wrote; a create that waited on the delete finds the marker gone and fails with `RepositoryNotFoundError`. No create commits after the drain has passed it, so nothing outlives the repository. The delete then drains relationships, entities, the change log and any other node carrying the `repositoryId`. The `_Vocabulary` node goes last. A delete that is interrupted part-way can be finished by calling `deleteRepository` again. It throws `RepositoryNotFoundError` only when nothing at all was left to delete. While a delete is unfinished (a `_Vocabulary` node or `_Entity` nodes remain with no marker), `createRepository` refuses with a `ProviderError` that tells you to finish the delete first.
 
 ### Upgrading
 
@@ -202,7 +202,16 @@ for await (const chunk of provider.exportAll(repositoryId)) {
 }
 ```
 
-`importBulk()` uses fixed-shape `UNWIND` templates — one Cypher string per chunk regardless of contents — so the plan cache stays at a single entry per import. Default chunk size is 100; concurrency is a simple bounded pool (default 8) — Neo4j Community has no per-query cost limit, so there is no adaptive controller. Use `skipExistenceCheck: true` when the caller knows the data is fresh (faster `CREATE` path); leave it `false` for idempotent `MERGE`-based upsert.
+`importBulk()` uses fixed-shape `UNWIND` templates — one Cypher string per chunk regardless of contents — so the plan cache stays at a single entry per import. Default chunk size is 500; chunks are dispatched through a simple bounded pool (default 8) — Neo4j Community has no per-query cost limit, so there is no adaptive controller. Each chunk write-locks the repository marker for the length of its statement (see [Repository delete](#repository-delete)), so the chunks of one repository's import — and any other create in that repository — run one at a time on the server; the pool overlaps round-trips, not writes. Imports into different repositories do not wait on each other.
+
+Use `skipExistenceCheck: true` when the caller knows the data is fresh (faster `CREATE` path); leave it `false` for idempotent `MERGE`-based upsert. Relationship ids are unique across every type in a repository, and Neo4j relationship constraints cover one type only, so the two paths treat ids differently:
+
+- **Insert** (`skipExistenceCheck: true`) trusts the caller that its relationship ids are not already in the store and does not look; checking every chunk against every edge in the repository would make a large import quadratic. An id repeated within the one call is refused: the first occurrence is attempted, and each later one is reported with `RELATIONSHIP_ALREADY_EXISTS` whatever the first occurrence's outcome.
+- **Upsert** (`skipExistenceCheck: false`) checks each id against the repository's existing edges. An edge with the same id, type and endpoints is updated in place; one whose type or endpoints differ makes the row fail with `RELATIONSHIP_ALREADY_EXISTS`. The endpoints are checked before the id, because telling the same edge from another one needs the bound source and target, so a row with a missing endpoint reports `ENTITY_NOT_FOUND` even when its id is in use. An id repeated within one chunk is applied in input order. Occurrences in different chunks (a different type, or more than a chunk apart) are applied in no defined order, but each meets the others' writes, so the id never ends up on two edges.
+
+`result.errors` is not in input order: entity rows come before relationship rows, and among relationships the repeats an insert refuses come before each chunk's failures, in chunk order. Each record's `item` names its row.
+
+`createRelationship` checks the id the same way as upsert, and refuses any existing edge with `DuplicateRelationshipError`. The check seeks the repository's entities through the `(repositoryId, id)` index and then reads their edges, so its cost grows with the repository's relationship count, and it runs under the marker lock.
 
 ## Native query escape hatch
 
@@ -217,13 +226,16 @@ All errors use the `@utaba/deep-memory` error hierarchy. Mapping is by `error.co
 | Driver code | Maps to |
 |-------------|---------|
 | `Neo.ClientError.Schema.ConstraintValidationFailed` (entity scope) | `DuplicateEntityError` |
-| `Neo.ClientError.Schema.ConstraintValidationFailed` (relationship scope) | `DuplicateRelationshipError` |
 | `Neo.ClientError.Schema.ConstraintValidationFailed` (repository scope) | `DuplicateRepositoryError` |
 | `Neo.ClientError.Statement.SyntaxError` | `ProviderError` |
 | `Neo.ClientError.Security.*` | `ProviderError` (original code attached) |
 | Anything else | `ProviderError` with `cause: error` |
 
-"Not found" outcomes (`EntityNotFoundError`, `RelationshipNotFoundError`, `RepositoryNotFoundError`) come from inspecting the result summary's counters — they are not driver errors.
+`DuplicateRelationshipError` does not come from a driver constraint: Neo4j relationship constraints cover one type only, so relationship id uniqueness is checked by the create statement itself (`createRelationship`), and the import reports a clash as an `id-exists` row outcome (`RELATIONSHIP_ALREADY_EXISTS`).
+
+"Not found" outcomes (`EntityNotFoundError`, `RelationshipNotFoundError`, `RepositoryNotFoundError`) come from the statement's own result (counters or a returned outcome) — they are not driver errors.
+
+One driver code is a not-found outcome: `Neo.ClientError.Statement.EntityNotFound`, which a server may raise when a create statement waited on the repository marker's lock and the marker was deleted meanwhile. `createEntity` reports it as `RepositoryNotFoundError`. `createRelationship` can also meet a deleted endpoint (entity deletes do not take the marker lock), so it reads the marker and both endpoints once more and throws `RepositoryNotFoundError` or `EntityNotFoundError` for the first one missing — or the mapped original error when all three exist. `importBulk` re-runs a chunk refused this way row by row: each re-run reports a deleted endpoint as an `ENTITY_NOT_FOUND` row and a deleted marker as `RepositoryNotFoundError`, which stops the import. A row still refused on its own is recorded with `ENTITY_NOT_FOUND` once a read confirms the marker is still there; if the marker is gone, the import stops with `RepositoryNotFoundError`.
 
 Transient errors are retried automatically by `driver.executeQuery` and `session.executeWrite/Read`; the provider does not check `error.isRetryable()` itself on those code paths.
 

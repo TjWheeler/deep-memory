@@ -360,6 +360,23 @@ export function isMemoryLimitFailure(error: unknown): boolean {
   return code === TRANSACTION_MEMORY_LIMIT_CODE || code === MEMORY_POOL_EXHAUSTED_CODE;
 }
 
+/**
+ * Status code for a statement that wrote to a node or relationship another
+ * transaction deleted while the statement waited for its lock. The server
+ * releases the lock on a deleted node to the waiter, and a server version
+ * may refuse the waiter's write instead of applying it to the deleted node.
+ */
+export const DELETED_ENTITY_CODE = 'Neo.ClientError.Statement.EntityNotFound';
+
+/**
+ * True when a statement touched a node or relationship that a concurrent
+ * transaction deleted. The error does not say which one, so the caller looks
+ * again before naming the cause.
+ */
+export function isDeletedEntityFailure(error: unknown): boolean {
+  return driverCode(error) === DELETED_ENTITY_CODE;
+}
+
 function formatOperation(context: DriverErrorContext): string {
   return context.operation ? ` in ${context.operation}` : '';
 }

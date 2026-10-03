@@ -1,0 +1,279 @@
+import { describe, expect, it } from 'vitest';
+import type { StoredRelationship } from '@utaba/deep-memory/types';
+import { DeepMemoryError } from '@utaba/deep-memory';
+import type { Neo4jConnection } from '../Neo4jConnection.js';
+import {
+  RELATIONSHIP_CREATE_OUTCOME,
+  buildCreateRelationshipQuery,
+  createRelationship,
+} from './relationship.js';
+import { LOCK_REPOSITORY_MARKER_OPTIONAL } from './repositoryLock.js';
+
+const RID = 'repo-relationship';
+
+function relationship(overrides: Partial<StoredRelationship> = {}): StoredRelationship {
+  const now = new Date().toISOString();
+  return {
+    id: 'r1',
+    relationshipType: 'KNOWS',
+    sourceEntityId: 'source-entity',
+    targetEntityId: 'target-entity',
+    properties: {},
+    bidirectional: false,
+    provenance: {
+      createdBy: 'relationship-test',
+      createdByType: 'agent',
+      createdAt: now,
+      modifiedBy: 'relationship-test',
+      modifiedByType: 'agent',
+      modifiedAt: now,
+    },
+    ...overrides,
+  };
+}
+
+/** Connection fake whose create statement reports `outcome` (or no row). */
+function connectionReporting(outcome: string | undefined): {
+  conn: Neo4jConnection;
+  calls: Array<{ cypher: string; params: Record<string, unknown> }>;
+} {
+  const calls: Array<{ cypher: string; params: Record<string, unknown> }> = [];
+  const fake = {
+    async executeQuery(cypher: string, params: Record<string, unknown>) {
+      calls.push({ cypher, params });
+      if (outcome === undefined) return { records: [] };
+      return { records: [{ get: (key: string) => (key === 'outcome' ? outcome : undefined) }] };
+    },
+  };
+  return { conn: fake as unknown as Neo4jConnection, calls };
+}
+
+describe('createRelationship outcome mapping', () => {
+  it('returns the relationship when the statement created it', async () => {
+    const rel = relationship();
+    const { conn, calls } = connectionReporting(RELATIONSHIP_CREATE_OUTCOME.created);
+
+    await expect(createRelationship(conn, RID, rel)).resolves.toBe(rel);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('maps a missing repository to RepositoryNotFoundError', async () => {
+    const { conn } = connectionReporting(RELATIONSHIP_CREATE_OUTCOME.repositoryMissing);
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'RepositoryNotFoundError',
+      code: 'REPOSITORY_NOT_FOUND',
+      repositoryId: RID,
+    });
+  });
+
+  it('maps a missing source to EntityNotFoundError carrying the source id', async () => {
+    const { conn } = connectionReporting(RELATIONSHIP_CREATE_OUTCOME.sourceMissing);
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'EntityNotFoundError',
+      code: 'ENTITY_NOT_FOUND',
+      id: 'source-entity',
+    });
+  });
+
+  it('maps a missing target to EntityNotFoundError carrying the target id', async () => {
+    const { conn } = connectionReporting(RELATIONSHIP_CREATE_OUTCOME.targetMissing);
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'EntityNotFoundError',
+      code: 'ENTITY_NOT_FOUND',
+      id: 'target-entity',
+    });
+  });
+
+  it('maps an id already in use to DuplicateRelationshipError', async () => {
+    const { conn } = connectionReporting(RELATIONSHIP_CREATE_OUTCOME.idExists);
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'DuplicateRelationshipError',
+      code: 'RELATIONSHIP_ALREADY_EXISTS',
+      relationshipId: 'r1',
+    });
+  });
+
+  it('reports a statement that returns no outcome as ProviderError', async () => {
+    const { conn } = connectionReporting(undefined);
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'ProviderError',
+      code: 'PROVIDER_ERROR',
+    });
+  });
+
+  it('reports an unrecognised outcome as ProviderError', async () => {
+    const { conn } = connectionReporting('something-else');
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'ProviderError',
+      code: 'PROVIDER_ERROR',
+    });
+  });
+
+  it('refuses an unsafe relationship type before any round-trip', async () => {
+    const { conn, calls } = connectionReporting(RELATIONSHIP_CREATE_OUTCOME.created);
+
+    await expect(
+      createRelationship(conn, RID, relationship({ relationshipType: 'KNOWS]->() DETACH DELETE (x' })),
+    ).rejects.toMatchObject({ name: 'ProviderError' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('passes the relationship id and endpoints as parameters, not in the Cypher text', async () => {
+    const rel = relationship({ id: 'rel-id-param', sourceEntityId: 'src-param', targetEntityId: 'tgt-param' });
+    const { conn, calls } = connectionReporting(RELATIONSHIP_CREATE_OUTCOME.created);
+
+    await createRelationship(conn, RID, rel);
+
+    const [call] = calls;
+    expect(call!.params).toMatchObject({ id: 'rel-id-param', sourceEntityId: 'src-param', targetEntityId: 'tgt-param' });
+    expect(call!.cypher).not.toContain('rel-id-param');
+    expect(call!.cypher).not.toContain('src-param');
+  });
+});
+
+/** A driver error carrying the status code a server raises for a deleted node. */
+function deletedEntityError(): Error & { code: string } {
+  return Object.assign(new Error('Node with id 42 has been deleted in this transaction'), {
+    code: 'Neo.ClientError.Statement.EntityNotFound',
+  });
+}
+
+/**
+ * Connection fake whose create statement fails with `error`, and whose
+ * follow-up precondition read reports `exists` (or no row when undefined).
+ */
+function connectionFailingWith(
+  error: unknown,
+  exists?: { repositoryExists: boolean; sourceExists: boolean; targetExists: boolean },
+): { conn: Neo4jConnection; calls: Array<{ cypher: string; params: Record<string, unknown> }> } {
+  const calls: Array<{ cypher: string; params: Record<string, unknown> }> = [];
+  const fake = {
+    async executeQuery(cypher: string, params: Record<string, unknown>) {
+      calls.push({ cypher, params });
+      if (calls.length === 1) throw error;
+      if (exists === undefined) return { records: [] };
+      const values: Record<string, boolean> = exists;
+      return { records: [{ get: (key: string) => values[key] }] };
+    },
+  };
+  return { conn: fake as unknown as Neo4jConnection, calls };
+}
+
+describe('createRelationship on a node deleted while the statement waited', () => {
+  const all = { repositoryExists: true, sourceExists: true, targetExists: true };
+
+  it('reads the preconditions once and reports a deleted repository first', async () => {
+    const { conn, calls } = connectionFailingWith(deletedEntityError(), {
+      repositoryExists: false,
+      sourceExists: false,
+      targetExists: false,
+    });
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'RepositoryNotFoundError',
+      repositoryId: RID,
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.cypher).toContain('$rid');
+    expect(calls[1]!.params).toEqual({ sourceEntityId: 'source-entity', targetEntityId: 'target-entity' });
+  });
+
+  it('reports a deleted source ahead of a deleted target', async () => {
+    const { conn } = connectionFailingWith(deletedEntityError(), {
+      ...all,
+      sourceExists: false,
+      targetExists: false,
+    });
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'EntityNotFoundError',
+      id: 'source-entity',
+    });
+  });
+
+  it('reports a deleted target', async () => {
+    const { conn } = connectionFailingWith(deletedEntityError(), { ...all, targetExists: false });
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'EntityNotFoundError',
+      id: 'target-entity',
+    });
+  });
+
+  it('rethrows the original error, mapped, when everything still exists', async () => {
+    const original = deletedEntityError();
+    const { conn } = connectionFailingWith(original, all);
+
+    const thrown: unknown = await createRelationship(conn, RID, relationship()).catch((err: unknown) => err);
+    expect(thrown).toMatchObject({ name: 'ProviderError', code: 'PROVIDER_ERROR' });
+    expect((thrown as Error).cause).toBe(original);
+  });
+
+  it('reports a precondition read with no row as ProviderError', async () => {
+    const { conn } = connectionFailingWith(deletedEntityError());
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'ProviderError',
+    });
+  });
+
+  it('maps a driver failure of the precondition read itself to a typed error', async () => {
+    const readFailure = Object.assign(new Error('connection reset'), {
+      code: 'ServiceUnavailable',
+    });
+    const calls: string[] = [];
+    const fake = {
+      async executeQuery(cypher: string) {
+        calls.push(cypher);
+        throw calls.length === 1 ? deletedEntityError() : readFailure;
+      },
+    };
+
+    const thrown: unknown = await createRelationship(fake as unknown as Neo4jConnection, RID, relationship()).catch(
+      (err: unknown) => err,
+    );
+    expect(calls).toHaveLength(2);
+    expect(thrown).toBeInstanceOf(DeepMemoryError);
+    expect(thrown).toMatchObject({ name: 'ProviderError', code: 'PROVIDER_ERROR' });
+    expect((thrown as Error).message).toContain('createRelationship');
+    expect((thrown as Error).cause).toBe(readFailure);
+  });
+
+  it('maps any other driver error without a follow-up read', async () => {
+    const other = Object.assign(new Error('boom'), { code: 'Neo.DatabaseError.General.UnknownError' });
+    const { conn, calls } = connectionFailingWith(other, all);
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'ProviderError',
+    });
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('buildCreateRelationshipQuery', () => {
+  const cypher = buildCreateRelationshipQuery('KNOWS');
+
+  it('locks the repository marker before any other clause', () => {
+    expect(cypher.trimStart().startsWith(LOCK_REPOSITORY_MARKER_OPTIONAL.trim())).toBe(true);
+  });
+
+  it('checks the id across every relationship type in the repository, after the lock', () => {
+    const idCheck = `EXISTS {
+    MATCH (e:_Entity {repositoryId: $rid})-[{repositoryId: $rid, id: $id}]->()
+    WHERE e.id IS NOT NULL
+  } AS idTaken`;
+    expect(cypher).toContain(idCheck);
+    expect(cypher.indexOf(idCheck)).toBeGreaterThan(cypher.indexOf('REMOVE repo._lock'));
+  });
+
+  it('creates with CREATE, never MERGE', () => {
+    expect(cypher).toContain('CREATE (s)-[r:KNOWS {');
+    expect(cypher).not.toContain('MERGE');
+  });
+});

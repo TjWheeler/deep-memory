@@ -55,7 +55,13 @@ import {
   createSafeSink,
 } from '@utaba/deep-memory';
 import { getSchemaSQL, SCHEMA_VERSION } from './schema.js';
-import { importFailure, mapUniqueViolation, type ImportRow, type UniqueViolationContext } from './errors.js';
+import {
+  importFailure,
+  isForeignKeyViolation,
+  mapUniqueViolation,
+  type ImportRow,
+  type UniqueViolationContext,
+} from './errors.js';
 
 const PROVIDER_NAME = 'sqlserver';
 
@@ -69,6 +75,23 @@ function rethrowUniqueViolation(context: UniqueViolationContext): (err: unknown)
   return (err: unknown): never => {
     throw mapUniqueViolation(err, context) ?? err;
   };
+}
+
+/** What a relationship create needs to exist (or not) before its INSERT. */
+interface RelationshipCreatePreconditions {
+  repositoryExists: boolean;
+  relationshipExists: boolean;
+  sourceExists: boolean;
+  targetExists: boolean;
+}
+
+/** Throw `EntityNotFoundError` for the source, then the target, when missing. */
+function throwForMissingEndpoint(
+  preconditions: RelationshipCreatePreconditions,
+  relationship: StoredRelationship,
+): void {
+  if (!preconditions.sourceExists) throw new EntityNotFoundError(relationship.sourceEntityId);
+  if (!preconditions.targetExists) throw new EntityNotFoundError(relationship.targetEntityId);
 }
 
 /**
@@ -1267,22 +1290,16 @@ export class SqlServerStorageProvider implements StorageProvider {
     repositoryId: string,
     relationship: StoredRelationship,
   ): Promise<StoredRelationship> {
-    await this.assertRepository(repositoryId);
+    // Check first so the common failures get their typed errors without a
+    // failed INSERT. The check and the INSERT are separate statements, so a
+    // concurrent writer can still change the answer in between; the INSERT's
+    // own failure is mapped below.
+    const preconditions = await this.readRelationshipCreatePreconditions(repositoryId, relationship);
+    if (!preconditions.repositoryExists) throw new RepositoryNotFoundError(repositoryId);
+    if (preconditions.relationshipExists) throw new DuplicateRelationshipError(relationship.id);
+    throwForMissingEndpoint(preconditions, relationship);
+
     const pool = this.getPool();
-
-    // Check for duplicate
-    const existing = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('relId', sql.NVarChar, relationship.id)
-      .query<{ relationship_id: string }>(
-        `SELECT [relationship_id] FROM ${this.t('dm_relationships')}
-         WHERE [repository_id] = @repoId AND [relationship_id] = @relId`,
-      );
-
-    if (existing.recordset.length > 0) {
-      throw new DuplicateRelationshipError(relationship.id);
-    }
-
     const req = pool.request()
       .input('repoId', sql.UniqueIdentifier, repositoryId)
       .input('relId', sql.NVarChar, relationship.id)
@@ -1310,9 +1327,77 @@ export class SqlServerStorageProvider implements StorageProvider {
         @modifiedBy, @modifiedByType, @modifiedAt,
         @modifiedInConversation, @modifiedFromMessage
       )
-    `).catch(rethrowUniqueViolation({ kind: 'relationship', relationshipId: relationship.id }));
+    `).catch(async (err: unknown): Promise<never> => {
+      if (isForeignKeyViolation(err)) await this.throwForDeletedPrecondition(repositoryId, relationship, err);
+      return rethrowUniqueViolation({ kind: 'relationship', relationshipId: relationship.id })(err);
+    });
 
     return relationship;
+  }
+
+  /**
+   * Whether the repository, an existing relationship with the same id, and
+   * both endpoints exist — one round-trip, read before a relationship
+   * INSERT and again when the INSERT fails on a foreign key.
+   */
+  private async readRelationshipCreatePreconditions(
+    repositoryId: string,
+    relationship: StoredRelationship,
+  ): Promise<RelationshipCreatePreconditions> {
+    const check = await this.getPool().request()
+      .input('repoId', sql.UniqueIdentifier, repositoryId)
+      .input('relId', sql.NVarChar, relationship.id)
+      .input('sourceId', sql.NVarChar, relationship.sourceEntityId)
+      .input('targetId', sql.NVarChar, relationship.targetEntityId)
+      .query<{
+        repository_exists: number;
+        relationship_exists: number;
+        source_exists: number;
+        target_exists: number;
+      }>(
+        `SELECT
+           CASE WHEN EXISTS (SELECT 1 FROM ${this.t('dm_repositories')}
+             WHERE [repository_id] = @repoId) THEN 1 ELSE 0 END AS repository_exists,
+           CASE WHEN EXISTS (SELECT 1 FROM ${this.t('dm_relationships')}
+             WHERE [repository_id] = @repoId AND [relationship_id] = @relId) THEN 1 ELSE 0 END AS relationship_exists,
+           CASE WHEN EXISTS (SELECT 1 FROM ${this.t('dm_entities')}
+             WHERE [repository_id] = @repoId AND [entity_id] = @sourceId) THEN 1 ELSE 0 END AS source_exists,
+           CASE WHEN EXISTS (SELECT 1 FROM ${this.t('dm_entities')}
+             WHERE [repository_id] = @repoId AND [entity_id] = @targetId) THEN 1 ELSE 0 END AS target_exists`,
+      );
+    const row = check.recordset[0];
+    if (row === undefined) {
+      throw new ProviderError('SQL Server createRelationship precondition check returned no row.');
+    }
+    return {
+      repositoryExists: row.repository_exists === 1,
+      relationshipExists: row.relationship_exists === 1,
+      sourceExists: row.source_exists === 1,
+      targetExists: row.target_exists === 1,
+    };
+  }
+
+  /**
+   * After a relationship INSERT failed on a foreign key: re-read what the
+   * keys reference and throw the typed error for the first thing missing —
+   * repository, then source, then target. The error number is shared by all
+   * three foreign keys and the message naming the key may be localised, so
+   * the rows decide, not the message. When everything exists the failure is
+   * not one the contract names, and it surfaces as `ProviderError`.
+   */
+  private async throwForDeletedPrecondition(
+    repositoryId: string,
+    relationship: StoredRelationship,
+    cause: unknown,
+  ): Promise<never> {
+    const preconditions = await this.readRelationshipCreatePreconditions(repositoryId, relationship);
+    if (!preconditions.repositoryExists) throw new RepositoryNotFoundError(repositoryId);
+    throwForMissingEndpoint(preconditions, relationship);
+    throw new ProviderError(
+      `SQL Server createRelationship failed on a foreign key although the repository and both endpoints exist.`,
+      undefined,
+      { cause },
+    );
   }
 
   async getRelationship(

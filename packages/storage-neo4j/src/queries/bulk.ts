@@ -43,10 +43,13 @@
 //     surface — the `BulkImportOptions` interface currently exposes
 //     adaptive-concurrency knobs only; chunk size lives in a private
 //     extension here.)
-//   - Bounded parallelism via `runBounded` — a hand-rolled minimal pool with
+//   - Bounded dispatch via `runBounded` — a hand-rolled minimal pool with
 //     default concurrency 8. Neo4j Community has no throttle signal; the
 //     adaptive-concurrency controller the Cosmos provider needs has no
-//     analog. Chunks complete independently; their results aggregate into a
+//     analog. Every chunk statement write-locks the repository marker, so
+//     the chunks of one repository's import serialise on the server; the
+//     pool overlaps their round-trips and client-side work, not their
+//     writes. Chunks complete independently; their results aggregate into a
 //     single `BulkImportResult` at the end. Per-row errors are collected per
 //     chunk, never swallowed. The first chunk that rejects stops dispatch.
 
@@ -71,8 +74,14 @@ import {
   relationshipFromRecord,
   relationshipToParams,
 } from '../mapping.js';
-import { DeepMemoryError, ProviderError } from '@utaba/deep-memory';
 import {
+  DeepMemoryError,
+  DuplicateRelationshipError,
+  ProviderError,
+  RepositoryNotFoundError,
+} from '@utaba/deep-memory';
+import {
+  isDeletedEntityFailure,
   isMemoryLimitFailure,
   isRowShapedFailure,
   isTransactionMemoryLimit,
@@ -80,6 +89,10 @@ import {
   toTypedError,
   type DriverErrorContext,
 } from '../errors.js';
+import { LOCK_REPOSITORY_MARKER } from './repositoryLock.js';
+
+/** What `Neo4jConnection.executeQuery` resolves to. */
+type QueryResult = Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
 
 /**
  * Streaming-export chunk size. Each yielded `ExportChunk` carries at most
@@ -231,6 +244,16 @@ export async function* exportAll(
 }
 
 // ─── Import — fixed-shape templates ──────────────────────────────────
+//
+// Every template opens with `LOCK_REPOSITORY_MARKER`: the chunk write-locks
+// the `_Repository` marker and writes only while the marker still exists,
+// so a chunk cannot commit after `deleteRepository` has drained the
+// repository (see `repositoryLock.ts`). The lock is held per chunk, so the
+// chunks of one import — and any other create in the repository — serialise
+// on the marker for the length of each chunk's statement. A missing marker
+// writes nothing and the template says so in its result (`written` = 0 for
+// entities, no rows for relationships); the import then stops with
+// `RepositoryNotFoundError`.
 
 /**
  * `INSERT_ENTITIES_QUERY` — `skipExistenceCheck: true` branch. One CREATE
@@ -245,8 +268,11 @@ export async function* exportAll(
  * which keys are populated. The JSON-stringified `properties` blob remains
  * authoritative for `entity.properties` round-trip (per O1); the user-property
  * scalars exist for `findEntities` predicate queries only.
+ *
+ * Returns one row: `written`, the number of rows written — 0 when the
+ * repository marker is missing.
  */
-const INSERT_ENTITIES_QUERY = `
+const INSERT_ENTITIES_QUERY = `${LOCK_REPOSITORY_MARKER}
 UNWIND $rows AS row
 CREATE (n:_Entity)
 SET
@@ -271,6 +297,7 @@ SET
   n.modifiedInConversation = row.modifiedInConversation,
   n.modifiedFromMessage = row.modifiedFromMessage
 SET n += row.userProperties
+RETURN count(*) AS written
 `;
 
 /**
@@ -284,8 +311,10 @@ SET n += row.userProperties
  * coalesce-style upsert semantic. The user-property `SET n += row.userProperties`
  * lives unconditionally so the Cypher string stays fixed; an empty
  * user-property map is a Cypher no-op.
+ *
+ * Returns one row: `written`, as for `INSERT_ENTITIES_QUERY`.
  */
-const UPSERT_ENTITIES_QUERY = `
+const UPSERT_ENTITIES_QUERY = `${LOCK_REPOSITORY_MARKER}
 UNWIND $rows AS row
 MERGE (n:_Entity {repositoryId: $rid, id: row.id})
 ON CREATE SET
@@ -327,81 +356,157 @@ ON MATCH SET
   n.modifiedInConversation = row.modifiedInConversation,
   n.modifiedFromMessage = row.modifiedFromMessage
 SET n += row.userProperties
+RETURN count(*) AS written
+`;
+
+/** Per-row outcome a relationship import template reports. */
+const RELATIONSHIP_ROW_OUTCOME = {
+  written: 'written',
+  endpointMissing: 'endpoint-missing',
+  idExists: 'id-exists',
+} as const;
+
+/**
+ * Head of the insert relationship template: the marker lock, then each
+ * row's endpoints matched under the repository scope. A missing marker
+ * leaves no row to unwind, so the statement returns nothing.
+ */
+const RELATIONSHIP_INSERT_HEAD = `${LOCK_REPOSITORY_MARKER}
+UNWIND $rows AS row
+OPTIONAL MATCH (s:_Entity {repositoryId: $rid, id: row.sourceEntityId})
+OPTIONAL MATCH (t:_Entity {repositoryId: $rid, id: row.targetEntityId})
 `;
 
 /**
- * Build the relationship import Cypher for a given relationship type. Cypher
- * 25 cannot parameterise the relationship-type slot, so each distinct type
- * compiles to its own plan-cache entry. The vocabulary bounds the per-type
- * cardinality (the same trade-off `createRelationship` makes).
+ * Head of the upsert relationship template. After the marker lock it
+ * collects, in one pass over the repository's edges, every edge that already
+ * carries one of the chunk's ids (`held`), then matches each row's
+ * endpoints under the repository scope. `$ids` holds the chunk's row ids.
  *
- * `MATCH (s)` and `MATCH (t)` find the endpoint entities under the repository
- * scope before the edge is created; an endpoint outside the repository fails
- * the match and the row is silently skipped. The skipped row is then surfaced
- * to the caller via the row-count comparison in `importRelationshipChunk` so
- * the import result still reports the missing-endpoint condition.
+ * Relationship ids are unique across every type in the repository, and
+ * Neo4j relationship indexes and constraints cover one type only, so the
+ * lookup is anchored on the repository's entities. Naming the anchor and
+ * requiring `e.id IS NOT NULL` lets the planner seek the `(repositoryId, id)`
+ * unique index for the repository's entities instead of scanning every
+ * `_Entity` in the database, and `repositoryId` on the edge pattern admits
+ * only the repository's own edges. Collecting once per chunk keeps the cost
+ * to one pass over the repository's edges per chunk rather than one per
+ * row. `held` reflects the store before the chunk writes, so the caller
+ * writes a chunk that repeats an id in waves of distinct ids.
+ *
+ * Grouping the collect by `live` keeps a missing marker at zero rows: an
+ * aggregate with a grouping key emits nothing for empty input.
  */
-function buildInsertRelationshipsQuery(relationshipType: string): string {
-  const safe = assertSafeRelationshipType(relationshipType);
-  return `
+const RELATIONSHIP_UPSERT_HEAD = `${LOCK_REPOSITORY_MARKER}
+OPTIONAL MATCH (e:_Entity {repositoryId: $rid})-[held {repositoryId: $rid}]->()
+WHERE e.id IS NOT NULL AND held.id IN $ids
+WITH live, collect(held) AS held
 UNWIND $rows AS row
-MATCH (s:_Entity {repositoryId: $rid, id: row.sourceEntityId})
-MATCH (t:_Entity {repositoryId: $rid, id: row.targetEntityId})
-CREATE (s)-[r:${safe} {
-  repositoryId: $rid,
-  id: row.id,
-  relationshipType: row.relationshipType,
-  sourceEntityId: row.sourceEntityId,
-  targetEntityId: row.targetEntityId,
-  properties: row.properties,
-  bidirectional: row.bidirectional,
-  createdBy: row.createdBy,
-  createdByType: row.createdByType,
-  createdAt: row.createdAt,
-  createdInConversation: row.createdInConversation,
-  createdFromMessage: row.createdFromMessage,
-  modifiedBy: row.modifiedBy,
-  modifiedByType: row.modifiedByType,
-  modifiedAt: row.modifiedAt,
-  modifiedInConversation: row.modifiedInConversation,
-  modifiedFromMessage: row.modifiedFromMessage
-}]->(t)
-RETURN row.id AS id
+OPTIONAL MATCH (s:_Entity {repositoryId: $rid, id: row.sourceEntityId})
+OPTIONAL MATCH (t:_Entity {repositoryId: $rid, id: row.targetEntityId})
+`;
+
+/**
+ * Build the relationship import Cypher for a given relationship type —
+ * `skipExistenceCheck: true` branch. Cypher 25 cannot parameterise the
+ * relationship-type slot, so each distinct type compiles to its own
+ * plan-cache entry. The vocabulary bounds the per-type cardinality (the same
+ * trade-off `createRelationship` makes).
+ *
+ * Each row reports its outcome: `written`, or `endpoint-missing` (the source
+ * or target is not in the repository — an endpoint in another repository
+ * fails the scoped match the same way). Only a `written` row is created. A
+ * missing repository marker returns no rows at all.
+ *
+ * The statement does not look for the row's id among the repository's
+ * existing edges: with `skipExistenceCheck: true` the caller vouches that
+ * its ids are new to the store, and checking each chunk against every edge
+ * in the repository would make a large import quadratic. `importBulk` still
+ * refuses an id repeated within the one call.
+ */
+export function buildInsertRelationshipsQuery(relationshipType: string): string {
+  const safe = assertSafeRelationshipType(relationshipType);
+  const o = RELATIONSHIP_ROW_OUTCOME;
+  return `${RELATIONSHIP_INSERT_HEAD}
+WITH row, s, t,
+  CASE
+    WHEN s IS NULL OR t IS NULL THEN '${o.endpointMissing}'
+    ELSE '${o.written}'
+  END AS outcome
+FOREACH (_ IN CASE WHEN outcome = '${o.written}' THEN [1] ELSE [] END |
+  CREATE (s)-[r:${safe} {
+    repositoryId: $rid,
+    id: row.id,
+    relationshipType: row.relationshipType,
+    sourceEntityId: row.sourceEntityId,
+    targetEntityId: row.targetEntityId,
+    properties: row.properties,
+    bidirectional: row.bidirectional,
+    createdBy: row.createdBy,
+    createdByType: row.createdByType,
+    createdAt: row.createdAt,
+    createdInConversation: row.createdInConversation,
+    createdFromMessage: row.createdFromMessage,
+    modifiedBy: row.modifiedBy,
+    modifiedByType: row.modifiedByType,
+    modifiedAt: row.modifiedAt,
+    modifiedInConversation: row.modifiedInConversation,
+    modifiedFromMessage: row.modifiedFromMessage
+  }]->(t)
+)
+RETURN row.id AS id, outcome
 `;
 }
 
-function buildUpsertRelationshipsQuery(relationshipType: string): string {
+/**
+ * `skipExistenceCheck: false` branch: as `buildInsertRelationshipsQuery`,
+ * but the row MERGEs on `(source)-[type {repositoryId, id}]->(target)`, so
+ * re-importing an edge updates it in place. The statement checks the row's
+ * id against the repository's existing edges (`held`, see
+ * `RELATIONSHIP_UPSERT_HEAD`): the id counts as in use — and the row is
+ * refused with `id-exists` — when an edge carrying it is not the one the
+ * MERGE would match, i.e. it has a different type or different endpoints.
+ */
+export function buildUpsertRelationshipsQuery(relationshipType: string): string {
   const safe = assertSafeRelationshipType(relationshipType);
-  return `
-UNWIND $rows AS row
-MATCH (s:_Entity {repositoryId: $rid, id: row.sourceEntityId})
-MATCH (t:_Entity {repositoryId: $rid, id: row.targetEntityId})
-MERGE (s)-[r:${safe} {repositoryId: $rid, id: row.id}]->(t)
-ON CREATE SET
-  r.relationshipType = row.relationshipType,
-  r.sourceEntityId = row.sourceEntityId,
-  r.targetEntityId = row.targetEntityId,
-  r.properties = row.properties,
-  r.bidirectional = row.bidirectional,
-  r.createdBy = row.createdBy,
-  r.createdByType = row.createdByType,
-  r.createdAt = row.createdAt,
-  r.createdInConversation = row.createdInConversation,
-  r.createdFromMessage = row.createdFromMessage,
-  r.modifiedBy = row.modifiedBy,
-  r.modifiedByType = row.modifiedByType,
-  r.modifiedAt = row.modifiedAt,
-  r.modifiedInConversation = row.modifiedInConversation,
-  r.modifiedFromMessage = row.modifiedFromMessage
-ON MATCH SET
-  r.properties = row.properties,
-  r.bidirectional = row.bidirectional,
-  r.modifiedBy = row.modifiedBy,
-  r.modifiedByType = row.modifiedByType,
-  r.modifiedAt = row.modifiedAt,
-  r.modifiedInConversation = row.modifiedInConversation,
-  r.modifiedFromMessage = row.modifiedFromMessage
-RETURN row.id AS id
+  const o = RELATIONSHIP_ROW_OUTCOME;
+  return `${RELATIONSHIP_UPSERT_HEAD}
+WITH row, s, t,
+  CASE
+    WHEN s IS NULL OR t IS NULL THEN '${o.endpointMissing}'
+    WHEN any(x IN held WHERE x.id = row.id
+      AND NOT (type(x) = row.relationshipType AND startNode(x) = s AND endNode(x) = t))
+      THEN '${o.idExists}'
+    ELSE '${o.written}'
+  END AS outcome
+FOREACH (_ IN CASE WHEN outcome = '${o.written}' THEN [1] ELSE [] END |
+  MERGE (s)-[r:${safe} {repositoryId: $rid, id: row.id}]->(t)
+  ON CREATE SET
+    r.relationshipType = row.relationshipType,
+    r.sourceEntityId = row.sourceEntityId,
+    r.targetEntityId = row.targetEntityId,
+    r.properties = row.properties,
+    r.bidirectional = row.bidirectional,
+    r.createdBy = row.createdBy,
+    r.createdByType = row.createdByType,
+    r.createdAt = row.createdAt,
+    r.createdInConversation = row.createdInConversation,
+    r.createdFromMessage = row.createdFromMessage,
+    r.modifiedBy = row.modifiedBy,
+    r.modifiedByType = row.modifiedByType,
+    r.modifiedAt = row.modifiedAt,
+    r.modifiedInConversation = row.modifiedInConversation,
+    r.modifiedFromMessage = row.modifiedFromMessage
+  ON MATCH SET
+    r.properties = row.properties,
+    r.bidirectional = row.bidirectional,
+    r.modifiedBy = row.modifiedBy,
+    r.modifiedByType = row.modifiedByType,
+    r.modifiedAt = row.modifiedAt,
+    r.modifiedInConversation = row.modifiedInConversation,
+    r.modifiedFromMessage = row.modifiedFromMessage
+)
+RETURN row.id AS id, outcome
 `;
 }
 
@@ -411,10 +516,33 @@ RETURN row.id AS id
  * Run a bulk import. Returns a single aggregate result spanning every chunk
  * and every entity / relationship row across the entire input.
  *
- * Concurrency: chunks within a phase (entities or relationships) run through
- * a bounded pool. Entities are imported strictly before relationships across
- * the whole input — relationship MATCH on the source/target entities requires
- * those entities to exist, so cross-phase parallelism is not safe.
+ * Concurrency: chunks within a phase (entities or relationships) are
+ * dispatched through a bounded pool. Every chunk statement write-locks the
+ * repository marker, so the chunks of one repository's import serialise on
+ * that lock as they reach the server — the pool overlaps client-side work
+ * and round-trips, not the writes themselves. Entities are imported strictly
+ * before relationships across the whole input — relationship MATCH on the
+ * source/target entities requires those entities to exist, so cross-phase
+ * parallelism is not safe.
+ *
+ * Relationship ids:
+ * - `skipExistenceCheck: true` (insert) trusts the caller that its ids are
+ *   not already in the store; the statement does not look. An id repeated
+ *   within the one call is refused: its first occurrence is attempted, and
+ *   each later one is recorded with `RELATIONSHIP_ALREADY_EXISTS` whatever
+ *   the first occurrence's outcome.
+ * - `skipExistenceCheck: false` (upsert) checks each id against the
+ *   repository's existing edges, whatever their type. An edge with the same
+ *   id, type and endpoints is updated in place; one whose type or endpoints
+ *   differ makes the row fail with `RELATIONSHIP_ALREADY_EXISTS`. The
+ *   endpoints are checked before the id, because telling "the same edge"
+ *   from "another edge" needs the bound source and target: a row with a
+ *   missing endpoint reports `ENTITY_NOT_FOUND` even when its id is in use.
+ *   An id repeated within one chunk is applied in input order, each
+ *   occurrence meeting the edge the one before it wrote. Occurrences in
+ *   different chunks (a different type, or more than a chunk apart) are
+ *   applied in no defined order, but each still meets the others' writes,
+ *   so the id never ends up on two edges.
  *
  * Error policy:
  * - A row the mapping refuses (an unsafe or reserved property key, a
@@ -426,6 +554,25 @@ RETURN row.id AS id
  *   failing row is recorded with its `code`. A single row over the
  *   per-transaction memory limit is a row error; an exhausted server-wide
  *   memory pool is a store failure.
+ * - A relationship whose source or target is not in the repository is
+ *   recorded with `ENTITY_NOT_FOUND`; one refused for its id (see above)
+ *   with `RELATIONSHIP_ALREADY_EXISTS`. Neither is written, and the rest of
+ *   the chunk still lands.
+ * - A chunk refused with `Neo.ClientError.Statement.EntityNotFound` (a node
+ *   it locked or matched was deleted by a concurrent transaction while it
+ *   waited) is retried row by row: each re-run reads the committed state, so
+ *   a deleted endpoint becomes an `ENTITY_NOT_FOUND` row and a deleted
+ *   marker stops the import (below). A single row still refused that way is
+ *   recorded with `ENTITY_NOT_FOUND` once a read confirms the marker is
+ *   still there.
+ * - A missing repository marker — the repository does not exist, or was
+ *   deleted while the import ran — stops the import with
+ *   `RepositoryNotFoundError`.
+ *
+ * `result.errors` lists entity rows before relationship rows. Among the
+ * relationships, the repeats an insert refuses come first, then each
+ * chunk's failures in chunk order (chunks are grouped by type), so the list
+ * is not in input order; each record's `item` names its row.
  * - Any other failure — a `QueryTimeoutError`, an unavailable or expired
  *   connection — means the store itself is failing: retrying every row would
  *   multiply the load and hide the cause, so the import stops dispatching
@@ -478,7 +625,20 @@ export async function importBulk(
     errors.push(...res.errors);
   }
 
-  const relationshipChunks = groupRelationshipsByTypeIntoChunks(allRelationships, chunkSize);
+  // Insert mode keeps a repeated id out of the store here, because its
+  // statement does not check ids: the first occurrence goes on to be
+  // attempted and every later one is refused, whether or not the first is
+  // written. Upsert's statement handles repeats.
+  let relationshipsToWrite = allRelationships;
+  if (skipCheck) {
+    const split = splitRepeatedIds(allRelationships);
+    relationshipsToWrite = split.first;
+    for (const rel of split.repeats) {
+      errors.push(refusedRow(`relationship:${rel.id}`, new DuplicateRelationshipError(rel.id)));
+    }
+  }
+
+  const relationshipChunks = groupRelationshipsByTypeIntoChunks(relationshipsToWrite, chunkSize);
   const relationshipResults = await runBounded(
     relationshipChunks,
     concurrency,
@@ -517,13 +677,51 @@ interface ImportRun {
 
 /**
  * After a whole-chunk write fails: rethrow `error` as a typed error unless
- * writing the rows one at a time can help — a row-shaped failure, or the
- * chunk running out of transaction memory (a single row needs far less).
+ * writing the rows one at a time can help — a row-shaped failure, the chunk
+ * running out of transaction memory (a single row needs far less), or a node
+ * the chunk touched being deleted while it waited (each re-run reads the
+ * committed state and reports the missing endpoint or marker as an outcome).
  */
 function rethrowUnlessChunkCanFallBack(error: unknown): void {
-  if (!isRowShapedFailure(error) && !isMemoryLimitFailure(error)) {
+  if (!isRowShapedFailure(error) && !isMemoryLimitFailure(error) && !isDeletedEntityFailure(error)) {
     mapDriverError(error, { operation: 'importBulk' });
   }
+}
+
+/**
+ * Reads whether the repository marker exists, after a single-row write was
+ * refused on a node a concurrent transaction deleted. The refusal does not
+ * name the node, and a deleted marker must stop the import rather than be
+ * recorded against the row.
+ */
+const REPOSITORY_MARKER_EXISTS_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+RETURN repo IS NOT NULL AS repositoryExists
+`;
+
+/**
+ * The row error for a single-row write refused because a node it touched was
+ * deleted by a concurrent transaction. Throws `RepositoryNotFoundError` when
+ * that node was the repository marker, which stops the import as a missing
+ * marker does anywhere else in it.
+ */
+async function deletedNodeRowError(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  item: string,
+  detail: string,
+): Promise<BulkImportItemError> {
+  let check: QueryResult;
+  try {
+    check = await conn.executeQuery(REPOSITORY_MARKER_EXISTS_QUERY, {}, { repositoryId });
+  } catch (err) {
+    mapDriverError(err, { operation: 'importBulk' });
+  }
+  const exists: unknown = check.records[0]?.get('repositoryExists');
+  if (typeof exists !== 'boolean') {
+    throw new ProviderError('Neo4j import repository check returned no row.');
+  }
+  if (!exists) throw new RepositoryNotFoundError(repositoryId);
+  return { item, error: `${detail} was deleted by a concurrent transaction`, code: 'ENTITY_NOT_FOUND' };
 }
 
 /**
@@ -579,14 +777,28 @@ async function importEntityChunk(
   if (prepared.length === 0) return { imported: 0, errors };
   const query = skipCheck ? INSERT_ENTITIES_QUERY : UPSERT_ENTITIES_QUERY;
 
+  let result: QueryResult;
   try {
-    await conn.executeQuery(query, { rows: prepared.map((row) => row.params) }, { repositoryId });
-    return { imported: prepared.length, errors };
+    result = await conn.executeQuery(query, { rows: prepared.map((row) => row.params) }, { repositoryId });
   } catch (err) {
     rethrowUnlessChunkCanFallBack(err);
     const fallback = await fallbackPerEntity(conn, repositoryId, prepared, query, run);
     return { imported: fallback.imported, errors: [...errors, ...fallback.errors] };
   }
+  assertEntityRowsWritten(result, repositoryId);
+  return { imported: prepared.length, errors };
+}
+
+/**
+ * The entity templates report `written`, the rows the statement wrote. Zero
+ * for a non-empty chunk means the repository marker was missing.
+ */
+function assertEntityRowsWritten(result: QueryResult, repositoryId: string): void {
+  const written = result.records[0]?.get('written');
+  if (written === undefined || written === null) {
+    throw new ProviderError('Neo4j entity import returned no written count.');
+  }
+  if (bigintToSafeNumber(written) === 0) throw new RepositoryNotFoundError(repositoryId);
 }
 
 /** A row to import, paired with the Cypher params built from it. */
@@ -601,7 +813,8 @@ interface PreparedRow<T> {
  * row-by-row so the rows that would have succeeded still land. The per-row
  * path is slower per call but only runs when a chunk actually failed. A
  * store failure on any row stops the fallback and propagates; so does a
- * failure in a sibling chunk (the fallback stops at its next row).
+ * failure in a sibling chunk (the fallback stops at its next row), and so
+ * does a missing repository.
  */
 async function fallbackPerEntity(
   conn: Neo4jConnection,
@@ -614,10 +827,21 @@ async function fallbackPerEntity(
   let imported = 0;
   for (const { item: entity, params } of prepared) {
     if (run.stopped) break;
+    let result: QueryResult;
     try {
-      await conn.executeQuery(query, { rows: [params] }, { repositoryId });
-      imported++;
+      result = await conn.executeQuery(query, { rows: [params] }, { repositoryId });
     } catch (rowErr) {
+      if (isDeletedEntityFailure(rowErr)) {
+        errors.push(
+          await deletedNodeRowError(
+            conn,
+            repositoryId,
+            `entity:${entity.id}`,
+            `a node the row for entity "${entity.id}" touches`,
+          ),
+        );
+        continue;
+      }
       rethrowUnlessRowFailure(rowErr);
       errors.push(
         rowError(`entity:${entity.id}`, rowErr, {
@@ -628,7 +852,10 @@ async function fallbackPerEntity(
           label: entity.label,
         }),
       );
+      continue;
     }
+    assertEntityRowsWritten(result, repositoryId);
+    imported++;
   }
   return { imported, errors };
 }
@@ -661,22 +888,37 @@ async function importRelationshipChunk(
   // only per-edge fields.
   const prepared = group.rows.map((rel) => ({ item: rel, params: relationshipToParams(rel) }));
 
-  try {
-    const result = await conn.executeQuery(query, { rows: prepared.map((row) => row.params) }, { repositoryId });
-    const importedIds = new Set<string>();
-    for (const record of result.records) {
-      const id = record.get('id');
-      if (typeof id === 'string') importedIds.add(id);
+  // The upsert statement's id check sees the store as it was before the
+  // statement, so an upsert chunk that repeats an id is written in waves of
+  // distinct ids: a repeat then meets the edge its first occurrence wrote,
+  // exactly as it would in another chunk. Waves keep input order within the
+  // chunk; chunks themselves complete in no defined order, but the marker
+  // lock serialises them, so each meets the others' writes. Insert chunks
+  // never repeat an id (`importBulk` refuses repeats up front) and are
+  // written in one go.
+  const waves = skipCheck ? [prepared] : wavesOfDistinctIds(prepared);
+  let imported = 0;
+  const errors: BulkImportItemError[] = [];
+  for (const wave of waves) {
+    if (run.stopped) break;
+    let result: QueryResult;
+    try {
+      result = await conn.executeQuery(query, relationshipChunkParams(wave, skipCheck), { repositoryId });
+    } catch (err) {
+      rethrowUnlessChunkCanFallBack(err);
+      const fallback = await fallbackPerRelationship(conn, repositoryId, wave, query, skipCheck, run);
+      imported += fallback.imported;
+      errors.push(...fallback.errors);
+      continue;
     }
-    const errors: BulkImportItemError[] = [];
-    for (const rel of group.rows) {
-      if (!importedIds.has(rel.id)) errors.push(missingEndpointError(rel));
+    const outcomes = relationshipRowOutcomes(result, wave, repositoryId);
+    for (const { item: rel } of wave) {
+      const rowFailure = relationshipRowFailure(rel, outcomes.get(rel.id));
+      if (rowFailure === undefined) imported++;
+      else errors.push(rowFailure);
     }
-    return { imported: importedIds.size, errors };
-  } catch (err) {
-    rethrowUnlessChunkCanFallBack(err);
-    return fallbackPerRelationship(conn, repositoryId, prepared, query, run);
   }
+  return { imported, errors };
 }
 
 async function fallbackPerRelationship(
@@ -684,20 +926,29 @@ async function fallbackPerRelationship(
   repositoryId: string,
   prepared: ReadonlyArray<PreparedRow<StoredRelationship>>,
   query: string,
+  skipCheck: boolean,
   run: ImportRun,
 ): Promise<ChunkResult> {
   const errors: BulkImportItemError[] = [];
   let imported = 0;
-  for (const { item: rel, params } of prepared) {
+  for (const row of prepared) {
     if (run.stopped) break;
+    const rel = row.item;
+    let result: QueryResult;
     try {
-      const result = await conn.executeQuery(query, { rows: [params] }, { repositoryId });
-      if (result.records.length === 1) {
-        imported++;
-      } else {
-        errors.push(missingEndpointError(rel));
-      }
+      result = await conn.executeQuery(query, relationshipChunkParams([row], skipCheck), { repositoryId });
     } catch (rowErr) {
+      if (isDeletedEntityFailure(rowErr)) {
+        errors.push(
+          await deletedNodeRowError(
+            conn,
+            repositoryId,
+            `relationship:${rel.id}`,
+            `an endpoint (source=${rel.sourceEntityId}, target=${rel.targetEntityId})`,
+          ),
+        );
+        continue;
+      }
       rethrowUnlessRowFailure(rowErr);
       errors.push(
         rowError(`relationship:${rel.id}`, rowErr, {
@@ -705,9 +956,119 @@ async function fallbackPerRelationship(
           relationshipId: rel.id,
         }),
       );
+      continue;
     }
+    const rowFailure = relationshipRowFailure(rel, relationshipRowOutcomes(result, [row], repositoryId).get(rel.id));
+    if (rowFailure === undefined) imported++;
+    else errors.push(rowFailure);
   }
   return { imported, errors };
+}
+
+/**
+ * Params for a relationship template: the rows, plus — for the upsert
+ * template, which checks ids against the store — their ids.
+ */
+function relationshipChunkParams(
+  rows: ReadonlyArray<PreparedRow<StoredRelationship>>,
+  skipCheck: boolean,
+): Record<string, unknown> {
+  const params: Record<string, unknown> = { rows: rows.map((row) => row.params) };
+  if (!skipCheck) params['ids'] = rows.map((row) => row.item.id);
+  return params;
+}
+
+/**
+ * Split relationships into the first occurrence of each id, in input order,
+ * and every later occurrence.
+ */
+function splitRepeatedIds(
+  relationships: readonly StoredRelationship[],
+): { first: StoredRelationship[]; repeats: StoredRelationship[] } {
+  const seen = new Set<string>();
+  const first: StoredRelationship[] = [];
+  const repeats: StoredRelationship[] = [];
+  for (const rel of relationships) {
+    if (seen.has(rel.id)) {
+      repeats.push(rel);
+    } else {
+      seen.add(rel.id);
+      first.push(rel);
+    }
+  }
+  return { first, repeats };
+}
+
+/**
+ * Split rows into consecutive waves in which every id appears once,
+ * preserving order. A chunk without repeated ids is a single wave.
+ */
+function wavesOfDistinctIds<T extends PreparedRow<StoredRelationship>>(rows: readonly T[]): T[][] {
+  const waves: T[][] = [];
+  const seenPerWave: Array<Set<string>> = [];
+  for (const row of rows) {
+    let index = seenPerWave.findIndex((seen) => !seen.has(row.item.id));
+    if (index === -1) {
+      index = waves.length;
+      waves.push([]);
+      seenPerWave.push(new Set());
+    }
+    waves[index]!.push(row);
+    seenPerWave[index]!.add(row.item.id);
+  }
+  return waves;
+}
+
+type RelationshipRowOutcome = (typeof RELATIONSHIP_ROW_OUTCOME)[keyof typeof RELATIONSHIP_ROW_OUTCOME];
+
+const RELATIONSHIP_ROW_OUTCOMES: ReadonlySet<string> = new Set(Object.values(RELATIONSHIP_ROW_OUTCOME));
+
+function isRelationshipRowOutcome(value: unknown): value is RelationshipRowOutcome {
+  return typeof value === 'string' && RELATIONSHIP_ROW_OUTCOMES.has(value);
+}
+
+/**
+ * Each row's outcome from a relationship template, keyed by id (ids are
+ * distinct within one statement). No rows at all for a non-empty statement
+ * means the repository marker was missing; a row whose outcome is not one
+ * the template emits is a fault below the data model.
+ */
+function relationshipRowOutcomes(
+  result: QueryResult,
+  rows: ReadonlyArray<PreparedRow<StoredRelationship>>,
+  repositoryId: string,
+): Map<string, RelationshipRowOutcome> {
+  if (rows.length > 0 && result.records.length === 0) throw new RepositoryNotFoundError(repositoryId);
+  const outcomes = new Map<string, RelationshipRowOutcome>();
+  for (const record of result.records) {
+    const id: unknown = record.get('id');
+    const outcome: unknown = record.get('outcome');
+    if (typeof id !== 'string' || !isRelationshipRowOutcome(outcome)) {
+      throw new ProviderError(
+        `Neo4j relationship import returned an unrecognised row ` +
+          `(id ${JSON.stringify(id ?? null)}, outcome ${JSON.stringify(outcome ?? null)}).`,
+      );
+    }
+    outcomes.set(id, outcome);
+  }
+  return outcomes;
+}
+
+/** The row error for a relationship row's outcome, or `undefined` when it was written. */
+function relationshipRowFailure(
+  rel: StoredRelationship,
+  outcome: RelationshipRowOutcome | undefined,
+): BulkImportItemError | undefined {
+  switch (outcome) {
+    case RELATIONSHIP_ROW_OUTCOME.written:
+      return undefined;
+    case RELATIONSHIP_ROW_OUTCOME.endpointMissing:
+      return missingEndpointError(rel);
+    case RELATIONSHIP_ROW_OUTCOME.idExists:
+      return refusedRow(`relationship:${rel.id}`, new DuplicateRelationshipError(rel.id));
+    case undefined:
+      throw new ProviderError(`Neo4j relationship import returned no outcome for relationship "${rel.id}".`);
+  }
 }
 
 /** Row record for a relationship whose source or target is not in the repository. */

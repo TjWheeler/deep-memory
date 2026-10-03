@@ -7,7 +7,13 @@ import {
   ProviderError,
   SlugConflictError,
 } from '@utaba/deep-memory';
-import { importFailure, mapUniqueViolation, readUniqueViolation, UNIQUE_KEYS_BY_TABLE } from './errors.js';
+import {
+  importFailure,
+  isForeignKeyViolation,
+  mapUniqueViolation,
+  readUniqueViolation,
+  UNIQUE_KEYS_BY_TABLE,
+} from './errors.js';
 import { getSchemaSQL } from './schema.js';
 
 /** Mirror of the `mssql` RequestError surface: `number` and `message` copied from the server. */
@@ -70,6 +76,19 @@ describe('readUniqueViolation', () => {
     expect(readUniqueViolation(sqlError(547, 'The INSERT statement conflicted with the FOREIGN KEY constraint'))).toBeUndefined();
     expect(readUniqueViolation(new Error('Connection lost'))).toBeUndefined();
     expect(readUniqueViolation(null)).toBeUndefined();
+  });
+});
+
+describe('isForeignKeyViolation', () => {
+  it('recognises error 547 on the RequestError and on the driver info', () => {
+    expect(isForeignKeyViolation(sqlError(547, 'The INSERT statement conflicted with the FOREIGN KEY constraint'))).toBe(true);
+    expect(isForeignKeyViolation({ originalError: { info: { number: 547, message: 'localised text' } } })).toBe(true);
+  });
+
+  it('is false for a unique-key violation and for anything that is not a SQL Server error', () => {
+    expect(isForeignKeyViolation(RELATIONSHIP_PK_VIOLATION)).toBe(false);
+    expect(isForeignKeyViolation(new Error('boom'))).toBe(false);
+    expect(isForeignKeyViolation(null)).toBe(false);
   });
 });
 

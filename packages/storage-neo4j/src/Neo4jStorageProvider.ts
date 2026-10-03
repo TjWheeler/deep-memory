@@ -163,10 +163,10 @@ export interface Neo4jStorageProviderConfig extends Neo4jConnectionConfig {
   /**
    * When `true`, prepend `PROFILE` to every compiled traversal query and
    * surface the resulting plan summary under `details.profile` on the sink
-   * record. Defaults to `false` — `PROFILE` more than doubles wall-clock on
-   * short traversals (see plan §D14 and the Phase 9 probe results), so the
-   * cost is worth paying only when an operator is actively investigating
-   * planner behaviour.
+   * record. Defaults to `false` — `PROFILE` records per-operator row counts
+   * and db hits while the query runs, which more than doubles wall-clock on
+   * short traversals, so the cost is worth paying only when an operator is
+   * actively investigating planner behaviour.
    */
   profileTraversals?: boolean;
 }
@@ -391,12 +391,11 @@ export class Neo4jStorageProvider {
    *   - an existing `_Repository` → `DuplicateRepositoryError`;
    *   - a `_Vocabulary` or any `_Entity` with no `_Repository` →
    *     `ProviderError`. That state means a `deleteRepository` removed the
-   *     marker but did not finish its chunked wipe (or a create racing the
-   *     wipe committed after it); creating on top of it would leave two
-   *     vocabularies or the old repository's data under the new one.
-   *     Re-running `deleteRepository` finishes the wipe, and the message says
-   *     so because tool surfaces may drop the suggestion. The entity check is
-   *     an `EXISTS` subquery, which stops at the first match.
+   *     marker but did not finish its chunked wipe; creating on top of it
+   *     would leave two vocabularies or the old repository's data under the
+   *     new one. Re-running `deleteRepository` finishes the wipe, and the
+   *     message says so because tool surfaces may drop the suggestion. The
+   *     entity check is an `EXISTS` subquery, which stops at the first match.
    *
    * Two concurrent creates can both pass the existence check; the
    * `(:_Repository) REQUIRE n.repositoryId IS UNIQUE` constraint then fails
@@ -608,13 +607,14 @@ export class Neo4jStorageProvider {
    * `_Repository` node itself:
    *
    *   1. Delete the `_Repository` marker node in its own statement. The
-   *      chunked wipe below spans many transactions, and entity /
-   *      relationship creates are guarded on the marker in the same
-   *      statement, so removing it first makes later creates fail with
-   *      `RepositoryNotFoundError` instead of landing an orphan after the
-   *      chunk that would have removed it. A create already executing when
-   *      the marker is deleted can still commit after the wipe; re-running
-   *      deleteRepository removes it.
+   *      chunked wipe below spans many transactions, so the marker is what
+   *      keeps new data out of it. Entity and relationship creates and bulk
+   *      import chunks write-lock the marker in the same statement as their
+   *      write and go on only while it still exists. Deleting the marker
+   *      takes the same lock, so this step waits for any create already
+   *      holding it to commit (the drains below then remove what it wrote),
+   *      and every create after it fails with `RepositoryNotFoundError`. No
+   *      create can commit after the drains.
    *   2. Drain relationships in batches via `CALL ( ) { ... } IN TRANSACTIONS`.
    *   3. Drain `_Entity` nodes in batches via the same form with
    *      `DETACH DELETE` (catches any straggler edges).
@@ -1066,12 +1066,14 @@ export class Neo4jStorageProvider {
   // ─── Relationships ─────────────────────────────────────────────────
 
   /**
-   * Create a relationship. The `_Repository` node and both endpoint entities
-   * are matched under the repository scope before the edge is created, so
-   * cross-repository edges are structurally impossible to write (D3b layer 3)
-   * and nothing lands once the repository is deleted. A missing repository
-   * surfaces as `RepositoryNotFoundError`; a missing endpoint as
-   * `EntityNotFoundError` carrying the absent id.
+   * Create a relationship. The statement write-locks the `_Repository` node,
+   * then matches both endpoint entities under the repository scope before
+   * the edge is created. The scope check lives in the statement itself, so
+   * no caller can write a cross-repository edge, and nothing lands once the
+   * repository is deleted. A missing repository surfaces as `RepositoryNotFoundError`;
+   * a missing endpoint as `EntityNotFoundError` carrying the absent id; an
+   * id already used by any relationship in the repository, whatever its
+   * type, as `DuplicateRelationshipError`.
    */
   public async createRelationship(
     repositoryId: string,

@@ -7,6 +7,7 @@ import type {
 } from '@utaba/deep-memory/types';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
 import { importBulk, runBounded } from './bulk.js';
+import { LOCK_REPOSITORY_MARKER } from './repositoryLock.js';
 
 const RID = 'repo-bulk';
 const CONSTRAINT_VIOLATION = 'Neo.ClientError.Schema.ConstraintValidationFailed';
@@ -61,9 +62,32 @@ interface Row {
   id: string;
 }
 
+type RowOutcome = 'written' | 'endpoint-missing' | 'id-exists';
+
+/** A driver record exposing `fields` through `get`. */
+function record(fields: Record<string, unknown>): { get: (key: string) => unknown } {
+  return { get: (key: string) => fields[key] };
+}
+
+/**
+ * The records a template returns when the repository marker exists: the
+ * entity templates report how many rows they wrote, the relationship
+ * templates one outcome per row.
+ */
+function successRecords(
+  cypher: string,
+  rows: Row[],
+  outcomeOf: (row: Row) => RowOutcome = () => 'written',
+): Array<{ get: (key: string) => unknown }> {
+  if (cypher.includes('AS outcome')) {
+    return rows.map((row) => record({ id: row.id, outcome: outcomeOf(row) }));
+  }
+  return [record({ written: BigInt(rows.length) })];
+}
+
 /**
  * Connection fake: `respond` decides, per call, whether the statement
- * succeeds (returning one record per row id) or throws.
+ * succeeds (returning the template's success records) or throws.
  */
 function fakeConnection(respond: (rows: Row[], call: number) => Error | undefined): {
   conn: Neo4jConnection;
@@ -71,11 +95,11 @@ function fakeConnection(respond: (rows: Row[], call: number) => Error | undefine
 } {
   const calls: Row[][] = [];
   const fake = {
-    async executeQuery(_cypher: string, params: { rows: Row[] }) {
+    async executeQuery(cypher: string, params: { rows: Row[] }) {
       calls.push(params.rows);
       const failure = respond(params.rows, calls.length);
       if (failure !== undefined) throw failure;
-      return { records: params.rows.map((row) => ({ get: () => row.id })) };
+      return { records: successRecords(cypher, params.rows) };
     },
   };
   return { conn: fake as unknown as Neo4jConnection, calls };
@@ -190,11 +214,11 @@ describe('importBulk failure handling', () => {
   });
 
   it('records a relationship whose endpoint is missing with ENTITY_NOT_FOUND', async () => {
-    const calls: Row[][] = [];
     const fake = {
-      async executeQuery(_cypher: string, params: { rows: Row[] }) {
-        calls.push(params.rows);
-        return { records: params.rows.filter((row) => row.id !== 'r2').map((row) => ({ get: () => row.id })) };
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
+        return {
+          records: successRecords(cypher, params.rows, (row) => (row.id === 'r2' ? 'endpoint-missing' : 'written')),
+        };
       },
     };
 
@@ -209,6 +233,226 @@ describe('importBulk failure handling', () => {
     expect(result.errors).toEqual([
       { item: 'relationship:r2', code: 'ENTITY_NOT_FOUND', error: expect.stringContaining('endpoint not found') },
     ]);
+  });
+
+  it('records an upserted relationship whose id is already in use with RELATIONSHIP_ALREADY_EXISTS', async () => {
+    const fake = {
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
+        return {
+          records: successRecords(cypher, params.rows, (row) => (row.id === 'r1' ? 'id-exists' : 'written')),
+        };
+      },
+    };
+
+    const result = await importBulk(
+      fake as unknown as Neo4jConnection,
+      RID,
+      [{ relationships: [relationship('r1'), relationship('r2')] }],
+      options(10, 1, false),
+    );
+
+    expect(result.relationshipsImported).toBe(1);
+    expect(result.errors).toEqual([
+      {
+        item: 'relationship:r1',
+        code: 'RELATIONSHIP_ALREADY_EXISTS',
+        error: expect.stringContaining('"r1" already exists'),
+      },
+    ]);
+  });
+
+  it('sends an upsert chunk its row ids for the id check, and an insert chunk none', async () => {
+    const sent: Array<{ skip: boolean; ids: unknown }> = [];
+    for (const skip of [false, true]) {
+      const fake = {
+        async executeQuery(cypher: string, params: { rows: Row[]; ids?: unknown }) {
+          sent.push({ skip, ids: params.ids });
+          return { records: successRecords(cypher, params.rows) };
+        },
+      };
+      await importBulk(
+        fake as unknown as Neo4jConnection,
+        RID,
+        [{ relationships: [relationship('r1'), relationship('r2')] }],
+        options(10, 1, skip),
+      );
+    }
+
+    expect(sent).toEqual([
+      { skip: false, ids: ['r1', 'r2'] },
+      { skip: true, ids: undefined },
+    ]);
+  });
+
+  it('checks ids in the upsert template only, anchored on the repository entities index', async () => {
+    const cyphers = new Map<boolean, string>();
+    for (const skip of [false, true]) {
+      const fake = {
+        async executeQuery(cypher: string, params: { rows: Row[] }) {
+          if (cypher.includes('AS outcome')) cyphers.set(skip, cypher);
+          return { records: successRecords(cypher, params.rows) };
+        },
+      };
+      await importBulk(fake as unknown as Neo4jConnection, RID, [{ relationships: [relationship('r1')] }], options(10, 1, skip));
+    }
+
+    const upsert = cyphers.get(false)!;
+    expect(upsert).toContain(
+      'OPTIONAL MATCH (e:_Entity {repositoryId: $rid})-[held {repositoryId: $rid}]->()\n' +
+        'WHERE e.id IS NOT NULL AND held.id IN $ids',
+    );
+    expect(upsert).toContain('MERGE (s)-[r:KNOWS {repositoryId: $rid, id: row.id}]->(t)');
+    const insert = cyphers.get(true)!;
+    expect(insert).not.toContain('held');
+    expect(insert).not.toContain('$ids');
+    expect(insert).toContain('CREATE (s)-[r:KNOWS {');
+  });
+
+  it('refuses an id repeated within one insert call: the first occurrence is written, later ones are row errors', async () => {
+    const calls: string[][] = [];
+    const fake = {
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
+        calls.push(params.rows.map((row) => row.id));
+        return { records: successRecords(cypher, params.rows) };
+      },
+    };
+
+    const result = await importBulk(
+      fake as unknown as Neo4jConnection,
+      RID,
+      [
+        { relationships: [relationship('r1'), relationship('r2')] },
+        { relationships: [relationship('r1'), relationship('r3'), relationship('r1')] },
+      ],
+      options(2),
+    );
+
+    // No waves in insert mode: each chunk goes to the store once, without the repeats.
+    expect(calls).toEqual([['r1', 'r2'], ['r3']]);
+    expect(result.relationshipsImported).toBe(3);
+    expect(result.errors).toEqual([
+      expect.objectContaining({ item: 'relationship:r1', code: 'RELATIONSHIP_ALREADY_EXISTS' }),
+      expect.objectContaining({ item: 'relationship:r1', code: 'RELATIONSHIP_ALREADY_EXISTS' }),
+    ]);
+  });
+
+  it('writes an upsert chunk that repeats an id in waves, so the repeat meets the first write', async () => {
+    const written = new Set<string>();
+    const calls: string[][] = [];
+    const fake = {
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
+        calls.push(params.rows.map((row) => row.id));
+        // The store refuses the repeat, as it does when its type or endpoints differ.
+        const records = successRecords(cypher, params.rows, (row) => (written.has(row.id) ? 'id-exists' : 'written'));
+        for (const row of params.rows) written.add(row.id);
+        return { records };
+      },
+    };
+
+    const result = await importBulk(
+      fake as unknown as Neo4jConnection,
+      RID,
+      [{ relationships: [relationship('r1'), relationship('r2'), relationship('r1')] }],
+      options(10, 1, false),
+    );
+
+    expect(calls).toEqual([['r1', 'r2'], ['r1']]);
+    expect(result.relationshipsImported).toBe(2);
+    expect(result.errors).toEqual([
+      expect.objectContaining({ item: 'relationship:r1', code: 'RELATIONSHIP_ALREADY_EXISTS' }),
+    ]);
+  });
+
+  it('applies a repeated id in a later upsert wave through MERGE, updating the first write in place', async () => {
+    const calls: Array<{ ids: string[]; merges: boolean }> = [];
+    const fake = {
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
+        calls.push({ ids: params.rows.map((row) => row.id), merges: cypher.includes('MERGE (s)-[r:KNOWS') });
+        // Same type and endpoints as the edge the first wave wrote: the store accepts it.
+        return { records: successRecords(cypher, params.rows) };
+      },
+    };
+
+    const result = await importBulk(
+      fake as unknown as Neo4jConnection,
+      RID,
+      [{ relationships: [relationship('r1'), relationship('r2'), relationship('r1')] }],
+      options(10, 1, false),
+    );
+
+    expect(calls).toEqual([
+      { ids: ['r1', 'r2'], merges: true },
+      { ids: ['r1'], merges: true },
+    ]);
+    expect(result.relationshipsImported).toBe(3);
+    expect(result.errors).toEqual([]);
+  });
+
+  it('reports a relationship row with an unrecognised outcome as ProviderError', async () => {
+    const fake = {
+      async executeQuery(_cypher: string, params: { rows: Row[] }) {
+        return { records: params.rows.map((row) => record({ id: row.id, outcome: 'something-else' })) };
+      },
+    };
+
+    await expect(
+      importBulk(fake as unknown as Neo4jConnection, RID, [{ relationships: [relationship('r1')] }], options(10)),
+    ).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('stops with RepositoryNotFoundError when an entity chunk finds no repository marker', async () => {
+    const calls: Row[][] = [];
+    const fake = {
+      async executeQuery(_cypher: string, params: { rows: Row[] }) {
+        calls.push(params.rows);
+        return { records: [record({ written: 0n })] };
+      },
+    };
+
+    await expect(
+      importBulk(fake as unknown as Neo4jConnection, RID, [{ entities: [entity('e1'), entity('e2')] }], options(1)),
+    ).rejects.toMatchObject({ name: 'RepositoryNotFoundError', code: 'REPOSITORY_NOT_FOUND' });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('stops with RepositoryNotFoundError when a relationship chunk finds no repository marker', async () => {
+    const fake = {
+      async executeQuery() {
+        return { records: [] };
+      },
+    };
+
+    await expect(
+      importBulk(
+        fake as unknown as Neo4jConnection,
+        RID,
+        [{ relationships: [relationship('r1')] }],
+        options(10),
+      ),
+    ).rejects.toMatchObject({ name: 'RepositoryNotFoundError', code: 'REPOSITORY_NOT_FOUND' });
+  });
+
+  it('opens every import template with the repository-marker lock', async () => {
+    const cyphers: string[] = [];
+    const fake = {
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
+        cyphers.push(cypher);
+        return { records: successRecords(cypher, params.rows) };
+      },
+    };
+    for (const skipExistenceCheck of [true, false]) {
+      await importBulk(
+        fake as unknown as Neo4jConnection,
+        RID,
+        [{ entities: [entity('e1')], relationships: [relationship('r1')] }],
+        options(10, 1, skipExistenceCheck),
+      );
+    }
+
+    expect(cyphers).toHaveLength(4);
+    for (const cypher of cyphers) {
+      expect(cypher.trimStart().startsWith(LOCK_REPOSITORY_MARKER.trim())).toBe(true);
+    }
   });
 
   it('records a row whose property key the mapping refuses and imports the rest of its chunk', async () => {
@@ -291,7 +535,7 @@ describe('importBulk failure handling', () => {
     const calls: string[][] = [];
     const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
     const fake = {
-      async executeQuery(_cypher: string, params: { rows: Row[] }) {
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
         const ids = params.rows.map((row) => row.id);
         calls.push(ids);
         if (ids.length > 1 && ids[0] === 'e1') throw slugViolation('person:e1');
@@ -300,7 +544,7 @@ describe('importBulk failure handling', () => {
           throw new QueryTimeoutError(30_000);
         }
         await delay(20);
-        return { records: [] };
+        return { records: successRecords(cypher, params.rows) };
       },
     };
 
@@ -320,6 +564,140 @@ describe('importBulk failure handling', () => {
       ['e4', 'e5', 'e6'],
       ['e1'],
     ]);
+  });
+});
+
+const DELETED_NODE = 'Neo.ClientError.Statement.EntityNotFound';
+
+/**
+ * Connection fake for a node deleted by a concurrent transaction. Import
+ * statements go to `respond`, which throws a deleted-node error or returns
+ * the statement's records; the repository-marker read answers `markerExists`
+ * (or throws it, when it is an error). `markerReads` counts those reads.
+ */
+function deletedNodeConnection(
+  respond: (cypher: string, rows: Row[], call: number) => Array<{ get: (key: string) => unknown }> | Error,
+  markerExists: boolean | Error = true,
+): { conn: Neo4jConnection; calls: Row[][]; markerReads: () => number } {
+  const calls: Row[][] = [];
+  let markerReads = 0;
+  const fake = {
+    async executeQuery(cypher: string, params: { rows?: Row[] }) {
+      if (cypher.includes('AS repositoryExists')) {
+        markerReads++;
+        if (markerExists instanceof Error) throw markerExists;
+        return { records: [record({ repositoryExists: markerExists })] };
+      }
+      const rows = params.rows ?? [];
+      calls.push(rows);
+      const response = respond(cypher, rows, calls.length);
+      if (response instanceof Error) throw response;
+      return { records: response };
+    },
+  };
+  return { conn: fake as unknown as Neo4jConnection, calls, markerReads: () => markerReads };
+}
+
+describe('importBulk on a node deleted while a statement waited', () => {
+  it('re-runs a refused relationship chunk per row and records a deleted endpoint with ENTITY_NOT_FOUND', async () => {
+    const { conn, calls, markerReads } = deletedNodeConnection((cypher, rows, call) =>
+      call === 1
+        ? driverError(DELETED_NODE, 'Node with id 7 has been deleted in this transaction')
+        : successRecords(cypher, rows, (row) => (row.id === 'r2' ? 'endpoint-missing' : 'written')),
+    );
+
+    const result = await importBulk(conn, RID, [{ relationships: [relationship('r1'), relationship('r2')] }], options(10));
+
+    expect(calls.map((rows) => rows.map((row) => row.id))).toEqual([['r1', 'r2'], ['r1'], ['r2']]);
+    expect(markerReads()).toBe(0);
+    expect(result.relationshipsImported).toBe(1);
+    expect(result.errors).toEqual([
+      { item: 'relationship:r2', code: 'ENTITY_NOT_FOUND', error: expect.stringContaining('endpoint not found') },
+    ]);
+  });
+
+  it('stops with RepositoryNotFoundError when the per-row re-run finds the marker gone', async () => {
+    const { conn, calls } = deletedNodeConnection((_cypher, _rows, call) =>
+      call === 1 ? driverError(DELETED_NODE, 'Node with id 7 has been deleted in this transaction') : [],
+    );
+
+    await expect(
+      importBulk(conn, RID, [{ relationships: [relationship('r1'), relationship('r2')] }], options(10)),
+    ).rejects.toMatchObject({ name: 'RepositoryNotFoundError', code: 'REPOSITORY_NOT_FOUND', repositoryId: RID });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('records a relationship row still refused on its own with ENTITY_NOT_FOUND while the marker exists', async () => {
+    const { conn, markerReads } = deletedNodeConnection((cypher, rows) =>
+      rows.some((row) => row.id === 'r2')
+        ? driverError(DELETED_NODE, 'Node with id 7 has been deleted in this transaction')
+        : successRecords(cypher, rows),
+    );
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ relationships: [relationship('r1'), relationship('r2'), relationship('r3')] }],
+      options(10),
+    );
+
+    expect(markerReads()).toBe(1);
+    expect(result.relationshipsImported).toBe(2);
+    expect(result.errors).toEqual([
+      {
+        item: 'relationship:r2',
+        code: 'ENTITY_NOT_FOUND',
+        error: expect.stringContaining('deleted by a concurrent transaction'),
+      },
+    ]);
+  });
+
+  it('records an entity row still refused on its own with ENTITY_NOT_FOUND while the marker exists', async () => {
+    const { conn } = deletedNodeConnection((cypher, rows) =>
+      rows.some((row) => row.id === 'e2')
+        ? driverError(DELETED_NODE, 'Node with id 7 has been deleted in this transaction')
+        : successRecords(cypher, rows),
+    );
+
+    const result = await importBulk(conn, RID, [{ entities: [entity('e1'), entity('e2')] }], options(10));
+
+    expect(result.entitiesImported).toBe(1);
+    expect(result.errors).toEqual([
+      { item: 'entity:e2', code: 'ENTITY_NOT_FOUND', error: expect.stringContaining('concurrent transaction') },
+    ]);
+  });
+
+  it('stops with RepositoryNotFoundError when a row is refused and the marker is gone', async () => {
+    const { conn, calls } = deletedNodeConnection(
+      (cypher, rows) =>
+        rows.some((row) => row.id === 'r1')
+          ? driverError(DELETED_NODE, 'Node with id 7 has been deleted in this transaction')
+          : successRecords(cypher, rows),
+      false,
+    );
+
+    await expect(
+      importBulk(conn, RID, [{ relationships: [relationship('r1'), relationship('r2')] }], options(10)),
+    ).rejects.toMatchObject({ name: 'RepositoryNotFoundError', code: 'REPOSITORY_NOT_FOUND' });
+    // The chunk, then r1 alone; r2 is never attempted.
+    expect(calls).toHaveLength(2);
+  });
+
+  it('maps a driver failure of the marker read to a typed error and stops', async () => {
+    const readFailure = driverError('ServiceUnavailable', 'connection reset');
+    const { conn } = deletedNodeConnection(
+      () => driverError(DELETED_NODE, 'Node with id 7 has been deleted in this transaction'),
+      readFailure,
+    );
+
+    const thrown: unknown = await importBulk(
+      conn,
+      RID,
+      [{ relationships: [relationship('r1')] }],
+      options(10),
+    ).catch((err: unknown) => err);
+    expect(thrown).toBeInstanceOf(ProviderError);
+    expect((thrown as Error).cause).toBe(readFailure);
   });
 });
 

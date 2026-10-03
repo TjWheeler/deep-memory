@@ -11,9 +11,45 @@ import type {
   EntityValidationIssue,
   RelationshipValidationIssue,
 } from '../types/results.js';
+import type { ExportChunk } from '../types/portability.js';
 
 const REPO_ID = '00000000-0000-4000-a000-000000000001';
 const ACTOR = 'test-agent';
+
+/**
+ * In-memory storage that can hold a relationship whose endpoint is missing.
+ * The provider refuses to create such an edge, but a store holding data
+ * written before that check (or by another tool) can contain one, and that
+ * is what the validator must detect. A ghost entity satisfies the create and
+ * is then left out of every export, so the validator sees the edge's
+ * endpoint as missing.
+ */
+class OrphanSimulatingStorage extends InMemoryStorageProvider {
+  private readonly ghosts = new Set<string>();
+
+  public async createGhostEntity(repositoryId: string, id: string): Promise<void> {
+    this.ghosts.add(id);
+    await this.createEntity(repositoryId, {
+      id,
+      entityType: 'ghost',
+      label: id,
+      slug: `ghost:${id}`,
+      properties: {},
+      provenance: provenance(),
+    });
+  }
+
+  public override async *exportAll(repositoryId: string): AsyncIterable<ExportChunk> {
+    for await (const chunk of super.exportAll(repositoryId)) {
+      if (chunk.type !== 'entities') {
+        yield chunk;
+        continue;
+      }
+      const data = (chunk.data as StoredEntity[]).filter((entity) => !this.ghosts.has(entity.id));
+      yield { ...chunk, data };
+    }
+  }
+}
 
 const provenance = (): Provenance => ({
   createdBy: ACTOR,
@@ -97,11 +133,11 @@ async function drainRelationshipIssues(
 
 describe('RepositoryValidator', () => {
   let memory: DeepMemory;
-  let storage: InMemoryStorageProvider;
+  let storage: OrphanSimulatingStorage;
   let repo: MemoryRepository;
 
   beforeEach(async () => {
-    storage = new InMemoryStorageProvider();
+    storage = new OrphanSimulatingStorage();
     memory = new DeepMemory({
       storage,
       provenance: { actorId: ACTOR, actorType: 'agent' },
@@ -136,6 +172,13 @@ describe('RepositoryValidator', () => {
       provenance: provenance(),
       ...rel,
     };
+    // An endpoint that does not exist is stood in for by a ghost entity the
+    // validator cannot see, leaving the edge orphaned from its point of view.
+    for (const endpointId of [full.sourceEntityId, full.targetEntityId]) {
+      if ((await storage.getEntity(REPO_ID, endpointId)) === null) {
+        await storage.createGhostEntity(REPO_ID, endpointId);
+      }
+    }
     await storage.createRelationship(REPO_ID, full);
     return full;
   }

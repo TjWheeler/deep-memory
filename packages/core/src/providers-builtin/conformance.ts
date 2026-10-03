@@ -21,6 +21,14 @@ import type { DeepMemoryErrorCode } from '../core/errors.js';
  * imports from `@utaba/deep-memory`. `instanceof` therefore cannot be relied
  * on across that boundary; `name` and `code` are the stable contract.
  */
+/**
+ * Timeout for a case that makes many sequential round trips. Against a
+ * remote store each round trip can take hundreds of milliseconds (a CosmosDB
+ * emulator in particular), so these outrun vitest's 5 s default without
+ * anything being wrong.
+ */
+const MULTI_STEP_TEST_TIMEOUT_MS = 30_000;
+
 function typedError(
   name: string,
   code: DeepMemoryErrorCode,
@@ -141,7 +149,10 @@ export function runStorageProviderConformanceTests(
       });
 
       it('deletes a repository', async () => {
-        await provider.deleteRepository(repoId);
+        await expect(provider.deleteRepository(repoId)).resolves.toEqual({
+          deletedEntities: 0,
+          deletedRelationships: 0,
+        });
         expect(await provider.getRepository(repoId)).toBeNull();
       });
 
@@ -574,26 +585,30 @@ export function runStorageProviderConformanceTests(
         expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
       });
 
-      it('the same relationship id can be used in two repositories', async () => {
-        // A second repository with its own entities "a" and "b". The suite
-        // has no teardown and live stores persist, so remove it on both sides.
-        const otherRepoId = '40000000-0000-4000-a000-000000000002';
-        const removeOther = async (): Promise<void> => {
-          if ((await provider.getRepository(otherRepoId)) !== null) {
-            await provider.deleteRepository(otherRepoId);
-          }
-        };
+      // A second repository with its own entities "a" and "b". The suite has
+      // no teardown and live stores persist, so tests remove it on both sides.
+      const otherRepoId = '40000000-0000-4000-a000-000000000002';
+      const removeOther = async (): Promise<void> => {
+        if ((await provider.getRepository(otherRepoId)) !== null) {
+          await provider.deleteRepository(otherRepoId);
+        }
+      };
+      const createOther = async (): Promise<void> => {
         await removeOther();
+        await provider.createRepository({
+          repositoryId: otherRepoId,
+          label: 'Conformance Test (second repository)',
+          governanceConfig: { mode: 'open' },
+          createdAt: new Date().toISOString(),
+          createdBy: 'conformance-test',
+        });
+        await provider.createEntity(otherRepoId, makeEntity('a'));
+        await provider.createEntity(otherRepoId, makeEntity('b'));
+      };
+
+      it('the same relationship id can be used in two repositories', async () => {
         try {
-          await provider.createRepository({
-            repositoryId: otherRepoId,
-            label: 'Conformance Test (second repository)',
-            governanceConfig: { mode: 'open' },
-            createdAt: new Date().toISOString(),
-            createdBy: 'conformance-test',
-          });
-          await provider.createEntity(otherRepoId, makeEntity('a'));
-          await provider.createEntity(otherRepoId, makeEntity('b'));
+          await createOther();
 
           await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
           await provider.createRelationship(otherRepoId, makeRelationship('r1', 'mentions', 'b', 'a'));
@@ -617,6 +632,52 @@ export function runStorageProviderConformanceTests(
         }
       });
 
+      it('deleting by a shared relationship id leaves the other repository untouched', async () => {
+        // Each delete path runs against the first repository while the second
+        // holds a relationship with the same id between same-id entities.
+        const expectOtherIntact = async (): Promise<void> => {
+          expect(await provider.getRelationship(otherRepoId, 'r1')).toMatchObject({
+            relationshipType: 'mentions',
+            sourceEntityId: 'b',
+            targetEntityId: 'a',
+          });
+          const entities = await provider.getEntities(otherRepoId, ['a', 'b']);
+          expect([...entities.keys()].sort()).toEqual(['a', 'b']);
+        };
+        try {
+          await createOther();
+          await provider.createRelationship(otherRepoId, makeRelationship('r1', 'mentions', 'b', 'a'));
+
+          await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+          await provider.deleteRelationship(repoId, 'r1');
+          expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
+          await expectOtherIntact();
+
+          await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+          await provider.deleteRelationships(repoId, ['r1']);
+          expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
+          await expectOtherIntact();
+
+          await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+          await expect(provider.deleteAllContents(repoId)).resolves.toEqual({
+            deletedEntities: 3,
+            deletedRelationships: 1,
+          });
+          await expectOtherIntact();
+
+          await provider.createEntity(repoId, makeEntity('a'));
+          await provider.createEntity(repoId, makeEntity('b'));
+          await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+          await expect(provider.deleteRepository(repoId)).resolves.toEqual({
+            deletedEntities: 2,
+            deletedRelationships: 1,
+          });
+          await expectOtherIntact();
+        } finally {
+          await removeOther();
+        }
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
       it('createRelationship throws RepositoryNotFoundError after the repository is deleted', async () => {
         // Entities "a" and "b" were created by beforeEach while the repository existed.
         await provider.deleteRepository(repoId);
@@ -624,6 +685,54 @@ export function runStorageProviderConformanceTests(
         await expect(
           provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b')),
         ).rejects.toMatchObject(typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'));
+        expect(await provider.getRepository(repoId)).toBeNull();
+      });
+
+      it('creates a relationship whose id the engine minted', async () => {
+        await provider.createRelationship(repoId, makeRelationship('minted-r1', 'connects', 'a', 'b'), {
+          idMinted: true,
+        });
+
+        expect(await provider.getRelationship(repoId, 'minted-r1')).toMatchObject({
+          relationshipType: 'connects',
+          sourceEntityId: 'a',
+          targetEntityId: 'b',
+        });
+        const fromA = await provider.getEntityRelationships(repoId, 'a');
+        expect(fromA.items.map((rel) => rel.id)).toEqual(['minted-r1']);
+      });
+
+      it('a minted-id create names a missing endpoint and writes nothing', async () => {
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('minted-r1', 'connects', 'missing-source', 'b'), {
+            idMinted: true,
+          }),
+        ).rejects.toMatchObject(typedError('EntityNotFoundError', 'ENTITY_NOT_FOUND', { id: 'missing-source' }));
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('minted-r1', 'connects', 'a', 'missing-target'), {
+            idMinted: true,
+          }),
+        ).rejects.toMatchObject(typedError('EntityNotFoundError', 'ENTITY_NOT_FOUND', { id: 'missing-target' }));
+        expect(await provider.getRelationship(repoId, 'minted-r1')).toBeNull();
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('a minted-id create throws RepositoryNotFoundError after the repository is deleted', async () => {
+        await provider.deleteRepository(repoId);
+
+        await expect(
+          provider.createRelationship(repoId, makeRelationship('minted-r1', 'connects', 'a', 'b'), { idMinted: true }),
+        ).rejects.toMatchObject(typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'));
+        expect(await provider.getRepository(repoId)).toBeNull();
+      });
+
+      it('deleteRepository reports the entities and relationships it removed', async () => {
+        await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+        await provider.createRelationship(repoId, makeRelationship('r2', 'mentions', 'b', 'c'));
+
+        await expect(provider.deleteRepository(repoId)).resolves.toEqual({
+          deletedEntities: 3,
+          deletedRelationships: 2,
+        });
         expect(await provider.getRepository(repoId)).toBeNull();
       });
     });
@@ -894,6 +1003,20 @@ export function runStorageProviderConformanceTests(
         const result = await provider.deleteAllContents(repoId);
         expect(result.deletedEntities).toBe(0);
         expect(result.deletedRelationships).toBe(0);
+      });
+
+      it('throws RepositoryNotFoundError for an unknown repository', async () => {
+        await expect(
+          provider.deleteAllContents('ffffffff-ffff-4fff-afff-ffffffffffff'),
+        ).rejects.toMatchObject(typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'));
+      });
+
+      it('throws RepositoryNotFoundError after the repository is deleted', async () => {
+        await provider.deleteRepository(repoId);
+
+        await expect(provider.deleteAllContents(repoId)).rejects.toMatchObject(
+          typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'),
+        );
       });
     });
 

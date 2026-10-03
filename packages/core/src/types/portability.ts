@@ -289,12 +289,14 @@ export interface AdaptiveConcurrencyAdjustEvent {
   throttledCount: number;
 }
 
-/** Progress callback for delete operations */
+/**
+ * Progress callback for delete operations: the running counts of entities and
+ * relationships removed so far. No totals are reported, because the delete
+ * does not count the repository first.
+ */
 export type DeleteProgressCallback = (progress: {
   entitiesDeleted: number;
   relationshipsDeleted: number;
-  totalEntities: number;
-  totalRelationships: number;
 }) => void | Promise<void>;
 
 /** Header for streaming import — sent before data chunks */

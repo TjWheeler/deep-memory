@@ -6,4 +6,5 @@
 
 export { Neo4jStorageProvider } from './Neo4jStorageProvider.js';
 export type { Neo4jStorageProviderConfig } from './Neo4jStorageProvider.js';
+export type { Neo4jSearchScoring } from './queries/entity.js';
 export { getSchemaCypher, SCHEMA_VERSION } from './schema.js';

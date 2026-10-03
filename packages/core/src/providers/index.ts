@@ -5,6 +5,7 @@ export type {
   EnsureSchemaResult,
   EntityReadOptions,
   VocabularyReadOptions,
+  RelationshipCreateOptions,
 } from './StorageProvider.js';
 export type { EmbeddingProvider, EmbeddingProviderFactory } from './EmbeddingProvider.js';
 export type {

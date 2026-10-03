@@ -1,13 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import {
   DuplicateEntityError,
+  InvalidInputError,
   ProviderError,
   RepositoryNotFoundError,
   SlugConflictError,
 } from '@utaba/deep-memory';
 import type { StoredEntity } from '@utaba/deep-memory/types';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
-import { buildFindEntitiesWhere, createEntity, escapeLuceneQuery, updateEntity } from './entity.js';
+import {
+  buildFindEntitiesWhere,
+  buildFulltextFindQuery,
+  createEntity,
+  escapeLuceneQuery,
+  resolveSearchScoring,
+  updateEntity,
+  type Neo4jSearchScoring,
+} from './entity.js';
 
 describe('buildFindEntitiesWhere', () => {
   it('returns an empty WHERE fragment when only the repository predicate is requested with no filters', () => {
@@ -438,5 +447,33 @@ describe('createEntity under a driver re-run', () => {
       name: 'ProviderError',
       cause: readFailure,
     });
+  });
+});
+
+describe('search scoring modes', () => {
+  // An untyped host config can carry any string.
+  const untyped: string = 'score';
+
+  it('resolves an unset mode to relevance and keeps each documented mode', () => {
+    expect(resolveSearchScoring(undefined)).toBe('relevance');
+    expect(resolveSearchScoring('relevance')).toBe('relevance');
+    expect(resolveSearchScoring('isolated')).toBe('isolated');
+  });
+
+  it('refuses any other mode', () => {
+    expect(() => resolveSearchScoring(untyped as Neo4jSearchScoring)).toThrow(InvalidInputError);
+  });
+
+  it('orders by score for relevance and by label, id for isolated', () => {
+    expect(buildFulltextFindQuery('relevance', 'WHERE node.repositoryId = $rid', 'node')).toContain('ORDER BY score DESC');
+    const isolated = buildFulltextFindQuery('isolated', 'WHERE node.repositoryId = $rid', 'node');
+    expect(isolated).toContain('ORDER BY node.label, node.id');
+    expect(isolated).not.toContain('score');
+  });
+
+  it('builds no statement for any other mode', () => {
+    expect(() => buildFulltextFindQuery(untyped as Neo4jSearchScoring, 'WHERE node.repositoryId = $rid', 'node')).toThrow(
+      InvalidInputError,
+    );
   });
 });

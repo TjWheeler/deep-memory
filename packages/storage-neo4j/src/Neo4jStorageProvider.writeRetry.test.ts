@@ -189,6 +189,49 @@ if (NEO4J_URI) {
       expect(JSON.stringify(await provider.getRelationship(repositoryId, relationship.id))).not.toContain('_attempt');
     });
 
+    it('createRelationship with a minted id answers success and stores the edge once', async () => {
+      const repositoryId = await newRepository();
+      const [a, b] = [makeEntity(randomUUID()), makeEntity(randomUUID())];
+      await provider.createEntity(repositoryId, a);
+      await provider.createEntity(repositoryId, b);
+      const relationship = makeRelationship(randomUUID(), a.id, b.id);
+
+      await expect(rerunning.createRelationship(repositoryId, relationship, { idMinted: true })).resolves.toEqual(
+        relationship,
+      );
+
+      expect(
+        await count(repositoryId, 'MATCH ()-[r {repositoryId: $repositoryId, id: $id}]->() RETURN count(r) AS n', {
+          id: relationship.id,
+        }),
+      ).toBe(1);
+      const stored = await provider.getRelationship(repositoryId, relationship.id);
+      expect(stored).toMatchObject({
+        id: relationship.id,
+        relationshipType: relationship.relationshipType,
+        sourceEntityId: a.id,
+        targetEntityId: b.id,
+        provenance: { createdBy: 'write-retry-test' },
+      });
+      expect(JSON.stringify(stored)).not.toContain('_attempt');
+    });
+
+    it('createRelationship with a minted id still reports a missing endpoint or repository when re-run', async () => {
+      const repositoryId = await newRepository();
+      const a = makeEntity(randomUUID());
+      await provider.createEntity(repositoryId, a);
+
+      await expect(
+        rerunning.createRelationship(repositoryId, makeRelationship(randomUUID(), a.id, 'missing-target'), {
+          idMinted: true,
+        }),
+      ).rejects.toBeInstanceOf(EntityNotFoundError);
+      await provider.deleteRepository(repositoryId);
+      await expect(
+        rerunning.createRelationship(repositoryId, makeRelationship(randomUUID(), a.id, a.id), { idMinted: true }),
+      ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    });
+
     it('deleteEntities and deleteRelationships report what the first attempt deleted as deleted', async () => {
       const repositoryId = await newRepository();
       const [a, b, c] = [makeEntity(randomUUID()), makeEntity(randomUUID()), makeEntity(randomUUID())];

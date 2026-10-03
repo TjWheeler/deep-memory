@@ -1,14 +1,16 @@
 // Neo4jConnection — the single chokepoint for every Bolt round-trip in this
 // provider. No other source file under src/ is allowed to import `neo4j-driver`
-// directly or call `driver.session()` / `driver.executeQuery()` — see D3b
-// (Isolation guarantee) in plans/neo4j-provider.md and the grep test that
-// enforces it.
+// directly or call `driver.session()` / `driver.executeQuery()`. Routing
+// every statement through here is what lets it require a repository scope on
+// each one (see `assertRepositoryId` / `assertScoped`); a grep test enforces
+// the rule.
 
 import neo4j from 'neo4j-driver';
 import type {
   Driver,
   EagerResult,
   ManagedTransaction,
+  QueryResult,
   RecordShape,
   ResultSummary,
   RoutingControl,
@@ -45,7 +47,10 @@ export interface Neo4jConnectionConfig {
   maxTransactionRetryTime?: number;
 }
 
-/** Options for `executeQuery` — required `repositoryId` enforces D3b layer 2. */
+/**
+ * Options for `executeQuery`. `repositoryId` is required so every scoped
+ * statement is bound to one repository.
+ */
 export interface ExecuteQueryOptions {
   repositoryId: string;
   routing?: RoutingControl;
@@ -80,7 +85,7 @@ export class Neo4jConnection {
       neo4j.auth.basic(config.username, config.password),
       {
         // BigInt for INTEGER avoids silent precision loss on counts that may
-        // exceed Number.MAX_SAFE_INTEGER — see D6b. The mapping layer
+        // exceed Number.MAX_SAFE_INTEGER. The mapping layer
         // narrows BigInt → Number at the public-API boundary.
         useBigInt: true,
         userAgent: config.userAgent ?? DEFAULT_USER_AGENT,
@@ -111,7 +116,8 @@ export class Neo4jConnection {
    *
    * Required `repositoryId` binds `$rid` for the caller. The Cypher string
    * MUST reference `$rid` somewhere in a predicate or property map; absence
-   * throws `ProviderError` as a programming error (D3b layer 2).
+   * throws `ProviderError` as a programming error: a scoped statement that
+   * never reads `$rid` would run across every repository.
    *
    * The driver runs the statement as a managed transaction and re-runs it
    * after a retryable failure, including a commit whose acknowledgement was
@@ -145,7 +151,7 @@ export class Neo4jConnection {
    * more than one Cypher statement must commit atomically, or when the
    * answer depends on the attempt number (below) — other single-statement
    * writes go through `executeQuery` so the driver handles transient-error
-   * retry uniformly (D2b).
+   * retry uniformly.
    *
    * Every `tx.run` call inside `txFn` is wrapped to inject `$rid` and assert
    * scope, so the same isolation enforcement applies as on the default path.
@@ -185,7 +191,7 @@ export class Neo4jConnection {
    * legitimate cross-repository operations: `ensureSchema` (DDL),
    * `listRepositories`, `_Meta` schema-version reads, server-info probes.
    * Does NOT inject `$rid`. Every call site MUST add a one-line comment
-   * justifying why cross-repository access is correct (D3b).
+   * justifying why cross-repository access is correct.
    */
   public async executeSystemQuery<T extends RecordShape = RecordShape>(
     cypher: string,
@@ -239,25 +245,29 @@ export class Neo4jConnection {
    * nothing (or only part of a batch) completing without error.
    *
    * Same `$rid` injection + scope assertion as `executeQuery`, so the chunked
-   * delete stays repository-scoped like every other query. Returns only the
-   * summary because the chunked-wipe subquery yields no rows; counters live on
+   * delete stays repository-scoped like every other query. Returns the rows
+   * the statement yields (a keyset drain returns its cursor) and the summary;
+   * the counters, summed over the inner transactions, live on
    * `summary.counters.updates()`.
+   *
+   * An auto-commit statement is not retried by the driver, so a statement run
+   * here executes at most once per call.
    */
-  public async executeImplicitInTransactions(
+  public async executeImplicitInTransactions<T extends RecordShape = RecordShape>(
     cypher: string,
     params: CypherParams,
     options: { repositoryId: string },
-  ): Promise<ResultSummary> {
+  ): Promise<QueryResult<T>> {
     this.assertRepositoryId(options.repositoryId);
     this.assertScoped(cypher);
     const session = this.driver.session({ database: this.database });
     try {
       const result = await translateTimeout(() =>
-        session.run(cypher, { ...params, rid: options.repositoryId }),
+        session.run<T>(cypher, { ...params, rid: options.repositoryId }),
       );
       recordRoundTrip(result.summary, result.records.length);
       this.surfaceNotifications(cypher, result.summary);
-      return result.summary;
+      return result;
     } finally {
       await session.close();
     }
@@ -298,7 +308,7 @@ export class Neo4jConnection {
   private assertRepositoryId(repositoryId: string): void {
     if (typeof repositoryId !== 'string' || repositoryId.length === 0) {
       throw new ProviderError(
-        'Neo4jConnection: repositoryId is required for scoped queries (D3b isolation guarantee).',
+        'Neo4jConnection: repositoryId is required for scoped queries, so that every statement is bound to one repository.',
       );
     }
   }
@@ -308,7 +318,7 @@ export class Neo4jConnection {
       throw new ProviderError(
         'Neo4jConnection: Cypher omits required $rid binding. ' +
           'Repository-scoped queries MUST reference $rid in a predicate or property map. ' +
-          'Use executeSystemQuery for cross-repository calls (D3b allowlist).',
+          'Use executeSystemQuery for the few calls that are cross-repository by design.',
       );
     }
   }
@@ -321,7 +331,8 @@ export class Neo4jConnection {
         ? `${cypher.slice(0, NOTIFICATION_QUERY_TRUNCATION)}…`
         : cypher;
     // One warn per emission keeps the signal scannable; the full notifications
-    // array intentionally does NOT flow into the usage sink (D14).
+    // array intentionally does NOT flow into the usage sink: usage records
+    // carry cost, not diagnostics.
     // eslint-disable-next-line no-console
     console.warn('[neo4j] notifications', { cypher: truncated, notifications: items });
   }
@@ -394,7 +405,7 @@ interface CollectedNotification {
  * Surface real warnings from a `ResultSummary` without drowning callers in
  * the always-present "successful completion" sentinels.
  *
- * Per probe P15 (local-tests/baseline/neo4j-phase3-probes-results.md):
+ * How the driver reports them:
  *
  * - `summary.notifications` is the legacy server-side filtered surface; if it
  *   is non-empty the server already decided the entries are worth flagging

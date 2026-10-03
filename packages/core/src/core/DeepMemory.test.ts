@@ -1,10 +1,11 @@
 // DeepMemory + MemoryRepository — end-to-end integration tests
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DeepMemory } from './DeepMemory.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
 import { InMemorySearchProvider } from '../providers-builtin/InMemorySearchProvider.js';
 import type { MemoryRepository } from './MemoryRepository.js';
+import { RepositoryNotFoundError } from './errors.js';
 
 describe('DeepMemory', () => {
   let memory: DeepMemory;
@@ -703,5 +704,139 @@ describe('DeepMemory with SearchProvider', () => {
     const results = await search.search('00000000-0000-4000-a000-000000000007', 'timeline deliverables');
     expect(results.items).toHaveLength(1);
     expect(results.items[0].id).toBeDefined();
+  });
+});
+
+describe('DeepMemory deletes and relationship id origin', () => {
+  const repositoryId = '00000000-0000-4000-a000-000000000008';
+  let storage: InMemoryStorageProvider;
+  let memory: DeepMemory;
+  let repo: MemoryRepository;
+  let aliceId: string;
+  let bobId: string;
+
+  beforeEach(async () => {
+    storage = new InMemoryStorageProvider();
+    memory = new DeepMemory({
+      storage,
+      provenance: { actorId: 'test-agent', actorType: 'agent' },
+    });
+    repo = await memory.createRepository({
+      repositoryId,
+      label: 'Delete Events',
+      vocabulary: {
+        entityTypes: [{ type: 'person', description: 'A person' }],
+        relationshipTypes: [
+          {
+            type: 'knows',
+            description: 'Personal acquaintance',
+            allowedSourceTypes: ['person'],
+            allowedTargetTypes: ['person'],
+          },
+        ],
+      },
+      governance: { mode: 'open' },
+    });
+    const [alice, bob] = await repo.createEntities([
+      { entityType: 'person', label: 'Alice' },
+      { entityType: 'person', label: 'Bob' },
+    ]);
+    aliceId = alice!.id;
+    bobId = bob!.id;
+    await repo.createRelationships([{ relationshipType: 'knows', sourceEntityId: aliceId, targetEntityId: bobId }]);
+  });
+
+  function recordDeleteEvents(): Array<{ type: string; payload: Record<string, unknown> }> {
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    memory.on('delete:started', (e) => { events.push({ type: e.type, payload: { ...e.payload } }); });
+    memory.on('delete:progress', (e) => { events.push({ type: e.type, payload: { ...e.payload } }); });
+    memory.on('delete:completed', (e) => { events.push({ type: e.type, payload: { ...e.payload } }); });
+    return events;
+  }
+
+  it('deleteRepository does not count the repository first and reports the counts the delete removed', async () => {
+    const stats = vi.spyOn(storage, 'getRepositoryStats');
+    const events = recordDeleteEvents();
+
+    await memory.deleteRepository(repositoryId);
+
+    expect(stats).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      { type: 'delete:started', payload: { repositoryId } },
+      { type: 'delete:completed', payload: { repositoryId, entitiesDeleted: 2, relationshipsDeleted: 1 } },
+    ]);
+  });
+
+  it('deleteAllContents does not count the repository first and reports the counts the delete removed', async () => {
+    const stats = vi.spyOn(storage, 'getRepositoryStats');
+    const events = recordDeleteEvents();
+
+    await expect(memory.deleteAllContents(repositoryId)).resolves.toEqual({ deletedEntities: 2, deletedRelationships: 1 });
+
+    expect(stats).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      { type: 'delete:started', payload: { repositoryId } },
+      { type: 'delete:completed', payload: { repositoryId, entitiesDeleted: 2, relationshipsDeleted: 1 } },
+    ]);
+  });
+
+  it('refuses to delete a repository that does not exist, before emitting any delete event', async () => {
+    const missingId = '00000000-0000-4000-a000-000000000009';
+    const events = recordDeleteEvents();
+    const storageDeleteAllContents = vi.spyOn(storage, 'deleteAllContents');
+
+    await expect(memory.deleteRepository(missingId)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(memory.deleteAllContents(missingId)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+
+    expect(events).toEqual([]);
+    expect(storageDeleteAllContents).not.toHaveBeenCalled();
+  });
+
+  it('still lets the provider finish a delete that was interrupted after the repository record went', async () => {
+    // The record is gone but the provider still finds data to remove.
+    vi.spyOn(storage, 'getRepository').mockResolvedValueOnce(null);
+    vi.spyOn(storage, 'deleteRepository').mockImplementation(async (_id, onProgress) => {
+      await onProgress?.({ entitiesDeleted: 2, relationshipsDeleted: 1 });
+      return { deletedEntities: 2, deletedRelationships: 1 };
+    });
+    const events = recordDeleteEvents();
+
+    await memory.deleteRepository(repositoryId);
+
+    expect(events).toEqual([
+      { type: 'delete:started', payload: { repositoryId } },
+      { type: 'delete:progress', payload: { repositoryId, entitiesDeleted: 2, relationshipsDeleted: 1 } },
+      { type: 'delete:completed', payload: { repositoryId, entitiesDeleted: 2, relationshipsDeleted: 1 } },
+    ]);
+  });
+
+  it('forwards provider progress without totals', async () => {
+    vi.spyOn(storage, 'deleteRepository').mockImplementation(async (_id, onProgress) => {
+      await onProgress?.({ entitiesDeleted: 0, relationshipsDeleted: 1 });
+      await onProgress?.({ entitiesDeleted: 2, relationshipsDeleted: 1 });
+      return { deletedEntities: 2, deletedRelationships: 1 };
+    });
+    const events = recordDeleteEvents();
+
+    await memory.deleteRepository(repositoryId);
+
+    expect(events.filter((e) => e.type === 'delete:progress').map((e) => e.payload)).toEqual([
+      { repositoryId, entitiesDeleted: 0, relationshipsDeleted: 1 },
+      { repositoryId, entitiesDeleted: 2, relationshipsDeleted: 1 },
+    ]);
+  });
+
+  it('tells the provider whether the relationship id was minted', async () => {
+    const create = vi.spyOn(storage, 'createRelationship');
+
+    await repo.createRelationships([
+      { relationshipType: 'knows', sourceEntityId: bobId, targetEntityId: aliceId },
+      { id: 'caller-chosen-id', relationshipType: 'knows', sourceEntityId: aliceId, targetEntityId: bobId },
+    ]);
+
+    expect(create.mock.calls.map((call) => [call[1].id === 'caller-chosen-id', call[2]])).toEqual([
+      [false, { idMinted: true }],
+      [true, { idMinted: false }],
+    ]);
   });
 });

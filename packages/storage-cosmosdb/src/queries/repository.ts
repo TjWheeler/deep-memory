@@ -49,8 +49,8 @@ const REPOSITORY_INDEX_LABEL = '_repository_index';
  * If the sentinel is missing, runs the legacy cross-partition
  * `g.V().hasLabel('_repository').values('repositoryId')` scan to collect every
  * existing repository's id and writes the sentinel with that array. This is
- * the only cross-partition Gremlin read remaining after Phase 11 — it runs
- * once per account on first migration and never again.
+ * the only cross-partition Gremlin read the provider makes — it runs once
+ * per account on first migration and never again.
  *
  * Returns the number of pre-existing repositories the sentinel was backfilled
  * with, or `null` if the sentinel already existed (no migration needed).
@@ -129,8 +129,8 @@ function propertyChain(bindings: Record<string, unknown>, props: Record<string, 
 // which optional fields (description / type / legal / owner / metadata) are
 // set, so the server-side plan cache reuses one compiled plan. A trailing
 // `.sideEffect(...)` step updates the `_repository_index` sentinel in the
-// `_index` partition atomically with the addV — probe-verified single-submit
-// cross-partition mutation on the emulator (2026-05-26).
+// `_index` partition in the same submit as the addV (a single-submit
+// cross-partition mutation; see docs/cosmosdb-gremlin-compatibility.md).
 const REPOSITORY_CREATE_QUERY =
   `g.addV('${REPO_LABEL}').property('id', vid).property('repositoryId', rid)${buildRepositoryPropertyLadder()}` +
   ".sideEffect(__.V().has('repositoryId', pk).hasId(sid).property('repositoryIds', updatedIndex))";
@@ -389,6 +389,29 @@ const UNLESS_RECREATED =
 export const DELETE_VERTEX_BATCH_QUERY =
   `${UNLESS_RECREATED}__.V().has('repositoryId', rid).limit(batchSize).drop())`;
 
+// One entity-vertex batch of deleteRepository's drain, skipped once a
+// re-create has landed. Entities drain ahead of the remaining vertices so the
+// delete can report how many entities it removed.
+export const DELETE_ENTITY_BATCH_QUERY =
+  `${UNLESS_RECREATED}__.V().has('repositoryId', rid).has('entityType').limit(batchSize).drop())`;
+
+// One batch of edges / entity vertices, dropped in one submit that also
+// reports what it dropped: the ids of the batch are collected into a bucket
+// before the drop and the bucket is returned (the aggregate-then-drop shape of
+// `deleteEntities`), so its length is the batch's count. Bounded by
+// `batchSize`, so no submit covers the whole repository.
+export const EDGE_BATCH_DROP_QUERY =
+  "g.E().has('repositoryId', rid).limit(batchSize).aggregate('found').by('id').drop().cap('found')";
+export const ENTITY_BATCH_DROP_QUERY =
+  "g.V().has('repositoryId', rid).has('entityType').limit(batchSize).aggregate('found').by('id').drop().cap('found')";
+// Sizing read for deleteRepository's entity batch, whose drop sits behind the
+// re-create guard (DELETE_ENTITY_BATCH_QUERY). Bounded by `batchSize`.
+export const ENTITY_BATCH_COUNT_QUERY = "g.V().has('repositoryId', rid).has('entityType').limit(batchSize).count()";
+// Whether the repository marker exists: a partition-scoped point read of the
+// marker vertex, read before deleteAllContents drains anything.
+export const REPOSITORY_MARKER_COUNT_QUERY =
+  "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').count()";
+
 // Sentinel cleanup, skipped once a re-create has landed. The marker check runs
 // in the repository's partition; the write targets the sentinel in the
 // `_index` partition (a cross-partition mutation in one submit, as in
@@ -413,9 +436,9 @@ export const DELETE_INDEX_ENTRY_QUERY =
  *      does not list the id did the repository never exist: throw
  *      `RepositoryNotFoundError`. Otherwise carry on, so a retry finishes
  *      the interrupted delete.
- *   3. Unless the probe found the partition empty, drain edges, then
- *      vertices (entities plus the `_vocabulary` / change-log system
- *      vertices), in batches.
+ *   3. Unless the probe found the partition empty, drain edges, then entity
+ *      vertices, then the remaining vertices (the `_vocabulary` / change-log
+ *      system vertices), in batches.
  *   4. Remove the id from the sentinel.
  *
  * Steps 3 (vertex batches) and 4 stand down if the repository is re-created
@@ -440,7 +463,7 @@ export async function deleteRepository(
   conn: CosmosDbConnection,
   repositoryId: string,
   onProgress?: DeleteProgressCallback,
-): Promise<void> {
+): Promise<{ deletedEntities: number; deletedRelationships: number }> {
   // Same aggregate-then-drop shape as deleteEntities: the bucket holds the id
   // of the marker actually dropped, so an empty bucket means there was none.
   const marker = await conn.submit(
@@ -468,11 +491,13 @@ export async function deleteRepository(
   }
 
   const markerVid = repoVertexId(repositoryId);
+  let deleted = { deletedEntities: 0, deletedRelationships: 0 };
   if (!partitionEmpty) {
-    const outcome = await drainPartition(conn, repositoryId, markerVid, onProgress);
+    const drained = await drainPartition(conn, repositoryId, markerVid, onProgress);
+    deleted = drained.deleted;
     // Re-created under the same id: what is left belongs to the new
     // repository, and the new create has already listed it in the sentinel.
-    if (outcome === 'recreated') return;
+    if (drained.outcome === 'recreated') return deleted;
   }
 
   // Remove this repo's id from the sentinel — a property update on the
@@ -491,66 +516,106 @@ export async function deleteRepository(
       updatedIndex: JSON.stringify(updatedIds),
     });
   }
+  return deleted;
+}
+
+/**
+ * Drop one batch at a time until a batch drops nothing, reporting each
+ * batch's size. Each batch is bounded by the batch size and reports how many
+ * it dropped, so the running count comes from the batches themselves rather
+ * than a count of the whole repository up front: an unbounded count can
+ * outlast a request timeout on a large repository, and then every re-run of
+ * the delete would fail the same way. `dropBatch` returns `'recreated'` to
+ * stop the drain.
+ */
+async function drainInBatches(
+  dropBatch: () => Promise<number | 'recreated'>,
+  onBatch: (dropped: number) => Promise<void>,
+): Promise<'drained' | 'recreated'> {
+  while (true) {
+    const dropped = await dropBatch();
+    if (dropped === 'recreated') return 'recreated';
+    if (dropped === 0) return 'drained';
+    await onBatch(dropped);
+  }
+}
+
+/**
+ * Drop one batch with an aggregate-then-drop query (`EDGE_BATCH_DROP_QUERY`,
+ * `ENTITY_BATCH_DROP_QUERY`) and return how many it dropped.
+ */
+async function dropCountedBatch(conn: CosmosDbConnection, repositoryId: string, query: string): Promise<number> {
+  const result = await conn.submit(query, { rid: repositoryId, batchSize: DELETE_BATCH_SIZE });
+  const bucket = result.items[0];
+  return Array.isArray(bucket) ? bucket.length : 0;
 }
 
 /**
  * Drain a repository's partition: edges first (avoids orphan-edge errors),
- * then vertices, in batches — a single unbounded drop() times out on large
- * repositories. Each vertex batch stands down when a re-created marker is
- * present (see deleteRepository), reported as `'recreated'`.
+ * then entity vertices, then the remaining vertices, in batches — a single
+ * unbounded drop() times out on large repositories. Each vertex batch stands
+ * down when a re-created marker is present (see deleteRepository), reported
+ * as `'recreated'`. Returns the edges and entity vertices it dropped.
  */
 async function drainPartition(
   conn: CosmosDbConnection,
   repositoryId: string,
   markerVid: string,
   onProgress?: DeleteProgressCallback,
-): Promise<'drained' | 'recreated'> {
-  // Totals for progress reporting.
-  const entityCountResult = await conn.submit(
-    "g.V().has('repositoryId', rid).has('entityType').count()",
-    { rid: repositoryId },
-  );
-  const totalEntities = Number(entityCountResult.items[0] ?? 0);
-
-  const relCountResult = await conn.submit(
-    "g.E().has('repositoryId', rid).count()",
-    { rid: repositoryId },
-  );
-  const totalRelationships = Number(relCountResult.items[0] ?? 0);
-
+): Promise<{ outcome: 'drained' | 'recreated'; deleted: { deletedEntities: number; deletedRelationships: number } }> {
   let relationshipsDeleted = 0;
   let entitiesDeleted = 0;
+  const deleted = (): { deletedEntities: number; deletedRelationships: number } => ({
+    deletedEntities: entitiesDeleted,
+    deletedRelationships: relationshipsDeleted,
+  });
 
-  while (true) {
-    await conn.submit(
-      "g.E().has('repositoryId', rid).limit(batchSize).drop()",
-      { rid: repositoryId, batchSize: DELETE_BATCH_SIZE },
-    );
-    const remaining = await conn.submit(
-      "g.E().has('repositoryId', rid).limit(1).count()",
-      { rid: repositoryId },
-    );
-    const remainingCount = Number(remaining.items[0] ?? 0);
-    relationshipsDeleted = totalRelationships - remainingCount;
-    await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
-    if (remainingCount === 0) break;
-  }
+  await drainInBatches(
+    () => dropCountedBatch(conn, repositoryId, EDGE_BATCH_DROP_QUERY),
+    async (dropped) => {
+      relationshipsDeleted += dropped;
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted });
+    },
+  );
 
+  // The entity batch is sized by a bounded read, then dropped behind the
+  // re-create guard. The guard's coalesce returns the sentinel or the drop's
+  // (empty) output, so the batch's count comes from the sizing read; a write
+  // that lands between the two can make one batch's count differ from what
+  // it dropped.
+  const entities = await drainInBatches(
+    async () => {
+      const count = await conn.submit(ENTITY_BATCH_COUNT_QUERY, { rid: repositoryId, batchSize: DELETE_BATCH_SIZE });
+      const sized = Number(count.items[0] ?? 0);
+      if (sized === 0) return 0;
+      const batch = await conn.submit(DELETE_ENTITY_BATCH_QUERY, {
+        rid: repositoryId,
+        vid: markerVid,
+        batchSize: DELETE_BATCH_SIZE,
+      });
+      return batch.items[0] === RECREATED_SENTINEL ? 'recreated' : sized;
+    },
+    async (dropped) => {
+      entitiesDeleted += dropped;
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted });
+    },
+  );
+  if (entities === 'recreated') return { outcome: 'recreated', deleted: deleted() };
+
+  // The remaining vertices are system vertices; they are not counted.
   while (true) {
     const batch = await conn.submit(DELETE_VERTEX_BATCH_QUERY, {
       rid: repositoryId,
       vid: markerVid,
       batchSize: DELETE_BATCH_SIZE,
     });
-    if (batch.items[0] === RECREATED_SENTINEL) return 'recreated';
+    if (batch.items[0] === RECREATED_SENTINEL) return { outcome: 'recreated', deleted: deleted() };
     const remaining = await conn.submit(
       "g.V().has('repositoryId', rid).limit(1).count()",
       { rid: repositoryId },
     );
     const remainingCount = Number(remaining.items[0] ?? 0);
-    entitiesDeleted = totalEntities - remainingCount;
-    await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
-    if (remainingCount === 0) return 'drained';
+    if (remainingCount === 0) return { outcome: 'drained', deleted: deleted() };
   }
 }
 
@@ -559,55 +624,38 @@ export async function deleteAllContents(
   repositoryId: string,
   onProgress?: DeleteProgressCallback,
 ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
-  // Count before deleting
-  const entityCountResult = await conn.submit(
-    "g.V().has('repositoryId', rid).has('entityType').count()",
-    { rid: repositoryId },
-  );
-  const totalEntities = Number(entityCountResult.items[0] ?? 0);
-
-  const relCountResult = await conn.submit(
-    "g.E().has('repositoryId', rid).count()",
-    { rid: repositoryId },
-  );
-  const totalRelationships = Number(relCountResult.items[0] ?? 0);
+  // A partition-scoped point read of the marker: a repository that does not
+  // exist is refused rather than reported as empty.
+  const marker = await conn.submit(REPOSITORY_MARKER_COUNT_QUERY, {
+    rid: repositoryId,
+    vid: repoVertexId(repositoryId),
+  });
+  if (Number(marker.items[0] ?? 0) === 0) {
+    throw new RepositoryNotFoundError(repositoryId);
+  }
 
   let relationshipsDeleted = 0;
   let entitiesDeleted = 0;
 
-  // Drop edges first (avoids orphan-edge errors), then entity vertices, in batches.
+  // Drop edges first (avoids orphan-edge errors), then entity vertices, in
+  // bounded batches that report what they dropped (see drainInBatches).
   // Preserves system vertices (_repository, _vocabulary).
-  while (true) {
-    await conn.submit(
-      "g.E().has('repositoryId', rid).limit(batchSize).drop()",
-      { rid: repositoryId, batchSize: DELETE_BATCH_SIZE },
-    );
-    const remaining = await conn.submit(
-      "g.E().has('repositoryId', rid).limit(1).count()",
-      { rid: repositoryId },
-    );
-    const remainingCount = Number(remaining.items[0] ?? 0);
-    relationshipsDeleted = totalRelationships - remainingCount;
-    await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
-    if (remainingCount === 0) break;
-  }
+  await drainInBatches(
+    () => dropCountedBatch(conn, repositoryId, EDGE_BATCH_DROP_QUERY),
+    async (dropped) => {
+      relationshipsDeleted += dropped;
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted });
+    },
+  );
+  await drainInBatches(
+    () => dropCountedBatch(conn, repositoryId, ENTITY_BATCH_DROP_QUERY),
+    async (dropped) => {
+      entitiesDeleted += dropped;
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted });
+    },
+  );
 
-  while (true) {
-    await conn.submit(
-      "g.V().has('repositoryId', rid).has('entityType').limit(batchSize).drop()",
-      { rid: repositoryId, batchSize: DELETE_BATCH_SIZE },
-    );
-    const remaining = await conn.submit(
-      "g.V().has('repositoryId', rid).has('entityType').limit(1).count()",
-      { rid: repositoryId },
-    );
-    const remainingCount = Number(remaining.items[0] ?? 0);
-    entitiesDeleted = totalEntities - remainingCount;
-    await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
-    if (remainingCount === 0) break;
-  }
-
-  return { deletedEntities: totalEntities, deletedRelationships: totalRelationships };
+  return { deletedEntities: entitiesDeleted, deletedRelationships: relationshipsDeleted };
 }
 
 export async function getRepositoryStats(

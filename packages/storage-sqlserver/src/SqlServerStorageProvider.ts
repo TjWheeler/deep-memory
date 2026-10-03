@@ -5,6 +5,7 @@ import type {
   StorageProvider,
   EnsureSchemaResult,
   EntityReadOptions,
+  RelationshipCreateOptions,
   VocabularyReadOptions,
 } from '@utaba/deep-memory/providers';
 import type {
@@ -674,15 +675,74 @@ export class SqlServerStorageProvider implements StorageProvider {
     return updated;
   }
 
-  public async deleteRepository(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<void> {
+  /**
+   * Delete the repository row and everything under it in one transaction.
+   * The repository row is locked first, so a missing repository rolls back
+   * before anything else is touched. Relationships and entities are then
+   * deleted explicitly, ahead of the repository row whose `ON DELETE
+   * CASCADE` covers the rest (vocabulary, change log), so the call can
+   * report how many of each it removed without counting first. A missing
+   * repository throws `RepositoryNotFoundError`. The delete is one statement
+   * batch, so `onProgress` is not called.
+   *
+   * Creates take no lock on the repository row of their own. A create whose
+   * INSERT runs while the delete holds that row can lock its new row first
+   * and then wait on the row for its foreign-key check, while the delete
+   * waits on the new row: a deadlock (error 1205). The batch runs at
+   * `DEADLOCK_PRIORITY HIGH` so SQL Server picks the create as the victim
+   * and the delete completes; the create fails, and a retry of it finds the
+   * repository gone.
+   */
+  public async deleteRepository(
+    repositoryId: string,
+    _onProgress?: DeleteProgressCallback,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
     const pool = this.getPool();
-    const result = await pool.request()
-      .input('id', sql.UniqueIdentifier, repositoryId)
-      .query(`DELETE FROM ${this.t('dm_repositories')} WHERE [repository_id] = @id`);
+    let counts: { relationships: number; entities: number; repositories: number } | undefined;
+    try {
+      // A parameterised query runs through sp_executesql, so the SET options
+      // apply to this request only and revert when the batch ends; they do
+      // not carry over to the pooled connection. With XACT_ABORT on, any
+      // error in the batch rolls the whole transaction back.
+      const result = await pool.request()
+        .input('id', sql.UniqueIdentifier, repositoryId)
+        .query<{ relationships: number; entities: number; repositories: number }>(`
+          SET XACT_ABORT ON;
+          SET DEADLOCK_PRIORITY HIGH;
+          DECLARE @relationships INT = 0, @entities INT = 0, @repositories INT = 0;
+          BEGIN TRANSACTION;
+          SELECT @repositories = 1
+            FROM ${this.t('dm_repositories')} WITH (XLOCK, HOLDLOCK, ROWLOCK)
+            WHERE [repository_id] = @id;
+          IF @repositories = 0
+            ROLLBACK TRANSACTION;
+          ELSE
+          BEGIN
+            DELETE FROM ${this.t('dm_relationships')} WHERE [repository_id] = @id;
+            SET @relationships = @@ROWCOUNT;
+            DELETE FROM ${this.t('dm_entities')} WHERE [repository_id] = @id;
+            SET @entities = @@ROWCOUNT;
+            DELETE FROM ${this.t('dm_repositories')} WHERE [repository_id] = @id;
+            COMMIT TRANSACTION;
+          END
+          SELECT @relationships AS relationships, @entities AS entities, @repositories AS repositories;
+        `);
+      counts = result.recordset[0];
+    } catch (err) {
+      throw new ProviderError(
+        `SQL Server deleteRepository failed: ${err instanceof Error ? err.message : String(err)}`,
+        'An error inside the batch rolls the whole delete back. Re-run the delete; a repository that is already gone reports not found.',
+        { cause: err },
+      );
+    }
 
-    if (result.rowsAffected[0] === 0) {
+    if (counts === undefined) {
+      throw new ProviderError('SQL Server deleteRepository returned no result row.');
+    }
+    if (counts.repositories === 0) {
       throw new RepositoryNotFoundError(repositoryId);
     }
+    return { deletedEntities: counts.entities, deletedRelationships: counts.relationships };
   }
 
   public async deleteAllContents(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
@@ -1286,9 +1346,15 @@ export class SqlServerStorageProvider implements StorageProvider {
 
   // ─── Relationships ──────────────────────────────────────────────
 
+  /**
+   * The id check is a primary-key seek, and the primary key enforces id
+   * uniqueness on the INSERT as well, so a reused id is refused whatever
+   * `options.idMinted` says.
+   */
   public async createRelationship(
     repositoryId: string,
     relationship: StoredRelationship,
+    _options?: RelationshipCreateOptions,
   ): Promise<StoredRelationship> {
     // Check first so the common failures get their typed errors without a
     // failed INSERT. The check and the INSERT are separate statements, so a

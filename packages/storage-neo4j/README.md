@@ -48,6 +48,7 @@ For local development with Docker, see [Local development setup](#local-developm
 | `maxTransactionRetryTime` | `number` | driver default (30 s) | Maximum time (ms) the driver keeps retrying a managed transaction on transient errors. It only bounds how long retries run. Creates, deletes by id and insert imports answer correctly when retried (see [Error handling](#error-handling)), so there is no need to set it to `0`, which does not turn retry off anyway. |
 | `reportUsage` | `UsageSink` | `undefined` | Optional sink invoked once per public method call with the server-side time (ms) consumed. See [Usage tracking](#usage-tracking). |
 | `profileTraversals` | `boolean` | `false` | When `true`, prepends `PROFILE` to compiled traversal queries and surfaces the plan summary on the sink record. `PROFILE` more than doubles wall-clock on short traversals — turn it on only when actively investigating planner behaviour. |
+| `searchScoring` | `'relevance' \| 'isolated'` | `'relevance'` | How `findEntities` orders the hits of a `searchTerm` query. `'relevance'` orders by full-text score; `'isolated'` orders by `label`, then `id`, so no statistic computed from other repositories reaches the order. See [Search ordering and tenant isolation](#search-ordering-and-tenant-isolation). |
 
 The provider holds a single Neo4j `Driver` per instance, per the driver's documented "create once, share, close on shutdown" lifecycle.
 
@@ -74,6 +75,15 @@ await provider.dispose();      // closes the Bolt driver
 Neo4j Community Edition has a single user database, so multiple repositories share one Neo4j database and are isolated by a `repositoryId` property on every node and edge. **Every Cypher statement** issued by this provider — apart from a small allowlist of system queries (`ensureSchema`, `listRepositories`, `_Meta` reads) — carries a required `$rid` parameter and references it in a predicate. The `Neo4jConnection` chokepoint enforces this at runtime: a Cypher string that omits `$rid` raises `ProviderError`, and no other file in the package is allowed to touch the driver directly.
 
 Operators who need physical isolation between tenants can run one Neo4j instance per tenant and create one `Neo4jStorageProvider` per URI — that is an operations choice, not a provider feature.
+
+Repository-scoped statements are planned so that their cost grows with the repository, not with the database. Lookups and deletes by relationship id (`getRelationship`, `deleteRelationship`, `deleteRelationships`), the `getRepositoryStats` counts and the batched drains of `deleteRepository` / `deleteAllContents` anchor on the repository's entities with `(e:_Entity {repositoryId: $rid}) WHERE e.id IS NOT NULL` (the relationship drain uses a range on `e.id` instead, as a keyset cursor that visits each entity once): the id predicate lets the planner seek the `(repositoryId, id)` unique index, where a bare `repositoryId` anchor would scan every `_Entity` in the database and an unanchored relationship pattern would scan every relationship. `Neo4jStorageProvider.queryPlans.test.ts` checks these plans with `EXPLAIN`.
+
+The exceptions, whose cost grows with the database:
+
+- **Full-text matching.** The `dm_entity_text` index covers every repository; see [Search ordering and tenant isolation](#search-ordering-and-tenant-isolation).
+- **`deleteRelationshipsByType`.** It matches the type's relationships across the database (a relationship-type scan) and keeps this repository's.
+- **The `_VocabularyChangeLog` drain** in `deleteRepository`, a scan of that label across every repository.
+- **The untyped-node sweep** in `deleteRepository`, which removes nodes with any label carrying the `repositoryId` (written through `executeNativeQuery`) and has no label to seek on, so each of its batches scans every node in the database. It runs once per delete, after the labelled drains.
 
 ### Label scheme
 
@@ -140,7 +150,7 @@ The vocabulary version is stored twice: inside the JSON blob and as a `version` 
 
 ### Repository delete
 
-`deleteRepository` deletes the `_Repository` marker first. Every create statement — `createEntity`, `createRelationship` and each `importBulk` chunk — write-locks the marker in the same statement as its write, then matches it again and writes only while it still exists. Deleting the marker takes the same lock, so a delete waits for a create that holds it, and its drain then removes what that create wrote; a create that waited on the delete finds the marker gone and fails with `RepositoryNotFoundError`. No create commits after the drain has passed it, so nothing outlives the repository. The delete then drains relationships, entities, the change log and any other node carrying the `repositoryId`. The `_Vocabulary` node goes last. A delete that is interrupted part-way can be finished by calling `deleteRepository` again. It throws `RepositoryNotFoundError` only when nothing at all was left to delete. While a delete is unfinished (a `_Vocabulary` node or `_Entity` nodes remain with no marker), `createRepository` refuses with a `ProviderError` that tells you to finish the delete first.
+`deleteRepository` deletes the `_Repository` marker first. Every create statement — `createEntity`, `createRelationship` and each `importBulk` chunk — write-locks the marker in the same statement as its write, then matches it again and writes only while it still exists. Deleting the marker takes the same lock, so a delete waits for a create that holds it, and its drain then removes what that create wrote; a create that waited on the delete finds the marker gone and fails with `RepositoryNotFoundError`. No create commits after the drain has passed it, so nothing outlives the repository. The delete then drains relationships, entities, the change log and any other node carrying the `repositoryId`, each in batches of its own transaction. The `_Vocabulary` node goes last. The relationship drain and the anchored relationship get/delete reach an edge from its source, one of the repository's `_Entity` nodes; an edge written through `executeNativeQuery` whose source is not one of them is not reached by those statements, and is removed only when its source node is (by the entity drain or the untyped-node sweep, if that node carries the `repositoryId`). Nothing counts the repository before the delete starts, because a whole-repository read could outlast the server's transaction timeout and then fail every retry the same way. The progress callback reports the running counts of entities and relationships removed so far (no totals), and `deleteRepository` / `deleteAllContents` return the counts removed. A delete that is interrupted part-way can be finished by calling `deleteRepository` again. It throws `RepositoryNotFoundError` only when nothing at all was left to delete. `deleteAllContents` reads the marker first (a seek of its unique constraint index) and throws `RepositoryNotFoundError` when there is none. While a delete is unfinished (a `_Vocabulary` node or `_Entity` nodes remain with no marker), `createRepository` refuses with a `ProviderError` that tells you to finish the delete first.
 
 ### Upgrading
 
@@ -169,6 +179,15 @@ The search branch ships the fulltext-index path only — no `WHERE … CONTAINS`
 A dual-path branch was rejected — the small win at 1k disappears as cohorts grow and the extra code surface is not worth carrying.
 
 Note that fulltext is token-based (Lucene). Sub-token matches like `alph` matching `alpha` would work under `CONTAINS` but **not** under tokenised fulltext. This is by design — the schema's intent is term-based search.
+
+### Search ordering and tenant isolation
+
+`dm_entity_text` is one full-text index over every `_Entity` in the database. A search queries it and then keeps only the caller's repository, so the hits and `total` are always the repository's own. Two things still depend on the rest of the database:
+
+- **Order, under `searchScoring: 'relevance'` (the default).** The Lucene score's term statistics (how common a word is) are computed over the whole index, so the order of one repository's hits can shift when another repository's data changes. In a store shared by several tenants, a tenant that controls its own data could probe, through its own result order, how common chosen words are in other tenants' data — frequencies, not content. Set `searchScoring: 'isolated'` to order hits by `label`, then `id`, instead; no score reaches the order, at the cost of relevance ranking. Single-tenant hosts can keep the default.
+- **Cost, under either setting.** The index produces every match in the database before the repository filter applies, so a search in a small repository pays for matches in every other repository.
+
+A database (or instance) per tenant is the full isolation option: it removes both effects.
 
 ## Graph traversal capabilities
 
@@ -211,11 +230,13 @@ Use `skipExistenceCheck: true` when the caller knows the data is fresh (faster p
 
 `result.errors` is not in input order: entity rows come before relationship rows, and among relationships the repeats an insert refuses come before each chunk's failures, in chunk order. Each record's `item` names its row.
 
-`createRelationship` checks the id the same way as upsert, and refuses any existing edge with `DuplicateRelationshipError`. The check seeks the repository's entities through the `(repositoryId, id)` index and then reads their edges, so its cost grows with the repository's relationship count, and it runs under the marker lock.
+`createRelationship` checks a caller-supplied id the same way as upsert, and refuses any existing edge with `DuplicateRelationshipError`. The check seeks the repository's entities through the `(repositoryId, id)` index and then reads their edges, so its cost grows with the repository's relationship count, and it runs under the marker lock. When the engine minted the id (`createRelationship(rid, relationship, { idMinted: true })`, which `RelationshipManager` passes whenever the caller gave no id), the id is a random UUID and the check is skipped: the statement locks the marker, seeks the two endpoints and `MERGE`s the edge between them on its id and the call's write token, so its cost does not grow with the repository.
 
 ## Native query escape hatch
 
 `executeNativeQuery(repositoryId, cypher, params)` runs a raw Cypher statement through the provider's connection. This bypasses the repository-scoping discipline that the rest of the provider enforces — the caller is fully responsible for scoping the query themselves.
+
+The provider's relationship statements reach an edge from its source entity: `getRelationship`, `deleteRelationship`, `deleteRelationships` and the relationship drain of `deleteRepository` / `deleteAllContents` start at the repository's `_Entity` nodes. An edge created here whose source is not one of the repository's `_Entity` nodes is not seen by them, even if it carries the `repositoryId`; it is removed only with its source node (see [Repository delete](#repository-delete)).
 
 **Do not expose this method to AI-agent-facing surfaces.** It exists for admin tooling and migration scripts only; the MCP server intentionally does not surface it.
 
@@ -241,7 +262,7 @@ Transient errors are retried automatically by `driver.executeQuery` and `session
 
 Creates, deletes by id and insert imports are retry-safe. The driver re-runs a transaction after a retryable failure, including a failure on commit: when the connection drops after the server committed but before the client heard back, the re-run meets what the first run already wrote. The provider answers that case as the success it was:
 
-- `createEntity`, `createRelationship` and `createRepository` write a per-call token (`_attempt`) on the record they create. When the re-run is refused (`DuplicateEntityError`, `SlugConflictError`, `DuplicateRepositoryError`, or the relationship id already in use), the provider reads the stored token back. This call's token means the create succeeded; any other token, or none, is a genuine duplicate and the error stands.
+- `createEntity`, `createRelationship` and `createRepository` write a per-call token (`_attempt`) on the record they create. When the re-run is refused (`DuplicateEntityError`, `SlugConflictError`, `DuplicateRepositoryError`, or the relationship id already in use), the provider reads the stored token back. This call's token means the create succeeded; any other token, or none, is a genuine duplicate and the error stands. A `createRelationship` with an engine-minted id `MERGE`s on the id and the token, so its re-run matches the edge the first run wrote and succeeds without a read-back.
 - `deleteEntity`, `deleteEntities` and `deleteRelationships` run in a transaction function that knows its attempt number and remembers what earlier attempts deleted. An id an earlier attempt deleted and the re-run finds absent counts as deleted (`deleteEntity` succeeds rather than throwing `EntityNotFoundError`).
 - `importBulk` with `skipExistenceCheck: true` writes a token per chunk statement. Relationships are MERGEd on their id together with that token, so a re-run, or the chunk's per-row fallback, matches the edge the first run wrote instead of writing it again; an edge written by any other call never matches. An entity chunk refused on re-run counts as imported when every row's id holds an entity with the chunk's token; otherwise its rows are written one at a time, each with its own token, and a row refused for its id or slug counts as imported when the stored entity carries its own token or the chunk's. A genuine duplicate is still reported with `ENTITY_ALREADY_EXISTS` or `SLUG_CONFLICT`, once per refused row: an entity id new to the repository and repeated N times within one call lands once and yields N-1 `ENTITY_ALREADY_EXISTS` errors.
 
@@ -362,7 +383,7 @@ import {
   SCHEMA_VERSION,
 } from '@utaba/deep-memory-storage-neo4j';
 
-import type { Neo4jStorageProviderConfig } from '@utaba/deep-memory-storage-neo4j';
+import type { Neo4jStorageProviderConfig, Neo4jSearchScoring } from '@utaba/deep-memory-storage-neo4j';
 ```
 
 ## See also

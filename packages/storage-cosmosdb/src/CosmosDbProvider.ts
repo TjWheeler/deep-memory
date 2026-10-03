@@ -4,6 +4,7 @@ import type {
   StorageProvider,
   EnsureSchemaResult,
   EntityReadOptions,
+  RelationshipCreateOptions,
   VocabularyReadOptions,
 } from '@utaba/deep-memory/providers';
 import type { GraphTraversalProvider, GraphTraversalCapabilities } from '@utaba/deep-memory/providers';
@@ -377,8 +378,8 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         );
       }
 
-      // 7. Step E — indexing-policy diagnostic. Always runs (operators may
-      // drift policy between calls). Never fails ensureSchema — see helper.
+      // 7. Indexing-policy diagnostic. Always runs (operators may change the
+      // policy between calls). Never fails ensureSchema — see helper.
       await this.runIndexingPolicyDiagnostic();
 
       return {
@@ -396,12 +397,11 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   }
 
   /**
-   * Step E — verify the container's indexing policy covers every path that
-   * the SQL `findEntities` rewrite hits. The probe (2026-05-26) confirmed
-   * code-managed containers get the Cosmos default policy (everything
-   * indexed). This guard is for operator-facing protection: externally
-   * provisioned containers (ARM/Bicep) can have `excludedPaths` set, which
-   * would force `findEntities` to scan rather than index-lookup.
+   * Verify the container's indexing policy covers every path that the SQL
+   * `findEntities` query hits. Code-managed containers get the Cosmos
+   * default policy (everything indexed). This guard protects operators:
+   * externally provisioned containers (ARM/Bicep) can have `excludedPaths`
+   * set, which would force `findEntities` to scan rather than index-lookup.
    *
    * Single GET against the colls resource, minimal RU. Never fails
    * `ensureSchema` — a diagnostic must not break provisioning.
@@ -501,11 +501,14 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    * repository later re-created under the same id must not be served it, so
    * the entry is dropped whether or not the delete succeeds.
    */
-  public async deleteRepository(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<void> {
+  public async deleteRepository(
+    repositoryId: string,
+    onProgress?: DeleteProgressCallback,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteRepository', repositoryId, async () => {
       try {
-        await repoQueries.deleteRepository(this.conn, repositoryId, onProgress);
+        return await repoQueries.deleteRepository(this.conn, repositoryId, onProgress);
       } finally {
         this.invalidateVocabularyCache(repositoryId);
       }
@@ -678,7 +681,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    *     .cap('found')                   // emits the bucket as the single result
    *
    * The bucket is always emitted as a single list item — empty when nothing
-   * matched (probe-verified 2026-05-25, local-tests/phase7-shape-probe.mjs).
+   * matched.
    * `notFound` is derived client-side as the set difference.
    */
   private async deleteEntitiesImpl(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
@@ -727,7 +730,16 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
   // ─── Relationships ─────────────────────────────────────────────────
 
-  async createRelationship(repositoryId: string, relationship: StoredRelationship): Promise<StoredRelationship> {
+  /**
+   * The id check is a partition-scoped edge lookup inside the create's single
+   * traversal, so it costs no extra round trip, and the create runs it
+   * whatever `options.idMinted` says.
+   */
+  public async createRelationship(
+    repositoryId: string,
+    relationship: StoredRelationship,
+    _options?: RelationshipCreateOptions,
+  ): Promise<StoredRelationship> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('createRelationship', repositoryId, () =>
       relQueries.createRelationship(this.conn, repositoryId, relationship),
@@ -994,15 +1006,12 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    * mode for cycle prevention, producing
    * `.emit().repeat(bothE().otherV()).times(maxDepth).simplePath()
    * .range(...).path().by(<v>).by(<e>)`, which yields paths of every length
-   * from 0 (the start vertex alone) to `maxDepth`. Live-probed against the
-   * Cosmos emulator 2026-05-25 — see local-tests/phase4-repeat-emit-probe.mjs.
+   * from 0 (the start vertex alone) to `maxDepth`.
    *
-   * The pre-Phase-4 Cosmos BFS in (now-deleted) `packages/storage-cosmosdb/
-   * src/queries/traversal.ts` traversed edges with unconditional `bothE()`
-   * regardless of the `bidirectional` flag (path discovery is reachability,
-   * not semantic direction). Mirror that here by using step direction
-   * `'both'` and not applying any direction filter. The plan's §6
-   * observable-outputs rule requires preserving this.
+   * Path discovery is reachability, not semantic direction, so edges are
+   * traversed in both directions regardless of the `bidirectional` flag: the
+   * step direction is `'both'` and no direction filter applies. Callers rely
+   * on that, so it must be preserved.
    *
    * One round-trip total. The previous BFS was up to `1 + fanout + fanout² + …`.
    */
@@ -1448,8 +1457,9 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     // produce scalars or projected Maps, not vertex property maps) so they
     // bypass the entity parsers entirely. The compiler only emits the
     // projection terminal when returnMode is 'terminal'; mirror that gate
-    // here so 'all' / 'path' projections fall through to the existing paths
-    // (where the projection block is silently dropped, per plan §2.2).
+    // here so 'all' / 'path' projections fall through to the existing paths,
+    // which ignore the projection block: they return every entity or path
+    // the walk visited, not one terminal set that a projection could shape.
     const emitsProjection =
       spec.projection !== undefined &&
       spec.returnMode !== 'all' &&

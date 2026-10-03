@@ -81,8 +81,20 @@ export class RelationshipManager {
       const relType = vocabulary.relationshipTypes.find((rt) => rt.type === normalizedType);
       const bidirectional = relType?.bidirectional ?? false;
 
-      // Generate GUID (or use provided)
-      const id = input.id ?? generateRelationshipId();
+      // Generate GUID (or use provided). The id and its origin come from one
+      // branch: `idMinted` lets the provider skip checking the repository for
+      // the id, so it is set only when this call generated the id. A missing
+      // id (`undefined`, or `null` from an untyped caller) is minted; any
+      // string the caller supplied, empty included, is checked.
+      let id: string;
+      let idMinted: boolean;
+      if (typeof input.id === 'string') {
+        id = input.id;
+        idMinted = false;
+      } else {
+        id = generateRelationshipId();
+        idMinted = true;
+      }
 
       // Stamp provenance
       const provenance = this.provenanceTracker.stampCreate();
@@ -99,7 +111,7 @@ export class RelationshipManager {
       };
 
       // Persist
-      const created = await this.storage.createRelationship(this.repositoryId, storedRelationship);
+      const created = await this.storage.createRelationship(this.repositoryId, storedRelationship, { idMinted });
 
       // Map to public type
       const relationship = storedToRelationship(created);

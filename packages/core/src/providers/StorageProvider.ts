@@ -75,6 +75,27 @@ export interface VocabularyReadOptions {
 }
 
 /**
+ * Options for `createRelationship`.
+ *
+ * `idMinted` is `true` when the engine generated `relationship.id` itself
+ * (`generateRelationshipId`, a random UUID) rather than taking it from the
+ * caller. A minted id cannot collide with a stored one in practice, so a
+ * provider may skip its check that the id is unused in the repository when
+ * that check is expensive. A provider that enforces id uniqueness for free
+ * (a primary key) keeps enforcing it. Defaults to `false`: an id the caller
+ * supplied is always checked.
+ *
+ * `idMinted` is an engine-only assertion. Only the engine's relationship
+ * create path, at the point where it generated the id, may set it. Setting it
+ * for an id the engine did not generate removes the reused-id guarantee on
+ * providers that skip the check: Neo4j, for example, then stores a second
+ * relationship with the same id in the repository.
+ */
+export interface RelationshipCreateOptions {
+  idMinted?: boolean;
+}
+
+/**
  * StorageProvider — the primary persistence interface.
  *
  * Must be supplied when creating a DeepMemory instance. Handles all
@@ -110,7 +131,18 @@ export interface StorageProvider {
     filter?: RepositoryFilter,
   ): Promise<PaginatedResult<StoredRepositorySummary>>;
   updateRepository(repositoryId: string, updates: RepositoryUpdate): Promise<StoredRepository>;
-  deleteRepository(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<void>;
+  /**
+   * Delete a repository and everything in it, and report how many entities
+   * and relationships the call removed. Providers do not count the
+   * repository before deleting it: a whole-repository read ahead of the
+   * delete can outlast a server timeout on a large repository and leave it
+   * undeletable. `onProgress` reports the running counts as the delete
+   * proceeds; providers that delete in one statement may not call it.
+   */
+  deleteRepository(
+    repositoryId: string,
+    onProgress?: DeleteProgressCallback,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }>;
   /** Delete all entities and relationships in a repository without deleting the repository itself */
   deleteAllContents(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }>;
   getRepositoryStats(repositoryId: string): Promise<RepositoryStats>;
@@ -217,9 +249,16 @@ export interface StorageProvider {
 
   // ─── Relationships ─────────────────────────────────────────────────
 
+  /**
+   * Create a relationship. Its id must be unused in the repository: a
+   * provider refuses an id already held by another relationship with
+   * `DuplicateRelationshipError`, unless `options.idMinted` says the engine
+   * generated the id (see `RelationshipCreateOptions`).
+   */
   createRelationship(
     repositoryId: string,
     relationship: StoredRelationship,
+    options?: RelationshipCreateOptions,
   ): Promise<StoredRelationship>;
   getRelationship(
     repositoryId: string,

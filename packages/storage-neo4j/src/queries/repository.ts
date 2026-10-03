@@ -8,26 +8,33 @@ import type { MemoryVocabulary, RepositoryStats } from '@utaba/deep-memory/types
 import { bigintToSafeNumber } from '../mapping.js';
 
 /**
- * Entities-by-type breakdown. One row per distinct `entityType`. The single
- * `:_Entity` umbrella label decision (P5 lock) is load-bearing here — the
- * planner aggregates over `n.entityType` rather than walking per-type labels,
- * so the plan is byte-identical regardless of which entity types live in the
- * repository.
+ * Entities-by-type breakdown. One row per distinct `entityType`. Every entity
+ * carries the single `:_Entity` umbrella label, so the aggregation groups on
+ * `n.entityType` rather than walking per-type labels, and the plan is the
+ * same whichever entity types live in the repository.
+ *
+ * `WHERE n.id IS NOT NULL` lets the planner seek the `(repositoryId, id)`
+ * unique index for the repository's entities. A bare `repositoryId` anchor
+ * has no index to use and scans every `_Entity` in the database.
  */
-const ENTITY_STATS_QUERY = `
+export const ENTITY_STATS_QUERY = `
 MATCH (n:_Entity {repositoryId: $rid})
+WHERE n.id IS NOT NULL
 RETURN n.entityType AS type, count(n) AS count
 `;
 
 /**
  * Relationships-by-type breakdown. `type(r)` returns the Cypher relationship
- * type slug exactly as written by `createRelationship`. The pattern endpoints
- * carry the repository predicate explicitly so the planner narrows via the
- * `(repositoryId, id)` constraint's backing index — fanning out across every
- * relationship in the database first would defeat the per-repository scope.
+ * type exactly as written by `createRelationship`. The pattern is anchored on
+ * the repository's entities through the `(repositoryId, id)` unique index
+ * (`WHERE e.id IS NOT NULL`) and expands their outgoing edges, so each edge
+ * is counted once from its source; `repositoryId` on the edge admits only
+ * this repository's relationships. An unanchored relationship pattern would
+ * scan every relationship in the database.
  */
-const RELATIONSHIP_STATS_QUERY = `
-MATCH (:_Entity {repositoryId: $rid})-[r {repositoryId: $rid}]->(:_Entity {repositoryId: $rid})
+export const RELATIONSHIP_STATS_QUERY = `
+MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid}]->()
+WHERE e.id IS NOT NULL
 RETURN type(r) AS type, count(r) AS count
 `;
 
@@ -42,16 +49,16 @@ RETURN type(r) AS type, count(r) AS count
  * vocabulary cache; on a warm cache the stats path costs exactly two round-
  * trips total.
  *
- * `count(n)` and `count(r)` come back as `BigInt` under `useBigInt: true`
- * (D6b lock — confirmed by the Phase 10 probe results). The mapping helper
+ * `count(n)` and `count(r)` come back as `BigInt` because the driver runs
+ * with `useBigInt: true`. The mapping helper
  * `bigintToSafeNumber` throws when a value exceeds `Number.MAX_SAFE_INTEGER`,
  * so callers never see a silent precision loss on extreme counts.
  *
  * Empty repository: both queries return zero rows; the returned breakdowns
  * are empty maps and the totals are 0. Cross-repository isolation is
- * structural — the `repositoryId` predicate on both endpoints scopes the
- * relationship pattern to this repository regardless of any overlapping
- * entity IDs in adjacent repositories.
+ * structural — the `repositoryId` predicate on the anchor entity and on the
+ * edge scopes the relationship pattern to this repository regardless of any
+ * overlapping entity ids in adjacent repositories.
  */
 export async function getRepositoryStats(
   conn: Neo4jConnection,

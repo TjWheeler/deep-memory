@@ -1,13 +1,12 @@
 // Relationship CRUD Cypher queries.
 //
-// Storage shape (per D5 / D7):
+// Storage shape:
 //   - Each relationship is a directed Cypher edge whose type is the
-//     vocabulary slug uppercased per Cypher convention (D5 — `WORKS_AT`,
+//     vocabulary slug uppercased per Cypher convention (`WORKS_AT`,
 //     `KNOWS`, …). The relationship-type slot cannot be parameterised in
 //     Cypher 25, so the slug is interpolated into the query string after
 //     passing `assertSafeRelationshipType` — vocabulary cardinality bounds
-//     the per-type plan-cache footprint (cheat sheet "Indexes" / Phase plan
-//     D7).
+//     the per-type plan-cache footprint.
 //   - `bidirectional: true` is a read-time hint: the edge is still stored as
 //     a single directed edge, and `getEntityRelationships` exposes it from
 //     both ends by UNION-ing the inverse-direction match for bidirectional
@@ -23,13 +22,24 @@
 // Isolation invariant — the repository scope is enforced inside each
 // statement, so no caller can write or read across repositories:
 //   - `createRelationship` matches both endpoint nodes under the scoping
-//     `$rid` predicate before issuing `CREATE`. A cross-repository edge is
-//     therefore structurally unwritable: the endpoint match for the
-//     out-of-scope side finds nothing and the `FOREACH` conditional skips
-//     the CREATE.
+//     `$rid` predicate before writing the edge (`CREATE`, or `MERGE` for a
+//     minted id). A cross-repository edge is therefore structurally
+//     unwritable: the endpoint match for the out-of-scope side finds nothing
+//     and the `FOREACH` conditional skips the write.
 //   - Every read / delete carries the `$rid` predicate on the relationship
 //     property map so reachability is bounded by the scope discriminator,
 //     not the graph topology.
+//
+// Cost invariant — a lookup by relationship id never scans the database.
+// Neo4j relationship indexes cover one relationship type, and a lookup by id
+// does not know the type, so the pattern is anchored on the repository's
+// entities instead: `(e:_Entity {repositoryId: $rid}) WHERE e.id IS NOT NULL`.
+// The id predicate lets the planner seek the `(repositoryId, id)` unique
+// index rather than scanning every `_Entity` in the database, and the
+// lookup then expands the repository's own edges only, so its cost scales
+// with the repository, not with every repository in the store. Every edge
+// leaves an `_Entity` of its repository (`createRelationship` binds both
+// endpoints under `$rid`), so the directed anchor reaches each edge once.
 
 import { randomUUID } from 'node:crypto';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
@@ -187,6 +197,66 @@ RETURN outcome
 }
 
 /**
+ * Build the `createRelationship` Cypher for a relationship whose id the
+ * engine minted (`RelationshipCreateOptions.idMinted`). It is the statement
+ * `buildCreateRelationshipQuery` builds without the id check: a minted id is
+ * a random UUID, so looking for it among the repository's edges — a pass
+ * over every edge of the repository, under the marker lock — buys nothing.
+ * The statement touches the marker, the two endpoints and the edges between
+ * them only (see the `MERGE` below), not the rest of the repository.
+ *
+ * The marker lock and the remaining outcomes are unchanged, in the same
+ * order of precedence: repository missing, source missing, target missing,
+ * created. The lock still closes the race with `deleteRepository`.
+ *
+ * The creating clause is a `MERGE` between the two bound endpoints, keyed
+ * on the id and this call's write token (`$writeAttempt`). The driver
+ * re-runs a statement whose commit acknowledgement was lost, sending the same
+ * token; the re-run matches the edge its first run committed instead of
+ * writing a second one, and reports `created`. An edge written by any other
+ * call carries another token and never matches. The `MERGE` looks only at
+ * the edges between `s` and `t`, which the endpoint seeks already bound: the
+ * planner expands into the pair (`Expand(Into)`), which walks the type-`T`
+ * edges of whichever endpoint has fewer of them. Its cost is bounded by that
+ * smaller endpoint degree for the type, not by the size of the repository.
+ */
+export function buildCreateMintedRelationshipQuery(relationshipType: string): string {
+  const relType = assertSafeRelationshipType(relationshipType);
+  const o = RELATIONSHIP_CREATE_OUTCOME;
+  return `${LOCK_REPOSITORY_MARKER_OPTIONAL}
+OPTIONAL MATCH (s:_Entity {repositoryId: $rid, id: $sourceEntityId})
+OPTIONAL MATCH (t:_Entity {repositoryId: $rid, id: $targetEntityId})
+WITH s, t,
+  CASE
+    WHEN live IS NULL THEN '${o.repositoryMissing}'
+    WHEN s IS NULL THEN '${o.sourceMissing}'
+    WHEN t IS NULL THEN '${o.targetMissing}'
+    ELSE '${o.created}'
+  END AS outcome
+FOREACH (_ IN CASE WHEN outcome = '${o.created}' THEN [1] ELSE [] END |
+  MERGE (s)-[r:${relType} {repositoryId: $rid, id: $id, ${WRITE_ATTEMPT_PROPERTY}: $writeAttempt}]->(t)
+  ON CREATE SET
+    r.relationshipType = $relationshipType,
+    r.sourceEntityId = $sourceEntityId,
+    r.targetEntityId = $targetEntityId,
+    r.properties = $properties,
+    r.bidirectional = $bidirectional,
+    r.createdBy = $createdBy,
+    r.createdByType = $createdByType,
+    r.createdAt = $createdAt,
+    r.createdInConversation = $createdInConversation,
+    r.createdFromMessage = $createdFromMessage,
+    r.modifiedBy = $modifiedBy,
+    r.modifiedByType = $modifiedByType,
+    r.modifiedAt = $modifiedAt,
+    r.modifiedInConversation = $modifiedInConversation,
+    r.modifiedFromMessage = $modifiedFromMessage
+)
+RETURN outcome
+`;
+}
+
+/**
  * Read back the write token of the edge carrying an id, after a create
  * reported the id as taken. Anchored on this call's source entity, which
  * seeks the unique `(repositoryId, id)` entity index and expands only that
@@ -212,13 +282,15 @@ RETURN repo IS NOT NULL AS repositoryExists,
 `;
 
 /**
- * Create a relationship in one statement (see `buildCreateRelationshipQuery`)
- * and translate its outcome: a missing repository →
- * `RepositoryNotFoundError`, a missing source or target →
+ * Create a relationship in one statement and translate its outcome. A
+ * caller-supplied id runs `buildCreateRelationshipQuery`, which checks the
+ * repository for the id; an id the engine minted (`idMinted`) runs
+ * `buildCreateMintedRelationshipQuery`, which does not. Outcomes: a missing
+ * repository → `RepositoryNotFoundError`, a missing source or target →
  * `EntityNotFoundError` carrying that endpoint's id, an id already in use in
- * the repository → `DuplicateRelationshipError`, unless the edge under that
- * id carries this call's write token (the driver re-ran a create whose first
- * run committed), which is success.
+ * the repository (checked path only) → `DuplicateRelationshipError`, unless
+ * the edge under that id carries this call's write token (the driver re-ran
+ * a create whose first run committed), which is success.
  *
  * A server may instead refuse the statement with
  * `Neo.ClientError.Statement.EntityNotFound` when a node it locked or
@@ -233,8 +305,11 @@ export async function createRelationship(
   conn: Neo4jConnection,
   repositoryId: string,
   relationship: StoredRelationship,
+  idMinted: boolean,
 ): Promise<StoredRelationship> {
-  const cypher = buildCreateRelationshipQuery(relationship.relationshipType);
+  const cypher = idMinted
+    ? buildCreateMintedRelationshipQuery(relationship.relationshipType)
+    : buildCreateRelationshipQuery(relationship.relationshipType);
   const writeAttempt = randomUUID();
   const params = { ...relationshipToParams(relationship), writeAttempt };
   let result: QueryResult;
@@ -358,22 +433,29 @@ async function throwForMissingPrecondition(
 }
 
 /**
- * Look up a relationship by id. The implicit-direction pattern
- * `()-[r {...}]-()` finds the edge from either endpoint; the
- * `(repositoryId, id)` predicate is the application-level dedup key (D7).
- * Returns `null` on miss — contract is `null`-on-miss, not throw.
+ * Look up a relationship by id, anchored on the repository's entities (see
+ * the cost invariant above). The `(repositoryId, id)` predicate on the edge
+ * is the application-level dedup key.
+ */
+export const RELATIONSHIP_GET_QUERY =
+  'MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid, id: $relId}]->() ' +
+  `WHERE e.id IS NOT NULL RETURN ${RELATIONSHIP_PROJECTION}`;
+
+/**
+ * Look up a relationship by id (`RELATIONSHIP_GET_QUERY`). Returns `null` on
+ * miss — contract is `null`-on-miss, not throw.
  */
 export async function getRelationship(
   conn: Neo4jConnection,
   repositoryId: string,
   relationshipId: string,
 ): Promise<StoredRelationship | null> {
-  // Edges are written directionally (D5) — the `->` pattern matches each
+  // Edges are written directionally — the `->` pattern matches each
   // relationship exactly once. The undirected `-[r]-` variant enumerates both
   // endpoint perspectives and yields each edge twice, which is wasted work
   // for a unique-by-id lookup.
   const result = await conn.executeQuery(
-    `MATCH ()-[r {repositoryId: $rid, id: $relId}]->() RETURN ${RELATIONSHIP_PROJECTION}`,
+    RELATIONSHIP_GET_QUERY,
     { relId: relationshipId },
     { repositoryId, routing: 'READ' },
   );
@@ -453,31 +535,44 @@ export async function getEntityRelationships(
 }
 
 /**
- * Drop a single relationship by id. No-op on miss — mirrors the Cosmos
- * contract (the public surface returns `void`, not a deleted-row count).
+ * Delete one relationship by id, anchored on the repository's entities (see
+ * the cost invariant above). Directional pattern: edges are stored
+ * directionally so `->` matches each relationship once. `-[r]-` would
+ * enumerate both endpoint perspectives and re-issue DELETE against an
+ * already-removed edge, which is wasted work even though the operation
+ * remains idempotent.
+ */
+export const RELATIONSHIP_DELETE_QUERY =
+  'MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid, id: $relId}]->() ' +
+  'WHERE e.id IS NOT NULL DELETE r';
+
+/**
+ * Drop a single relationship by id (`RELATIONSHIP_DELETE_QUERY`). No-op on
+ * miss — mirrors the Cosmos contract (the public surface returns `void`, not
+ * a deleted-row count).
  */
 export async function deleteRelationship(
   conn: Neo4jConnection,
   repositoryId: string,
   relationshipId: string,
 ): Promise<void> {
-  // Directional pattern: edges are stored directionally so `->` matches each
-  // relationship once. `-[r]-` would enumerate both endpoint perspectives
-  // and re-issue DELETE against an already-removed edge, which is wasted
-  // work even though the operation remains idempotent.
   await conn.executeQuery(
-    'MATCH ()-[r {repositoryId: $rid, id: $relId}]->() DELETE r',
+    RELATIONSHIP_DELETE_QUERY,
     { relId: relationshipId },
     { repositoryId },
   );
 }
 
-// Directional pattern — edges are stored directionally, so `->` matches each
-// relationship exactly once. `-[r]-` would double-yield each edge (once per
-// endpoint perspective), producing duplicate ids in the returned `deleted`
-// set.
-const RELATIONSHIP_DELETE_MANY_QUERY =
-  'MATCH ()-[r {repositoryId: $rid}]->() WHERE r.id IN $ids ' +
+/**
+ * Delete relationships by id, anchored on the repository's entities (see the
+ * cost invariant above). Directional pattern — edges are stored
+ * directionally, so `->` matches each relationship exactly once. `-[r]-`
+ * would double-yield each edge (once per endpoint perspective), producing
+ * duplicate ids in the returned `deleted` set.
+ */
+export const RELATIONSHIP_DELETE_MANY_QUERY =
+  'MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid}]->() ' +
+  'WHERE e.id IS NOT NULL AND r.id IN $ids ' +
   'WITH r, r.id AS id DELETE r RETURN id AS deleted';
 
 /**

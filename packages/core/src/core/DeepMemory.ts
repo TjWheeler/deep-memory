@@ -286,6 +286,17 @@ export class DeepMemory {
     return repo;
   }
 
+  /**
+   * Point read of the repository marker, so a delete of a repository that does
+   * not exist fails before any delete event is emitted for it.
+   */
+  private async requireRepositoryExists(repositoryId: string): Promise<void> {
+    const storedRepo = await this.storage.getRepository(repositoryId);
+    if (!storedRepo) {
+      throw new RepositoryNotFoundError(repositoryId);
+    }
+  }
+
   /** Get the full stored record for a single repository (including legal, owner, metadata, governance) */
   public async getRepository(repositoryId: string): Promise<StoredRepository> {
     await this.ensureInitialized();
@@ -330,41 +341,62 @@ export class DeepMemory {
     return updated;
   }
 
-  /** Delete a repository */
+  /**
+   * Delete a repository. The repository is not counted first: a
+   * whole-repository read ahead of the delete can outlast a server timeout on
+   * a large repository, and a delete that fails before it starts can never be
+   * finished by re-running it. Progress and completion events carry the
+   * counts the delete itself reports.
+   *
+   * No delete event is emitted for a repository that does not exist. A point
+   * read of the repository record decides when `delete:started` goes out:
+   * up front when the record exists. When it does not, the provider is still
+   * called, because a delete interrupted after it removed the record leaves
+   * data behind that only a re-run of `deleteRepository` can finish (the
+   * providers refuse to re-create the repository until it is finished). The
+   * provider throws `RepositoryNotFoundError` when nothing at all is left,
+   * before any event; otherwise `delete:started` goes out with the first
+   * progress report, or ahead of `delete:completed` at the latest.
+   */
   public async deleteRepository(repositoryId: string): Promise<void> {
     await this.ensureInitialized();
     this.validateRepositoryId(repositoryId);
 
-    const stats = await this.storage.getRepositoryStats(repositoryId);
-    await this.globalEventBus.emit('delete:started', {
-      repositoryId,
-      totalEntities: stats.entityCount,
-      totalRelationships: stats.relationshipCount,
+    let started = false;
+    const start = async (): Promise<void> => {
+      if (started) return;
+      started = true;
+      await this.globalEventBus.emit('delete:started', { repositoryId });
+    };
+    if ((await this.storage.getRepository(repositoryId)) !== null) {
+      await start();
+    }
+
+    const result = await this.storage.deleteRepository(repositoryId, async (progress) => {
+      await start();
+      await this.globalEventBus.emit('delete:progress', { repositoryId, ...progress });
     });
 
-    await this.storage.deleteRepository(repositoryId, (progress) =>
-      this.globalEventBus.emit('delete:progress', { repositoryId, ...progress }),
-    );
-
+    await start();
     await this.globalEventBus.emit('delete:completed', {
       repositoryId,
-      entitiesDeleted: stats.entityCount,
-      relationshipsDeleted: stats.relationshipCount,
+      entitiesDeleted: result.deletedEntities,
+      relationshipsDeleted: result.deletedRelationships,
     });
     await this.globalEventBus.emit('repository:deleted', { repositoryId });
   }
 
-  /** Delete all entities and relationships in a repository, preserving the repository and vocabulary */
+  /**
+   * Delete all entities and relationships in a repository, preserving the
+   * repository and vocabulary. Like `deleteRepository`, it does not count the
+   * repository first; the events carry the counts the delete reports.
+   */
   public async deleteAllContents(repositoryId: string): Promise<{ deletedEntities: number; deletedRelationships: number }> {
     await this.ensureInitialized();
     this.validateRepositoryId(repositoryId);
+    await this.requireRepositoryExists(repositoryId);
 
-    const stats = await this.storage.getRepositoryStats(repositoryId);
-    await this.globalEventBus.emit('delete:started', {
-      repositoryId,
-      totalEntities: stats.entityCount,
-      totalRelationships: stats.relationshipCount,
-    });
+    await this.globalEventBus.emit('delete:started', { repositoryId });
 
     const result = await this.storage.deleteAllContents(repositoryId, (progress) =>
       this.globalEventBus.emit('delete:progress', { repositoryId, ...progress }),

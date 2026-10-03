@@ -13,9 +13,9 @@
 //      contract against the running Neo4j instance. Every contract assertion
 //      is identical to the Cosmos and SQL Server runs, so any silent
 //      divergence in semantics surfaces here. The Neo4j build is expected to
-//      pass with zero skips and zero `total: undefined` paths (D22 —
-//      findEntities is strictly more precise than the Cosmos surface because
-//      every filter shape resolves to a server-side exact predicate).
+//      pass with zero skips and zero `total: undefined` paths: findEntities
+//      is strictly more precise than the Cosmos surface because every filter
+//      shape resolves to a server-side exact predicate.
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run.
 // Example:
@@ -398,7 +398,7 @@ if (NEO4J_URI) {
       await expect(provider.createRepository(config)).rejects.toBeInstanceOf(ProviderError);
 
       // The retry finds the leftovers and finishes the wipe.
-      await expect(provider.deleteRepository(rid)).resolves.toBeUndefined();
+      await expect(provider.deleteRepository(rid)).resolves.toEqual({ deletedEntities: 2, deletedRelationships: 1 });
       const remaining = await rawConnection.executeQuery(
         'MATCH (n {repositoryId: $rid}) RETURN count(n) AS total',
         {},
@@ -439,15 +439,15 @@ if (NEO4J_URI) {
         createdBy: 'conformance',
       };
       await expect(provider.createRepository(config)).rejects.toBeInstanceOf(ProviderError);
-      await expect(provider.deleteRepository(rid)).resolves.toBeUndefined();
+      await expect(provider.deleteRepository(rid)).resolves.toEqual({ deletedEntities: 1, deletedRelationships: 0 });
       await provider.createRepository(config);
       expect(await provider.getEntity(rid, 'straggler-e1')).toBeNull();
     });
 
-    it('deleteRepository fires the progress callback at least once when there is data to drain', async () => {
+    it('deleteRepository on a repository with no data emits no progress and reports zero counts', async () => {
       await provider.createRepository({
         repositoryId: rid,
-        label: 'has-data',
+        label: 'no-data',
         governanceConfig: { mode: 'open' },
         createdAt: '2026-05-27T00:00:00Z',
         createdBy: 'conformance',
@@ -457,13 +457,57 @@ if (NEO4J_URI) {
       // The repo has no entities or relationships, only its _Repository and
       // _Vocabulary nodes. The marker is removed up front, the relationship
       // and entity drains find nothing and emit no progress, and the final
-      // system-node drain removes the _Vocabulary node without a callback —
-      // assert the call resolves cleanly.
+      // system-node drain removes the _Vocabulary node without a callback.
       await expect(
         provider.deleteRepository(rid, (p) => {
-          progress.push({ entitiesDeleted: p.entitiesDeleted, relationshipsDeleted: p.relationshipsDeleted });
+          progress.push({ ...p });
         }),
-      ).resolves.toBeUndefined();
+      ).resolves.toEqual({ deletedEntities: 0, deletedRelationships: 0 });
+      expect(progress).toEqual([]);
+    });
+
+    it('deleteRepository reports running counts from its drains, with no totals', async () => {
+      await provider.createRepository({
+        repositoryId: rid,
+        label: 'has-data',
+        governanceConfig: { mode: 'open' },
+        createdAt: '2026-05-27T00:00:00Z',
+        createdBy: 'conformance',
+      });
+      for (const id of ['drain-e1', 'drain-e2', 'drain-e3']) await provider.createEntity(rid, makeEntity(id));
+      const now = new Date().toISOString();
+      for (const [id, source, target] of [
+        ['drain-r1', 'drain-e1', 'drain-e2'],
+        ['drain-r2', 'drain-e2', 'drain-e3'],
+      ] as const) {
+        await provider.createRelationship(rid, {
+          id,
+          relationshipType: 'connects',
+          sourceEntityId: source,
+          targetEntityId: target,
+          properties: {},
+          bidirectional: false,
+          provenance: {
+            createdBy: 'conformance',
+            createdByType: 'agent',
+            createdAt: now,
+            modifiedBy: 'conformance',
+            modifiedByType: 'agent',
+            modifiedAt: now,
+          },
+        });
+      }
+
+      const progress: Array<Record<string, number>> = [];
+      await expect(
+        provider.deleteRepository(rid, (p) => {
+          progress.push({ ...p });
+        }),
+      ).resolves.toEqual({ deletedEntities: 3, deletedRelationships: 2 });
+      expect(progress).toEqual([
+        { entitiesDeleted: 0, relationshipsDeleted: 2 },
+        { entitiesDeleted: 3, relationshipsDeleted: 2 },
+      ]);
     });
   });
 

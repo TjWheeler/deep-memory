@@ -1,6 +1,11 @@
 // InMemoryStorageProvider — reference implementation of StorageProvider using Maps
 
-import type { StorageProvider, EntityReadOptions, VocabularyReadOptions } from '../providers/StorageProvider.js';
+import type {
+  StorageProvider,
+  EntityReadOptions,
+  RelationshipCreateOptions,
+  VocabularyReadOptions,
+} from '../providers/StorageProvider.js';
 import type {
   StoredEntity,
   StoredEntityUpdate,
@@ -168,11 +173,16 @@ export class InMemoryStorageProvider implements StorageProvider {
     return repo;
   }
 
-  public async deleteRepository(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<void> {
-    if (!this.stores.has(repositoryId)) {
+  public async deleteRepository(
+    repositoryId: string,
+    _onProgress?: DeleteProgressCallback,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+    const store = this.stores.get(repositoryId);
+    if (store === undefined) {
       throw new RepositoryNotFoundError(repositoryId);
     }
     this.stores.delete(repositoryId);
+    return { deletedEntities: store.entities.size, deletedRelationships: store.relationships.size };
   }
 
   public async deleteAllContents(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
@@ -446,9 +456,14 @@ export class InMemoryStorageProvider implements StorageProvider {
 
   // ─── Relationships ─────────────────────────────────────────────────
 
+  /**
+   * The relationship map is keyed by id, so a reused id is refused whatever
+   * `options.idMinted` says; the check costs a map lookup.
+   */
   public async createRelationship(
     repositoryId: string,
     relationship: StoredRelationship,
+    _options?: RelationshipCreateOptions,
   ): Promise<StoredRelationship> {
     const store = this.getStore(repositoryId);
     if (store.relationships.has(relationship.id)) {

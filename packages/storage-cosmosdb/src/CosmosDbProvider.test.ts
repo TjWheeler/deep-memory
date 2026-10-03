@@ -29,7 +29,15 @@ import {
 } from '@utaba/deep-memory';
 import { ENTITY_CREATE_QUERY } from './queries/entity.js';
 import { RELATIONSHIP_CREATE_QUERY } from './queries/relationship.js';
-import { DELETE_INDEX_ENTRY_QUERY, DELETE_VERTEX_BATCH_QUERY } from './queries/repository.js';
+import {
+  DELETE_ENTITY_BATCH_QUERY,
+  DELETE_INDEX_ENTRY_QUERY,
+  DELETE_VERTEX_BATCH_QUERY,
+  EDGE_BATCH_DROP_QUERY,
+  ENTITY_BATCH_COUNT_QUERY,
+  ENTITY_BATCH_DROP_QUERY,
+  REPOSITORY_MARKER_COUNT_QUERY,
+} from './queries/repository.js';
 import {
   VOCABULARY_BACKFILL_SCAN_SQL,
   VOCABULARY_BACKFILL_WRITE_QUERY,
@@ -1597,8 +1605,6 @@ describe('createRelationship user-property scalars', () => {
 // previous existence-check + drop into one Gremlin round-trip per chunk. The
 // bucket emits a list of ids the drop actually touched; the caller derives
 // notFound = requestedIds - foundIds client-side.
-//
-// Shape verified live against the Cosmos emulator 2026-05-25.
 
 // Shared bulk-test helpers used by the partition-key shape test and by the
 // `importBulk user-property scalars` block further down. The same fixtures and
@@ -2520,14 +2526,14 @@ describe('importBulk(skipExistenceCheck) user-property scalars', () => {
   });
 });
 
-// ─── Step D — findEntities routes through the Document (SQL) endpoint ─
+// ─── findEntities routes through the Document (SQL) endpoint ──────────
 //
-// The Gremlin JS-filter fan-out is gone. All findEntities calls — with or
-// without searchTerm / properties — go through CosmosDocumentClient.query
-// against the Cosmos NoSQL endpoint. The Gremlin connection is no longer
-// touched on this path. These tests inject a stub docClient and assert the
-// SQL shape, parameter binding, parallel COUNT, and properties prefilter +
-// client-side exact-match.
+// All findEntities calls — with or without searchTerm / properties — go
+// through CosmosDocumentClient.query against the Cosmos NoSQL endpoint, a
+// single-partition query, rather than a Gremlin read filtered in JS. The
+// Gremlin connection is not touched on this path. These tests inject a stub
+// docClient and assert the SQL shape, parameter binding, parallel COUNT, and
+// properties prefilter + client-side exact-match.
 
 interface DocQueryCall {
   sql: string;
@@ -2574,7 +2580,7 @@ function makeProviderWithDocStub(): { provider: CosmosDbProvider; doc: DocClient
   return { provider, doc };
 }
 
-describe('Step D findEntities SQL shape', () => {
+describe('findEntities SQL shape', () => {
   it('binds the partition predicate and pins the partition key on every query', async () => {
     const { provider, doc } = makeProviderWithDocStub();
     doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
@@ -2592,8 +2598,7 @@ describe('Step D findEntities SQL shape', () => {
   it('filters out _repository / _vocabulary system vertices via IS_DEFINED(c.entityType)', async () => {
     // Regression — the system vertices share the partition with entities and
     // lack an `entityType` property; without this filter they leak into the
-    // result page and break pagination math (conformance suite caught this
-    // running against the live emulator on 2026-05-26).
+    // result page and break pagination math.
     const { provider, doc } = makeProviderWithDocStub();
     doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
 
@@ -2830,18 +2835,18 @@ describe('Step D findEntities SQL shape', () => {
   });
 });
 
-// ─── Step E — indexing-policy diagnostic in ensureSchema ──────────────
+// ─── Indexing-policy diagnostic in ensureSchema ───────────────────────
 //
 // `ensureSchema()` reads the container's indexing policy after the schema
 // version is settled and warns when `excludedPaths` would force the
-// findEntities SQL rewrite to scan. Code-managed containers get the default
+// findEntities SQL query to scan. Code-managed containers get the default
 // policy (everything indexed). This guard catches containers provisioned via
 // external ARM/Bicep that strip indexing on the searched paths.
 //
 // The diagnostic is unit-tested in isolation by invoking
 // `runIndexingPolicyDiagnostic` directly via the private-access cast — going
 // through `ensureSchema()` would require stubbing the module-scoped
-// `cosmosRestPut` helper as well, which is covered by Step F's live run.
+// `cosmosRestPut` helper as well; that path needs a real container.
 
 interface ContainerPropertiesStub {
   getContainerProperties(): Promise<{
@@ -2882,7 +2887,7 @@ async function callDiagnostic(provider: CosmosDbProvider): Promise<void> {
     .runIndexingPolicyDiagnostic();
 }
 
-describe('Step E indexing-policy diagnostic', () => {
+describe('ensureSchema indexing-policy diagnostic', () => {
   it('does not warn when the default policy is applied (only /_etag excluded)', async () => {
     const { provider } = makeProvider();
     injectContainerPropertiesStub(provider, [{ path: '/"_etag"/?' }]);
@@ -2950,8 +2955,7 @@ describe('Step E indexing-policy diagnostic', () => {
 // the engine fans the lookup out to every physical partition. Every system-
 // vertex query whose repositoryId is known must therefore scope via
 // `has('repositoryId', rid)` BEFORE `hasId(vid)`. These tests lock the
-// emission shape so the 7 violations the 2026-05-26 audit caught do not
-// regress.
+// emission shape so an unscoped system-vertex lookup cannot come back.
 
 describe('system-vertex queries scope by partition before hasId', () => {
   function partitionPredicateBeforeHasId(query: string): boolean {
@@ -3244,9 +3248,17 @@ describe('system-vertex queries scope by partition before hasId', () => {
       recreatedAfterBatches?: number;
       /** A re-create lands just before the sentinel cleanup. */
       recreatedBeforeCleanup?: boolean;
+      /** Edges in the partition; each edge batch drops up to 500. */
+      edges?: number;
+      /** Entity vertices in the partition; each entity batch drops up to 500. */
+      entities?: number;
+      /** Whether the marker point read finds the marker (default true). */
+      markerExists?: boolean;
     }): { provider: CosmosDbProvider; stub: SubmitStub } {
       const { provider, stub } = makeProvider();
       const defaultSubmit = stub.submit;
+      let edgesLeft = options.edges ?? 0;
+      let entitiesLeft = options.entities ?? 0;
       // The vertex drain's remaining-count check is the same query as the
       // partition probe; once a drain batch has run, the partition is empty
       // unless a re-create has landed.
@@ -3261,6 +3273,24 @@ describe('system-vertex queries scope by partition before hasId', () => {
         if (query === DELETE_VERTEX_BATCH_QUERY) {
           if (recreated()) return { items: ['__recreated'] };
           batches++;
+          return { items: [] };
+        }
+        if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [options.markerExists === false ? 0 : 1] };
+        // An aggregate-then-drop batch returns the bucket of dropped ids.
+        const droppedIds = (n: number): string[] => Array.from({ length: n }, (_, i) => `dropped-${i}`);
+        if (query === EDGE_BATCH_DROP_QUERY) {
+          const dropped = Math.min(edgesLeft, 500);
+          edgesLeft -= dropped;
+          return { items: [droppedIds(dropped)] };
+        }
+        if (query === ENTITY_BATCH_DROP_QUERY) {
+          const dropped = Math.min(entitiesLeft, 500);
+          entitiesLeft -= dropped;
+          return { items: [droppedIds(dropped)] };
+        }
+        if (query === ENTITY_BATCH_COUNT_QUERY) return { items: [Math.min(entitiesLeft, 500)] };
+        if (query === DELETE_ENTITY_BATCH_QUERY) {
+          entitiesLeft = Math.max(0, entitiesLeft - 500);
           return { items: [] };
         }
         if (query === PROBE) {
@@ -3293,7 +3323,7 @@ describe('system-vertex queries scope by partition before hasId', () => {
     });
 
     it('drops the repository marker first, partition-scoped, then probes, then drains', async () => {
-      const { provider, stub } = stubDelete({ markerDropped: true, remaining: 1, indexed: [TEST_REPO] });
+      const { provider, stub } = stubDelete({ markerDropped: true, remaining: 1, indexed: [TEST_REPO], edges: 1 });
 
       await provider.deleteRepository(TEST_REPO);
 
@@ -3302,9 +3332,7 @@ describe('system-vertex queries scope by partition before hasId', () => {
       expect(stub.calls[0]!.params).toEqual({ rid: TEST_REPO, vid: `repo:${TEST_REPO}` });
       expect(stub.calls[1]!.query).toBe(PROBE);
       expect(stub.calls[1]!.params).toEqual({ rid: TEST_REPO });
-      const firstEdgeBatch = stub.calls.findIndex(
-        (c) => c.query === "g.E().has('repositoryId', rid).limit(batchSize).drop()",
-      );
+      const firstEdgeBatch = stub.calls.findIndex((c) => c.query === EDGE_BATCH_DROP_QUERY);
       const firstBatch = stub.calls.findIndex((c) => c.query === DELETE_VERTEX_BATCH_QUERY);
       expect(firstEdgeBatch).toBeGreaterThan(1);
       expect(firstBatch).toBeGreaterThan(firstEdgeBatch);
@@ -3323,6 +3351,78 @@ describe('system-vertex queries scope by partition before hasId', () => {
         sid: '_repository_index',
         updatedIndex: JSON.stringify([]),
       });
+    });
+
+    it('drains in batches sized by bounded reads, without counting the repository first', async () => {
+      const { provider, stub } = stubDelete({
+        markerDropped: true,
+        remaining: 1,
+        indexed: [TEST_REPO],
+        edges: 700,
+        entities: 520,
+      });
+      const progress: Array<{ entitiesDeleted: number; relationshipsDeleted: number }> = [];
+
+      const result = await provider.deleteRepository(TEST_REPO, (p) => {
+        progress.push(p);
+      });
+
+      expect(result).toEqual({ deletedEntities: 520, deletedRelationships: 700 });
+      expect(progress).toEqual([
+        { entitiesDeleted: 0, relationshipsDeleted: 500 },
+        { entitiesDeleted: 0, relationshipsDeleted: 700 },
+        { entitiesDeleted: 500, relationshipsDeleted: 700 },
+        { entitiesDeleted: 520, relationshipsDeleted: 700 },
+      ]);
+      // Every read is bounded: a batch-sized count or a one-item probe.
+      for (const call of stub.calls.filter((c) => c.query.endsWith('.count()'))) {
+        expect(call.query).toMatch(/\.limit\((batchSize|1)\)\.count\(\)$/);
+      }
+      // Two edge batches drop 500 and 200 and report it; a third finds none.
+      expect(stub.calls.filter((c) => c.query === EDGE_BATCH_DROP_QUERY)).toHaveLength(3);
+      for (const call of stub.calls.filter((c) => c.query === EDGE_BATCH_DROP_QUERY)) {
+        expect(call.params).toEqual({ rid: TEST_REPO, batchSize: 500 });
+      }
+      expect(stub.calls.filter((c) => c.query === DELETE_ENTITY_BATCH_QUERY)).toHaveLength(2);
+      for (const call of stub.calls.filter((c) => c.query === DELETE_ENTITY_BATCH_QUERY)) {
+        expect(call.params).toEqual({ rid: TEST_REPO, vid: `repo:${TEST_REPO}`, batchSize: 500 });
+      }
+    });
+
+    it('deleteAllContents drains in bounded batches and reports what it dropped', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: true, remaining: 1, indexed: [TEST_REPO], edges: 3, entities: 2 });
+      const progress: Array<{ entitiesDeleted: number; relationshipsDeleted: number }> = [];
+
+      const result = await provider.deleteAllContents(TEST_REPO, (p) => {
+        progress.push(p);
+      });
+
+      expect(result).toEqual({ deletedEntities: 2, deletedRelationships: 3 });
+      expect(progress).toEqual([
+        { entitiesDeleted: 0, relationshipsDeleted: 3 },
+        { entitiesDeleted: 2, relationshipsDeleted: 3 },
+      ]);
+      // The marker is read first, partition-scoped, and left alone with the
+      // system vertices.
+      expect(stub.calls[0]!.query).toBe(REPOSITORY_MARKER_COUNT_QUERY);
+      expect(partitionPredicateBeforeHasId(stub.calls[0]!.query)).toBe(true);
+      expect(stub.calls[0]!.params).toEqual({ rid: TEST_REPO, vid: `repo:${TEST_REPO}` });
+      expect(stub.calls.some((c) => c.query === MARKER_DROP || c.query === DELETE_VERTEX_BATCH_QUERY)).toBe(false);
+      // Each batch is one bounded submit that reports what it dropped; there
+      // is no separate sizing read.
+      expect(stub.calls.some((c) => c.query === ENTITY_BATCH_COUNT_QUERY)).toBe(false);
+      for (const call of stub.calls.filter((c) => c.query === EDGE_BATCH_DROP_QUERY || c.query === ENTITY_BATCH_DROP_QUERY)) {
+        expect(call.query).toContain('.limit(batchSize).aggregate(');
+        expect(call.params).toEqual({ rid: TEST_REPO, batchSize: 500 });
+      }
+    });
+
+    it('deleteAllContents on a missing repository throws RepositoryNotFoundError and drops nothing', async () => {
+      const { provider, stub } = stubDelete({ markerDropped: false, remaining: 0, indexed: [], markerExists: false });
+
+      await expect(provider.deleteAllContents(TEST_REPO)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+
+      expect(stub.calls.map((c) => c.query)).toEqual([REPOSITORY_MARKER_COUNT_QUERY]);
     });
 
     it('nothing at all for the id → RepositoryNotFoundError, no drain', async () => {
@@ -3360,7 +3460,10 @@ describe('system-vertex queries scope by partition before hasId', () => {
     it('a dropped marker over an otherwise empty partition skips both drains', async () => {
       const { provider, stub } = stubDelete({ markerDropped: true, remaining: 0, indexed: [TEST_REPO] });
 
-      await provider.deleteRepository(TEST_REPO);
+      await expect(provider.deleteRepository(TEST_REPO)).resolves.toEqual({
+        deletedEntities: 0,
+        deletedRelationships: 0,
+      });
 
       expect(stub.calls.map((c) => c.query)).toEqual([
         MARKER_DROP,
@@ -3378,7 +3481,10 @@ describe('system-vertex queries scope by partition before hasId', () => {
         recreatedAfterBatches: 1,
       });
 
-      await expect(provider.deleteRepository(TEST_REPO)).resolves.toBeUndefined();
+      await expect(provider.deleteRepository(TEST_REPO)).resolves.toEqual({
+        deletedEntities: 0,
+        deletedRelationships: 0,
+      });
 
       // Batch 1 drained the old vertices; the remaining check saw the
       // re-created ones; batch 2 found the new marker and did nothing.
@@ -3396,7 +3502,10 @@ describe('system-vertex queries scope by partition before hasId', () => {
 
       // The gated write emits the re-create sentinel and writes nothing; the
       // delete itself is complete.
-      await expect(provider.deleteRepository(TEST_REPO)).resolves.toBeUndefined();
+      await expect(provider.deleteRepository(TEST_REPO)).resolves.toEqual({
+        deletedEntities: 0,
+        deletedRelationships: 0,
+      });
     });
 
     it('drops the cached vocabulary even when the repository is not found', async () => {

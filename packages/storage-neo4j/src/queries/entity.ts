@@ -78,6 +78,7 @@ import { deleteByIds } from './deleteByIds.js';
 import {
   DuplicateEntityError,
   EntityNotFoundError,
+  InvalidInputError,
   ProviderError,
   RepositoryNotFoundError,
   SlugConflictError,
@@ -218,7 +219,7 @@ export async function createEntity(
     // read, so the refusal stands.
     if (
       (refusal instanceof DuplicateEntityError || refusal instanceof SlugConflictError) &&
-      (await readEntityWriteAttempt(conn, repositoryId, entity.id, 'createEntity')) === writeAttempt
+      (await readEntityWriteAttempt(conn, repositoryId, entity.id)) === writeAttempt
     ) {
       return entity;
     }
@@ -234,20 +235,18 @@ export async function createEntity(
  * The write token on the entity stored under `entityId`, or `null` when no
  * entity has that id or it carries no token (one written before tokens were
  * recorded, or by an upsert import). Runs on the write route so it sees the
- * commit that refused the create. `operation` names the refused write in a
- * failed read's error.
+ * commit that refused the create.
  */
 export async function readEntityWriteAttempt(
   conn: Neo4jConnection,
   repositoryId: string,
   entityId: string,
-  operation: 'createEntity' | 'importBulk',
 ): Promise<string | null> {
   let result: Awaited<ReturnType<typeof conn.executeQuery>>;
   try {
     result = await conn.executeQuery(ENTITY_WRITE_ATTEMPT_QUERY, { id: entityId }, { repositoryId });
   } catch (err) {
-    mapDriverError(err, { entityId, operation });
+    mapDriverError(err, { entityId, operation: 'createEntity' });
   }
   const value: unknown = result.records[0]?.get('writeAttempt');
   return typeof value === 'string' ? value : null;
@@ -642,6 +641,66 @@ export function escapeLuceneQuery(searchTerm: string): string {
 }
 
 /**
+ * How the search-term branch of `findEntities` orders its hits.
+ *
+ * - `'relevance'` orders by the full-text score, descending. The score comes
+ *   from one index over every repository in the database, and its term
+ *   statistics (how common a word is) are computed over that whole index, so
+ *   the order of one repository's hits can shift with other repositories'
+ *   data. Only the order carries that signal; the hits and the total are the
+ *   repository's own.
+ * - `'isolated'` filters the hits to the repository and orders them by
+ *   `label`, then `id`. No score reaches the order, so nothing computed from
+ *   other repositories' data does either. Matching itself still runs against
+ *   the whole index, so a search's cost still grows with the database.
+ */
+export type Neo4jSearchScoring = 'relevance' | 'isolated';
+
+/**
+ * The scoring mode a provider config asks for: `'relevance'` when unset. Any
+ * other value (a host passing an untyped config) is refused at construction
+ * with `InvalidInputError`, rather than quietly falling back to an order the
+ * host did not choose.
+ */
+export function resolveSearchScoring(value: Neo4jSearchScoring | undefined): Neo4jSearchScoring {
+  if (value === undefined) return 'relevance';
+  if (value === 'relevance' || value === 'isolated') return value;
+  throw new InvalidInputError(
+    'searchScoring',
+    `Neo4j searchScoring must be 'relevance' or 'isolated', got ${JSON.stringify(value)}.`,
+  );
+}
+
+/**
+ * The search-term branch's data statement for a scoring mode. `where` is the
+ * complete `WHERE` clause, repository predicate first; `projection` reads
+ * from `node`. Each mode is handled explicitly; any other value throws, so
+ * an unknown mode can never reach the score order.
+ */
+export function buildFulltextFindQuery(scoring: Neo4jSearchScoring, where: string, projection: string): string {
+  if (scoring === 'isolated') {
+    return (
+      `CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node ` +
+      `${where} ` +
+      `RETURN ${projection} ` +
+      `ORDER BY node.label, node.id SKIP $skip LIMIT $limit`
+    );
+  }
+  if (scoring === 'relevance') {
+    return (
+      `CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node, score ` +
+      `${where} ` +
+      `RETURN ${projection} ` +
+      `ORDER BY score DESC SKIP $skip LIMIT $limit`
+    );
+  }
+  throw new InvalidInputError(
+    'searchScoring',
+    `Neo4j searchScoring must be 'relevance' or 'isolated', got ${JSON.stringify(scoring)}.`,
+  );
+}
+
+/**
  * Find entities matching a `StorageFindQuery`. Returns one page plus an exact
  * total via a `Promise.all([data, count])` round-trip pair — the parallel
  * shape saves ~1.5 ms over sequential and keeps each query's plan-cache
@@ -652,7 +711,8 @@ export function escapeLuceneQuery(searchTerm: string): string {
  *   through the `dm_entity_text` fulltext index via
  *   `CALL db.index.fulltext.queryNodes(...) YIELD node, score`. The fulltext
  *   index is unfiltered by repository, so the next predicate is always
- *   `node.repositoryId = $rid`. Page ordering is by score descending. A
+ *   `node.repositoryId = $rid`. Page ordering follows `searchScoring` (see
+ *   `Neo4jSearchScoring`): score descending by default, or `label, id`. A
  *   property-CONTAINS substring fallback for searchTerm was measured against
  *   the fulltext path and rejected: the fulltext path is uniformly faster at
  *   10k+ entities and only marginally slower at 1k; carrying a dual-path
@@ -673,7 +733,8 @@ export async function findEntities(
   conn: Neo4jConnection,
   repositoryId: string,
   query: StorageFindQuery,
-  options?: EntityReadOptions,
+  options: EntityReadOptions | undefined,
+  searchScoring: Neo4jSearchScoring,
 ): Promise<PaginatedResult<StoredEntity>> {
   const loadEmbeddings = options?.loadEmbeddings === true;
   const skipLimitParams = {
@@ -698,11 +759,7 @@ export async function findEntities(
       where.cypherWhere.length > 0
         ? `WHERE ${repoPredicate} AND ${where.cypherWhere.slice('WHERE '.length)}`
         : `WHERE ${repoPredicate}`;
-    const dataCypher =
-      `CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node, score ` +
-      `${combinedWhere} ` +
-      `RETURN ${projection} ` +
-      `ORDER BY score DESC SKIP $skip LIMIT $limit`;
+    const dataCypher = buildFulltextFindQuery(searchScoring, combinedWhere, projection);
     const countCypher =
       `CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node ` +
       `${combinedWhere} ` +

@@ -7,6 +7,7 @@ import type {
   EnsureSchemaResult,
   EntityReadOptions,
   GraphTraversalCapabilities,
+  RelationshipCreateOptions,
   VocabularyReadOptions,
 } from '@utaba/deep-memory/providers';
 import type {
@@ -56,7 +57,7 @@ import {
 } from '@utaba/deep-memory';
 import { Neo4jTraversalExecutor } from './Neo4jTraversalExecutor.js';
 import type { RawTraversalResult } from './Neo4jTraversalExecutor.js';
-import { Neo4jConnection, type Neo4jConnectionConfig } from './Neo4jConnection.js';
+import { Neo4jConnection, type CypherParams, type Neo4jConnectionConfig } from './Neo4jConnection.js';
 import { mapDriverError, toTypedError } from './errors.js';
 import {
   bigintToSafeNumber,
@@ -67,8 +68,14 @@ import {
 } from './mapping.js';
 import * as bulkQueries from './queries/bulk.js';
 import * as entityQueries from './queries/entity.js';
+import { resolveSearchScoring, type Neo4jSearchScoring } from './queries/entity.js';
 import * as relationshipQueries from './queries/relationship.js';
 import * as repositoryQueries from './queries/repository.js';
+import {
+  ENTITY_DRAIN_QUERY,
+  RELATIONSHIP_DRAIN_QUERY,
+  REPOSITORY_MARKER_EXISTS_QUERY,
+} from './queries/repositoryDrain.js';
 import * as timelineQueries from './queries/timeline.js';
 import * as vocabQueries from './queries/vocabulary.js';
 import { getSchemaCypher, SCHEMA_VERSION } from './schema.js';
@@ -80,6 +87,14 @@ import {
 
 const PROVIDER_NAME = 'neo4j';
 const DELETE_BATCH_SIZE = 500;
+/**
+ * Most edges one relationship-drain statement buffers and deletes (see
+ * `RELATIONSHIP_DRAIN_QUERY`). Twenty inner transactions' worth at
+ * `DELETE_BATCH_SIZE`: enough that an ordinary batch of entities finishes in
+ * one statement, small enough that a hub entity's edges cannot exhaust the
+ * transaction memory limit.
+ */
+const DELETE_EDGE_CAP = 10_000;
 
 /**
  * Lifetime of an entry in the per-process vocabulary cache. The vocabulary is
@@ -171,6 +186,18 @@ export interface Neo4jStorageProviderConfig extends Neo4jConnectionConfig {
    * actively investigating planner behaviour.
    */
   profileTraversals?: boolean;
+  /**
+   * How `findEntities` orders the hits of a `searchTerm` query. Defaults to
+   * `'relevance'`: full-text score, descending. The score's term statistics
+   * are computed over every repository in the database, so in a store shared
+   * by several tenants the order of one repository's hits can reflect how
+   * common the search words are in other repositories. `'isolated'` orders
+   * by `label`, then `id`, so nothing computed from other repositories
+   * reaches the order. Either way matching runs against the whole index, so a
+   * search's cost grows with the database; a database per tenant is the full
+   * isolation option. See `Neo4jSearchScoring`.
+   */
+  searchScoring?: Neo4jSearchScoring;
 }
 
 /**
@@ -184,6 +211,7 @@ export class Neo4jStorageProvider {
   private readonly connection: Neo4jConnection;
   private readonly traversalExecutor: Neo4jTraversalExecutor;
   private initialized = false;
+  private readonly searchScoring: Neo4jSearchScoring;
   /**
    * In-process vocabulary cache. Reads hit this map first; writes inside this
    * process invalidate the entry so cache hits stay coherent with the local
@@ -200,8 +228,16 @@ export class Neo4jStorageProvider {
    * streaming-iterator case only.
    */
   private readonly reportUsage: UsageSink | undefined;
+  /**
+   * Most edges one relationship-drain statement takes; see
+   * `DELETE_EDGE_CAP`. Not configuration: a subclass lowers it only to drive
+   * the repeat-at-cap path with a small repository.
+   */
+  protected readonly relationshipDrainEdgeCap: number = DELETE_EDGE_CAP;
 
   constructor(config: Neo4jStorageProviderConfig) {
+    // Validated before the driver is created, so a refused config opens nothing.
+    this.searchScoring = resolveSearchScoring(config.searchScoring);
     this.connection = new Neo4jConnection(config);
     this.traversalExecutor = new Neo4jTraversalExecutor(this.connection, {
       profileTraversals: config.profileTraversals === true,
@@ -563,7 +599,7 @@ export class Neo4jStorageProvider {
     }
     const whereClause = wherePredicates.length > 0 ? `WHERE ${wherePredicates.join(' AND ')}` : '';
 
-    // listRepositories is cross-repository by definition (D18 — no sentinel
+    // listRepositories is cross-repository by definition (no sentinel
     // index, direct scan against the dm_repository_unique constraint's
     // backing index). Both queries route through executeSystemQuery; the
     // composite scan is cheap because there is no partition fan-out cost on
@@ -595,9 +631,10 @@ export class Neo4jStorageProvider {
   }
 
   /**
-   * Variable-shape Cypher (per D23 trade-off — repository writes are rare so
-   * the plan-cache cost is negligible). Projection-on-write returns the
-   * updated row in one round-trip; empty-rowset → `RepositoryNotFoundError`.
+   * Variable-shape Cypher (repository writes are rare, so the plan-cache cost
+   * of one statement shape per set of updated fields is negligible).
+   * Projection-on-write returns the updated row in one round-trip;
+   * empty-rowset → `RepositoryNotFoundError`.
    */
   public async updateRepository(
     repositoryId: string,
@@ -667,9 +704,10 @@ export class Neo4jStorageProvider {
    *      holding it to commit (the drains below then remove what it wrote),
    *      and every create after it fails with `RepositoryNotFoundError`. No
    *      create can commit after the drains.
-   *   2. Drain relationships in batches via `CALL ( ) { ... } IN TRANSACTIONS`.
+   *   2. Drain relationships in batches via `CALL ( ) { ... } IN TRANSACTIONS`
+   *      (`RELATIONSHIP_DRAIN_QUERY`, anchored on the repository's entities).
    *   3. Drain `_Entity` nodes in batches via the same form with
-   *      `DETACH DELETE` (catches any straggler edges).
+   *      `DETACH DELETE` (`ENTITY_DRAIN_QUERY`; catches any straggler edges).
    *   4. Drain `_VocabularyChangeLog` nodes in batches.
    *   5. Drain any other node carrying the `repositoryId`, excluding
    *      `_Repository` and `_Vocabulary`. `executeNativeQuery` can write
@@ -689,27 +727,37 @@ export class Neo4jStorageProvider {
    * `_Repository` marker means a delete is in progress or was interrupted;
    * `createRepository` relies on that (together with leftover `_Entity`
    * nodes) and refuses to create over it. A retry after an interruption at
-   * any point still finds something to delete and finishes the wipe. Only when the marker and every drain
-   * removed nothing does the repository count as missing:
-   * `RepositoryNotFoundError`.
+   * any point still finds something to delete and finishes the wipe. Only
+   * when the marker and every drain removed nothing does the repository
+   * count as missing: `RepositoryNotFoundError`.
    *
    * Stages 2 and 3 are app-side loops so the progress callback fires at a
-   * useful cadence.
+   * useful cadence. Nothing counts the repository first: progress and the
+   * returned counts are the running totals of the batches' update counters,
+   * so no step reads the whole repository in one transaction.
    *
    * `IN TRANSACTIONS` can only run on auto-commit sessions — `executeWrite`
    * fails with `Neo.DatabaseError.Transaction.TransactionStartFailed`. The
    * chokepoint's `executeImplicitInTransactions` is the only legitimate entry
-   * point for this pattern.
+   * point for this pattern. A statement that fails surfaces as a typed error
+   * through `mapDriverError`; the batches it already committed stay deleted,
+   * and a re-run of the delete resumes from what is left.
    */
   public async deleteRepository(
     repositoryId: string,
     onProgress?: DeleteProgressCallback,
-  ): Promise<void> {
-    const marker = await this.connection.executeQuery(
-      'MATCH (r:_Repository {repositoryId: $rid}) DETACH DELETE r',
-      {},
-      { repositoryId },
-    );
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+    const operation = 'deleteRepository';
+    let marker: Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
+    try {
+      marker = await this.connection.executeQuery(
+        'MATCH (r:_Repository {repositoryId: $rid}) DETACH DELETE r',
+        {},
+        { repositoryId },
+      );
+    } catch (err) {
+      mapDriverError(err, { repositoryId, operation });
+    }
     // The cached vocabulary belongs to the repository being removed; a
     // repository later re-created under the same id must not be served it.
     this.invalidateVocabularyCache(repositoryId);
@@ -717,53 +765,11 @@ export class Neo4jStorageProvider {
     // zero means there was no repository to delete.
     let rawDeleted = marker.summary.counters.updates()['nodesDeleted'] ?? 0;
 
-    const { totalEntities, totalRelationships } = await this.countRepositoryContents(repositoryId);
-
-    let relationshipsDeleted = 0;
-    let entitiesDeleted = 0;
+    const drained = await this.drainEntitiesAndRelationships(repositoryId, operation, onProgress);
+    rawDeleted += drained.deletedEntities + drained.deletedRelationships;
 
     while (true) {
-      const summary = await this.connection.executeImplicitInTransactions(
-        `CALL () {
-           MATCH ()-[r {repositoryId: $rid}]-()
-           WITH r LIMIT $batchSize
-           DELETE r
-         } IN TRANSACTIONS OF $batchSize ROWS`,
-        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
-        { batchSize: BigInt(DELETE_BATCH_SIZE) },
-        { repositoryId },
-      );
-      const stats = summary.counters.updates();
-      const deletedThisBatch = stats['relationshipsDeleted'] ?? 0;
-      if (deletedThisBatch === 0) break;
-      rawDeleted += deletedThisBatch;
-      relationshipsDeleted = Math.min(relationshipsDeleted + deletedThisBatch, totalRelationships);
-      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
-    }
-
-    while (true) {
-      const summary = await this.connection.executeImplicitInTransactions(
-        `CALL () {
-           MATCH (n:_Entity {repositoryId: $rid})
-           WITH n LIMIT $batchSize
-           DETACH DELETE n
-         } IN TRANSACTIONS OF $batchSize ROWS`,
-        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
-        { batchSize: BigInt(DELETE_BATCH_SIZE) },
-        { repositoryId },
-      );
-      const stats = summary.counters.updates();
-      const deletedThisBatch = stats['nodesDeleted'] ?? 0;
-      if (deletedThisBatch === 0) break;
-      rawDeleted += deletedThisBatch;
-      // Cap so the callback never reports more than it promised — an entity
-      // created after the pre-count would otherwise push the total past it.
-      entitiesDeleted = Math.min(entitiesDeleted + deletedThisBatch, totalEntities);
-      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
-    }
-
-    while (true) {
-      const summary = await this.connection.executeImplicitInTransactions(
+      const { summary } = await this.runDrainStatement(
         `CALL () {
            MATCH (n:_VocabularyChangeLog {repositoryId: $rid})
            WITH n LIMIT $batchSize
@@ -771,7 +777,8 @@ export class Neo4jStorageProvider {
          } IN TRANSACTIONS OF $batchSize ROWS`,
         // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
         { batchSize: BigInt(DELETE_BATCH_SIZE) },
-        { repositoryId },
+        repositoryId,
+        operation,
       );
       const deletedThisBatch = summary.counters.updates()['nodesDeleted'] ?? 0;
       if (deletedThisBatch === 0) break;
@@ -785,7 +792,7 @@ export class Neo4jStorageProvider {
     // every node in the database; it runs once per delete after the labelled
     // drains have removed the bulk of the data.
     while (true) {
-      const summary = await this.connection.executeImplicitInTransactions(
+      const { summary } = await this.runDrainStatement(
         `CALL () {
            MATCH (n {repositoryId: $rid})
            WHERE NOT n:_Repository AND NOT n:_Vocabulary
@@ -794,7 +801,8 @@ export class Neo4jStorageProvider {
          } IN TRANSACTIONS OF $batchSize ROWS`,
         // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
         { batchSize: BigInt(DELETE_BATCH_SIZE) },
-        { repositoryId },
+        repositoryId,
+        operation,
       );
       const deletedThisBatch = summary.counters.updates()['nodesDeleted'] ?? 0;
       if (deletedThisBatch === 0) break;
@@ -804,104 +812,123 @@ export class Neo4jStorageProvider {
     // The vocabulary goes last and only while no marker exists: once it is
     // gone createRepository may run again, and a repository re-created under
     // this id must not lose its fresh vocabulary to a straggling delete.
-    const vocabulary = await this.connection.executeQuery(
-      `MATCH (v:_Vocabulary {repositoryId: $rid})
-       WHERE NOT EXISTS { MATCH (:_Repository {repositoryId: $rid}) }
-       DETACH DELETE v`,
-      {},
-      { repositoryId },
-    );
+    let vocabulary: Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
+    try {
+      vocabulary = await this.connection.executeQuery(
+        `MATCH (v:_Vocabulary {repositoryId: $rid})
+         WHERE NOT EXISTS { MATCH (:_Repository {repositoryId: $rid}) }
+         DETACH DELETE v`,
+        {},
+        { repositoryId },
+      );
+    } catch (err) {
+      mapDriverError(err, { repositoryId, operation });
+    }
     rawDeleted += vocabulary.summary.counters.updates()['nodesDeleted'] ?? 0;
 
     if (rawDeleted === 0) {
       throw new RepositoryNotFoundError(repositoryId);
     }
+    return drained;
   }
 
   /**
    * Drop every entity and relationship scoped to `repositoryId` but preserve
    * the `_Repository` and `_Vocabulary` / `_VocabularyChangeLog` system nodes.
    * Same chunked-wipe contract as `deleteRepository`, restricted to the
-   * `:_Entity` umbrella label for nodes.
+   * `:_Entity` umbrella label for nodes. A repository with no marker throws
+   * `RepositoryNotFoundError`; the check is a seek of the marker's unique
+   * constraint index, not a read of the repository's contents.
    */
   public async deleteAllContents(
     repositoryId: string,
     onProgress?: DeleteProgressCallback,
   ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
-    const { totalEntities, totalRelationships } = await this.countRepositoryContents(repositoryId);
-
-    let relationshipsDeleted = 0;
-    let entitiesDeleted = 0;
-
-    while (true) {
-      const summary = await this.connection.executeImplicitInTransactions(
-        `CALL () {
-           MATCH (:_Entity {repositoryId: $rid})-[r {repositoryId: $rid}]-(:_Entity {repositoryId: $rid})
-           WITH r LIMIT $batchSize
-           DELETE r
-         } IN TRANSACTIONS OF $batchSize ROWS`,
-        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
-        { batchSize: BigInt(DELETE_BATCH_SIZE) },
-        { repositoryId },
-      );
-      const stats = summary.counters.updates();
-      const deletedThisBatch = stats['relationshipsDeleted'] ?? 0;
-      if (deletedThisBatch === 0) break;
-      relationshipsDeleted = Math.min(relationshipsDeleted + deletedThisBatch, totalRelationships);
-      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
+    const operation = 'deleteAllContents';
+    let marker: Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
+    try {
+      marker = await this.connection.executeQuery(REPOSITORY_MARKER_EXISTS_QUERY, {}, { repositoryId });
+    } catch (err) {
+      mapDriverError(err, { repositoryId, operation });
     }
-
-    while (true) {
-      const summary = await this.connection.executeImplicitInTransactions(
-        `CALL () {
-           MATCH (n:_Entity {repositoryId: $rid})
-           WITH n LIMIT $batchSize
-           DETACH DELETE n
-         } IN TRANSACTIONS OF $batchSize ROWS`,
-        // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
-        { batchSize: BigInt(DELETE_BATCH_SIZE) },
-        { repositoryId },
-      );
-      const stats = summary.counters.updates();
-      const deletedThisBatch = stats['nodesDeleted'] ?? 0;
-      if (deletedThisBatch === 0) break;
-      entitiesDeleted = Math.min(entitiesDeleted + deletedThisBatch, totalEntities);
-      await onProgress?.({ entitiesDeleted, relationshipsDeleted, totalEntities, totalRelationships });
+    if (marker.records[0]?.get('repositoryExists') !== true) {
+      throw new RepositoryNotFoundError(repositoryId);
     }
-
-    return { deletedEntities: totalEntities, deletedRelationships: totalRelationships };
+    return this.drainEntitiesAndRelationships(repositoryId, operation, onProgress);
   }
 
   /**
-   * One-shot pre-count used by `deleteRepository` / `deleteAllContents`. The
-   * entity count uses the umbrella `:_Entity` label so system nodes
-   * (`_Repository` / `_Vocabulary`) are excluded — that matches the
-   * user-facing semantics of the progress callback.
-   *
-   * The relationship count uses the **directed** pattern `()-[r]->()`: every
-   * edge is written in its stored direction (D5), so the directed pattern
-   * binds each edge to exactly one row. An undirected `-` pattern would
-   * double-count every edge whose endpoints are distinct vertices, because
-   * Cypher enumerates the pattern from both directions.
+   * Drain the repository's relationships, then its entities, in batches
+   * (`RELATIONSHIP_DRAIN_QUERY`, `ENTITY_DRAIN_QUERY`), reporting the running
+   * counts after each batch that removed something and returning the totals
+   * removed. The relationship drain is a keyset cursor over the repository's
+   * entities: each batch returns the last entity id it visited, and the next
+   * resumes after it once the batch's edges are gone, until no entity
+   * remains past the cursor. A batch that took `relationshipDrainEdgeCap`
+   * edges may have left more, so it runs again from the same cursor. The
+   * counts come from each batch's update counters; edges the entity drain
+   * detaches count as relationships.
    */
-  private async countRepositoryContents(
+  private async drainEntitiesAndRelationships(
     repositoryId: string,
-  ): Promise<{ totalEntities: number; totalRelationships: number }> {
-    const [entitiesResult, relationshipsResult] = await Promise.all([
-      this.connection.executeQuery(
-        'MATCH (n:_Entity {repositoryId: $rid}) RETURN count(n) AS total',
-        {},
-        { repositoryId, routing: 'READ' },
-      ),
-      this.connection.executeQuery(
-        'MATCH ()-[r {repositoryId: $rid}]->() RETURN count(r) AS total',
-        {},
-        { repositoryId, routing: 'READ' },
-      ),
-    ]);
-    const totalEntities = bigintToSafeNumber(entitiesResult.records[0]?.get('total') ?? 0);
-    const totalRelationships = bigintToSafeNumber(relationshipsResult.records[0]?.get('total') ?? 0);
-    return { totalEntities, totalRelationships };
+    operation: string,
+    onProgress?: DeleteProgressCallback,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+    const batch = { batchSize: BigInt(DELETE_BATCH_SIZE) };
+    const edgeCap = this.relationshipDrainEdgeCap;
+    let relationshipsDeleted = 0;
+    let entitiesDeleted = 0;
+
+    let after = '';
+    while (true) {
+      const { records, summary } = await this.runDrainStatement(
+        RELATIONSHIP_DRAIN_QUERY,
+        { ...batch, edgeCap: BigInt(edgeCap), after },
+        repositoryId,
+        operation,
+      );
+      const deletedThisBatch = summary.counters.updates()['relationshipsDeleted'] ?? 0;
+      if (deletedThisBatch > 0) {
+        relationshipsDeleted += deletedThisBatch;
+        await onProgress?.({ entitiesDeleted, relationshipsDeleted });
+      }
+      // At the cap, the batch's entities may still have edges: run it again.
+      if (bigintToSafeNumber(records[0]?.get('edges') ?? 0n) >= edgeCap) continue;
+      const lastId: unknown = records[0]?.get('lastId');
+      if (typeof lastId !== 'string') break;
+      after = lastId;
+    }
+
+    while (true) {
+      const { summary } = await this.runDrainStatement(ENTITY_DRAIN_QUERY, batch, repositoryId, operation);
+      const stats = summary.counters.updates();
+      const deletedThisBatch = stats['nodesDeleted'] ?? 0;
+      if (deletedThisBatch === 0) break;
+      entitiesDeleted += deletedThisBatch;
+      relationshipsDeleted += stats['relationshipsDeleted'] ?? 0;
+      await onProgress?.({ entitiesDeleted, relationshipsDeleted });
+    }
+
+    return { deletedEntities: entitiesDeleted, deletedRelationships: relationshipsDeleted };
+  }
+
+  /**
+   * Run one batched drain statement on an auto-commit session, raising a
+   * driver failure as the project's typed error. The driver does not retry
+   * these statements and neither does this method: the batches already
+   * committed stay deleted, so a re-run of the delete picks up the rest.
+   */
+  private async runDrainStatement(
+    cypher: string,
+    params: CypherParams,
+    repositoryId: string,
+    operation: string,
+  ): Promise<Awaited<ReturnType<Neo4jConnection['executeImplicitInTransactions']>>> {
+    try {
+      return await this.connection.executeImplicitInTransactions(cypher, params, { repositoryId });
+    } catch (err) {
+      mapDriverError(err, { repositoryId, operation });
+    }
   }
 
   // ─── Vocabulary ────────────────────────────────────────────────────
@@ -1053,8 +1080,9 @@ export class Neo4jStorageProvider {
   }
 
   /**
-   * Variable-shape projection-on-write update (D23) — single round-trip
-   * MATCH+SET+RETURN. Empty record array → `EntityNotFoundError`.
+   * Variable-shape projection-on-write update: one MATCH+SET+RETURN round
+   * trip, at the cost of one statement shape per set of updated fields.
+   * Empty record array → `EntityNotFoundError`.
    */
   public async updateEntity(
     repositoryId: string,
@@ -1104,15 +1132,16 @@ export class Neo4jStorageProvider {
    * pair; `total` is always exact because every filter (entity-type, property
    * equality, search term, provenance) is server-side via either a typed
    * predicate or the `dm_entity_text` fulltext index. Search-term queries
-   * order by Lucene score descending; non-search queries order by `n.id` to
-   * pin pagination determinism across slices.
+   * order as `searchScoring` says (Lucene score descending by default, or
+   * `label, id`); non-search queries order by `n.id` to pin pagination
+   * determinism across slices.
    */
   public async findEntities(
     repositoryId: string,
     query: StorageFindQuery,
     options?: EntityReadOptions,
   ): Promise<PaginatedResult<StoredEntity>> {
-    return entityQueries.findEntities(this.connection, repositoryId, query, options);
+    return entityQueries.findEntities(this.connection, repositoryId, query, options, this.searchScoring);
   }
 
   // ─── Relationships ─────────────────────────────────────────────────
@@ -1125,13 +1154,21 @@ export class Neo4jStorageProvider {
    * repository is deleted. A missing repository surfaces as `RepositoryNotFoundError`;
    * a missing endpoint as `EntityNotFoundError` carrying the absent id; an
    * id already used by any relationship in the repository, whatever its
-   * type, as `DuplicateRelationshipError`.
+   * type, as `DuplicateRelationshipError`. That id check passes over every
+   * edge of the repository, so it is skipped when `options.idMinted` says
+   * the engine generated the id (see `buildCreateMintedRelationshipQuery`).
    */
   public async createRelationship(
     repositoryId: string,
     relationship: StoredRelationship,
+    options?: RelationshipCreateOptions,
   ): Promise<StoredRelationship> {
-    return relationshipQueries.createRelationship(this.connection, repositoryId, relationship);
+    return relationshipQueries.createRelationship(
+      this.connection,
+      repositoryId,
+      relationship,
+      options?.idMinted === true,
+    );
   }
 
   /** Read a single relationship by id; `null` when not found. */
@@ -1381,7 +1418,8 @@ export class Neo4jStorageProvider {
 
   /**
    * Lower-level compile + submit + parse helper. Fetches the cached
-   * vocabulary once (D16) and hands it to the executor; the executor handles
+   * vocabulary once (so one call compiles against one vocabulary) and hands
+   * it to the executor; the executor handles
    * the repositoryId-scope rewrite, optional PROFILE prefix, and Path-object
    * parsing.
    */

@@ -103,6 +103,17 @@ If you find yourself unsure which doc to load, ask the user one short question r
 - Do not change SQL passwords or other secrets across files based on a single example in the README. The README's password is an example — confirm with the user before touching real config.
 - Do not commit `.mcp.json` (it is gitignored). `.mcp.json.example` is the tracked template.
 
+## Working with the User on Plans - The Q&A Process
+
+When a plan is inbetween phases, and you need decisions made, you should use a process with these steps:
+- State that we are resolving decisions or issues
+- Give a Summary with a numbered point list of each decision or issue that needs to be resolve, include a single sentence that describes or names that item and prefix 'Current -' on the next item to discuss starting at 1.
+- Show the first item with a Summary, Background and Important Context
+- List any solutions and recommendation
+- Stop and wait for further questions or a decision from the user
+- Record or document the decision as needed
+- Repeat the process with the next item to discuss
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).

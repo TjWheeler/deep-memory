@@ -390,3 +390,98 @@ describe('Neo4jConnection transaction timeout translation', () => {
     }
   });
 });
+
+// ─── 6. executeWrite — attempt numbering and scope ───────────────────────
+
+describe('Neo4jConnection.executeWrite', () => {
+  const URI = 'bolt://localhost:7687';
+  const summary = { counters: { updates: () => ({}) } };
+
+  interface RecordedRun {
+    cypher: string;
+    params: Record<string, unknown>;
+  }
+
+  /**
+   * A driver whose managed write runs the transaction function `runs` times
+   * in a row, as the driver does when an attempt's commit fails with a
+   * retryable error, and answers with the last run's result.
+   */
+  function stubDriverRunning(runs: number) {
+    const sessionConfigs: Array<Record<string, unknown>> = [];
+    const executed: RecordedRun[] = [];
+    const tx = {
+      run: async (cypher: string, params: Record<string, unknown>) => {
+        executed.push({ cypher, params });
+        return { records: [], summary };
+      },
+    };
+    const bookmarkManager = { name: 'execute-query-bookmarks' };
+    const stub = {
+      executeQueryBookmarkManager: bookmarkManager,
+      session: (config: Record<string, unknown>) => {
+        sessionConfigs.push(config);
+        return {
+          executeWrite: async <T>(work: (managed: typeof tx) => Promise<T>): Promise<T> => {
+            for (let i = 1; i < runs; i += 1) await work(tx);
+            return work(tx);
+          },
+          close: async () => {},
+        };
+      },
+      close: async () => {},
+    };
+    return { stub, sessionConfigs, executed, bookmarkManager };
+  }
+
+  function connectionWith(stub: object): Neo4jConnection {
+    const connection = new Neo4jConnection({ uri: URI, username: 'neo4j', password: 'unused' });
+    (connection as unknown as { driver: object }).driver = stub;
+    return connection;
+  }
+
+  it('numbers each invocation of the transaction function from 1', async () => {
+    const { stub } = stubDriverRunning(3);
+    const connection = connectionWith(stub);
+    const attempts: number[] = [];
+
+    const answer = await connection.executeWrite('repo-a', async (_tx, attempt) => {
+      attempts.push(attempt);
+      return attempt;
+    });
+
+    expect(attempts).toEqual([1, 2, 3]);
+    expect(answer).toBe(3);
+  });
+
+  it('binds $rid on every statement and joins the executeQuery bookmark chain', async () => {
+    const { stub, sessionConfigs, executed, bookmarkManager } = stubDriverRunning(2);
+    const connection = connectionWith(stub);
+
+    await connection.executeWrite('repo-a', async (tx) => {
+      await tx.run('MATCH (n:_Entity {repositoryId: $rid}) RETURN n', { id: 'x' });
+    });
+
+    expect(executed).toHaveLength(2);
+    for (const run of executed) expect(run.params).toEqual({ id: 'x', rid: 'repo-a' });
+    expect(sessionConfigs).toEqual([{ database: 'neo4j', bookmarkManager }]);
+  });
+
+  it('refuses a statement that omits $rid', async () => {
+    const { stub, executed } = stubDriverRunning(1);
+    const connection = connectionWith(stub);
+
+    await expect(
+      connection.executeWrite('repo-a', async (tx) => tx.run('MATCH (n) RETURN n', {})),
+    ).rejects.toBeInstanceOf(ProviderError);
+    expect(executed).toHaveLength(0);
+  });
+
+  it('refuses an empty repositoryId before opening a session', async () => {
+    const { stub, sessionConfigs } = stubDriverRunning(1);
+    const connection = connectionWith(stub);
+
+    await expect(connection.executeWrite('', async () => 1)).rejects.toBeInstanceOf(ProviderError);
+    expect(sessionConfigs).toHaveLength(0);
+  });
+});

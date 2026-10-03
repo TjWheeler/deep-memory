@@ -86,8 +86,20 @@ function successRecords(
 }
 
 /**
+ * The answer to an insert import's write-token reads in a fake that never
+ * committed a refused write: no chunk id carries the chunk's token, and no
+ * row's id carries a token. `undefined` for any other statement.
+ */
+function noOwnWriteRecords(cypher: string): Array<{ get: (key: string) => unknown }> | undefined {
+  if (cypher.includes('AS carrying')) return [record({ carrying: 0n })];
+  if (cypher.includes('AS writeAttempt')) return [];
+  return undefined;
+}
+
+/**
  * Connection fake: `respond` decides, per call, whether the statement
- * succeeds (returning the template's success records) or throws.
+ * succeeds (returning the template's success records) or throws. Write-token
+ * reads after a refusal find no write of this import's own.
  */
 function fakeConnection(respond: (rows: Row[], call: number) => Error | undefined): {
   conn: Neo4jConnection;
@@ -96,6 +108,8 @@ function fakeConnection(respond: (rows: Row[], call: number) => Error | undefine
   const calls: Row[][] = [];
   const fake = {
     async executeQuery(cypher: string, params: { rows: Row[] }) {
+      const tokenRead = noOwnWriteRecords(cypher);
+      if (tokenRead !== undefined) return { records: tokenRead };
       calls.push(params.rows);
       const failure = respond(params.rows, calls.length);
       if (failure !== undefined) throw failure;
@@ -302,10 +316,11 @@ describe('importBulk failure handling', () => {
         'WHERE e.id IS NOT NULL AND held.id IN $ids',
     );
     expect(upsert).toContain('MERGE (s)-[r:KNOWS {repositoryId: $rid, id: row.id}]->(t)');
+    expect(upsert).not.toContain('$writeAttempt');
     const insert = cyphers.get(true)!;
     expect(insert).not.toContain('held');
     expect(insert).not.toContain('$ids');
-    expect(insert).toContain('CREATE (s)-[r:KNOWS {');
+    expect(insert).toContain('MERGE (s)-[r:KNOWS {repositoryId: $rid, id: row.id, _attempt: $writeAttempt}]->(t)\n  ON CREATE SET');
   });
 
   it('refuses an id repeated within one insert call: the first occurrence is written, later ones are row errors', async () => {
@@ -536,6 +551,8 @@ describe('importBulk failure handling', () => {
     const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
     const fake = {
       async executeQuery(cypher: string, params: { rows: Row[] }) {
+        const tokenRead = noOwnWriteRecords(cypher);
+        if (tokenRead !== undefined) return { records: tokenRead };
         const ids = params.rows.map((row) => row.id);
         calls.push(ids);
         if (ids.length > 1 && ids[0] === 'e1') throw slugViolation('person:e1');
@@ -564,6 +581,363 @@ describe('importBulk failure handling', () => {
       ['e4', 'e5', 'e6'],
       ['e1'],
     ]);
+  });
+});
+
+describe('importBulk insert mode under a driver re-run', () => {
+  interface EntityParams {
+    id: string;
+    slug: string;
+  }
+
+  interface StoredEdge {
+    id: string;
+    token: string;
+  }
+
+  interface InsertStoreState {
+    nodes: Map<string, { slug: string; token: string | null }>;
+    edges: StoredEdge[];
+    missingEndpoints: Set<string>;
+  }
+
+  function idViolation(id: string): Error & { code: string } {
+    return driverError(
+      CONSTRAINT_VIOLATION,
+      `Node(1) already exists with label \`_Entity\` and properties \`repositoryId\` = '${RID}', \`id\` = '${id}'`,
+    );
+  }
+
+  function entityWithSlug(id: string, slug: string): StoredEntity {
+    return { ...entity(id), slug };
+  }
+
+  /**
+   * A store fake for insert imports. An entity statement writes its rows
+   * atomically, enforcing the id and slug constraints across the store and
+   * the statement's own rows; a relationship statement MERGEs each row on
+   * its id and write token. `ackLost(call)` makes the driver commit that
+   * statement, lose the acknowledgement and run it again, answering with the
+   * second run; `failAfterCommit(call)` makes the re-run fail with that
+   * error instead (a re-run refused for a reason of its own), and
+   * `afterCommit(call, store)` changes the store between the two runs (a
+   * concurrent delete). `slugFirst` reports a row's slug violation before
+   * its id violation, as the server may check either constraint first. A
+   * relationship row whose id is in `missingEndpoints` finds an endpoint
+   * gone and writes nothing.
+   */
+  function insertStore(options: {
+    seed?: Array<[string, { slug: string; token: string | null }]>;
+    ackLost?: (call: number) => boolean;
+    failAfterCommit?: (call: number) => Error | undefined;
+    failBeforeCommit?: (call: number) => Error | undefined;
+    afterCommit?: (call: number, store: InsertStoreState) => void;
+    slugFirst?: boolean;
+  }) {
+    const nodes = new Map<string, { slug: string; token: string | null }>(options.seed ?? []);
+    const edges: StoredEdge[] = [];
+    const missingEndpoints = new Set<string>();
+    const writes: Array<{ ids: string[]; token: unknown }> = [];
+    const tokenReads: string[][] = [];
+
+    const writeEntities = (rows: EntityParams[], token: string) => {
+      const working = new Map(nodes);
+      for (const row of rows) {
+        const idTaken = working.has(row.id);
+        const slugTaken = Array.from(working.values()).some((n) => n.slug === row.slug);
+        if (options.slugFirst === true && slugTaken) throw slugViolation(row.slug);
+        if (idTaken) throw idViolation(row.id);
+        if (slugTaken) throw slugViolation(row.slug);
+        working.set(row.id, { slug: row.slug, token });
+      }
+      for (const [id, node] of working) nodes.set(id, node);
+      return [record({ written: BigInt(rows.length) })];
+    };
+
+    const writeEdges = (rows: Row[], token: string) =>
+      rows.map((row) => {
+        if (missingEndpoints.has(row.id)) return record({ id: row.id, outcome: 'endpoint-missing' });
+        if (!edges.some((edge) => edge.id === row.id && edge.token === token)) edges.push({ id: row.id, token });
+        return record({ id: row.id, outcome: 'written' });
+      });
+
+    let call = 0;
+    const fake = {
+      async executeQuery(cypher: string, params: Record<string, unknown>) {
+        if (cypher.includes('AS carrying')) {
+          // The statement matches each stored node once, however often its id repeats.
+          const ids = new Set(params['ids'] as string[]);
+          const carrying = Array.from(ids).filter((id) => nodes.get(id)?.token === params['writeAttempt']).length;
+          return { records: [record({ carrying: BigInt(carrying) })] };
+        }
+        if (cypher.includes('AS writeAttempt')) {
+          const ids = params['ids'] as string[];
+          tokenReads.push(ids);
+          return {
+            records: ids.flatMap((id) => {
+              const node = nodes.get(id);
+              return node === undefined ? [] : [record({ id, writeAttempt: node.token })];
+            }),
+          };
+        }
+        call += 1;
+        const thisCall = call;
+        const token = params['writeAttempt'] as string;
+        const rows = params['rows'] as Array<EntityParams & Row>;
+        writes.push({ ids: rows.map((row) => row.id), token });
+        const run = () => (cypher.includes('AS outcome') ? writeEdges(rows, token) : writeEntities(rows, token));
+        const before = options.failBeforeCommit?.(thisCall);
+        if (before !== undefined) throw before;
+        if (options.ackLost?.(thisCall) === true) {
+          run();
+          options.afterCommit?.(thisCall, { nodes, edges, missingEndpoints });
+          const after = options.failAfterCommit?.(thisCall);
+          if (after !== undefined) throw after;
+        }
+        return { records: run() };
+      },
+    };
+    return { conn: fake as unknown as Neo4jConnection, nodes, edges, writes, tokenReads };
+  }
+
+  it('lands a relationship chunk once when the driver re-runs its committed statement', async () => {
+    const { conn, edges, writes } = insertStore({ ackLost: (call) => call === 1 });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ relationships: [relationship('r1'), relationship('r2'), relationship('r3')] }],
+      options(10),
+    );
+
+    expect(result).toEqual({ entitiesImported: 0, relationshipsImported: 3, errors: [] });
+    expect(edges.map((edge) => edge.id).sort()).toEqual(['r1', 'r2', 'r3']);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('reuses the chunk token in the relationship fallback, so rows the chunk committed are not written twice', async () => {
+    const refused = driverError('Neo.ClientError.Statement.TypeError', 'refused on re-run');
+    const { conn, edges, writes } = insertStore({
+      ackLost: (call) => call === 1,
+      failAfterCommit: (call) => (call === 1 ? refused : undefined),
+    });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ relationships: [relationship('r1'), relationship('r2')] }],
+      options(10),
+    );
+
+    expect(result).toEqual({ entitiesImported: 0, relationshipsImported: 2, errors: [] });
+    expect(edges.map((edge) => edge.id).sort()).toEqual(['r1', 'r2']);
+    expect(writes.map((write) => write.ids)).toEqual([['r1', 'r2'], ['r1'], ['r2']]);
+    expect(new Set(writes.map((write) => write.token)).size).toBe(1);
+  });
+
+  it('reports an entity chunk the re-run finds committed as imported, without a per-row fallback', async () => {
+    const { conn, nodes, writes } = insertStore({ ackLost: (call) => call === 1 });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ entities: [entity('e1'), entity('e2'), entity('e3')] }],
+      options(10),
+    );
+
+    expect(result).toEqual({ entitiesImported: 3, relationshipsImported: 0, errors: [] });
+    expect(nodes.size).toBe(3);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('counts a fallback row the driver re-ran after committing it as imported', async () => {
+    const { conn, nodes, writes } = insertStore({
+      seed: [['x', { slug: 'person:e2', token: 'another-call' }]],
+      // Call 1 is the chunk (refused for e2's slug); call 2 is e1 on its own.
+      ackLost: (call) => call === 2,
+    });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ entities: [entity('e1'), entity('e2'), entity('e3')] }],
+      options(10),
+    );
+
+    expect(result.entitiesImported).toBe(2);
+    expect(result.errors).toEqual([expect.objectContaining({ item: 'entity:e2', code: 'SLUG_CONFLICT' })]);
+    expect(Array.from(nodes.keys()).sort()).toEqual(['e1', 'e3', 'x']);
+    // Every fallback row carries a token of its own, distinct from the chunk's.
+    expect(new Set(writes.map((write) => write.token)).size).toBe(4);
+  });
+
+  it('counts a fallback row the chunk statement committed as imported', async () => {
+    // The chunk commits, its acknowledgement is lost, and the re-run fails
+    // for a reason that is not a uniqueness clash, so the rows go one by one.
+    const refused = driverError('Neo.ClientError.Statement.TypeError', 'refused on re-run');
+    const { conn, nodes } = insertStore({
+      ackLost: (call) => call === 1,
+      failAfterCommit: (call) => (call === 1 ? refused : undefined),
+    });
+
+    const result = await importBulk(conn, RID, [{ entities: [entity('e1'), entity('e2')] }], options(10));
+
+    expect(result).toEqual({ entitiesImported: 2, relationshipsImported: 0, errors: [] });
+    expect(nodes.size).toBe(2);
+  });
+
+  it('still records an entity id another call wrote as ENTITY_ALREADY_EXISTS', async () => {
+    const { conn } = insertStore({ seed: [['e1', { slug: 'person:other', token: 'another-call' }]] });
+
+    const result = await importBulk(conn, RID, [{ entities: [entity('e1'), entity('e2')] }], options(10));
+
+    expect(result.entitiesImported).toBe(1);
+    expect(result.errors).toEqual([expect.objectContaining({ item: 'entity:e1', code: 'ENTITY_ALREADY_EXISTS' })]);
+  });
+
+  it('still records an entity id stored without a token as ENTITY_ALREADY_EXISTS', async () => {
+    const { conn } = insertStore({ seed: [['e1', { slug: 'person:other', token: null }]] });
+
+    const result = await importBulk(conn, RID, [{ entities: [entity('e1')] }], options(10));
+
+    expect(result.entitiesImported).toBe(0);
+    expect(result.errors).toEqual([expect.objectContaining({ item: 'entity:e1', code: 'ENTITY_ALREADY_EXISTS' })]);
+  });
+
+  it('reports an entity id repeated within one chunk once, even when its first row was re-run', async () => {
+    const { conn, nodes } = insertStore({
+      // Call 1 is the chunk (refused for the repeat); call 2 is the first e1.
+      ackLost: (call) => call === 2,
+    });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ entities: [entity('e1'), entityWithSlug('e1', 'person:e1-again'), entity('e2')] }],
+      options(10),
+    );
+
+    expect(result.entitiesImported).toBe(2);
+    expect(result.errors).toEqual([expect.objectContaining({ item: 'entity:e1', code: 'ENTITY_ALREADY_EXISTS' })]);
+    expect(nodes.get('e1')?.slug).toBe('person:e1');
+  });
+
+  it('reports an entity id repeated across chunks once', async () => {
+    const { conn, nodes } = insertStore({});
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ entities: [entity('e1'), entityWithSlug('e1', 'person:e1-again')] }],
+      options(1),
+    );
+
+    expect(result.entitiesImported).toBe(1);
+    expect(result.errors).toEqual([expect.objectContaining({ item: 'entity:e1', code: 'ENTITY_ALREADY_EXISTS' })]);
+    expect(nodes.size).toBe(1);
+  });
+
+  it('counts a fallback row whose re-run reports its slug before its id as imported, from its own token', async () => {
+    const { conn, nodes, tokenReads } = insertStore({
+      seed: [['x', { slug: 'person:e2', token: 'another-call' }]],
+      // Call 1 is the chunk (refused for e2's slug); call 2 is e1 on its own.
+      ackLost: (call) => call === 2,
+      slugFirst: true,
+    });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ entities: [entity('e1'), entity('e2'), entity('e3')] }],
+      options(10),
+    );
+
+    expect(result.entitiesImported).toBe(2);
+    expect(result.errors).toEqual([expect.objectContaining({ item: 'entity:e2', code: 'SLUG_CONFLICT' })]);
+    expect(Array.from(nodes.keys()).sort()).toEqual(['e1', 'e3', 'x']);
+    // Both refused rows' tokens are read back together, once.
+    expect(tokenReads).toEqual([['e1', 'e2']]);
+  });
+
+  it('counts fallback rows whose re-run reports their slug before their id as imported, from the chunk token', async () => {
+    const refused = driverError('Neo.ClientError.Statement.TypeError', 'refused on re-run');
+    const { conn, nodes, writes, tokenReads } = insertStore({
+      ackLost: (call) => call === 1,
+      failAfterCommit: (call) => (call === 1 ? refused : undefined),
+      slugFirst: true,
+    });
+
+    const result = await importBulk(conn, RID, [{ entities: [entity('e1'), entity('e2')] }], options(10));
+
+    expect(result).toEqual({ entitiesImported: 2, relationshipsImported: 0, errors: [] });
+    expect(nodes.size).toBe(2);
+    // The chunk token is what the fallback rows find stored.
+    expect(Array.from(nodes.values()).every((node) => node.token === writes[0]?.token)).toBe(true);
+    expect(tokenReads).toEqual([['e1', 'e2']]);
+  });
+
+  it('re-writes a chunk row a concurrent delete removed, and counts the committed rest as imported', async () => {
+    const { conn, nodes, writes, tokenReads } = insertStore({
+      ackLost: (call) => call === 1,
+      afterCommit: (call, store) => {
+        if (call === 1) store.nodes.delete('e2');
+      },
+    });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ entities: [entity('e1'), entity('e2'), entity('e3')] }],
+      options(10),
+    );
+
+    expect(result).toEqual({ entitiesImported: 3, relationshipsImported: 0, errors: [] });
+    expect(writes.map((write) => write.ids)).toEqual([['e1', 'e2', 'e3'], ['e1'], ['e2'], ['e3']]);
+    const chunkToken = writes[0]?.token;
+    expect(nodes.get('e1')?.token).toBe(chunkToken);
+    expect(nodes.get('e3')?.token).toBe(chunkToken);
+    // e2 was written again by its own fallback row.
+    expect(nodes.get('e2')?.token).toBe(writes[2]?.token);
+    expect(tokenReads).toEqual([['e1', 'e3']]);
+  });
+
+  it('matches committed relationship rows in the deleted-endpoint fallback and reports the deleted endpoint', async () => {
+    const { conn, edges, writes } = insertStore({
+      ackLost: (call) => call === 1,
+      // Between the two runs a concurrent delete removes r2's endpoint and r2 with it.
+      afterCommit: (call, store) => {
+        if (call !== 1) return;
+        store.missingEndpoints.add('r2');
+        store.edges.splice(store.edges.findIndex((edge) => edge.id === 'r2'), 1);
+      },
+      failAfterCommit: (call) =>
+        call === 1 ? driverError(DELETED_NODE, 'Node with id 7 has been deleted in this transaction') : undefined,
+    });
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ relationships: [relationship('r1'), relationship('r2'), relationship('r3')] }],
+      options(10),
+    );
+
+    expect(result.relationshipsImported).toBe(2);
+    expect(result.errors).toEqual([
+      { item: 'relationship:r2', code: 'ENTITY_NOT_FOUND', error: expect.stringContaining('endpoint not found') },
+    ]);
+    expect(writes.map((write) => write.ids)).toEqual([['r1', 'r2', 'r3'], ['r1'], ['r2'], ['r3']]);
+    expect(edges.map((edge) => edge.id).sort()).toEqual(['r1', 'r3']);
+  });
+
+  it('reads no tokens back for an upsert import', async () => {
+    const { conn, tokenReads, writes } = insertStore({
+      failBeforeCommit: (call) => (call === 1 ? idViolation('e1') : undefined),
+    });
+
+    await importBulk(conn, RID, [{ entities: [entity('e1')] }], options(10, 1, false));
+
+    expect(tokenReads).toEqual([]);
+    expect(writes.every((write) => write.token === undefined)).toBe(true);
   });
 });
 

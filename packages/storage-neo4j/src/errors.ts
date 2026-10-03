@@ -186,6 +186,22 @@ export function toTypedError(error: unknown, context: DriverErrorContext = {}): 
 }
 
 /**
+ * True when `error` is a uniqueness violation that `toTypedError` maps, for
+ * an entity write, to `DuplicateEntityError` (the id) or `SlugConflictError`
+ * (the slug). For a write that carries many entities and so has no single
+ * id or slug to put on the typed error.
+ */
+export function isEntityUniquenessViolation(error: unknown): boolean {
+  if (error instanceof DuplicateEntityError || error instanceof SlugConflictError) return true;
+  if (error instanceof DeepMemoryError) return false;
+  const driverError = (error ?? {}) as DriverError;
+  if (driverError.code !== CONSTRAINT_VIOLATION_CODE) return false;
+  const message = typeof driverError.message === 'string' ? driverError.message : '';
+  const target = identifyConstraint(error, message) ?? targetFromKind('entity');
+  return target === 'entity-id' || target === 'entity-slug';
+}
+
+/**
  * The typed error for a violated uniqueness rule, or `undefined` when the id
  * that error needs is not in the caller's context.
  */

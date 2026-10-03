@@ -16,6 +16,7 @@
 
 import type {
   MemoryVocabulary,
+  PropertyFilter,
   StoredEntity,
   StoredRelationship,
   TraversalAggregation,
@@ -27,9 +28,14 @@ import {
   ProviderError,
   QueryTimeoutError,
   TraversalTimeoutError,
+  TraversalValidationError,
 } from '@utaba/deep-memory';
 import type { Neo4jConnection } from './Neo4jConnection.js';
-import { entityFromProperties, relationshipFromProperties } from './mapping.js';
+import {
+  entityFromProperties,
+  INTERNAL_RECORD_PROPERTY_KEYS,
+  relationshipFromProperties,
+} from './mapping.js';
 
 /**
  * Raw, un-projected output of `Neo4jTraversalExecutor.execute`. Only the
@@ -143,6 +149,7 @@ export class Neo4jTraversalExecutor {
     vocabulary: MemoryVocabulary,
   ): Promise<RawTraversalResult> {
     const startTime = Date.now();
+    assertNoInternalPropertyKeys(spec);
     const compiled = this.compiler.compile(spec, vocabulary);
     const scopedQuery = this.scopeQuery(compiled.query);
     const finalQuery = this.config.profileTraversals ? `PROFILE ${scopedQuery}` : scopedQuery;
@@ -488,3 +495,47 @@ function summariseProfile(plan: PlanLike): { totalDbHits: number; rootOperator: 
   return { totalDbHits: total, rootOperator: plan.operatorType ?? 'unknown' };
 }
 
+
+/**
+ * Refuse a traversal that names one of the provider's bookkeeping properties
+ * in a filter or projection. Entity and relationship system fields are flat
+ * properties on the stored node or edge, and the compiler emits every filter
+ * key and projected property as `alias.key`, so naming a bookkeeping property
+ * would read it straight off the record. The rule belongs to this provider's
+ * storage layout, so it is enforced here, ahead of the shared compiler.
+ *
+ * Specs can arrive from untyped JSON. A list field that is not an array, or a
+ * filter that is not an object, is skipped here and left to the compiler's
+ * own shape checks, which report it as a typed refusal.
+ */
+function assertNoInternalPropertyKeys(spec: TraversalSpec): void {
+  const refused = new Set<string>();
+  const checkKey = (key: unknown): void => {
+    if (typeof key === 'string' && INTERNAL_RECORD_PROPERTY_KEYS.has(key)) refused.add(key);
+  };
+  const checkFilters = (filters: readonly PropertyFilter[] | undefined): void => {
+    if (!Array.isArray(filters)) return;
+    for (const filter of filters) {
+      if (typeof filter === 'object' && filter !== null) checkKey(filter.key);
+    }
+  };
+
+  checkFilters(spec.start?.filter);
+  if (Array.isArray(spec.steps)) {
+    for (const step of spec.steps) {
+      if (typeof step !== 'object' || step === null) continue;
+      checkFilters(step.relationshipFilter);
+      checkFilters(step.entityFilter);
+      checkFilters(step.repeat?.until);
+    }
+  }
+  if (Array.isArray(spec.projection?.properties)) {
+    for (const property of spec.projection.properties) checkKey(property);
+  }
+
+  if (refused.size > 0) {
+    throw new TraversalValidationError(
+      Array.from(refused, (key) => `Property "${key}" is reserved for storage bookkeeping and cannot be filtered on or projected`),
+    );
+  }
+}

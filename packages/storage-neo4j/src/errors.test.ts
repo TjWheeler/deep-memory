@@ -10,6 +10,7 @@ import {
   SlugConflictError,
 } from '@utaba/deep-memory';
 import {
+  isEntityUniquenessViolation,
   isMemoryLimitFailure,
   isRowShapedFailure,
   isTransactionMemoryLimit,
@@ -273,6 +274,27 @@ describe('isRowShapedFailure', () => {
     expect(isRowShapedFailure(fakeDriverError('Neo.ClientError.Statement.SyntaxError', 'x'))).toBe(false);
     expect(isRowShapedFailure(new Error('socket hang up'))).toBe(false);
     expect(isRowShapedFailure(null)).toBe(false);
+  });
+});
+
+describe('isEntityUniquenessViolation', () => {
+  it('accepts an entity id or slug violation, and the typed errors for them', () => {
+    expect(isEntityUniquenessViolation(fakeDriverError(CONSTRAINT_VIOLATION, ID_VIOLATION))).toBe(true);
+    expect(isEntityUniquenessViolation(fakeDriverError(CONSTRAINT_VIOLATION, SLUG_VIOLATION))).toBe(true);
+    expect(isEntityUniquenessViolation(new DuplicateEntityError('e1'))).toBe(true);
+    expect(isEntityUniquenessViolation(new SlugConflictError('s'))).toBe(true);
+  });
+
+  it('reads an unidentified violation as an entity id clash, as toTypedError does for an entity write', () => {
+    expect(isEntityUniquenessViolation(fakeDriverError(CONSTRAINT_VIOLATION, 'constraint violated'))).toBe(true);
+  });
+
+  it('rejects other constraints and other failures', () => {
+    expect(isEntityUniquenessViolation(fakeDriverError(CONSTRAINT_VIOLATION, REPOSITORY_VIOLATION))).toBe(false);
+    expect(isEntityUniquenessViolation(new DuplicateRepositoryError('r1'))).toBe(false);
+    expect(isEntityUniquenessViolation(fakeDriverError('Neo.ClientError.Statement.TypeError', 'x'))).toBe(false);
+    expect(isEntityUniquenessViolation(new ProviderError('down'))).toBe(false);
+    expect(isEntityUniquenessViolation(null)).toBe(false);
   });
 });
 

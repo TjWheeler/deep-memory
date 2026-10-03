@@ -296,6 +296,17 @@ export function buildEntityProjection(options?: {
 }
 
 /**
+ * Property holding the write token of the provider call that created an
+ * entity, relationship or repository marker. Each create mints one token and
+ * writes it with the record. The driver may re-run a create whose commit
+ * succeeded but whose acknowledgement was lost; the re-run then meets the
+ * record its own first run wrote and fails on a uniqueness check. Reading the
+ * token back tells that case (the token is this call's: report success) from
+ * a genuine duplicate (another call's token: report the duplicate).
+ */
+export const WRITE_ATTEMPT_PROPERTY = '_attempt';
+
+/**
  * Schema-managed property names on `:_Entity` nodes. User-supplied
  * `entity.properties` keys cannot collide with these — colliding would clobber
  * a schema-managed scalar via `SET n += $userProperties` and break round-trip.
@@ -323,6 +334,17 @@ export const RESERVED_ENTITY_PROPERTY_KEYS: ReadonlySet<string> = new Set([
   'modifiedAt',
   'modifiedInConversation',
   'modifiedFromMessage',
+  WRITE_ATTEMPT_PROPERTY,
+]);
+
+/**
+ * Properties the provider writes for its own bookkeeping, on entity nodes,
+ * relationship edges and repository markers. They are not part of any public
+ * record: read paths never project them, and a traversal may not name them
+ * in a filter or projection.
+ */
+export const INTERNAL_RECORD_PROPERTY_KEYS: ReadonlySet<string> = new Set([
+  WRITE_ATTEMPT_PROPERTY,
 ]);
 
 /**

@@ -6,24 +6,40 @@
 // repository's entities. The anchor must reach them through the
 // `(repositoryId, id)` unique index; a plan that scans every `_Entity` in
 // the database, or every relationship, makes each create pay for every
-// repository in the store. EXPLAIN plans the statements without running
-// them, so this checks the operators the server would use.
+// repository in the store. The write-token read-backs that answer a re-run
+// of a committed create are held to the same rule. EXPLAIN plans the
+// statements without running them, so this checks the operators the server
+// would use.
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run. Skipped otherwise so
 // CI builds without a live Neo4j stay green.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Neo4jConnection } from './Neo4jConnection.js';
-import { buildCreateRelationshipQuery } from './queries/relationship.js';
-import { buildInsertRelationshipsQuery, buildUpsertRelationshipsQuery } from './queries/bulk.js';
+import { buildCreateRelationshipQuery, RELATIONSHIP_WRITE_ATTEMPT_QUERY } from './queries/relationship.js';
+import {
+  buildInsertRelationshipsQuery,
+  buildUpsertRelationshipsQuery,
+  ENTITY_WRITE_ATTEMPT_COUNT_QUERY,
+  ENTITY_WRITE_ATTEMPTS_QUERY,
+} from './queries/bulk.js';
 
 const NEO4J_URI = process.env['NEO4J_URI'];
 const NEO4J_USER = process.env['NEO4J_USER'] ?? 'neo4j';
 const NEO4J_PASSWORD = process.env['NEO4J_PASSWORD'] ?? '';
 const NEO4J_DATABASE = process.env['NEO4J_DATABASE'] ?? 'neo4j';
 
-/** Operators that visit every node of a label, or every relationship, in the database. */
-const WHOLE_STORE_SCANS = ['NodeByLabelScan', 'AllNodesScan', 'AllRelationshipsScan', 'DirectedAllRelationshipsScan', 'UndirectedAllRelationshipsScan'];
+/** Operators that visit every node of a label, or every relationship (of a type), in the database. */
+const WHOLE_STORE_SCANS = [
+  'NodeByLabelScan',
+  'AllNodesScan',
+  'AllRelationshipsScan',
+  'DirectedAllRelationshipsScan',
+  'UndirectedAllRelationshipsScan',
+  'RelationshipTypeScan',
+  'DirectedRelationshipTypeScan',
+  'UndirectedRelationshipTypeScan',
+];
 
 interface PlanNode {
   operatorType: string;
@@ -97,8 +113,29 @@ if (NEO4J_URI) {
     });
 
     it('the insert import template scans nothing store-wide', async () => {
-      const names = (await explain(buildInsertRelationshipsQuery('KNOWS'), { rows: [ROW] })).map(operatorName);
+      const names = (await explain(buildInsertRelationshipsQuery('KNOWS'), { rows: [ROW], writeAttempt: 'plan-token' })).map(
+        operatorName,
+      );
       for (const scan of WHOLE_STORE_SCANS) expect(names).not.toContain(scan);
+    });
+
+    /** No whole-store scan, and a unique-index seek of the repository's entity by id. */
+    function expectEntityIdSeek(ops: string[]): void {
+      const names = ops.map(operatorName);
+      for (const scan of WHOLE_STORE_SCANS) expect(names).not.toContain(scan);
+      expect(ops.some((op) => op.startsWith('NodeUniqueIndexSeek') && op.includes(':_Entity(repositoryId, id)'))).toBe(true);
+    }
+
+    it('the relationship write-token read-back seeks its source entity by id', async () => {
+      expectEntityIdSeek(await explain(RELATIONSHIP_WRITE_ATTEMPT_QUERY, { id: ROW.id, sourceEntityId: ROW.sourceEntityId }));
+    });
+
+    it('the insert import entity token count seeks each id in the entity index', async () => {
+      expectEntityIdSeek(await explain(ENTITY_WRITE_ATTEMPT_COUNT_QUERY, { ids: ['plan-a', 'plan-b'], writeAttempt: 'plan-token' }));
+    });
+
+    it('the insert import fallback token read seeks each id in the entity index', async () => {
+      expectEntityIdSeek(await explain(ENTITY_WRITE_ATTEMPTS_QUERY, { ids: ['plan-a', 'plan-b'] }));
     });
   });
 } else {

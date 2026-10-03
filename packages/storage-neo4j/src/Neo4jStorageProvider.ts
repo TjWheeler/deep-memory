@@ -2,6 +2,7 @@
 // StorageProvider. CRUD methods are added incrementally; the `implements
 // StorageProvider` declaration is added once the surface is complete.
 
+import { randomUUID } from 'node:crypto';
 import type {
   EnsureSchemaResult,
   EntityReadOptions,
@@ -56,12 +57,13 @@ import {
 import { Neo4jTraversalExecutor } from './Neo4jTraversalExecutor.js';
 import type { RawTraversalResult } from './Neo4jTraversalExecutor.js';
 import { Neo4jConnection, type Neo4jConnectionConfig } from './Neo4jConnection.js';
-import { mapDriverError } from './errors.js';
+import { mapDriverError, toTypedError } from './errors.js';
 import {
   bigintToSafeNumber,
   repositoryCreateParams,
   repositoryFromRecord,
   repositorySummaryFromRecord,
+  WRITE_ATTEMPT_PROPERTY,
 } from './mapping.js';
 import * as bulkQueries from './queries/bulk.js';
 import * as entityQueries from './queries/entity.js';
@@ -402,10 +404,18 @@ export class Neo4jStorageProvider {
    * the second with `Neo.ClientError.Schema.ConstraintValidationFailed`,
    * which `mapDriverError({ kind: 'repository', ... })` routes to
    * `DuplicateRepositoryError`, rolling back both of its nodes.
+   *
+   * The marker carries the call's write token. When the driver re-runs the
+   * statement after a commit whose acknowledgement was lost, the re-run
+   * finds that marker; its token being this call's proves the create
+   * succeeded, so the call returns the repository instead of
+   * `DuplicateRepositoryError`.
    */
   public async createRepository(config: StorageRepositoryConfig): Promise<StoredRepository> {
     const initialVocabulary = config.vocabulary ?? createEmptyVocabulary(config.createdBy);
+    const writeAttempt = randomUUID();
     let alreadyExists = false;
+    let createdByThisCall = false;
     let staleVocabularies = 0;
     let leftoverEntities = false;
     try {
@@ -426,7 +436,8 @@ export class Neo4jStorageProvider {
             governanceConfig: $governanceConfig,
             metadata: $metadata,
             createdAt: $createdAt,
-            createdBy: $createdBy
+            createdBy: $createdBy,
+            ${WRITE_ATTEMPT_PROPERTY}: $writeAttempt
           })
           CREATE (:_Vocabulary {
             repositoryId: $rid,
@@ -434,30 +445,51 @@ export class Neo4jStorageProvider {
             version: $vocabularyVersion
           })
         )
-        RETURN live IS NOT NULL AS alreadyExists, vocabularies, leftoverEntities`,
+        RETURN live IS NOT NULL AS alreadyExists, live.${WRITE_ATTEMPT_PROPERTY} AS liveWriteAttempt,
+          vocabularies, leftoverEntities`,
         {
           ...repositoryCreateParams(config),
           vocabularyJson: JSON.stringify(initialVocabulary),
           vocabularyVersion: initialVocabulary.version,
+          writeAttempt,
         },
         { repositoryId: config.repositoryId },
       );
       const record = result.records[0];
       alreadyExists = record?.get('alreadyExists') === true;
+      const storedWriteAttempt: unknown = record?.get('liveWriteAttempt');
+      // The driver re-runs a statement whose commit acknowledgement was lost;
+      // the re-run then finds the marker its own first run committed (and the
+      // vocabulary seeded with it). The marker carrying this call's token
+      // proves that, and the create succeeded.
+      createdByThisCall = alreadyExists && storedWriteAttempt === writeAttempt;
       // `count()` is a Cypher INTEGER — a BigInt under `useBigInt: true`.
       staleVocabularies = bigintToSafeNumber(record?.get('vocabularies') ?? 0);
       leftoverEntities = record?.get('leftoverEntities') === true;
     } catch (err) {
-      mapDriverError(err, {
+      // A uniqueness refusal means another transaction committed the marker
+      // after this statement's existence check. The marker carrying this
+      // call's token would mean that transaction was this call's own first
+      // run; every other refusal propagates as mapped. A concurrent
+      // deleteRepository between the refusal and the read-back leaves no
+      // marker to read, so the refusal stands.
+      const refusal = toTypedError(err, {
         kind: 'repository',
         repositoryId: config.repositoryId,
         operation: 'createRepository',
       });
+      if (
+        !(refusal instanceof DuplicateRepositoryError) ||
+        (await this.readRepositoryWriteAttempt(config.repositoryId)) !== writeAttempt
+      ) {
+        throw refusal;
+      }
+      createdByThisCall = true;
     }
-    if (alreadyExists) {
+    if (alreadyExists && !createdByThisCall) {
       throw new DuplicateRepositoryError(config.repositoryId);
     }
-    if (staleVocabularies > 0 || leftoverEntities) {
+    if (!createdByThisCall && (staleVocabularies > 0 || leftoverEntities)) {
       throw new ProviderError(
         `Repository "${config.repositoryId}" still holds data from a delete that did not finish; call deleteRepository("${config.repositoryId}") to finish it, then create it again`,
         `Call deleteRepository("${config.repositoryId}") to finish the interrupted delete, then retry createRepository.`,
@@ -480,6 +512,26 @@ export class Neo4jStorageProvider {
     if (config.owner !== undefined) result.owner = config.owner;
     if (config.metadata !== undefined) result.metadata = config.metadata;
     return result;
+  }
+
+  /**
+   * The write token on the repository marker, or `null` when there is no
+   * marker or it carries no token. Runs on the write route so it sees the
+   * commit that refused the create.
+   */
+  private async readRepositoryWriteAttempt(repositoryId: string): Promise<string | null> {
+    let result: Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
+    try {
+      result = await this.connection.executeQuery(
+        `MATCH (r:_Repository {repositoryId: $rid}) RETURN r.${WRITE_ATTEMPT_PROPERTY} AS writeAttempt`,
+        {},
+        { repositoryId },
+      );
+    } catch (err) {
+      mapDriverError(err, { repositoryId, operation: 'createRepository' });
+    }
+    const value: unknown = result.records[0]?.get('writeAttempt');
+    return typeof value === 'string' ? value : null;
   }
 
   public async getRepository(repositoryId: string): Promise<StoredRepository | null> {
@@ -1626,9 +1678,12 @@ export class Neo4jStorageProvider {
 
   /**
    * Run a bulk import: every entity then every relationship from the input
-   * chunks lands in the repository. `skipExistenceCheck: true` uses CREATE
-   * for the absolute peak throughput; `false` (default) uses MERGE for
-   * idempotent re-imports.
+   * chunks lands in the repository. `skipExistenceCheck: true` is the insert
+   * path: entities are CREATEd and relationships are MERGEd on their id
+   * together with the chunk statement's write token, so a driver re-run
+   * matches the edge its first run wrote while an edge from any other call
+   * never matches; `false` (default) MERGEs on the id for idempotent
+   * re-imports.
    *
    * Returns a single aggregate `BulkImportResult` spanning every chunk.
    * Per-row failures land in `result.errors`; surviving rows still count

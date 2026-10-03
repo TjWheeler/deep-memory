@@ -3,6 +3,7 @@ import {
   ProviderError,
   QueryTimeoutError,
   TraversalTimeoutError,
+  TraversalValidationError,
 } from '@utaba/deep-memory';
 import type { MemoryVocabulary, TraversalSpec } from '@utaba/deep-memory/types';
 import type { Neo4jConnection } from './Neo4jConnection.js';
@@ -61,5 +62,77 @@ describe('Neo4jTraversalExecutor error mapping', () => {
     const rejection = await rejectionOf(executorRejectingWith(typed));
 
     expect(rejection).toBe(typed);
+  });
+});
+
+describe('Neo4jTraversalExecutor bookkeeping-property guard', () => {
+  function recordingExecutor(): { executor: Neo4jTraversalExecutor; statements: string[] } {
+    const statements: string[] = [];
+    const connection = {
+      executeQuery: async (cypher: string) => {
+        statements.push(cypher);
+        return { records: [], summary: {} };
+      },
+    } as unknown as Neo4jConnection;
+    return { executor: new Neo4jTraversalExecutor(connection, { profileTraversals: false }), statements };
+  }
+
+  const refusedSpecs: Array<[string, TraversalSpec]> = [
+    [
+      'a projected property',
+      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['label', '_attempt'] } },
+    ],
+    [
+      'a start filter key',
+      { start: { filter: [{ key: '_attempt', operator: 'isNotNull' }] }, returnMode: 'terminal' },
+    ],
+    [
+      'a step entity filter key',
+      {
+        start: { entityId: 'entity-1' },
+        steps: [{ direction: 'out', entityFilter: [{ key: '_attempt', operator: 'eq', value: 'x' }] }],
+        returnMode: 'terminal',
+      },
+    ],
+    [
+      'a step relationship filter key',
+      {
+        start: { entityId: 'entity-1' },
+        steps: [{ direction: 'out', relationshipFilter: [{ key: '_attempt', operator: 'isNotNull' }] }],
+        returnMode: 'all',
+      },
+    ],
+    [
+      'a repeat stop-condition key',
+      {
+        start: { entityId: 'entity-1' },
+        steps: [{ direction: 'out', repeat: { maxDepth: 2, until: [{ key: '_attempt', operator: 'isNull' }] } }],
+        returnMode: 'terminal',
+      },
+    ],
+  ];
+
+  for (const [where, refused] of refusedSpecs) {
+    it(`refuses the write-token property as ${where} before any round-trip`, async () => {
+      const { executor, statements } = recordingExecutor();
+
+      const rejection = await executor.execute('repo-a', refused, vocabulary).catch((err: unknown) => err);
+
+      expect(rejection).toBeInstanceOf(TraversalValidationError);
+      expect((rejection as TraversalValidationError).errors.join(' ')).toContain('_attempt');
+      expect(statements).toHaveLength(0);
+    });
+  }
+
+  it('lets a spec that names no bookkeeping property through to the server', async () => {
+    const { executor, statements } = recordingExecutor();
+
+    await executor.execute(
+      'repo-a',
+      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['label'] } },
+      vocabulary,
+    );
+
+    expect(statements).toHaveLength(1);
   });
 });

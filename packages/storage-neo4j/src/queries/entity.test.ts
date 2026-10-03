@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderError, RepositoryNotFoundError, SlugConflictError } from '@utaba/deep-memory';
+import {
+  DuplicateEntityError,
+  ProviderError,
+  RepositoryNotFoundError,
+  SlugConflictError,
+} from '@utaba/deep-memory';
 import type { StoredEntity } from '@utaba/deep-memory/types';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
 import { buildFindEntitiesWhere, createEntity, escapeLuceneQuery, updateEntity } from './entity.js';
@@ -282,6 +287,156 @@ describe('createEntity error mapping', () => {
     await expect(createEntity(failingConnection(driverError).conn, 'r1', entity)).rejects.toMatchObject({
       name: 'ProviderError',
       cause: driverError,
+    });
+  });
+});
+
+describe('createEntity under a driver re-run', () => {
+  const now = '2026-01-01T00:00:00.000Z';
+  const CONSTRAINT_VIOLATION = 'Neo.ClientError.Schema.ConstraintValidationFailed';
+
+  function entity(overrides: Partial<StoredEntity> = {}): StoredEntity {
+    return {
+      id: 'e1',
+      slug: 'Thing:e1',
+      entityType: 'Thing',
+      label: 'e1',
+      summary: '',
+      properties: {},
+      provenance: {
+        createdBy: 't',
+        createdByType: 'agent',
+        createdAt: now,
+        modifiedBy: 't',
+        modifiedByType: 'agent',
+        modifiedAt: now,
+      },
+      ...overrides,
+    };
+  }
+
+  interface StoredNode {
+    slug: string;
+    writeAttempt: string | null;
+  }
+
+  function violation(key: 'id' | 'slug', value: string): Error & { code: string } {
+    return Object.assign(
+      new Error(`Node(9) already exists with label \`_Entity\` and properties \`repositoryId\` = 'r1', \`${key}\` = '${value}'`),
+      { code: CONSTRAINT_VIOLATION },
+    );
+  }
+
+  /**
+   * A connection fake over an in-memory set of entity nodes. Its create
+   * statement enforces the id and slug constraints in `checkOrder`. With
+   * `ackLost`, the driver commits the first run, loses the acknowledgement
+   * and runs the statement again, answering with the second run's outcome
+   * — the shape `driver.executeQuery`'s managed retry gives the caller.
+   */
+  function entityStore(options: {
+    seed?: Array<[string, StoredNode]>;
+    ackLost: boolean;
+    checkOrder?: Array<'id' | 'slug'>;
+  }) {
+    const nodes = new Map<string, StoredNode>(options.seed ?? []);
+    const checkOrder = options.checkOrder ?? ['id', 'slug'];
+    const statements: Array<{ cypher: string; params: Record<string, unknown> }> = [];
+
+    const runCreate = (params: Record<string, unknown>) => {
+      const id = params['id'] as string;
+      const slug = params['slug'] as string;
+      for (const key of checkOrder) {
+        if (key === 'id' && nodes.has(id)) throw violation('id', id);
+        if (key === 'slug' && Array.from(nodes.values()).some((n) => n.slug === slug)) throw violation('slug', slug);
+      }
+      nodes.set(id, { slug, writeAttempt: params['writeAttempt'] as string });
+      return {
+        records: [{ get: (key: string) => (key === 'id' ? id : undefined) }],
+        summary: { counters: { updates: () => ({ nodesCreated: 1 }) } },
+      };
+    };
+
+    const fake = {
+      async executeQuery(cypher: string, params: Record<string, unknown>) {
+        statements.push({ cypher, params });
+        if (cypher.includes('CREATE (n:_Entity')) {
+          if (options.ackLost) runCreate(params);
+          return runCreate(params);
+        }
+        if (cypher.includes('AS writeAttempt')) {
+          const node = nodes.get(params['id'] as string);
+          return {
+            records: node === undefined ? [] : [{ get: (key: string) => (key === 'writeAttempt' ? node.writeAttempt : undefined) }],
+          };
+        }
+        throw new Error(`unexpected statement: ${cypher}`);
+      },
+    };
+    return { conn: fake as unknown as Neo4jConnection, nodes, statements };
+  }
+
+  it('writes a fresh write token with every create', async () => {
+    const { conn, nodes, statements } = entityStore({ ackLost: false });
+
+    await createEntity(conn, 'r1', entity());
+    await createEntity(conn, 'r1', entity({ id: 'e2', slug: 'Thing:e2' }));
+
+    const [first, second] = statements;
+    expect(first!.cypher).toContain('_attempt: $writeAttempt');
+    expect(first!.params['writeAttempt']).toMatch(/^[0-9a-f-]{36}$/);
+    expect(first!.params['writeAttempt']).not.toBe(second!.params['writeAttempt']);
+    expect(nodes.get('e1')!.writeAttempt).toBe(first!.params['writeAttempt']);
+  });
+
+  it('reports success when the re-run trips the id constraint on its own committed entity', async () => {
+    const created = entity();
+    const { conn, nodes } = entityStore({ ackLost: true, checkOrder: ['id', 'slug'] });
+
+    await expect(createEntity(conn, 'r1', created)).resolves.toBe(created);
+    expect(nodes.size).toBe(1);
+  });
+
+  it('reports success when the re-run trips the slug constraint first on its own committed entity', async () => {
+    const created = entity();
+    const { conn, nodes } = entityStore({ ackLost: true, checkOrder: ['slug', 'id'] });
+
+    await expect(createEntity(conn, 'r1', created)).resolves.toBe(created);
+    expect(nodes.size).toBe(1);
+  });
+
+  it('still throws DuplicateEntityError for an id another call created', async () => {
+    const { conn } = entityStore({ ackLost: false, seed: [['e1', { slug: 'Thing:other', writeAttempt: 'another-call' }]] });
+
+    await expect(createEntity(conn, 'r1', entity())).rejects.toBeInstanceOf(DuplicateEntityError);
+  });
+
+  it('still throws DuplicateEntityError for an id an import wrote without a token', async () => {
+    const { conn } = entityStore({ ackLost: false, seed: [['e1', { slug: 'Thing:other', writeAttempt: null }]] });
+
+    await expect(createEntity(conn, 'r1', entity())).rejects.toBeInstanceOf(DuplicateEntityError);
+  });
+
+  it('still throws SlugConflictError for a slug another entity holds', async () => {
+    const { conn } = entityStore({ ackLost: false, seed: [['e0', { slug: 'Thing:e1', writeAttempt: 'another-call' }]] });
+
+    const rejection = createEntity(conn, 'r1', entity());
+    await expect(rejection).rejects.toBeInstanceOf(SlugConflictError);
+    await expect(rejection).rejects.toMatchObject({ slug: 'Thing:e1' });
+  });
+
+  it('reports a failed token read-back as ProviderError rather than guessing', async () => {
+    const readFailure = Object.assign(new Error('connection reset'), { code: 'ServiceUnavailable' });
+    const fake = {
+      async executeQuery(cypher: string) {
+        if (cypher.includes('CREATE (n:_Entity')) throw violation('id', 'e1');
+        throw readFailure;
+      },
+    };
+
+    await expect(createEntity(fake as unknown as Neo4jConnection, 'r1', entity())).rejects.toMatchObject({
+      name: 'ProviderError',
+      cause: readFailure,
     });
   });
 });

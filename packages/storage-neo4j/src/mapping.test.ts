@@ -14,8 +14,11 @@ import {
   relationshipFromProperties,
   relationshipFromRecord,
   relationshipToParams,
+  repositoryFromRecord,
   RESERVED_ENTITY_PROPERTY_KEYS,
+  STORED_ENTITY_FIELDS,
   STORED_RELATIONSHIP_FIELDS,
+  WRITE_ATTEMPT_PROPERTY,
   type DriverRecord,
 } from './mapping.js';
 
@@ -524,5 +527,41 @@ describe('assertSafeRelationshipType', () => {
     expect(() => assertSafeRelationshipType('KNOWS`')).toThrowError(ProviderError);
     expect(() => assertSafeRelationshipType('a]->(b)')).toThrowError(ProviderError);
     expect(() => assertSafeRelationshipType('')).toThrowError(ProviderError);
+  });
+});
+
+// ─── write token ────────────────────────────────────────────────────
+
+describe('write token property', () => {
+  it('is reserved, so it cannot be written or filtered as an entity property', () => {
+    expect(WRITE_ATTEMPT_PROPERTY).toBe('_attempt');
+    expect(RESERVED_ENTITY_PROPERTY_KEYS.has('_attempt')).toBe(true);
+    expect(() => assertSafeUserPropertyKey('_attempt')).toThrowError(ProviderError);
+    expect(() => entityUserPropertyParams({ _attempt: 'forged' })).toThrowError(ProviderError);
+  });
+
+  it('is never projected by the entity or relationship read projections', () => {
+    expect(STORED_ENTITY_FIELDS).not.toContain('_attempt');
+    expect(STORED_RELATIONSHIP_FIELDS).not.toContain('_attempt');
+    expect(buildRelationshipProjection()).not.toContain('_attempt');
+  });
+
+  it('does not surface on records read back as whole nodes or edges', () => {
+    const entity = entityFromRecord(recordFromNode('n', { ...FULL_ENTITY_PROPS, _attempt: 'token' }));
+    const relationship = relationshipFromRecord(recordFromRelationship('r', { ...FULL_REL_PROPS, _attempt: 'token' }));
+    const repository = repositoryFromRecord(
+      recordFromNode('r', {
+        repositoryId: 'repo-1',
+        label: 'Repo',
+        governanceConfig: JSON.stringify({ mode: 'open' }),
+        createdAt: '2026-01-01T00:00:00.000Z',
+        createdBy: 'tester',
+        _attempt: 'token',
+      }),
+    );
+
+    expect(JSON.stringify(entity)).not.toContain('token');
+    expect(JSON.stringify(relationship)).not.toContain('token');
+    expect(JSON.stringify(repository)).not.toContain('token');
   });
 });

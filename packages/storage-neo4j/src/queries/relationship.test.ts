@@ -277,3 +277,134 @@ describe('buildCreateRelationshipQuery', () => {
     expect(cypher).not.toContain('MERGE');
   });
 });
+
+describe('createRelationship under a driver re-run', () => {
+  /**
+   * A connection fake over an in-memory set of edges keyed by id, each with
+   * its source entity and the write token it was created with. The create statement reports
+   * `id-exists` for a stored id, as the real statement does. With `ackLost`,
+   * the driver commits the first run, loses the acknowledgement and runs the
+   * statement again, answering with the second run's outcome.
+   */
+  interface StoredEdge {
+    source: string;
+    token: string | null;
+  }
+
+  function edgeStore(options: { seed?: Array<[string, StoredEdge]>; ackLost: boolean }) {
+    const edges = new Map<string, StoredEdge[]>();
+    for (const [id, edge] of options.seed ?? []) edges.set(id, [...(edges.get(id) ?? []), edge]);
+    const statements: Array<{ cypher: string; params: Record<string, unknown> }> = [];
+
+    const runCreate = (params: Record<string, unknown>) => {
+      const id = params['id'] as string;
+      let outcome: string = RELATIONSHIP_CREATE_OUTCOME.idExists;
+      if (!edges.has(id)) {
+        edges.set(id, [{ source: params['sourceEntityId'] as string, token: params['writeAttempt'] as string }]);
+        outcome = RELATIONSHIP_CREATE_OUTCOME.created;
+      }
+      return { records: [{ get: (key: string) => (key === 'outcome' ? outcome : undefined) }] };
+    };
+
+    const fake = {
+      async executeQuery(cypher: string, params: Record<string, unknown>) {
+        statements.push({ cypher, params });
+        if (cypher.includes('RETURN outcome')) {
+          if (options.ackLost) runCreate(params);
+          return runCreate(params);
+        }
+        if (cypher.includes('AS writeAttempt')) {
+          const matching = (edges.get(params['id'] as string) ?? []).filter(
+            (edge) => edge.source === params['sourceEntityId'],
+          );
+          return {
+            records: matching.map((edge) => ({ get: (key: string) => (key === 'writeAttempt' ? edge.token : undefined) })),
+          };
+        }
+        throw new Error(`unexpected statement: ${cypher}`);
+      },
+    };
+    return { conn: fake as unknown as Neo4jConnection, edges, statements };
+  }
+
+  it('writes a fresh write token with every create', async () => {
+    const { conn, edges, statements } = edgeStore({ ackLost: false });
+
+    await createRelationship(conn, RID, relationship());
+    await createRelationship(conn, RID, relationship({ id: 'r2' }));
+
+    const [first, second] = statements;
+    expect(first!.cypher).toContain('_attempt: $writeAttempt');
+    expect(first!.params['writeAttempt']).toMatch(/^[0-9a-f-]{36}$/);
+    expect(first!.params['writeAttempt']).not.toBe(second!.params['writeAttempt']);
+    expect(edges.get('r1')).toEqual([{ source: 'source-entity', token: first!.params['writeAttempt'] }]);
+  });
+
+  it('reports success, with one edge stored, when the re-run finds its own committed edge', async () => {
+    const rel = relationship();
+    const { conn, edges } = edgeStore({ ackLost: true });
+
+    await expect(createRelationship(conn, RID, rel)).resolves.toBe(rel);
+    expect(edges.get('r1')).toHaveLength(1);
+  });
+
+  it('reads the token back by id from the source entity under the repository scope', async () => {
+    const { conn, statements } = edgeStore({ ackLost: true });
+
+    await createRelationship(conn, RID, relationship({ id: 'rel-param', sourceEntityId: 'src-param' }));
+
+    const readBack = statements.find((s) => s.cypher.includes('AS writeAttempt'));
+    expect(readBack!.params).toEqual({ id: 'rel-param', sourceEntityId: 'src-param' });
+    expect(readBack!.cypher).toContain('(s:_Entity {repositoryId: $rid, id: $sourceEntityId})');
+    expect(readBack!.cypher).toContain('[r {repositoryId: $rid, id: $id}]');
+    expect(readBack!.cypher).not.toContain('rel-param');
+    expect(readBack!.cypher).not.toContain('src-param');
+  });
+
+  it('still throws DuplicateRelationshipError when the id is held by an edge from another source', async () => {
+    const { conn } = edgeStore({ ackLost: false, seed: [['r1', { source: 'other-source', token: 'another-call' }]] });
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'DuplicateRelationshipError',
+      relationshipId: 'r1',
+    });
+  });
+
+  it('reports a failed token read-back as ProviderError rather than guessing', async () => {
+    const readFailure = Object.assign(new Error('connection reset'), { code: 'ServiceUnavailable' });
+    const fake = {
+      async executeQuery(cypher: string) {
+        if (cypher.includes('RETURN outcome')) {
+          return {
+            records: [
+              { get: (key: string) => (key === 'outcome' ? RELATIONSHIP_CREATE_OUTCOME.idExists : undefined) },
+            ],
+          };
+        }
+        throw readFailure;
+      },
+    };
+
+    await expect(createRelationship(fake as unknown as Neo4jConnection, RID, relationship())).rejects.toMatchObject({
+      name: 'ProviderError',
+      cause: readFailure,
+    });
+  });
+
+  it('still throws DuplicateRelationshipError for an id another call created', async () => {
+    const { conn } = edgeStore({ ackLost: false, seed: [['r1', { source: 'source-entity', token: 'another-call' }]] });
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'DuplicateRelationshipError',
+      relationshipId: 'r1',
+    });
+  });
+
+  it('still throws DuplicateRelationshipError for an id an import wrote without a token', async () => {
+    const { conn } = edgeStore({ ackLost: false, seed: [['r1', { source: 'source-entity', token: null }]] });
+
+    await expect(createRelationship(conn, RID, relationship())).rejects.toMatchObject({
+      name: 'DuplicateRelationshipError',
+    });
+  });
+});

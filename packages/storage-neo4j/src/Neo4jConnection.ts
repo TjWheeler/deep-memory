@@ -112,6 +112,11 @@ export class Neo4jConnection {
    * Required `repositoryId` binds `$rid` for the caller. The Cypher string
    * MUST reference `$rid` somewhere in a predicate or property map; absence
    * throws `ProviderError` as a programming error (D3b layer 2).
+   *
+   * The driver runs the statement as a managed transaction and re-runs it
+   * after a retryable failure, including a commit whose acknowledgement was
+   * lost. A write sent here must therefore answer correctly when the re-run
+   * meets the effect of its own committed first run.
    */
   public async executeQuery<T extends RecordShape = RecordShape>(
     cypher: string,
@@ -137,19 +142,29 @@ export class Neo4jConnection {
 
   /**
    * Run a managed write transaction scoped to a repository. Use only when
-   * more than one Cypher statement must commit atomically — single-statement
+   * more than one Cypher statement must commit atomically, or when the
+   * answer depends on the attempt number (below) — other single-statement
    * writes go through `executeQuery` so the driver handles transient-error
    * retry uniformly (D2b).
    *
    * Every `tx.run` call inside `txFn` is wrapped to inject `$rid` and assert
    * scope, so the same isolation enforcement applies as on the default path.
    * The transaction function MUST be idempotent (the driver retries on
-   * transient errors) and MUST NOT return the raw `Result` — process records
-   * inside the function and return mapped data.
+   * transient errors, including after a commit whose acknowledgement was
+   * lost) and MUST NOT return the raw `Result` — process records inside the
+   * function and return mapped data.
+   *
+   * The transaction function receives the attempt number (1 on the first
+   * run, 2 on the driver's first retry, and so on). After a commit whose
+   * acknowledgement was lost, the next attempt runs against state the
+   * previous attempt already wrote, so a function whose answer depends on
+   * what it finds (a delete reporting which ids it removed) uses the attempt
+   * number, together with what its earlier attempts saw, to tell its own
+   * committed work apart from a genuine miss.
    */
   public async executeWrite<T>(
     repositoryId: string,
-    txFn: (tx: ScopedTransaction) => Promise<T>,
+    txFn: (tx: ScopedTransaction, attempt: number) => Promise<T>,
   ): Promise<T> {
     return this.runManaged('write', repositoryId, txFn);
   }
@@ -218,13 +233,13 @@ export class Neo4jConnection {
    * `IN TRANSACTIONS` is only valid in implicit (auto-commit) transactions —
    * the managed `executeWrite` / `executeRead` helpers open an explicit
    * transaction internally and the server rejects the statement with
-   * `Neo.DatabaseError.Transaction.TransactionStartFailed`. Probe P13
-   * (local-tests/baseline/neo4j-call-in-transactions-results.md) captured the
-   * exact failure mode and the empty-match / partial-batch behaviour the
-   * chunked-wipe path relies on.
+   * `Neo.DatabaseError.Transaction.TransactionStartFailed`. The chunked
+   * wipe relies on each inner batch committing on its own, so no single
+   * transaction spans the whole repository, and on a batch that matches
+   * nothing (or only part of a batch) completing without error.
    *
    * Same `$rid` injection + scope assertion as `executeQuery`, so the chunked
-   * delete still flows through the D3b layer 2 lifeline. Returns only the
+   * delete stays repository-scoped like every other query. Returns only the
    * summary because the chunked-wipe subquery yields no rows; counters live on
    * `summary.counters.updates()`.
    */
@@ -251,13 +266,27 @@ export class Neo4jConnection {
   private async runManaged<T>(
     mode: 'read' | 'write',
     repositoryId: string,
-    txFn: (tx: ScopedTransaction) => Promise<T>,
+    txFn: (tx: ScopedTransaction, attempt: number) => Promise<T>,
   ): Promise<T> {
     this.assertRepositoryId(repositoryId);
-    const session = this.driver.session({ database: this.database });
+    // Join the bookmark chain `executeQuery` uses, so a managed transaction
+    // stays causally ordered with the single-statement reads and writes
+    // around it in a cluster.
+    const session = this.driver.session({
+      database: this.database,
+      bookmarkManager: this.driver.executeQueryBookmarkManager,
+    });
     try {
-      const wrapped = (managed: ManagedTransaction): Promise<T> =>
-        txFn(new ScopedTransaction(managed, repositoryId, this.surfaceNotifications.bind(this)));
+      // The driver invokes the transaction function once per attempt, so
+      // counting invocations yields the attempt number.
+      let attempt = 0;
+      const wrapped = (managed: ManagedTransaction): Promise<T> => {
+        attempt += 1;
+        return txFn(
+          new ScopedTransaction(managed, repositoryId, this.surfaceNotifications.bind(this)),
+          attempt,
+        );
+      };
       return await translateTimeout(() =>
         mode === 'write' ? session.executeWrite(wrapped) : session.executeRead(wrapped),
       );

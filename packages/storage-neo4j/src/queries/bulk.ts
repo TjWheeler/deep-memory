@@ -23,16 +23,25 @@
 // Import:
 //   - Fixed-shape `UNWIND $rows AS row …` templates so the planner caches one
 //     plan per template regardless of `$rows` contents. Plan-cache footprint
-//     is four entries total (entity CREATE, entity MERGE, relationship CREATE,
-//     relationship MERGE) across every import in the system.
-//   - `skipExistenceCheck: true` uses the CREATE branch. A duplicate row
-//     causes the whole chunk to fail with
+//     is one entity insert, one entity upsert, and one relationship insert and
+//     upsert per relationship type, across every import in the system.
+//   - `skipExistenceCheck: true` uses the insert branch: entities are
+//     CREATEd, relationships are MERGEd on `{repositoryId, id, _attempt}`. A
+//     duplicate entity row causes the whole chunk to fail with
 //     `Neo.ClientError.Schema.ConstraintValidationFailed`; the import falls
-//     back to a per-row CREATE for that chunk so good rows still land. The
+//     back to writing that chunk row by row so good rows still land. The
 //     downside is one extra round-trip per failed-chunk; the upside is that
 //     the success path is one round-trip per chunk regardless of chunk size.
 //     Only row-shaped failures take the fallback; a timeout or connection
 //     failure stops the import with its typed error.
+//   - The insert branch writes a token per statement (`_attempt`) on every
+//     record it writes. The driver re-runs a statement whose commit
+//     acknowledgement was lost; the token lets the re-run, and the per-row
+//     fallback after it, recognise rows the first run committed instead of
+//     reporting them as duplicates or writing them twice. Relationships
+//     MERGE on the token rather than CREATE so a re-run matches the edge its
+//     own first run wrote, while an edge any other call wrote, which carries
+//     a different token or none, never matches.
 //   - `skipExistenceCheck: false` uses the MERGE branch. `NodeUniqueIndexSeek`
 //     on the `(repositoryId, id)` constraint backs the MERGE so the per-row
 //     cost is O(log n) — re-imports are idempotent without paying a full scan.
@@ -53,6 +62,7 @@
 //     single `BulkImportResult` at the end. Per-row errors are collected per
 //     chunk, never swallowed. The first chunk that rejects stops dispatch.
 
+import { randomUUID } from 'node:crypto';
 import type {
   BulkImportItemError,
   BulkImportOptions,
@@ -73,15 +83,19 @@ import {
   entityUserPropertyParams,
   relationshipFromRecord,
   relationshipToParams,
+  WRITE_ATTEMPT_PROPERTY,
 } from '../mapping.js';
 import {
   DeepMemoryError,
+  DuplicateEntityError,
   DuplicateRelationshipError,
   ProviderError,
   RepositoryNotFoundError,
+  SlugConflictError,
 } from '@utaba/deep-memory';
 import {
   isDeletedEntityFailure,
+  isEntityUniquenessViolation,
   isMemoryLimitFailure,
   isRowShapedFailure,
   isTransactionMemoryLimit,
@@ -269,6 +283,10 @@ export async function* exportAll(
  * authoritative for `entity.properties` round-trip (per O1); the user-property
  * scalars exist for `findEntities` predicate queries only.
  *
+ * Every node carries the statement's write token (`$writeAttempt`), so a
+ * refusal of a re-run can be told apart from a genuine clash (see
+ * `importEntityChunk`).
+ *
  * Returns one row: `written`, the number of rows written — 0 when the
  * repository marker is missing.
  */
@@ -295,9 +313,30 @@ SET
   n.modifiedByType = row.modifiedByType,
   n.modifiedAt = row.modifiedAt,
   n.modifiedInConversation = row.modifiedInConversation,
-  n.modifiedFromMessage = row.modifiedFromMessage
+  n.modifiedFromMessage = row.modifiedFromMessage,
+  n.${WRITE_ATTEMPT_PROPERTY} = $writeAttempt
 SET n += row.userProperties
 RETURN count(*) AS written
+`;
+
+/**
+ * How many of a chunk's ids hold an entity carrying the chunk statement's
+ * write token. Seeks the `(repositoryId, id)` unique index for each id.
+ */
+export const ENTITY_WRITE_ATTEMPT_COUNT_QUERY = `MATCH (n:_Entity {repositoryId: $rid})
+WHERE n.id IN $ids AND n.${WRITE_ATTEMPT_PROPERTY} = $writeAttempt
+RETURN count(n) AS carrying
+`;
+
+/**
+ * The write token stored on each of the given ids' entities, for the
+ * per-row fallback to tell rows a re-run refused from genuine clashes in
+ * one round trip. Seeks the `(repositoryId, id)` unique index for each id;
+ * an id with no entity returns no row.
+ */
+export const ENTITY_WRITE_ATTEMPTS_QUERY = `MATCH (n:_Entity {repositoryId: $rid})
+WHERE n.id IN $ids
+RETURN n.id AS id, n.${WRITE_ATTEMPT_PROPERTY} AS writeAttempt
 `;
 
 /**
@@ -423,6 +462,14 @@ OPTIONAL MATCH (t:_Entity {repositoryId: $rid, id: row.targetEntityId})
  * its ids are new to the store, and checking each chunk against every edge
  * in the repository would make a large import quadratic. `importBulk` still
  * refuses an id repeated within the one call.
+ *
+ * The edge is MERGEd on its id together with the statement's write token
+ * (`$writeAttempt`). A re-run of a statement whose commit acknowledgement
+ * was lost, or the per-row fallback reusing the chunk's token, matches the
+ * edge the first run wrote instead of writing a second one. An edge written
+ * by any other statement carries another token, so it never matches and the
+ * row still writes: the template trusts the caller about stored ids exactly
+ * as a plain CREATE would.
  */
 export function buildInsertRelationshipsQuery(relationshipType: string): string {
   const safe = assertSafeRelationshipType(relationshipType);
@@ -434,25 +481,23 @@ WITH row, s, t,
     ELSE '${o.written}'
   END AS outcome
 FOREACH (_ IN CASE WHEN outcome = '${o.written}' THEN [1] ELSE [] END |
-  CREATE (s)-[r:${safe} {
-    repositoryId: $rid,
-    id: row.id,
-    relationshipType: row.relationshipType,
-    sourceEntityId: row.sourceEntityId,
-    targetEntityId: row.targetEntityId,
-    properties: row.properties,
-    bidirectional: row.bidirectional,
-    createdBy: row.createdBy,
-    createdByType: row.createdByType,
-    createdAt: row.createdAt,
-    createdInConversation: row.createdInConversation,
-    createdFromMessage: row.createdFromMessage,
-    modifiedBy: row.modifiedBy,
-    modifiedByType: row.modifiedByType,
-    modifiedAt: row.modifiedAt,
-    modifiedInConversation: row.modifiedInConversation,
-    modifiedFromMessage: row.modifiedFromMessage
-  }]->(t)
+  MERGE (s)-[r:${safe} {repositoryId: $rid, id: row.id, ${WRITE_ATTEMPT_PROPERTY}: $writeAttempt}]->(t)
+  ON CREATE SET
+    r.relationshipType = row.relationshipType,
+    r.sourceEntityId = row.sourceEntityId,
+    r.targetEntityId = row.targetEntityId,
+    r.properties = row.properties,
+    r.bidirectional = row.bidirectional,
+    r.createdBy = row.createdBy,
+    r.createdByType = row.createdByType,
+    r.createdAt = row.createdAt,
+    r.createdInConversation = row.createdInConversation,
+    r.createdFromMessage = row.createdFromMessage,
+    r.modifiedBy = row.modifiedBy,
+    r.modifiedByType = row.modifiedByType,
+    r.modifiedAt = row.modifiedAt,
+    r.modifiedInConversation = row.modifiedInConversation,
+    r.modifiedFromMessage = row.modifiedFromMessage
 )
 RETURN row.id AS id, outcome
 `;
@@ -776,17 +821,64 @@ async function importEntityChunk(
   }
   if (prepared.length === 0) return { imported: 0, errors };
   const query = skipCheck ? INSERT_ENTITIES_QUERY : UPSERT_ENTITIES_QUERY;
+  // The insert template writes one token for the whole chunk statement.
+  const writeAttempt = skipCheck ? randomUUID() : undefined;
 
   let result: QueryResult;
   try {
-    result = await conn.executeQuery(query, { rows: prepared.map((row) => row.params) }, { repositoryId });
+    result = await conn.executeQuery(
+      query,
+      { rows: prepared.map((row) => row.params), ...(writeAttempt === undefined ? {} : { writeAttempt }) },
+      { repositoryId },
+    );
   } catch (err) {
     rethrowUnlessChunkCanFallBack(err);
-    const fallback = await fallbackPerEntity(conn, repositoryId, prepared, query, run);
+    // The driver re-runs a chunk whose commit acknowledgement was lost, and
+    // the re-run trips the id or slug constraint on the rows its own first
+    // run committed. Every row's id holding an entity with this chunk's
+    // token proves the whole chunk landed (a chunk commits all its rows or
+    // none). Anything less — a genuine clash, an id repeated within the
+    // chunk, a row a concurrent delete removed since — goes row by row.
+    if (
+      writeAttempt !== undefined &&
+      isEntityUniquenessViolation(err) &&
+      (await countEntitiesCarrying(conn, repositoryId, prepared, writeAttempt)) === prepared.length
+    ) {
+      return { imported: prepared.length, errors };
+    }
+    const fallback = await fallbackPerEntity(conn, repositoryId, prepared, query, run, writeAttempt);
     return { imported: fallback.imported, errors: [...errors, ...fallback.errors] };
   }
   assertEntityRowsWritten(result, repositoryId);
   return { imported: prepared.length, errors };
+}
+
+/**
+ * How many of the rows' ids hold an entity carrying `writeAttempt`. Ids are
+ * unique in the repository, so this equals the row count only when the rows
+ * are distinct and every one of them was written with that token.
+ */
+async function countEntitiesCarrying(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  prepared: ReadonlyArray<PreparedRow<StoredEntity>>,
+  writeAttempt: string,
+): Promise<number> {
+  let result: QueryResult;
+  try {
+    result = await conn.executeQuery(
+      ENTITY_WRITE_ATTEMPT_COUNT_QUERY,
+      { ids: prepared.map((row) => row.item.id), writeAttempt },
+      { repositoryId },
+    );
+  } catch (err) {
+    mapDriverError(err, { operation: 'importBulk' });
+  }
+  const carrying = result.records[0]?.get('carrying');
+  if (carrying === undefined || carrying === null) {
+    throw new ProviderError('Neo4j entity import token count returned no row.');
+  }
+  return bigintToSafeNumber(carrying);
 }
 
 /**
@@ -815,6 +907,15 @@ interface PreparedRow<T> {
  * store failure on any row stops the fallback and propagates; so does a
  * failure in a sibling chunk (the fallback stops at its next row), and so
  * does a missing repository.
+ *
+ * For the insert template (`chunkWriteAttempt` set), each row is written
+ * with a token of its own. A row refused for its id or slug counts as
+ * imported when the entity stored under its id carries its own token (the
+ * driver re-ran the row after a lost acknowledgement) or the chunk's token
+ * (the chunk statement committed it). Rows need their own tokens because an
+ * entity id repeated within one call is not refused up front: with a shared
+ * token, a later repeat would read the earlier occurrence's entity as its
+ * own and be reported imported instead of `ENTITY_ALREADY_EXISTS`.
  */
 async function fallbackPerEntity(
   conn: Neo4jConnection,
@@ -822,17 +923,26 @@ async function fallbackPerEntity(
   prepared: ReadonlyArray<PreparedRow<StoredEntity>>,
   query: string,
   run: ImportRun,
+  chunkWriteAttempt: string | undefined,
 ): Promise<ChunkResult> {
-  const errors: BulkImportItemError[] = [];
+  // Rows refused for their id or slug are resolved after the pass with one
+  // token read; their slot keeps the reported error order identical to the
+  // row order.
+  const outcomes: Array<BulkImportItemError | RefusedEntityRow> = [];
   let imported = 0;
   for (const { item: entity, params } of prepared) {
     if (run.stopped) break;
+    const rowWriteAttempt = chunkWriteAttempt === undefined ? undefined : randomUUID();
     let result: QueryResult;
     try {
-      result = await conn.executeQuery(query, { rows: [params] }, { repositoryId });
+      result = await conn.executeQuery(
+        query,
+        { rows: [params], ...(rowWriteAttempt === undefined ? {} : { writeAttempt: rowWriteAttempt }) },
+        { repositoryId },
+      );
     } catch (rowErr) {
       if (isDeletedEntityFailure(rowErr)) {
-        errors.push(
+        outcomes.push(
           await deletedNodeRowError(
             conn,
             repositoryId,
@@ -843,21 +953,88 @@ async function fallbackPerEntity(
         continue;
       }
       rethrowUnlessRowFailure(rowErr);
-      errors.push(
-        rowError(`entity:${entity.id}`, rowErr, {
-          kind: 'entity',
-          entityId: entity.id,
-          slug: entity.slug,
-          entityType: entity.entityType,
-          label: entity.label,
-        }),
-      );
+      const refusal = toTypedError(rowErr, {
+        kind: 'entity',
+        entityId: entity.id,
+        slug: entity.slug,
+        entityType: entity.entityType,
+        label: entity.label,
+        operation: 'importBulk',
+      });
+      if (
+        rowWriteAttempt !== undefined &&
+        (refusal instanceof DuplicateEntityError || refusal instanceof SlugConflictError)
+      ) {
+        outcomes.push({ entityId: entity.id, rowWriteAttempt, refusal });
+        continue;
+      }
+      outcomes.push(refusedRow(`entity:${entity.id}`, refusal));
       continue;
     }
     assertEntityRowsWritten(result, repositoryId);
     imported++;
   }
+
+  const refused = outcomes.filter(isRefusedEntityRow);
+  // A concurrent delete of the entity between the refusal and the read-back
+  // leaves no token to read, so the refusal stands.
+  const stored =
+    refused.length === 0
+      ? new Map<string, string>()
+      : await readEntityWriteAttempts(
+          conn,
+          repositoryId,
+          refused.map((row) => row.entityId),
+        );
+  const errors: BulkImportItemError[] = [];
+  for (const outcome of outcomes) {
+    if (!isRefusedEntityRow(outcome)) {
+      errors.push(outcome);
+      continue;
+    }
+    const token = stored.get(outcome.entityId);
+    if (token !== undefined && (token === outcome.rowWriteAttempt || token === chunkWriteAttempt)) {
+      imported++;
+      continue;
+    }
+    errors.push(refusedRow(`entity:${outcome.entityId}`, outcome.refusal));
+  }
   return { imported, errors };
+}
+
+/** An insert-mode fallback row refused for its id or slug, awaiting its token read. */
+interface RefusedEntityRow {
+  entityId: string;
+  rowWriteAttempt: string;
+  refusal: DuplicateEntityError | SlugConflictError;
+}
+
+function isRefusedEntityRow(outcome: BulkImportItemError | RefusedEntityRow): outcome is RefusedEntityRow {
+  return 'refusal' in outcome;
+}
+
+/**
+ * The write token stored on each given id's entity, keyed by id. An id with
+ * no entity, or whose entity carries no token, is absent from the map.
+ */
+async function readEntityWriteAttempts(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  entityIds: ReadonlyArray<string>,
+): Promise<Map<string, string>> {
+  let result: QueryResult;
+  try {
+    result = await conn.executeQuery(ENTITY_WRITE_ATTEMPTS_QUERY, { ids: [...new Set(entityIds)] }, { repositoryId });
+  } catch (err) {
+    mapDriverError(err, { operation: 'importBulk' });
+  }
+  const stored = new Map<string, string>();
+  for (const record of result.records) {
+    const id: unknown = record.get('id');
+    const writeAttempt: unknown = record.get('writeAttempt');
+    if (typeof id === 'string' && typeof writeAttempt === 'string') stored.set(id, writeAttempt);
+  }
+  return stored;
 }
 
 async function importRelationshipChunk(
@@ -897,16 +1074,22 @@ async function importRelationshipChunk(
   // never repeat an id (`importBulk` refuses repeats up front) and are
   // written in one go.
   const waves = skipCheck ? [prepared] : wavesOfDistinctIds(prepared);
+  // The insert template's write token: one per chunk statement, reused by
+  // that chunk's per-row fallback. Reusing it is what keeps a row the chunk
+  // statement already committed from being written a second time; it is safe
+  // because insert chunks never repeat an id, so a row can only ever match
+  // its own edge.
+  const writeAttempt = skipCheck ? randomUUID() : undefined;
   let imported = 0;
   const errors: BulkImportItemError[] = [];
   for (const wave of waves) {
     if (run.stopped) break;
     let result: QueryResult;
     try {
-      result = await conn.executeQuery(query, relationshipChunkParams(wave, skipCheck), { repositoryId });
+      result = await conn.executeQuery(query, relationshipChunkParams(wave, writeAttempt), { repositoryId });
     } catch (err) {
       rethrowUnlessChunkCanFallBack(err);
-      const fallback = await fallbackPerRelationship(conn, repositoryId, wave, query, skipCheck, run);
+      const fallback = await fallbackPerRelationship(conn, repositoryId, wave, query, writeAttempt, run);
       imported += fallback.imported;
       errors.push(...fallback.errors);
       continue;
@@ -926,7 +1109,7 @@ async function fallbackPerRelationship(
   repositoryId: string,
   prepared: ReadonlyArray<PreparedRow<StoredRelationship>>,
   query: string,
-  skipCheck: boolean,
+  writeAttempt: string | undefined,
   run: ImportRun,
 ): Promise<ChunkResult> {
   const errors: BulkImportItemError[] = [];
@@ -936,7 +1119,7 @@ async function fallbackPerRelationship(
     const rel = row.item;
     let result: QueryResult;
     try {
-      result = await conn.executeQuery(query, relationshipChunkParams([row], skipCheck), { repositoryId });
+      result = await conn.executeQuery(query, relationshipChunkParams([row], writeAttempt), { repositoryId });
     } catch (rowErr) {
       if (isDeletedEntityFailure(rowErr)) {
         errors.push(
@@ -966,15 +1149,17 @@ async function fallbackPerRelationship(
 }
 
 /**
- * Params for a relationship template: the rows, plus — for the upsert
- * template, which checks ids against the store — their ids.
+ * Params for a relationship template: the rows, plus the insert template's
+ * write token (`writeAttempt`, set only for that template) or, for the
+ * upsert template, which checks ids against the store, the rows' ids.
  */
 function relationshipChunkParams(
   rows: ReadonlyArray<PreparedRow<StoredRelationship>>,
-  skipCheck: boolean,
+  writeAttempt: string | undefined,
 ): Record<string, unknown> {
   const params: Record<string, unknown> = { rows: rows.map((row) => row.params) };
-  if (!skipCheck) params['ids'] = rows.map((row) => row.item.id);
+  if (writeAttempt === undefined) params['ids'] = rows.map((row) => row.item.id);
+  else params['writeAttempt'] = writeAttempt;
   return params;
 }
 

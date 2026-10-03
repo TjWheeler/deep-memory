@@ -52,6 +52,7 @@
 //     caller computes the `notFound` set client-side from set difference,
 //     avoiding a per-id existence pre-check.
 
+import { randomUUID } from 'node:crypto';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
 import type {
   PaginatedResult,
@@ -69,10 +70,18 @@ import {
   entityUserPropertyParams,
   isNativeStorableValue,
   RESERVED_ENTITY_PROPERTY_KEYS,
+  WRITE_ATTEMPT_PROPERTY,
 } from '../mapping.js';
-import { isDeletedEntityFailure, mapDriverError } from '../errors.js';
+import { isDeletedEntityFailure, mapDriverError, toTypedError } from '../errors.js';
 import { LOCK_REPOSITORY_MARKER } from './repositoryLock.js';
-import { EntityNotFoundError, ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
+import { deleteByIds } from './deleteByIds.js';
+import {
+  DuplicateEntityError,
+  EntityNotFoundError,
+  ProviderError,
+  RepositoryNotFoundError,
+  SlugConflictError,
+} from '@utaba/deep-memory';
 
 /**
  * Fixed-shape `CREATE` template — same Cypher string for every entity create
@@ -89,6 +98,10 @@ import { EntityNotFoundError, ProviderError, RepositoryNotFoundError } from '@ut
  *
  * Returns `n.id AS id` only — the caller already holds the `StoredEntity` it
  * passed in and does not need the round-trip to re-materialise it.
+ *
+ * The node carries the call's write token (`WRITE_ATTEMPT_PROPERTY`), which
+ * lets `createEntity` recognise its own committed write when the driver
+ * re-runs the statement.
  *
  * The statement opens with `LOCK_REPOSITORY_MARKER`: it write-locks the
  * `_Repository` marker and continues only while the marker still exists.
@@ -119,11 +132,18 @@ CREATE (n:_Entity {
   modifiedByType: $modifiedByType,
   modifiedAt: $modifiedAt,
   modifiedInConversation: $modifiedInConversation,
-  modifiedFromMessage: $modifiedFromMessage
+  modifiedFromMessage: $modifiedFromMessage,
+  ${WRITE_ATTEMPT_PROPERTY}: $writeAttempt
 })
 SET n += $userProperties
 RETURN n.id AS id
 `;
+
+/**
+ * Read back the write token of the entity stored under an id, after a
+ * create was refused by a uniqueness constraint.
+ */
+const ENTITY_WRITE_ATTEMPT_QUERY = `MATCH (n:_Entity {repositoryId: $rid, id: $id}) RETURN n.${WRITE_ATTEMPT_PROPERTY} AS writeAttempt`;
 
 // Read-projection chains are constant — compute once at module load so the
 // query string fed to the planner is byte-identical across calls. Two
@@ -151,6 +171,10 @@ const ENTITY_GET_MANY_QUERY_FULL = `MATCH (n:_Entity {repositoryId: $rid}) WHERE
  * `mapDriverError` translates by the constraint that fired:
  * `DuplicateEntityError` for the id, `SlugConflictError` for the slug (the
  * engine retries that one with the next free slug).
+ *
+ * Either refusal is answered as success when the entity stored under this
+ * call's id carries this call's write token: the driver re-ran a create
+ * whose first run committed but whose acknowledgement was lost.
  */
 export async function createEntity(
   conn: Neo4jConnection,
@@ -161,11 +185,12 @@ export async function createEntity(
   // round-trip. A reserved-key collision or a malformed identifier throws
   // `ProviderError` here so the surface never reaches the server.
   const userProperties = entityUserPropertyParams(entity.properties);
+  const writeAttempt = randomUUID();
   let nodesCreated = 0;
   try {
     const result = await conn.executeQuery(
       ENTITY_CREATE_QUERY,
-      { ...entityToParams(entity), userProperties },
+      { ...entityToParams(entity), userProperties, writeAttempt },
       { repositoryId },
     );
     nodesCreated = result.summary.counters.updates()['nodesCreated'] ?? 0;
@@ -176,7 +201,7 @@ export async function createEntity(
     if (isDeletedEntityFailure(err)) {
       throw new RepositoryNotFoundError(repositoryId);
     }
-    mapDriverError(err, {
+    const refusal = toTypedError(err, {
       kind: 'entity',
       entityId: entity.id,
       slug: entity.slug,
@@ -184,11 +209,48 @@ export async function createEntity(
       label: entity.label,
       operation: 'createEntity',
     });
+    // The driver re-runs a statement whose commit acknowledgement was lost.
+    // The re-run then trips the id constraint, or the slug constraint first,
+    // on the entity its own first run committed. The entity stored under this
+    // call's id carrying this call's token proves that, and the create
+    // succeeded; any other token is a genuine clash. A concurrent delete of
+    // the entity between the refusal and the read-back leaves no token to
+    // read, so the refusal stands.
+    if (
+      (refusal instanceof DuplicateEntityError || refusal instanceof SlugConflictError) &&
+      (await readEntityWriteAttempt(conn, repositoryId, entity.id, 'createEntity')) === writeAttempt
+    ) {
+      return entity;
+    }
+    throw refusal;
   }
   // The repository marker is missing, or was deleted while the statement
   // waited for its lock, so the CREATE never ran.
   if (nodesCreated === 0) throw new RepositoryNotFoundError(repositoryId);
   return entity;
+}
+
+/**
+ * The write token on the entity stored under `entityId`, or `null` when no
+ * entity has that id or it carries no token (one written before tokens were
+ * recorded, or by an upsert import). Runs on the write route so it sees the
+ * commit that refused the create. `operation` names the refused write in a
+ * failed read's error.
+ */
+export async function readEntityWriteAttempt(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  entityId: string,
+  operation: 'createEntity' | 'importBulk',
+): Promise<string | null> {
+  let result: Awaited<ReturnType<typeof conn.executeQuery>>;
+  try {
+    result = await conn.executeQuery(ENTITY_WRITE_ATTEMPT_QUERY, { id: entityId }, { repositoryId });
+  } catch (err) {
+    mapDriverError(err, { entityId, operation });
+  }
+  const value: unknown = result.records[0]?.get('writeAttempt');
+  return typeof value === 'string' ? value : null;
 }
 
 /**
@@ -413,32 +475,32 @@ export async function updateEntity(
   return entityFromRecord(record);
 }
 
+const ENTITY_DELETE_MANY_QUERY =
+  'MATCH (n:_Entity {repositoryId: $rid}) WHERE n.id IN $ids ' +
+  'WITH n, n.id AS id DETACH DELETE n RETURN id AS deleted';
+
 /**
  * Delete a single entity and its incident relationships (`DETACH DELETE`).
  *
- * `RETURN count(n)` distinguishes match-not-found (0) from match-and-delete
- * (1) without a separate existence check. Counts ≠ 1 → `EntityNotFoundError`
- * — covers both the no-match case and the (impossible-in-practice) duplicate
- * case if the uniqueness constraint were somehow circumvented.
+ * Runs the bulk delete statement for one id through `deleteByIds`, so a
+ * re-run by the driver after a commit whose acknowledgement was lost still
+ * answers success: the entity the first attempt deleted counts as deleted
+ * rather than as missing. An id no attempt found → `EntityNotFoundError`.
  */
 export async function deleteEntity(
   conn: Neo4jConnection,
   repositoryId: string,
   entityId: string,
 ): Promise<void> {
-  const result = await conn.executeQuery(
-    'MATCH (n:_Entity {repositoryId: $rid, id: $id}) DETACH DELETE n RETURN count(n) AS deleted',
-    { id: entityId },
-    { repositoryId },
-  );
-  const deleted = bigintToSafeNumber(result.records[0]?.get('deleted') ?? 0);
-  if (deleted !== 1) throw new EntityNotFoundError(entityId);
+  const { notFound } = await deleteByIds(conn, repositoryId, ENTITY_DELETE_MANY_QUERY, [entityId]);
+  if (notFound.length > 0) throw new EntityNotFoundError(entityId);
 }
 
 /**
- * Bulk delete by ids — single round-trip. Returns the ids actually deleted
- * (drawn from the `DETACH DELETE` operator's RETURN slice); the caller
- * computes the `notFound` set via set difference against the input ids.
+ * Bulk delete by ids — single statement. Returns the ids actually deleted
+ * (drawn from the `DETACH DELETE` operator's RETURN slice); the `notFound`
+ * set is the set difference against the input ids. `deleteByIds` keeps the
+ * answer right when the driver re-runs a delete whose commit succeeded.
  *
  * Empty input → empty result, no round-trip.
  */
@@ -447,21 +509,7 @@ export async function deleteEntities(
   repositoryId: string,
   ids: string[],
 ): Promise<{ deleted: string[]; notFound: string[] }> {
-  if (ids.length === 0) return { deleted: [], notFound: [] };
-  const result = await conn.executeQuery(
-    'MATCH (n:_Entity {repositoryId: $rid}) WHERE n.id IN $ids ' +
-      'WITH n, n.id AS id DETACH DELETE n RETURN id AS deleted',
-    { ids },
-    { repositoryId },
-  );
-  const deleted: string[] = [];
-  for (const record of result.records) {
-    const id = record.get('deleted');
-    if (typeof id === 'string') deleted.push(id);
-  }
-  const deletedSet = new Set(deleted);
-  const notFound = ids.filter((id) => !deletedSet.has(id));
-  return { deleted, notFound };
+  return deleteByIds(conn, repositoryId, ENTITY_DELETE_MANY_QUERY, ids);
 }
 
 // Read-projection chains reused by `findEntities`. The non-search branch

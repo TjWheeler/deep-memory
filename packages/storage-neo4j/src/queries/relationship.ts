@@ -31,6 +31,7 @@
 //     property map so reachability is bounded by the scope discriminator,
 //     not the graph topology.
 
+import { randomUUID } from 'node:crypto';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
 import type {
   PaginatedResult,
@@ -50,8 +51,10 @@ import {
   buildRelationshipProjection,
   relationshipFromRecord,
   relationshipToParams,
+  WRITE_ATTEMPT_PROPERTY,
 } from '../mapping.js';
 import { LOCK_REPOSITORY_MARKER_OPTIONAL } from './repositoryLock.js';
+import { deleteByIds } from './deleteByIds.js';
 import { isDeletedEntityFailure, mapDriverError } from '../errors.js';
 
 type QueryResult = Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
@@ -175,12 +178,25 @@ FOREACH (_ IN CASE WHEN outcome = '${o.created}' THEN [1] ELSE [] END |
     modifiedByType: $modifiedByType,
     modifiedAt: $modifiedAt,
     modifiedInConversation: $modifiedInConversation,
-    modifiedFromMessage: $modifiedFromMessage
+    modifiedFromMessage: $modifiedFromMessage,
+    ${WRITE_ATTEMPT_PROPERTY}: $writeAttempt
   }]->(t)
 )
 RETURN outcome
 `;
 }
+
+/**
+ * Read back the write token of the edge carrying an id, after a create
+ * reported the id as taken. Anchored on this call's source entity, which
+ * seeks the unique `(repositoryId, id)` entity index and expands only that
+ * node's outgoing edges. An edge this call wrote always leaves this source;
+ * an edge under the same id from another source is another call's, and its
+ * absence from the result leaves the refusal standing.
+ */
+export const RELATIONSHIP_WRITE_ATTEMPT_QUERY = `MATCH (s:_Entity {repositoryId: $rid, id: $sourceEntityId})-[r {repositoryId: $rid, id: $id}]->()
+RETURN r.${WRITE_ATTEMPT_PROPERTY} AS writeAttempt
+`;
 
 /**
  * Reads whether the repository marker and both endpoints exist, after a
@@ -200,7 +216,9 @@ RETURN repo IS NOT NULL AS repositoryExists,
  * and translate its outcome: a missing repository →
  * `RepositoryNotFoundError`, a missing source or target →
  * `EntityNotFoundError` carrying that endpoint's id, an id already in use in
- * the repository → `DuplicateRelationshipError`.
+ * the repository → `DuplicateRelationshipError`, unless the edge under that
+ * id carries this call's write token (the driver re-ran a create whose first
+ * run committed), which is success.
  *
  * A server may instead refuse the statement with
  * `Neo.ClientError.Statement.EntityNotFound` when a node it locked or
@@ -217,7 +235,8 @@ export async function createRelationship(
   relationship: StoredRelationship,
 ): Promise<StoredRelationship> {
   const cypher = buildCreateRelationshipQuery(relationship.relationshipType);
-  const params = relationshipToParams(relationship);
+  const writeAttempt = randomUUID();
+  const params = { ...relationshipToParams(relationship), writeAttempt };
   let result: QueryResult;
   try {
     result = await conn.executeQuery(cypher, params, { repositoryId });
@@ -248,10 +267,56 @@ export async function createRelationship(
     case RELATIONSHIP_CREATE_OUTCOME.targetMissing:
       throw new EntityNotFoundError(relationship.targetEntityId);
     case RELATIONSHIP_CREATE_OUTCOME.idExists:
+      // The driver re-runs a statement whose commit acknowledgement was
+      // lost, and the re-run finds the edge its own first run committed. An
+      // edge under this id carrying this call's token proves that, and the
+      // create succeeded; any other token is a genuine reuse of the id.
+      // A concurrent delete of the edge between the refusal and this
+      // read-back leaves nothing to match, so the refusal stands.
+      if (
+        await relationshipCarriesWriteAttempt(
+          conn,
+          repositoryId,
+          relationship.id,
+          relationship.sourceEntityId,
+          writeAttempt,
+        )
+      ) {
+        return relationship;
+      }
       throw new DuplicateRelationshipError(relationship.id);
     case RELATIONSHIP_CREATE_OUTCOME.created:
       return relationship;
   }
+}
+
+/**
+ * Whether the edge with `relationshipId` leaving `sourceEntityId` carries
+ * `writeAttempt`. Runs on the write route so it sees the commit that made
+ * the id taken.
+ */
+async function relationshipCarriesWriteAttempt(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  relationshipId: string,
+  sourceEntityId: string,
+  writeAttempt: string,
+): Promise<boolean> {
+  let check: QueryResult;
+  try {
+    check = await conn.executeQuery(
+      RELATIONSHIP_WRITE_ATTEMPT_QUERY,
+      { id: relationshipId, sourceEntityId },
+      { repositoryId },
+    );
+  } catch (err) {
+    mapDriverError(err, {
+      kind: 'relationship',
+      relationshipId,
+      operation: 'createRelationship',
+    });
+  }
+  return check.records.some((record) => record.get('writeAttempt') === writeAttempt);
 }
 
 /**
@@ -407,10 +472,19 @@ export async function deleteRelationship(
   );
 }
 
+// Directional pattern — edges are stored directionally, so `->` matches each
+// relationship exactly once. `-[r]-` would double-yield each edge (once per
+// endpoint perspective), producing duplicate ids in the returned `deleted`
+// set.
+const RELATIONSHIP_DELETE_MANY_QUERY =
+  'MATCH ()-[r {repositoryId: $rid}]->() WHERE r.id IN $ids ' +
+  'WITH r, r.id AS id DELETE r RETURN id AS deleted';
+
 /**
- * Bulk delete by ids — single round-trip. Returns the ids actually deleted
- * (drawn from the `DELETE` operator's RETURN slice); the caller computes
- * the `notFound` set via set difference against the input ids. Empty input
+ * Bulk delete by ids — single statement. Returns the ids actually deleted
+ * (drawn from the `DELETE` operator's RETURN slice); the `notFound` set is
+ * the set difference against the input ids. `deleteByIds` keeps the answer
+ * right when the driver re-runs a delete whose commit succeeded. Empty input
  * short-circuits without a round-trip.
  */
 export async function deleteRelationships(
@@ -418,25 +492,7 @@ export async function deleteRelationships(
   repositoryId: string,
   ids: string[],
 ): Promise<{ deleted: string[]; notFound: string[] }> {
-  if (ids.length === 0) return { deleted: [], notFound: [] };
-  // Directional pattern — edges are stored directionally, so `->` matches
-  // each relationship exactly once. `-[r]-` would double-yield each edge
-  // (once per endpoint perspective), producing duplicate ids in the
-  // returned `deleted` set.
-  const result = await conn.executeQuery(
-    'MATCH ()-[r {repositoryId: $rid}]->() WHERE r.id IN $ids ' +
-      'WITH r, r.id AS id DELETE r RETURN id AS deleted',
-    { ids },
-    { repositoryId },
-  );
-  const deleted: string[] = [];
-  for (const record of result.records) {
-    const id = record.get('deleted');
-    if (typeof id === 'string') deleted.push(id);
-  }
-  const deletedSet = new Set(deleted);
-  const notFound = ids.filter((id) => !deletedSet.has(id));
-  return { deleted, notFound };
+  return deleteByIds(conn, repositoryId, RELATIONSHIP_DELETE_MANY_QUERY, ids);
 }
 
 /**

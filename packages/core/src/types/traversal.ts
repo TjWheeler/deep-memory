@@ -59,7 +59,7 @@ export interface TraversalSpec {
 
   /**
    * Pagination offset for the final result set.
-   * Default: 0.
+   * Default: 0. Maximum: 1000.
    */
   offset?: number;
 

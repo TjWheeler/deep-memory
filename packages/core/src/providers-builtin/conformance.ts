@@ -419,6 +419,65 @@ export function runStorageProviderConformanceTests(
         expect(page2.hasMore).toBe(false);
       });
 
+      it('createEntity rejects an existing id with DuplicateEntityError', async () => {
+        await provider.createEntity(repoId, makeEntity('e1', 'test-type', 'Alpha'));
+
+        await expect(
+          provider.createEntity(repoId, makeEntity('e1', 'test-type', 'Beta')),
+        ).rejects.toMatchObject(typedError('DuplicateEntityError', 'ENTITY_ALREADY_EXISTS', { id: 'e1' }));
+      });
+
+      it('createEntity refuses a slug another entity holds with SlugConflictError', async () => {
+        // Slugs are unique per repository. The refusal must name the slug, not
+        // the new id (no entity has that id), so the engine can retry with the
+        // next free slug.
+        const first = makeEntity('e1', 'test-type', 'Alpha');
+        const second = makeEntity('e2', 'test-type', 'Alpha');
+        expect(second.slug).toBe(first.slug);
+        await provider.createEntity(repoId, first);
+
+        await expect(provider.createEntity(repoId, second)).rejects.toMatchObject(
+          typedError('SlugConflictError', 'SLUG_CONFLICT', { slug: first.slug }),
+        );
+        expect(await provider.getEntity(repoId, 'e2')).toBeNull();
+        expect((await provider.getEntityBySlug(repoId, first.slug))?.id).toBe('e1');
+      });
+
+      it('updateEntity refuses a slug another entity holds and leaves the entity unchanged', async () => {
+        const first = makeEntity('e1', 'test-type', 'Alpha');
+        const second = makeEntity('e2', 'test-type', 'Beta');
+        await provider.createEntity(repoId, first);
+        await provider.createEntity(repoId, second);
+
+        await expect(
+          provider.updateEntity(repoId, 'e2', {
+            label: 'Alpha',
+            slug: first.slug,
+            provenance: makeProvenance(),
+          }),
+        ).rejects.toMatchObject(typedError('SlugConflictError', 'SLUG_CONFLICT', { slug: first.slug }));
+
+        const unchanged = await provider.getEntity(repoId, 'e2');
+        expect(unchanged!.slug).toBe(second.slug);
+        expect(unchanged!.label).toBe('Beta');
+        expect((await provider.getEntityBySlug(repoId, first.slug))?.id).toBe('e1');
+        expect((await provider.getEntityBySlug(repoId, second.slug))?.id).toBe('e2');
+      });
+
+      it("updateEntity accepts the entity's own current slug", async () => {
+        const entity = makeEntity('e1', 'test-type', 'Alpha');
+        await provider.createEntity(repoId, entity);
+
+        const updated = await provider.updateEntity(repoId, 'e1', {
+          summary: 'Revised',
+          slug: entity.slug,
+          provenance: makeProvenance(),
+        });
+
+        expect(updated.slug).toBe(entity.slug);
+        expect((await provider.getEntityBySlug(repoId, entity.slug))?.id).toBe('e1');
+      });
+
       it('createEntity throws RepositoryNotFoundError after the repository is deleted', async () => {
         await provider.deleteRepository(repoId);
 
@@ -588,6 +647,101 @@ export function runStorageProviderConformanceTests(
         const firstPath = result.paths[0]!;
         expect(firstPath.entityIds[0]).toBe('a');
         expect(firstPath.entityIds[firstPath.entityIds.length - 1]).toBe('d');
+      });
+
+      // A caller-supplied relationship type or filter key must never change
+      // the structure of the query a provider runs. Providers that write
+      // names into query text refuse unsafe ones with a typed validation
+      // error; providers that bind or match names directly treat them as
+      // ordinary (non-matching) names. Either is acceptable. A provider error
+      // (the query failed to parse) or a match (the text altered the query)
+      // is not. The filter uses `eq` with a value nothing stores, because
+      // `isNull` matches a missing key on providers that filter in process.
+      describe('caller-supplied names cannot alter the query', () => {
+        const injectionStrings = [
+          'KNOWS]-() WITH 1 AS x MATCH (m:_Entity) RETURN m //',
+          'id IS NOT NULL OR true OR n0.id',
+        ];
+        const unmatchedValue = 'conformance-value-that-is-never-stored';
+
+        async function expectRefusedOrNoMatch<T>(
+          call: () => Promise<T>,
+          hasMatch: (result: T) => boolean,
+        ): Promise<void> {
+          let result: T;
+          try {
+            result = await call();
+          } catch (err) {
+            expect(err).toMatchObject(
+              typedError('TraversalValidationError', 'TRAVERSAL_VALIDATION_FAILED'),
+            );
+            return;
+          }
+          expect(hasMatch(result)).toBe(false);
+        }
+
+        const exploreHasMatch = (result: Awaited<ReturnType<StorageProvider['exploreNeighborhood']>>): boolean =>
+          result.layers.some((layer) =>
+            Object.values(layer).some((group) => group.total > 0 || group.entities.length > 0),
+          );
+        const pathsHaveMatch = (result: Awaited<ReturnType<StorageProvider['findPaths']>>): boolean =>
+          result.paths.length > 0;
+
+        for (const injection of injectionStrings) {
+          it(`exploreNeighborhood: relationship type ${JSON.stringify(injection)}`, async () => {
+            await expectRefusedOrNoMatch(
+              () =>
+                provider.exploreNeighborhood(repoId, 'a', {
+                  depth: 1,
+                  direction: 'both',
+                  limitPerType: 10,
+                  offsetPerType: 0,
+                  relationshipTypes: [injection],
+                }),
+              exploreHasMatch,
+            );
+          });
+
+          it(`exploreNeighborhood: relationship filter key ${JSON.stringify(injection)}`, async () => {
+            await expectRefusedOrNoMatch(
+              () =>
+                provider.exploreNeighborhood(repoId, 'a', {
+                  depth: 1,
+                  direction: 'both',
+                  limitPerType: 10,
+                  offsetPerType: 0,
+                  relationshipPropertyFilters: [{ key: injection, operator: 'eq', value: unmatchedValue }],
+                }),
+              exploreHasMatch,
+            );
+          });
+
+          it(`findPaths: relationship type ${JSON.stringify(injection)}`, async () => {
+            await expectRefusedOrNoMatch(
+              () =>
+                provider.findPaths(repoId, 'a', 'c', {
+                  maxDepth: 3,
+                  limit: 5,
+                  offset: 0,
+                  relationshipTypes: [injection],
+                }),
+              pathsHaveMatch,
+            );
+          });
+
+          it(`findPaths: relationship filter key ${JSON.stringify(injection)}`, async () => {
+            await expectRefusedOrNoMatch(
+              () =>
+                provider.findPaths(repoId, 'a', 'c', {
+                  maxDepth: 3,
+                  limit: 5,
+                  offset: 0,
+                  relationshipPropertyFilters: [{ key: injection, operator: 'eq', value: unmatchedValue }],
+                }),
+              pathsHaveMatch,
+            );
+          });
+        }
       });
     });
 

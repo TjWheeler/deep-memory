@@ -4,6 +4,7 @@ import type { CreateEntityInput, Entity, UpdateEntityInput } from './entities.js
 import type { CreateRelationshipInput, Relationship } from './relationships.js';
 import type { ProvenanceContext } from './provenance.js';
 import type { VocabularyChangeRecord } from './vocabulary.js';
+import type { DeepMemoryErrorCode } from '../core/errors.js';
 
 /** All event types emitted by the Deep Memory engine */
 export type DeepMemoryEventType =
@@ -87,7 +88,7 @@ export type EventPayload<T extends DeepMemoryEventType> =
   T extends 'export:completed' ? { repositoryId: string; entityCount: number; relationshipCount: number } :
   T extends 'import:started' ? { repositoryId: string } :
   T extends 'import:progress' ? { repositoryId: string; entitiesImported: number; relationshipsImported: number; totalEntities: number; totalRelationships: number; chunksCompleted: number; totalChunks: number } :
-  T extends 'import:item-failed' ? { repositoryId: string; itemId: string; itemType: 'entity' | 'relationship'; error: string } :
+  T extends 'import:item-failed' ? { repositoryId: string; itemId: string; itemType: 'entity' | 'relationship'; error: string; code?: DeepMemoryErrorCode } :
   T extends 'import:completed' ? { repositoryId: string; entitiesImported: number; relationshipsImported: number } :
   T extends 'import:failed' ? { repositoryId: string; error: string } :
   T extends 'delete:started' ? { repositoryId: string; totalEntities: number; totalRelationships: number } :

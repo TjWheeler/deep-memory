@@ -33,8 +33,14 @@ import type {
   StoragePathResult,
   StorageTimelineResult,
   BulkImportResult,
+  BulkImportItemError,
 } from '../types/results.js';
-import type { ExportChunk, ImportChunk } from '../types/portability.js';
+import type {
+  BulkImportOptions,
+  DeleteProgressCallback,
+  ExportChunk,
+  ImportChunk,
+} from '../types/portability.js';
 import { matchesPropertyFilters } from '../relationships/PropertyFilterMatcher.js';
 import { createEmptyVocabulary } from '../vocabulary/VocabularySchema.js';
 import {
@@ -45,6 +51,8 @@ import {
   RelationshipNotFoundError,
   DuplicateRelationshipError,
   VocabularyVersionConflictError,
+  SlugConflictError,
+  DeepMemoryError,
 } from '../core/errors.js';
 
 /** Per-repository data store */
@@ -160,14 +168,14 @@ export class InMemoryStorageProvider implements StorageProvider {
     return repo;
   }
 
-  async deleteRepository(repositoryId: string, _onProgress?: import('../types/portability.js').DeleteProgressCallback): Promise<void> {
+  public async deleteRepository(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<void> {
     if (!this.stores.has(repositoryId)) {
       throw new RepositoryNotFoundError(repositoryId);
     }
     this.stores.delete(repositoryId);
   }
 
-  async deleteAllContents(repositoryId: string, _onProgress?: import('../types/portability.js').DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+  public async deleteAllContents(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
     const store = this.getStore(repositoryId);
     const deletedEntities = store.entities.size;
     const deletedRelationships = store.relationships.size;
@@ -241,10 +249,13 @@ export class InMemoryStorageProvider implements StorageProvider {
 
   // ─── Entities ──────────────────────────────────────────────────────
 
-  async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
+  public async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
     const store = this.getStore(repositoryId);
     if (store.entities.has(entity.id)) {
       throw new DuplicateEntityError(entity.id);
+    }
+    if (this.slugHolder(store, entity.slug) !== undefined) {
+      throw new SlugConflictError(entity.slug, { entityType: entity.entityType, label: entity.label });
     }
     store.entities.set(entity.id, entity);
     store.slugIndex.set(entity.slug, entity.id);
@@ -259,11 +270,21 @@ export class InMemoryStorageProvider implements StorageProvider {
     return store.entities.get(entityId) ?? null;
   }
 
-  async getEntityBySlug(repositoryId: string, slug: string, _options?: EntityReadOptions): Promise<StoredEntity | null> {
+  public async getEntityBySlug(repositoryId: string, slug: string, _options?: EntityReadOptions): Promise<StoredEntity | null> {
     const store = this.getStore(repositoryId);
+    return this.slugHolder(store, slug) ?? null;
+  }
+
+  /**
+   * The entity that currently holds `slug`, if any. The index hit is
+   * confirmed against the entity's own slug so a stale index entry (one the
+   * entity has since moved off) is never reported as a holder.
+   */
+  private slugHolder(store: RepositoryStore, slug: string): StoredEntity | undefined {
     const id = store.slugIndex.get(slug);
-    if (!id) return null;
-    return store.entities.get(id) ?? null;
+    if (id === undefined) return undefined;
+    const entity = store.entities.get(id);
+    return entity !== undefined && entity.slug === slug ? entity : undefined;
   }
 
   async getEntities(
@@ -282,7 +303,7 @@ export class InMemoryStorageProvider implements StorageProvider {
     return result;
   }
 
-  async updateEntity(
+  public async updateEntity(
     repositoryId: string,
     entityId: string,
     updates: StoredEntityUpdate,
@@ -291,6 +312,15 @@ export class InMemoryStorageProvider implements StorageProvider {
     const existing = store.entities.get(entityId);
     if (!existing) {
       throw new EntityNotFoundError(entityId);
+    }
+    if (updates.slug !== undefined && updates.slug !== existing.slug) {
+      const holder = this.slugHolder(store, updates.slug);
+      if (holder !== undefined && holder.id !== entityId) {
+        throw new SlugConflictError(updates.slug, {
+          entityType: updates.entityType ?? existing.entityType,
+          label: updates.label ?? existing.label,
+        });
+      }
     }
 
     // For optional string fields, null clears, undefined preserves, string sets.
@@ -891,15 +921,15 @@ export class InMemoryStorageProvider implements StorageProvider {
     }
   }
 
-  async importBulk(
+  public async importBulk(
     repositoryId: string,
     data: ImportChunk[],
-    _options?: import('../types/portability.js').BulkImportOptions,
+    _options?: BulkImportOptions,
   ): Promise<BulkImportResult> {
     const store = this.getStore(repositoryId);
     let entitiesImported = 0;
     let relationshipsImported = 0;
-    const errors: Array<{ item: string; error: string }> = [];
+    const errors: BulkImportItemError[] = [];
 
     for (const chunk of data) {
       if (chunk.entities) {
@@ -909,10 +939,7 @@ export class InMemoryStorageProvider implements StorageProvider {
             store.slugIndex.set(entity.slug, entity.id);
             entitiesImported++;
           } catch (err) {
-            errors.push({
-              item: entity.id,
-              error: err instanceof Error ? err.message : String(err),
-            });
+            errors.push(importItemError(`entity:${entity.id}`, err));
           }
         }
       }
@@ -920,13 +947,15 @@ export class InMemoryStorageProvider implements StorageProvider {
       if (chunk.relationships) {
         for (const rel of chunk.relationships) {
           try {
+            // An edge needs both endpoints. A missing one becomes this row's
+            // error rather than a dangling edge or a failed import.
+            for (const endpointId of [rel.sourceEntityId, rel.targetEntityId]) {
+              if (!store.entities.has(endpointId)) throw new EntityNotFoundError(endpointId);
+            }
             store.relationships.set(rel.id, rel);
             relationshipsImported++;
           } catch (err) {
-            errors.push({
-              item: rel.id,
-              error: err instanceof Error ? err.message : String(err),
-            });
+            errors.push(importItemError(`relationship:${rel.id}`, err));
           }
         }
       }
@@ -934,6 +963,12 @@ export class InMemoryStorageProvider implements StorageProvider {
 
     return { entitiesImported, relationshipsImported, errors };
   }
+}
+
+/** A bulk-import row error, carrying the typed error's code when it has one. */
+function importItemError(item: string, err: unknown): BulkImportItemError {
+  if (err instanceof DeepMemoryError) return { item, error: err.message, code: err.code };
+  return { item, error: err instanceof Error ? err.message : String(err) };
 }
 
 // ─── Provenance filter helper ──────────────────────────────────────

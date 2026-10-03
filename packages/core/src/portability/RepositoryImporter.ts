@@ -13,10 +13,12 @@ import type {
 import type { RepositoryConfig } from '../types/repositories.js';
 import { MigrationEngine } from './MigrationEngine.js';
 import { generateId } from '../core/DeepMemory.js';
+import { generateUniqueSlugFrom } from '../entities/IdGenerator.js';
 import {
-  DuplicateRelationshipError,
+  hasErrorCode,
   InvalidInputError,
   OperationAbortedError,
+  type DeepMemoryErrorCode,
 } from '../core/errors.js';
 import {
   compareVersions,
@@ -41,6 +43,8 @@ export interface ImportItemFailure {
   itemId: string;
   itemType: 'entity' | 'relationship';
   error: string;
+  /** Code of the typed error the item failed with, when the storage layer classified it. */
+  code?: DeepMemoryErrorCode;
 }
 
 export interface ImporterConfig {
@@ -240,16 +244,14 @@ export class RepositoryImporter {
       chunksCompleted++;
 
       for (const e of bulkResult.errors) {
+        const { itemType, itemId } = parseImportItem(e.item, chunk);
         warnings.push({
           code: 'import_error',
           message: `Failed to import ${e.item}: ${e.error}`,
-          id: e.item,
+          id: itemId,
+          errorCode: e.code,
         });
-        const itemType: 'entity' | 'relationship' =
-          chunk.entities?.some((x) => x.id === e.item) ? 'entity' :
-          chunk.relationships?.some((x) => x.id === e.item) ? 'relationship' :
-          'entity';
-        await this.onItemFailed?.({ itemId: e.item, itemType, error: e.error });
+        await this.onItemFailed?.({ itemId, itemType, error: e.error, code: e.code });
       }
 
       await this.onProgress?.({
@@ -382,8 +384,15 @@ export class RepositoryImporter {
                 continue;
 
               case 'rename': {
-                // Create a new entity with a new GUID and modified slug to avoid collision
-                const renamedEntity = { ...entity, id: generateId(), slug: `${entity.slug}-imported` };
+                // Create a new entity with a new GUID and a free slug derived
+                // from the imported one. Slugs are unique per repository, so a
+                // fixed suffix would collide on the second rename of the same
+                // entity.
+                const renamedSlug = await generateUniqueSlugFrom(
+                  `${entity.slug}-imported`,
+                  async (candidate) => (await this.storage.getEntityBySlug(repositoryId, candidate)) !== null,
+                );
+                const renamedEntity = { ...entity, id: generateId(), slug: renamedSlug };
                 await this.storage.createEntity(repositoryId, renamedEntity);
                 entitiesImported++;
                 warnings.push({
@@ -425,7 +434,7 @@ export class RepositoryImporter {
                 message: `Relationship "${rel.id}" skipped — ${errorMsg}`,
                 relationshipId: rel.id,
               });
-              await this.onItemFailed?.({ itemId: rel.id, itemType: 'relationship', error: errorMsg });
+              await this.onItemFailed?.({ itemId: rel.id, itemType: 'relationship', error: errorMsg, code: 'ENTITY_NOT_FOUND' });
             } else {
               try {
                 await this.storage.createRelationship(repositoryId, rel);
@@ -434,7 +443,7 @@ export class RepositoryImporter {
                 // Storage layers may enforce composite uniqueness (e.g. source+target+type)
                 // that getRelationship() by ID cannot detect. Treat as skip+warning,
                 // consistent with the duplicate-by-id branch above.
-                if (err instanceof DuplicateRelationshipError) {
+                if (hasErrorCode(err, 'RELATIONSHIP_ALREADY_EXISTS')) {
                   relationshipsSkipped++;
                   warnings.push({
                     code: 'relationship_skipped',
@@ -499,4 +508,24 @@ export class RepositoryImporter {
 
     return warnings;
   }
+}
+
+/**
+ * Split a bulk-import error's `item` (`entity:<id>` / `relationship:<id>`)
+ * into its type and id. An item without a recognised prefix is matched
+ * against the chunk's ids instead.
+ */
+function parseImportItem(
+  item: string,
+  chunk: ImportChunk,
+): { itemType: 'entity' | 'relationship'; itemId: string } {
+  const separator = item.indexOf(':');
+  if (separator > 0) {
+    const prefix = item.slice(0, separator);
+    if (prefix === 'entity' || prefix === 'relationship') {
+      return { itemType: prefix, itemId: item.slice(separator + 1) };
+    }
+  }
+  const itemType = chunk.relationships?.some((x) => x.id === item) ? 'relationship' : 'entity';
+  return { itemType, itemId: item };
 }

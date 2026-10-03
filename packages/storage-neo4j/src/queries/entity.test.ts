@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderError } from '@utaba/deep-memory';
-import { buildFindEntitiesWhere, escapeLuceneQuery } from './entity.js';
+import { ProviderError, SlugConflictError } from '@utaba/deep-memory';
+import type { Neo4jConnection } from '../Neo4jConnection.js';
+import { buildFindEntitiesWhere, escapeLuceneQuery, updateEntity } from './entity.js';
 
 describe('buildFindEntitiesWhere', () => {
   it('returns an empty WHERE fragment when only the repository predicate is requested with no filters', () => {
@@ -179,5 +180,56 @@ describe('escapeLuceneQuery', () => {
 
   it('returns an empty string unchanged', () => {
     expect(escapeLuceneQuery('')).toBe('');
+  });
+});
+
+describe('updateEntity error mapping', () => {
+  const CONSTRAINT_VIOLATION = 'Neo.ClientError.Schema.ConstraintValidationFailed';
+  const provenance = {
+    createdBy: 't',
+    createdByType: 'agent' as const,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    modifiedBy: 't',
+    modifiedByType: 'agent' as const,
+    modifiedAt: '2026-01-01T00:00:00.000Z',
+  };
+
+  function failingConnection(error: unknown): Neo4jConnection {
+    const fake = {
+      async executeQuery(): Promise<never> {
+        throw error;
+      },
+    };
+    return fake as unknown as Neo4jConnection;
+  }
+
+  it('maps a slug-constraint violation on a slug change to SlugConflictError with cause', async () => {
+    const driverError = Object.assign(
+      new Error(
+        "Node(7) already exists with label `_Entity` and properties `repositoryId` = 'r1', `slug` = 'person:sam'",
+      ),
+      { code: CONSTRAINT_VIOLATION },
+    );
+
+    const rejection = updateEntity(failingConnection(driverError), 'r1', 'e1', {
+      label: 'Sam',
+      slug: 'person:sam',
+      provenance,
+    });
+
+    await expect(rejection).rejects.toBeInstanceOf(SlugConflictError);
+    await expect(rejection).rejects.toMatchObject({ slug: 'person:sam', label: 'Sam', cause: driverError });
+  });
+
+  it('reports a violation it cannot identify as ProviderError rather than guessing', async () => {
+    const driverError = Object.assign(new Error('Node(7) already exists'), { code: CONSTRAINT_VIOLATION });
+
+    const rejection = updateEntity(failingConnection(driverError), 'r1', 'e1', {
+      slug: 'person:sam',
+      provenance,
+    });
+
+    await expect(rejection).rejects.toBeInstanceOf(ProviderError);
+    await expect(rejection).rejects.toMatchObject({ cause: driverError });
   });
 });

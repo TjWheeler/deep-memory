@@ -92,7 +92,7 @@ Projection works with traversals too — add \`projection\` to aggregate propert
         },
         returnMode: { type: 'string', enum: ['terminal', 'path', 'all'], description: 'What to return (default: terminal)' },
         limit: { type: 'number', description: 'Maximum results (default: 50, max: 200)' },
-        offset: { type: 'number', description: 'Pagination offset (default: 0)' },
+        offset: { type: 'number', description: 'Pagination offset (default: 0, max: 1000)' },
         detailLevel: { type: 'string', enum: ['brief', 'summary', 'full'], description: 'Detail level for entities (default: summary)' },
         dedup: { type: 'boolean', description: 'Deduplicate entities (default: true)' },
         includeRelationshipSummary: { type: 'boolean', description: 'Attach out/in relationship counts by type to each entity (default: true). Set false to reduce response size.' },

@@ -442,6 +442,60 @@ describe('runAdaptive', () => {
     expect(results).toEqual([]);
   });
 
+  it('runs a task again after a transient throw, counting it as a throttle', async () => {
+    const controller = new AdaptiveConcurrencyController({ start: 1, min: 1, max: 1, cooldownMs: 0 });
+    const attempts = new Map<number, number>();
+
+    const results = await runAdaptive([0, 1, 2], controller, async (i) => {
+      const n = (attempts.get(i) ?? 0) + 1;
+      attempts.set(i, n);
+      if (i === 1 && n === 1) {
+        throw Object.assign(new Error('throttled'), { statusAttributes: { 'x-ms-status-code': 429 } });
+      }
+      return i * 10;
+    });
+
+    expect(results).toEqual([0, 10, 20]);
+    expect(attempts.get(1)).toBe(2);
+    expect(controller.getThrottledCount()).toBe(1);
+  });
+
+  it('ends a task that throws transient errors forever with the circuit breaker', async () => {
+    const controller = new AdaptiveConcurrencyController({
+      start: 1,
+      min: 1,
+      max: 1,
+      cooldownMs: 0,
+      maxConsecutiveThrottlesAtMin: 4,
+    });
+
+    await expect(
+      runAdaptive([0, 1], controller, async () => {
+        throw Object.assign(new Error('unavailable'), { statusAttributes: { 'x-ms-status-code': 503 } });
+      }),
+    ).rejects.toBeInstanceOf(ImportThrottleAbortError);
+  });
+
+  it('stops dispatching after a task throws, awaits in-flight tasks, and rejects with the first error', async () => {
+    const controller = new AdaptiveConcurrencyController({ start: 2, max: 2, min: 1 });
+    const started: number[] = [];
+    let settled = 0;
+    const first = new Error('first');
+
+    await expect(
+      runAdaptive([0, 1, 2, 3, 4, 5], controller, async (i) => {
+        started.push(i);
+        await new Promise((resolve) => setTimeout(resolve, i === 0 ? 1 : 10));
+        settled++;
+        if (i === 0) throw first;
+        return i;
+      }),
+    ).rejects.toBe(first);
+
+    expect(started).toEqual([0, 1]);
+    expect(settled).toBe(2);
+  });
+
   it('respects current concurrency — never more than current() in flight', async () => {
     const controller = new AdaptiveConcurrencyController({
       start: 3,

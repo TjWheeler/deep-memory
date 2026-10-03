@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { GremlinCompiler } from './GremlinCompiler.js';
-import type { TraversalSpec } from '../../types/traversal.js';
+import { TraversalValidationError } from '../../core/errors.js';
+import type { TraversalSpec, TraversalStep } from '../../types/traversal.js';
 import type { MemoryVocabulary } from '../../types/vocabulary.js';
+import type { PropertyFilter } from '../../types/queries.js';
 
 const compiler = new GremlinCompiler();
 
@@ -134,7 +136,7 @@ describe('GremlinCompiler', () => {
   });
 
   it('rejects non-positive-integer repeat.maxDepth', () => {
-    expect(() =>
+    const zero = () =>
       compiler.compile(
         {
           start: { entityId: 'e1' },
@@ -142,18 +144,20 @@ describe('GremlinCompiler', () => {
           returnMode: 'terminal',
         },
         emptyVocab,
-      ),
-    ).toThrow(/positive integer/);
-    expect(() =>
+      );
+    expect(zero).toThrow(TraversalValidationError);
+    expect(zero).toThrow(/positive integer/);
+    const fractional = () =>
       compiler.compile(
         {
           start: { entityId: 'e1' },
-          steps: [{ direction: 'out', repeat: { maxDepth: 2.5 } }],
+          steps: [{ direction: 'out' }, { direction: 'out', repeat: { maxDepth: 2.5 } }],
           returnMode: 'terminal',
         },
         emptyVocab,
-      ),
-    ).toThrow(/positive integer/);
+      );
+    expect(fractional).toThrow(TraversalValidationError);
+    expect(fractional).toThrow(/steps\[1\]\.repeat\.maxDepth must be a positive integer/);
   });
 
   it('compiles path return mode', () => {
@@ -339,6 +343,7 @@ describe('GremlinCompiler', () => {
       steps: [{ direction: 'out', relationshipTypes: ['CONTAINS'], repeat: { maxDepth: 3 } }],
       returnMode: 'all',
     };
+    expect(() => compiler.compile(spec, emptyVocab)).toThrow(TraversalValidationError);
     expect(() => compiler.compile(spec, emptyVocab)).toThrow(/repeat/);
   });
 
@@ -530,6 +535,7 @@ describe('GremlinCompiler', () => {
         returnMode: 'terminal',
         projection: { properties: [`orgType').values('embedding`], mode: 'count' },
       };
+      expect(() => compiler.compile(spec, emptyVocab)).toThrow(TraversalValidationError);
       expect(() => compiler.compile(spec, emptyVocab)).toThrow(
         /Unsafe projection property name/,
       );
@@ -563,6 +569,97 @@ describe('GremlinCompiler', () => {
       expect(result.query).toContain(`.dedup().by(select('id'))`);
       expect(result.query).not.toContain('count()');
       expect(result.query).not.toContain(`values('anything')`);
+    });
+  });
+
+  describe('malformed input', () => {
+    // Untyped input (e.g. parsed JSON from a tool call) can carry values of
+    // the wrong runtime type into typed fields.
+    const asStringList = (value: string[] | string): string[] => value as string[];
+    const asFilters = (value: PropertyFilter[] | PropertyFilter | string | null[]): PropertyFilter[] => value as PropertyFilter[];
+    const asStep = (value: TraversalStep | null): TraversalStep => value as TraversalStep;
+    const asSteps = (value: TraversalStep[] | TraversalStep): TraversalStep[] => value as TraversalStep[];
+
+    it.each(['terminal', 'path', 'all'] as const)(
+      'rejects an unknown direction in %s mode with TraversalValidationError',
+      (returnMode) => {
+        expect(() =>
+          compiler.compile(
+            { start: { entityId: 'a' }, steps: [{ direction: 'sideways' as 'out' }], returnMode },
+            emptyVocab,
+          ),
+        ).toThrow(TraversalValidationError);
+      },
+    );
+
+    it('rejects an unknown filter operator', () => {
+      expect(() =>
+        compiler.compile(
+          {
+            start: { entityId: 'a', filter: [{ key: 'name', operator: 'like' as 'eq', value: 'x' }] },
+            returnMode: 'terminal',
+          },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it.each([
+      ['relationshipTypes', { direction: 'out' as const, relationshipTypes: asStringList('KNOWS') }],
+      ['entityTypes', { direction: 'out' as const, entityTypes: asStringList('Person') }],
+      ['entityFilter', { direction: 'out' as const, entityFilter: asFilters('name') }],
+      ['relationshipFilter', { direction: 'out' as const, relationshipFilter: asFilters('since') }],
+      ['a null filter element', { direction: 'out' as const, entityFilter: asFilters([null]) }],
+    ])('rejects a non-array or malformed %s with TraversalValidationError', (_label, step) => {
+      expect(() =>
+        compiler.compile({ start: { entityId: 'a' }, steps: [step], returnMode: 'terminal' }, emptyVocab),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it.each(['terminal', 'path', 'all'] as const)(
+      'rejects a non-array steps or a null step element in %s mode',
+      (returnMode) => {
+        expect(() =>
+          compiler.compile({ start: { entityId: 'a' }, steps: asSteps({ direction: 'out' }), returnMode }, emptyVocab),
+        ).toThrow(TraversalValidationError);
+        expect(() =>
+          compiler.compile(
+            { start: { entityId: 'a' }, steps: [{ direction: 'out' }, asStep(null)], returnMode },
+            emptyVocab,
+          ),
+        ).toThrow(TraversalValidationError);
+      },
+    );
+
+    // A non-array object has no `length`, so without a shape check it would
+    // read as "no filter" and the step would compile with the filter dropped.
+    it.each([
+      ['a plain step', { direction: 'out' as const }],
+      ['a repeat step', { direction: 'out' as const, repeat: { maxDepth: 2 } }],
+    ])('rejects a non-array relationshipFilter object on %s instead of ignoring it', (_label, step) => {
+      expect(() =>
+        compiler.compile(
+          {
+            start: { entityId: 'a' },
+            steps: [{ ...step, relationshipFilter: asFilters({ key: 'since', operator: 'eq', value: 1 }) }],
+            returnMode: 'terminal',
+          },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it('rejects a non-array projection.properties', () => {
+      expect(() =>
+        compiler.compile(
+          {
+            start: { entityId: 'a' },
+            returnMode: 'terminal',
+            projection: { properties: asStringList('name') },
+          },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
     });
   });
 });

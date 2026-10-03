@@ -24,6 +24,7 @@ import {
   EntityNotFoundError,
   ProviderError,
   RepositoryNotFoundError,
+  SlugConflictError,
   VocabularyVersionConflictError,
 } from '@utaba/deep-memory';
 import { ENTITY_CREATE_QUERY } from './queries/entity.js';
@@ -442,12 +443,14 @@ describe('single-round-trip create / update', () => {
     expect(call.query.startsWith(ENTITY_CREATE_START)).toBe(true);
     // Inner duplicate check: the lookup runs inside map(), so it only runs
     // for a marker that exists (a bare fold() would emit [] without one).
+    // Then the slug check, partition-scoped, before the write.
     expect(call.query).toContain(
-      "coalesce(unfold().map(__.V().has('repositoryId', rid).hasId(vid).fold()).coalesce(unfold().constant('__duplicate'),addV(vertexLabel)",
+      "coalesce(unfold().map(__.V().has('repositoryId', rid).hasId(vid).fold()).coalesce(unfold().constant('__duplicate'),__.V().has('repositoryId', rid).has('slug', slugVal).has('entityType').limit(1).constant('__slug_taken'),addV(vertexLabel)",
     );
     expect(call.query.endsWith("),constant('__no_repository'))")).toBe(true);
     expect(call.params!['repoVid']).toBe(`repo:${TEST_REPO}`);
     expect(call.params!['rid']).toBe(TEST_REPO);
+    expect(typeof call.params!['slugVal']).toBe('string');
   });
 
   it('createEntity throws RepositoryNotFoundError when the marker is gone, in one call', async () => {
@@ -603,6 +606,263 @@ describe('single-round-trip create / update', () => {
     await expect(
       provider.updateEntity(TEST_REPO, '40000000-0000-4000-a000-000000006006', updates),
     ).rejects.toBeInstanceOf(EntityNotFoundError);
+  });
+});
+
+// ─── Slug uniqueness and store-side conflicts on create / update ─────
+
+const SLUG_HOLDERS_QUERY = "g.V().has('repositoryId', rid).has('slug', slugVal).has('entityType').id()";
+const ENTITY_CURRENT_QUERY =
+  "g.V().has('repositoryId', rid).hasId(eid).has('entityType')" +
+  ".project('entityType','label').by(values('entityType')).by(coalesce(values('entityLabel'), constant('')))";
+
+/** Shape of the gremlin driver's ResponseError for a Cosmos-side failure. */
+function cosmosResponseError(status: number): Error {
+  return Object.assign(new Error(`Server error (${status})`), {
+    name: 'ResponseError',
+    statusCode: 500,
+    statusAttributes: { 'x-ms-status-code': status },
+  });
+}
+
+function slugUpdate(slug: string | undefined): StoredEntityUpdate {
+  return {
+    label: 'Alpha',
+    ...(slug !== undefined ? { slug } : {}),
+    provenance: {
+      createdBy: 'test',
+      createdByType: 'agent',
+      createdAt: '2026-05-25T00:00:00.000Z',
+      modifiedBy: 'test',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-25T00:00:01.000Z',
+    },
+  };
+}
+
+describe('slug uniqueness', () => {
+  const ENTITY_ID = '40000000-0000-4000-a000-000000006101';
+  const OTHER_ID = '40000000-0000-4000-a000-000000006102';
+
+  it('createEntity maps the slug-taken sentinel to SlugConflictError in one call', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith(ENTITY_CREATE_START)) return { items: ['__slug_taken'] };
+      return { items: [] };
+    };
+    const entity = makeEntity(ENTITY_ID);
+
+    const before = stub.calls.length;
+    await expect(provider.createEntity(TEST_REPO, entity)).rejects.toMatchObject({
+      name: 'SlugConflictError',
+      code: 'SLUG_CONFLICT',
+      slug: entity.slug,
+    });
+    expect(stub.calls.length - before).toBe(1);
+    expect(stub.calls[stub.calls.length - 1]!.params!['slugVal']).toBe(entity.slug);
+  });
+
+  it('updateEntity refuses a slug another entity holds, before any write', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === SLUG_HOLDERS_QUERY) return { items: [OTHER_ID] };
+      if (query === ENTITY_CURRENT_QUERY) return { items: [{ entityType: 'Person', label: 'Old' }] };
+      return { items: [] };
+    };
+
+    const update = provider.updateEntity(TEST_REPO, ENTITY_ID, slugUpdate('person:alpha'));
+
+    await expect(update).rejects.toBeInstanceOf(SlugConflictError);
+    // The type the update leaves unchanged comes from the stored entity.
+    await expect(update).rejects.toMatchObject({
+      code: 'SLUG_CONFLICT',
+      slug: 'person:alpha',
+      entityType: 'Person',
+      label: 'Alpha',
+    });
+    const lookup = stub.calls.find((c) => c.query === SLUG_HOLDERS_QUERY)!;
+    expect(lookup.params).toEqual({ rid: TEST_REPO, slugVal: 'person:alpha' });
+    expect(stub.calls.some((c) => c.query.includes('.property('))).toBe(false);
+  });
+
+  it('updateEntity reports a missing entity as EntityNotFoundError, not a slug clash', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === SLUG_HOLDERS_QUERY) return { items: [OTHER_ID] };
+      if (query === ENTITY_CURRENT_QUERY) return { items: [] };
+      return { items: [] };
+    };
+
+    await expect(
+      provider.updateEntity(TEST_REPO, ENTITY_ID, slugUpdate('person:alpha')),
+    ).rejects.toBeInstanceOf(EntityNotFoundError);
+    const existence = stub.calls.find((c) => c.query === ENTITY_CURRENT_QUERY)!;
+    expect(existence.params).toEqual({ rid: TEST_REPO, eid: ENTITY_ID });
+  });
+
+  it("updateEntity accepts the entity's own slug and goes on to the write", async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === SLUG_HOLDERS_QUERY) return { items: [ENTITY_ID] };
+      return { items: [] };
+    };
+
+    // The stubbed write matches nothing, so the update itself reports the
+    // entity as missing; reaching it shows the slug check let it through.
+    await expect(
+      provider.updateEntity(TEST_REPO, ENTITY_ID, slugUpdate('person:alpha')),
+    ).rejects.toBeInstanceOf(EntityNotFoundError);
+    expect(stub.calls.some((c) => c.query === ENTITY_CURRENT_QUERY)).toBe(false);
+    expect(stub.calls.length).toBeGreaterThan(1);
+  });
+
+  it('updateEntity keeps its own slug when another entity holds the same slug too', async () => {
+    const { provider, stub } = makeProvider();
+    const projected = {
+      id: ENTITY_ID,
+      entityType: 'Person',
+      entityLabel: 'Alpha',
+      slug: 'person:alpha',
+      summary: '',
+      properties: '{}',
+      data: '',
+      dataFormat: '',
+      createdBy: 'test',
+      createdByType: 'agent',
+      createdAt: '2026-05-25T00:00:00.000Z',
+      createdInConversation: '',
+      createdFromMessage: '',
+      modifiedBy: 'test',
+      modifiedByType: 'agent',
+      modifiedAt: '2026-05-25T00:00:01.000Z',
+      modifiedInConversation: '',
+      modifiedFromMessage: '',
+    };
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === SLUG_HOLDERS_QUERY) return { items: [ENTITY_ID, OTHER_ID] };
+      if (query === ENTITY_CURRENT_QUERY) return { items: [{ entityType: 'Person', label: 'Alpha' }] };
+      if (query.startsWith("g.V().has('repositoryId', rid).hasId(eid).has('entityType')") && query.includes('.project(')) {
+        return { items: [projected] };
+      }
+      return { items: [] };
+    };
+
+    const updated = await provider.updateEntity(TEST_REPO, ENTITY_ID, slugUpdate('person:alpha'));
+
+    expect(updated.slug).toBe('person:alpha');
+    expect(stub.calls.some((c) => c.query === ENTITY_CURRENT_QUERY)).toBe(false);
+  });
+
+  it('updateEntity reads the unchanged label from a Map-shaped projection for the refusal', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === SLUG_HOLDERS_QUERY) return { items: [OTHER_ID] };
+      if (query === ENTITY_CURRENT_QUERY) {
+        return { items: [new Map<string, unknown>([['entityType', 'Person'], ['label', 'Old']])] };
+      }
+      return { items: [] };
+    };
+    const { label: _unchanged, ...withoutLabel } = slugUpdate('person:alpha');
+
+    await expect(provider.updateEntity(TEST_REPO, ENTITY_ID, withoutLabel)).rejects.toMatchObject({
+      code: 'SLUG_CONFLICT',
+      entityType: 'Person',
+      label: 'Old',
+    });
+  });
+
+  it('updateEntity without a slug makes no slug lookup', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      return { items: [] };
+    };
+
+    const before = stub.calls.length;
+    await expect(
+      provider.updateEntity(TEST_REPO, ENTITY_ID, slugUpdate(undefined)),
+    ).rejects.toBeInstanceOf(EntityNotFoundError);
+    expect(stub.calls.length - before).toBe(1);
+    expect(stub.calls.some((c) => c.query === SLUG_HOLDERS_QUERY)).toBe(false);
+  });
+});
+
+describe('create maps a store-side 409 to the duplicate error', () => {
+  it('createEntity → DuplicateEntityError with the driver error as cause', async () => {
+    const { provider, stub } = makeProvider();
+    const driverError = cosmosResponseError(409);
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith(ENTITY_CREATE_START)) throw driverError;
+      return { items: [] };
+    };
+    const entity = makeEntity('40000000-0000-4000-a000-000000006201');
+
+    const create = provider.createEntity(TEST_REPO, entity);
+
+    await expect(create).rejects.toBeInstanceOf(DuplicateEntityError);
+    await expect(create).rejects.toMatchObject({ id: entity.id, cause: driverError });
+  });
+
+  it('createRelationship → DuplicateRelationshipError with the driver error as cause', async () => {
+    const { provider, stub } = makeProvider();
+    const driverError = cosmosResponseError(409);
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith("g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(")) throw driverError;
+      return { items: [] };
+    };
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006202',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0002',
+    );
+
+    const create = provider.createRelationship(TEST_REPO, rel);
+
+    await expect(create).rejects.toBeInstanceOf(DuplicateRelationshipError);
+    await expect(create).rejects.toMatchObject({ relationshipId: rel.id, cause: driverError });
+  });
+
+  it('createRepository → DuplicateRepositoryError with the driver error as cause', async () => {
+    const { provider, stub } = makeProvider();
+    const driverError = cosmosResponseError(409);
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith("g.addV('_vocabulary')")) throw driverError;
+      return { items: [0] };
+    };
+
+    const create = provider.createRepository({
+      repositoryId: TEST_REPO,
+      label: 'Test',
+      governanceConfig: { mode: 'open' },
+      createdAt: '2026-05-26T00:00:00.000Z',
+      createdBy: 'creator',
+    });
+
+    await expect(create).rejects.toBeInstanceOf(DuplicateRepositoryError);
+    await expect(create).rejects.toMatchObject({ cause: driverError });
+  });
+
+  it('createEntity lets any other store error through unchanged', async () => {
+    const { provider, stub } = makeProvider();
+    const driverError = cosmosResponseError(400);
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith(ENTITY_CREATE_START)) throw driverError;
+      return { items: [] };
+    };
+
+    await expect(
+      provider.createEntity(TEST_REPO, makeEntity('40000000-0000-4000-a000-000000006203')),
+    ).rejects.toBe(driverError);
   });
 });
 

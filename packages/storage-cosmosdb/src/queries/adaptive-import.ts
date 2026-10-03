@@ -36,6 +36,7 @@ import type {
 } from '@utaba/deep-memory/types';
 import { ImportThrottleAbortError } from '@utaba/deep-memory';
 import { usageScope, type UsageAccumulator } from '../usage.js';
+import { isTransientError } from '../CosmosDbConnection.js';
 
 const DEFAULT_MIN = 1;
 const DEFAULT_START = 5;
@@ -334,10 +335,20 @@ function sleep(ms: number): Promise<void> {
  * been observed, no new task is dispatched until the cooldown elapses, even
  * if a worker slot is otherwise free. In-flight tasks are unaffected.
  *
- * Throws {@link ImportThrottleAbortError} if the controller's circuit breaker
- * trips (sustained throttling at minimum concurrency). In-flight tasks are
- * awaited before the throw so observers see consistent state, but no new
- * tasks are dispatched once the breaker has tripped.
+ * A task that throws a transient error (throttling or unavailability that
+ * outlived the connection's own retries — see `isTransientError`) counts as
+ * a throttle and is queued to run again; queued tasks are dispatched before
+ * new ones, behind the same cooldown. The circuit breaker is therefore the
+ * only stop for sustained throttling: it throws
+ * {@link ImportThrottleAbortError} when the controller trips (sustained
+ * throttling at minimum concurrency). In-flight tasks are awaited before the
+ * throw so observers see consistent state, but no new tasks are dispatched
+ * once the breaker has tripped.
+ *
+ * A task that throws any other error stops the run the same way: no new
+ * tasks are dispatched, in-flight tasks are awaited, and the runner rejects
+ * with the first such error. Tasks that want partial success catch inside
+ * `fn`.
  */
 export async function runAdaptive<T, R>(
   items: T[],
@@ -351,10 +362,14 @@ export async function runAdaptive<T, R>(
   let nextIndex = 0;
   let inFlight = 0;
   let aborted = false;
+  let failure: { error: unknown } | undefined;
+  // Indexes of tasks that hit a transient error, waiting to run again.
+  const retryQueue: number[] = [];
 
   // Workers wait on `gate` when they cannot dispatch (cooldown active, all
-  // slots taken, or the breaker has tripped and we are draining). Any state
-  // change re-issues the gate so all waiters wake up and re-check.
+  // slots taken, no work left while tasks are in flight, or the breaker has
+  // tripped and we are draining). Any state change re-issues the gate so all
+  // waiters wake up and re-check.
   let gate = createGate();
 
   function pokeGate(): void {
@@ -363,12 +378,22 @@ export async function runAdaptive<T, R>(
     old.resolve();
   }
 
+  function hasWork(): boolean {
+    return retryQueue.length > 0 || nextIndex < items.length;
+  }
+
   async function worker(): Promise<void> {
-    while (nextIndex < items.length) {
-      if (aborted) return;
-      // Wait until both: a slot is free AND any active cooldown has elapsed.
+    while (true) {
+      // Wait until there is work, a slot is free, and any cooldown has
+      // elapsed. With no work left, a worker stays only while tasks are in
+      // flight — one of them may be queued to run again.
       while (true) {
-        if (aborted || nextIndex >= items.length) return;
+        if (aborted) return;
+        if (!hasWork()) {
+          if (inFlight === 0) return;
+          await gate.promise;
+          continue;
+        }
         const cooldownRemaining = controller.getCooldownUntil() - Date.now();
         const slotsAvailable = inFlight < controller.getConcurrency();
         if (cooldownRemaining <= 0 && slotsAvailable) break;
@@ -378,9 +403,8 @@ export async function runAdaptive<T, R>(
           await gate.promise;
         }
       }
-      if (aborted || nextIndex >= items.length) return;
 
-      const idx = nextIndex++;
+      const idx = retryQueue.shift() ?? nextIndex++;
       inFlight++;
       try {
         const { result, retries } = await runTaskWithUsage(() => fn(items[idx]!));
@@ -391,6 +415,15 @@ export async function runAdaptive<T, R>(
           controller.noteSuccess();
         }
         if (controller.shouldAbort()) {
+          aborted = true;
+        }
+      } catch (err) {
+        if (isTransientError(err)) {
+          controller.noteThrottle();
+          retryQueue.push(idx);
+          if (controller.shouldAbort()) aborted = true;
+        } else {
+          failure ??= { error: err };
           aborted = true;
         }
       } finally {
@@ -411,6 +444,7 @@ export async function runAdaptive<T, R>(
 
   await Promise.all(workers);
 
+  if (failure !== undefined) throw failure.error;
   if (aborted) {
     throw new ImportThrottleAbortError(
       controller.getConcurrency(),

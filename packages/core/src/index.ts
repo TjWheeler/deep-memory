@@ -10,6 +10,7 @@ export {
   InvalidInputError,
   EntityNotFoundError,
   DuplicateEntityError,
+  SlugConflictError,
   RelationshipNotFoundError,
   DuplicateRelationshipError,
   RepositoryNotFoundError,
@@ -43,6 +44,7 @@ export { RepositoryValidator } from './validation/RepositoryValidator.js';
 
 // Utilities
 export { matchesPropertyFilters } from './relationships/PropertyFilterMatcher.js';
+export { SAFE_IDENTIFIER_PATTERN, isSafeIdentifier } from './validation/identifier.js';
 export { projectEntity } from './entities/entityProjection.js';
 export { createSafeSink } from './usage/safeSink.js';
 

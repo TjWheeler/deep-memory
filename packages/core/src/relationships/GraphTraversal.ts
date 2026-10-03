@@ -19,7 +19,7 @@ import type {
 import type { TraversalSpec, TraversalResult } from '../types/traversal.js';
 import { projectEntity } from '../entities/entityProjection.js';
 import { EntityNotFoundError, GraphTraversalProviderRequiredError, TraversalValidationError, TraversalVocabularyError } from '../core/errors.js';
-import { validateTraversalSpec } from './TraversalValidator.js';
+import { validateExploreOptions, validatePathOptions, validateTraversalSpec } from './TraversalValidator.js';
 import { executeFallbackTraversal } from './FallbackTraversalExecutor.js';
 
 export class GraphTraversal {
@@ -31,10 +31,19 @@ export class GraphTraversal {
   ) {}
 
   /** BFS neighborhood exploration from a center entity */
-  async exploreNeighborhood(
+  public async exploreNeighborhood(
     entityId: string,
     options?: ExploreOptions,
   ): Promise<Neighborhood> {
+    // Enforce the documented option shapes, bounds and the safe-identifier
+    // rule the same way on every provider, before any storage work, so a
+    // name that works on one backend works on all of them. The graph
+    // compilers re-check identifiers where they emit query text.
+    const validation = validateExploreOptions(options);
+    if (!validation.valid) {
+      throw new TraversalValidationError(validation.errors);
+    }
+
     const storageOptions = {
       depth: options?.depth ?? 1,
       relationshipTypes: options?.relationshipTypes,
@@ -101,11 +110,20 @@ export class GraphTraversal {
   }
 
   /** BFS shortest path finding between two entities */
-  async findPaths(
+  public async findPaths(
     sourceId: string,
     targetId: string,
     options?: PathOptions,
   ): Promise<PathResult> {
+    // Enforce the documented option shapes, bounds (depth, limit, offset) and
+    // the safe-identifier rule the same way on every provider, before any
+    // storage work, so a name that works on one backend works on all of them.
+    // The graph compilers re-check identifiers where they emit query text.
+    const validation = validatePathOptions(options);
+    if (!validation.valid) {
+      throw new TraversalValidationError(validation.errors);
+    }
+
     const storageOptions = {
       maxDepth: options?.maxDepth ?? 3,
       relationshipTypes: options?.relationshipTypes,
@@ -199,7 +217,7 @@ export class GraphTraversal {
    * registered (the provider owns native compilation), or falls back to
    * application-level BFS over StorageProvider.
    */
-  async traverse(spec: TraversalSpec): Promise<TraversalResult> {
+  public async traverse(spec: TraversalSpec): Promise<TraversalResult> {
     // 1. Validate spec against structural rules and vocabulary
     const capabilities = this.graphTraversalProvider?.getCapabilities();
     const vocabulary = this.vocabularyEngine
@@ -208,19 +226,22 @@ export class GraphTraversal {
     const validation = validateTraversalSpec(spec, vocabulary, capabilities);
 
     if (!validation.valid) {
-      // Separate vocabulary errors from structural errors
+      // Separate vocabulary errors from structural errors. Structural errors
+      // win: a malformed or out-of-bounds spec is reported as such even when
+      // it also names unknown types, so no structural problem is hidden
+      // behind a vocabulary error.
       const vocabErrors = validation.errors.filter((e) => e.startsWith('Unknown vocabulary types:'));
       const structErrors = validation.errors.filter((e) => !e.startsWith('Unknown vocabulary types:'));
 
-      if (vocabErrors.length > 0) {
-        const unknownTypes = vocabErrors.join('; ')
-          .replace(/Unknown vocabulary types: /g, '')
-          .split(', ')
-          .map((t) => t.trim());
-        throw new TraversalVocabularyError(unknownTypes);
+      if (structErrors.length > 0) {
+        throw new TraversalValidationError(structErrors);
       }
 
-      throw new TraversalValidationError(structErrors.length > 0 ? structErrors : validation.errors);
+      const unknownTypes = vocabErrors.join('; ')
+        .replace(/Unknown vocabulary types: /g, '')
+        .split(', ')
+        .map((t) => t.trim());
+      throw new TraversalVocabularyError(unknownTypes);
     }
 
     // 2. If GraphTraversalProvider registered, delegate — the provider owns
@@ -238,7 +259,7 @@ export class GraphTraversal {
    * Pass-through to GraphTraversalProvider.executeNativeQuery().
    * Throws GraphTraversalProviderRequiredError if no provider registered.
    */
-  async executeNativeQuery(
+  public async executeNativeQuery(
     query: string,
     params?: Record<string, unknown>,
   ): Promise<unknown[]> {

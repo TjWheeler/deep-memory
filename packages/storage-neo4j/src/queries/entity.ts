@@ -1,6 +1,6 @@
 // Entity CRUD Cypher queries.
 //
-// Storage shape (per D4 / D6 / D15 / D22):
+// Storage shape:
 //   - Every entity is a `(:_Entity)` node carrying `repositoryId`, `id`,
 //     `entityType`, `slug`, `label`, plus the optional / provenance scalars
 //     bound by `entityToParams`. The `:_Entity` umbrella label is the ONLY
@@ -25,7 +25,8 @@
 // Strategy:
 //   - `createEntity` uses `CREATE` + catch on
 //     `Neo.ClientError.Schema.ConstraintValidationFailed`, translated by
-//     `mapDriverError({ kind: 'entity', ... })` to `DuplicateEntityError`.
+//     `mapDriverError` to `DuplicateEntityError` (id clash) or
+//     `SlugConflictError` (slug clash).
 //     A `MERGE`-with-discriminator alternative is marginally faster on the
 //     happy path but mutates the existing node on every collision (writes a
 //     discriminator property onto durable graph state that the caller never
@@ -37,7 +38,7 @@
 //     caller opts in via `EntityReadOptions.loadEmbeddings`. User-property
 //     scalars on the node are not projected — `entity.properties` round-trips
 //     from the JSON blob.
-//   - `updateEntity` is variable-shape (D23) projection-on-write: build a
+//   - `updateEntity` is variable-shape projection-on-write: build a
 //     `SET n.<field> = $param` list from the dirty fields, then `RETURN
 //     <projection>` to ship the post-SET state in one round-trip. When
 //     `updates.properties !== undefined` the update pays an extra read of
@@ -45,7 +46,8 @@
 //     keys that left the new shape — Cypher 25 cannot REMOVE a property
 //     whose key is bound at run-time without APOC, and the provider
 //     deliberately does not depend on APOC. Updates are not on the hot
-//     read path.
+//     read path. A slug change that trips `dm_entity_slug_unique` is
+//     translated by `mapDriverError` to `SlugConflictError`.
 //   - Bulk deletes return the affected ids in the same round-trip — the
 //     caller computes the `notFound` set client-side from set difference,
 //     avoiding a per-id existence pre-check.
@@ -74,7 +76,7 @@ import { EntityNotFoundError, ProviderError, RepositoryNotFoundError } from '@ut
 /**
  * Fixed-shape `CREATE` template — same Cypher string for every entity create
  * regardless of which optional fields are populated. The planner caches one
- * plan across every entity create in the system (D15). Computed once at
+ * plan across every entity create in the system. Computed once at
  * module load so the constant string is what the planner keys off.
  *
  * `SET n += $userProperties` writes user-supplied entity properties as native
@@ -145,11 +147,11 @@ const ENTITY_GET_MANY_QUERY_FULL = `MATCH (n:_Entity {repositoryId: $rid}) WHERE
 
 /**
  * Create a new entity via fixed-shape `CREATE` + catch on the uniqueness
- * constraint. Constraint-violation paths (duplicate `(repositoryId, id)` or
- * `(repositoryId, slug)`) surface as
- * `Neo.ClientError.Schema.ConstraintValidationFailed`, which
- * `mapDriverError` translates to `DuplicateEntityError`. The error mapping
- * picks the right kind from the `{ kind: 'entity', entityId }` context.
+ * constraints. A duplicate `(repositoryId, id)` or `(repositoryId, slug)`
+ * surfaces as `Neo.ClientError.Schema.ConstraintValidationFailed`, which
+ * `mapDriverError` translates by the constraint that fired:
+ * `DuplicateEntityError` for the id, `SlugConflictError` for the slug (the
+ * engine retries that one with the next free slug).
  */
 export async function createEntity(
   conn: Neo4jConnection,
@@ -172,6 +174,9 @@ export async function createEntity(
     mapDriverError(err, {
       kind: 'entity',
       entityId: entity.id,
+      slug: entity.slug,
+      entityType: entity.entityType,
+      label: entity.label,
       operation: 'createEntity',
     });
   }
@@ -258,7 +263,7 @@ export async function getEntities(
 }
 
 /**
- * Variable-shape projection-on-write update (D23). Builds a `SET n.<field> =
+ * Variable-shape projection-on-write update. Builds a `SET n.<field> =
  * $param` clause per dirty field, then projects the post-SET state in the
  * same round-trip — `MATCH ... SET ... RETURN <projection>` ships the
  * post-SET values without a re-MATCH.
@@ -279,7 +284,8 @@ export async function getEntities(
  * for `entity.properties` round-trip, so the divergence affects only
  * predicate-match shape, not read shape.
  *
- * Empty record array → `EntityNotFoundError`.
+ * Empty record array → `EntityNotFoundError`. A slug change that collides
+ * with another entity's slug → `SlugConflictError`.
  */
 export async function updateEntity(
   conn: Neo4jConnection,
@@ -381,7 +387,21 @@ export async function updateEntity(
     `${removeClause} ` +
     `RETURN ${ENTITY_PROJECTION_LIGHT}`;
 
-  const result = await conn.executeQuery(cypher, params, { repositoryId });
+  // A slug change can violate `dm_entity_slug_unique`. No `kind` is passed:
+  // a violation the mapping cannot identify becomes a ProviderError (with the
+  // driver error as cause) rather than being guessed at.
+  let result: Awaited<ReturnType<typeof conn.executeQuery>>;
+  try {
+    result = await conn.executeQuery(cypher, params, { repositoryId });
+  } catch (err) {
+    mapDriverError(err, {
+      entityId,
+      slug: updates.slug,
+      entityType: updates.entityType,
+      label: updates.label,
+      operation: 'updateEntity',
+    });
+  }
   const record = result.records[0];
   if (record === undefined) throw new EntityNotFoundError(entityId);
   return entityFromRecord(record);
@@ -529,7 +549,7 @@ export function buildFindEntitiesWhere(
         `((${alias}.createdAt >= $dateFrom AND ${alias}.createdAt <= $dateTo) ` +
           `OR (${alias}.modifiedAt >= $dateFrom AND ${alias}.modifiedAt <= $dateTo))`,
       );
-      // Timestamps are ISO-8601 strings (D6); lexicographic compare is
+      // Timestamps are ISO-8601 strings; lexicographic compare is
       // chronologically correct for the canonical Z-suffixed form.
       params['dateFrom'] = query.provenance.dateRange.from;
       params['dateTo'] = query.provenance.dateRange.to;

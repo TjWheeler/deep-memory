@@ -40,8 +40,22 @@ export async function generateUniqueSlug(
   label: string,
   existsCheck: (slug: string) => Promise<boolean>,
 ): Promise<string> {
-  const baseSlug = generateSlug(entityType, label);
+  return generateUniqueSlugFrom(generateSlug(entityType, label), existsCheck);
+}
 
+/**
+ * Generate a unique slug from a ready-made base slug, appending a suffix if
+ * the base is already taken.
+ *
+ * @param baseSlug - The preferred slug
+ * @param existsCheck - Async function to check if a slug is already taken
+ * @returns `baseSlug` if free, otherwise `baseSlug-2`, `baseSlug-3`, … or a
+ *          random suffix once those run out
+ */
+export async function generateUniqueSlugFrom(
+  baseSlug: string,
+  existsCheck: (slug: string) => Promise<boolean>,
+): Promise<string> {
   if (!(await existsCheck(baseSlug))) {
     return baseSlug;
   }

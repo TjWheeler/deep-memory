@@ -1,7 +1,9 @@
 // GraphTraversal — tests for neighborhood exploration and path finding
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { GraphTraversal } from './GraphTraversal.js';
+import { TraversalValidationError, TraversalVocabularyError } from '../core/errors.js';
+import { VocabularyEngine } from '../core/VocabularyEngine.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
 import { buildVocabulary } from '../vocabulary/VocabularySchema.js';
 import type { StoredEntity } from '../types/entities.js';
@@ -193,6 +195,122 @@ describe('GraphTraversal', () => {
         relationshipTypes: ['works_at'], // Can't traverse "knows" to reach Bob
       });
       expect(result.paths).toHaveLength(0);
+    });
+  });
+
+  // ─── Option validation ─────────────────────────────────────
+
+  describe('option validation before storage', () => {
+    // Untyped input (e.g. parsed JSON from a tool call) can carry a value of
+    // the wrong runtime type into a typed field.
+    const asNumber = (value: number | string): number => value as number;
+    const asStringList = (value: string[] | string): string[] => value as string[];
+
+    it.each([
+      ['an out-of-range depth', { depth: 4 as 1 }],
+      ['a fractional depth', { depth: 1.5 as 1 }],
+      ['a non-array relationshipTypes', { relationshipTypes: asStringList('knows') }],
+      ['a non-array entityTypes', { entityTypes: asStringList('company') }],
+      ['an unknown filter operator', { relationshipPropertyFilters: [{ key: 'since', operator: 'like' as 'eq' }] }],
+    ])('exploreNeighborhood rejects %s without calling storage', async (_label, options) => {
+      const spy = vi.spyOn(storage, 'exploreNeighborhood');
+      await expect(traversal.exploreNeighborhood('person:alice', options)).rejects.toBeInstanceOf(
+        TraversalValidationError,
+      );
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a fractional maxDepth', { maxDepth: 1.5 }],
+      ['a string maxDepth', { maxDepth: asNumber('3') }],
+      ['a NaN maxDepth', { maxDepth: Number.NaN }],
+      ['an out-of-range maxDepth', { maxDepth: 6 }],
+      ['an out-of-range limit', { limit: 201 }],
+      ['a negative offset', { offset: -1 }],
+      ['an offset above the cap', { offset: 1001 }],
+      ['a non-array relationshipTypes', { relationshipTypes: asStringList('knows') }],
+      ['a non-array entityTypes', { entityTypes: asStringList('company') }],
+    ])('findPaths rejects %s without calling storage', async (_label, options) => {
+      const spy = vi.spyOn(storage, 'findPaths');
+      await expect(traversal.findPaths('person:alice', 'company:acme', options)).rejects.toBeInstanceOf(
+        TraversalValidationError,
+      );
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    // The identifier rule applies on every provider, including the in-memory
+    // one, which could otherwise match these names directly.
+    it.each([
+      ['a hyphenated relationship filter key', { relationshipPropertyFilters: [{ key: 'start-date', operator: 'eq' as const, value: '2020-01-01' }] }],
+      ['a digit-leading relationship type', { relationshipTypes: ['2ND_DEGREE'] }],
+    ])('exploreNeighborhood and findPaths reject %s on InMemory without calling storage', async (_label, options) => {
+      const exploreSpy = vi.spyOn(storage, 'exploreNeighborhood');
+      const pathSpy = vi.spyOn(storage, 'findPaths');
+      await expect(traversal.exploreNeighborhood('person:alice', options)).rejects.toBeInstanceOf(
+        TraversalValidationError,
+      );
+      await expect(traversal.findPaths('person:alice', 'project:x', options)).rejects.toBeInstanceOf(
+        TraversalValidationError,
+      );
+      expect(exploreSpy).not.toHaveBeenCalled();
+      expect(pathSpy).not.toHaveBeenCalled();
+    });
+
+    it('still passes safe options through to storage', async () => {
+      const exploreSpy = vi.spyOn(storage, 'exploreNeighborhood');
+      const pathSpy = vi.spyOn(storage, 'findPaths');
+      await traversal.exploreNeighborhood('person:alice', {
+        relationshipTypes: ['knows'],
+        relationshipPropertyFilters: [{ key: 'since', operator: 'isNull' }],
+      });
+      await traversal.findPaths('person:alice', 'company:acme', { maxDepth: 2, offset: 1000 });
+      expect(exploreSpy).toHaveBeenCalledTimes(1);
+      expect(pathSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ─── Structured traversal error precedence ─────────────────
+
+  describe('traverse with a vocabulary', () => {
+    let vocabTraversal: GraphTraversal;
+
+    beforeEach(() => {
+      const vocabularyEngine = new VocabularyEngine({
+        repositoryId: repoId,
+        storageProvider: storage,
+        governanceConfig: { mode: 'open' },
+      });
+      vocabTraversal = new GraphTraversal(repoId, storage, undefined, vocabularyEngine);
+    });
+
+    it('reports an unsafe relationship type as a validation error, not an unknown type', async () => {
+      await expect(
+        vocabTraversal.traverse({
+          start: { entityId: 'person:alice' },
+          steps: [{ direction: 'out', relationshipTypes: ['KNOWS]-() WITH 1 AS x MATCH (m:_Entity) RETURN m //'] }],
+          returnMode: 'terminal',
+        }),
+      ).rejects.toBeInstanceOf(TraversalValidationError);
+    });
+
+    it('reports a structural error ahead of an unknown type in the same spec', async () => {
+      await expect(
+        vocabTraversal.traverse({
+          start: { entityId: 'person:alice' },
+          steps: [{ direction: 'out', relationshipTypes: ['not_in_vocabulary'], repeat: { maxDepth: 1.5 } }],
+          returnMode: 'terminal',
+        }),
+      ).rejects.toBeInstanceOf(TraversalValidationError);
+    });
+
+    it('reports an unknown but well-formed type as a vocabulary error', async () => {
+      await expect(
+        vocabTraversal.traverse({
+          start: { entityId: 'person:alice' },
+          steps: [{ direction: 'out', relationshipTypes: ['not_in_vocabulary'] }],
+          returnMode: 'terminal',
+        }),
+      ).rejects.toBeInstanceOf(TraversalVocabularyError);
     });
   });
 });

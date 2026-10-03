@@ -53,9 +53,9 @@ export interface PathOptions {
   relationshipTypes?: string[];
   /** Filter entities in paths by type(s) — only paths through matching entity types are returned */
   entityTypes?: string[];
-  /** Maximum number of paths to return (default 5) */
+  /** Maximum number of paths to return (default 5, max 200) */
   limit?: number;
-  /** Pagination offset */
+  /** Pagination offset (default 0, max 1000) */
   offset?: number;
   /** Detail level for returned entities (default: brief) */
   detailLevel?: DetailLevel;

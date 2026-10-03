@@ -16,9 +16,21 @@
 // the project-chain helpers used elsewhere; they strip fields the import path
 // expects.
 
-import type { CosmosDbConnection } from '../CosmosDbConnection.js';
+import {
+  cosmosStatusCode,
+  isTransientError,
+  type CosmosDbConnection,
+  type GremlinResult,
+} from '../CosmosDbConnection.js';
 import type { ExportChunk, ImportChunk, BulkImportOptions } from '@utaba/deep-memory/types';
-import type { BulkImportResult, StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
+import type {
+  BulkImportItemError,
+  BulkImportResult,
+  StoredEntity,
+  StoredRelationship,
+} from '@utaba/deep-memory/types';
+import { DeepMemoryError, ProviderError } from '@utaba/deep-memory';
+import type { DeepMemoryErrorCode } from '@utaba/deep-memory';
 import {
   buildEntityPropertyLadder,
   buildRelationshipPropertyLadder,
@@ -112,6 +124,26 @@ export async function* exportAll(
 
 // ─── Import ─────────────────────────────────────────────────────
 
+/**
+ * Import entities, then relationships, one write per row through the
+ * adaptive pool.
+ *
+ * Error policy:
+ * - A row that fails because of its own contents — a property the mapping
+ *   refuses, a write the server rejects for that document (see
+ *   `isRowShapedSubmitFailure`), or a relationship whose endpoint is not in
+ *   the repository — lands in `result.errors` with a `code` and the import
+ *   carries on.
+ * - Throttling or unavailability that outlived the connection's retries is
+ *   rethrown unchanged: the adaptive pool counts it as a throttle and runs
+ *   the row again, and its circuit breaker (`ImportThrottleAbortError`) is
+ *   the only stop for sustained throttling.
+ * - Any other failure means the store itself is failing (a lost connection,
+ *   a missing database or container): recording it against every remaining
+ *   row would hide the cause and keep loading a failing store, so the import
+ *   stops dispatching rows and rejects with a ProviderError. Rows written
+ *   before that point stay written.
+ */
 export async function importBulk(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -120,7 +152,7 @@ export async function importBulk(
 ): Promise<BulkImportResult> {
   let entitiesImported = 0;
   let relationshipsImported = 0;
-  const errors: Array<{ item: string; error: string }> = [];
+  const errors: BulkImportItemError[] = [];
   const skipCheck = options?.skipExistenceCheck ?? false;
 
   // Resolve the controller from the caller-supplied handle if any, so the
@@ -137,29 +169,22 @@ export async function importBulk(
       const results = await runAdaptive(
         chunk.entities,
         controller,
-        async (entity): Promise<{ ok: boolean; id: string; error?: string }> => {
-          try {
-            if (skipCheck) {
-              await insertEntity(conn, repositoryId, entity);
-            } else {
-              await upsertEntity(conn, repositoryId, entity);
-            }
-            return { ok: true, id: entity.id };
-          } catch (err: unknown) {
-            return {
-              ok: false,
-              id: entity.id,
-              error: err instanceof Error ? err.message : String(err),
-            };
-          }
-        },
+        (entity) =>
+          writeRow(conn, {
+            item: `entity:${entity.id}`,
+            conflictCode: 'ENTITY_ALREADY_EXISTS',
+            buildStatement: () =>
+              skipCheck
+                ? insertEntityStatement(repositoryId, entity)
+                : upsertEntityStatement(repositoryId, entity),
+          }),
       );
 
-      for (const r of results) {
-        if (r.ok) {
+      for (const failure of results) {
+        if (failure === undefined) {
           entitiesImported++;
         } else {
-          errors.push({ item: `entity:${r.id}`, error: r.error! });
+          errors.push(failure);
         }
       }
     }
@@ -168,35 +193,106 @@ export async function importBulk(
       const results = await runAdaptive(
         chunk.relationships,
         controller,
-        async (rel): Promise<{ ok: boolean; id: string; error?: string }> => {
-          try {
-            if (skipCheck) {
-              await insertRelationship(conn, repositoryId, rel);
-            } else {
-              await upsertRelationship(conn, repositoryId, rel);
-            }
-            return { ok: true, id: rel.id };
-          } catch (err: unknown) {
-            return {
-              ok: false,
-              id: rel.id,
-              error: err instanceof Error ? err.message : String(err),
-            };
-          }
-        },
+        (rel) =>
+          writeRow(conn, {
+            item: `relationship:${rel.id}`,
+            conflictCode: 'RELATIONSHIP_ALREADY_EXISTS',
+            buildStatement: () =>
+              skipCheck
+                ? insertRelationshipStatement(repositoryId, rel)
+                : upsertRelationshipStatement(repositoryId, rel),
+            // Both statements start from the source vertex and attach to the
+            // target vertex; when either is missing they match nothing, write
+            // nothing and return no rows.
+            onEmptyResult: () => ({
+              item: `relationship:${rel.id}`,
+              error: `endpoint not found in repository (source=${rel.sourceEntityId}, target=${rel.targetEntityId})`,
+              code: 'ENTITY_NOT_FOUND',
+            }),
+          }),
       );
 
-      for (const r of results) {
-        if (r.ok) {
+      for (const failure of results) {
+        if (failure === undefined) {
           relationshipsImported++;
         } else {
-          errors.push({ item: `relationship:${r.id}`, error: r.error! });
+          errors.push(failure);
         }
       }
     }
   }
 
   return { entitiesImported, relationshipsImported, errors };
+}
+
+/** A fixed-shape Gremlin statement and its bindings, ready to submit. */
+interface GremlinStatement {
+  query: string;
+  bindings: Record<string, unknown>;
+}
+
+/**
+ * Cosmos status codes that report a problem with the one document a write
+ * touched rather than with the store: 400 (the server refused a value), 409
+ * (the id already exists), 413 (the document is too large). A 404 is not
+ * among them: on a write it means the database or container is gone.
+ */
+const ROW_SHAPED_STATUS_CODES: ReadonlySet<number> = new Set([400, 409, 413]);
+
+/** True when a failed submit was caused by the row it carried. */
+export function isRowShapedSubmitFailure(err: unknown): boolean {
+  const status = cosmosStatusCode(err);
+  return status !== undefined && ROW_SHAPED_STATUS_CODES.has(status);
+}
+
+interface RowWrite {
+  /** The row, as recorded in `result.errors` (`entity:<id>` / `relationship:<id>`). */
+  item: string;
+  /** Code for a 409: the row's id is already taken. */
+  conflictCode: DeepMemoryErrorCode;
+  buildStatement: () => GremlinStatement;
+  /** The row's error when the statement succeeds but returns nothing. */
+  onEmptyResult?: () => BulkImportItemError;
+}
+
+/**
+ * Write one row. Resolves to `undefined` on success or to the row's error
+ * record for a row-shaped failure. Rethrows a transient error unchanged (the
+ * adaptive pool runs the row again) and rejects with a ProviderError when
+ * the store itself fails.
+ */
+async function writeRow(conn: CosmosDbConnection, row: RowWrite): Promise<BulkImportItemError | undefined> {
+  const { item } = row;
+  let statement: GremlinStatement;
+  try {
+    statement = row.buildStatement();
+  } catch (err: unknown) {
+    // The mapping refused one of this row's properties before any round-trip.
+    if (!(err instanceof DeepMemoryError)) throw err;
+    return { item, error: err.message, code: err.code };
+  }
+
+  let result: GremlinResult;
+  try {
+    result = await conn.submit(statement.query, statement.bindings);
+  } catch (err: unknown) {
+    if (err instanceof DeepMemoryError || isTransientError(err)) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    if (isRowShapedSubmitFailure(err)) {
+      return {
+        item,
+        error: message,
+        code: cosmosStatusCode(err) === 409 ? row.conflictCode : 'PROVIDER_ERROR',
+      };
+    }
+    throw new ProviderError(
+      `CosmosDB import stopped at ${item}: ${message}`,
+      'The store failed rather than this row; rows written before it remain. Check the CosmosDB account, database and container are reachable, then re-run the import (an upsert import is idempotent).',
+      { cause: err },
+    );
+  }
+  if (result.items.length === 0 && row.onEmptyResult !== undefined) return row.onEmptyResult();
+  return undefined;
 }
 
 // ─── Fixed-shape query templates ─────────────────────────────────
@@ -252,7 +348,7 @@ const UPSERT_RELATIONSHIP_QUERY =
 // ─── Direct insert (no existence check) ─────────────────────────
 
 /**
- * Insert an entity directly — assumes it does not exist.
+ * Build the statement that inserts an entity directly — assumes it does not exist.
  *
  * User-property dual-write contract: native-storable values in
  * `entity.properties` also project to per-key vertex properties so server-
@@ -267,11 +363,10 @@ const UPSERT_RELATIONSHIP_QUERY =
  * fixed `INSERT_ENTITY_QUERY` string (byte-identical to the historical
  * shape), keeping the dominant plan-cache entry warm.
  */
-async function insertEntity(
-  conn: CosmosDbConnection,
+function insertEntityStatement(
   repositoryId: string,
   entity: StoredEntity,
-): Promise<void> {
+): GremlinStatement {
   const bindings: Record<string, unknown> = {
     rid: repositoryId,
     vid: entity.id,
@@ -293,11 +388,11 @@ async function insertEntity(
     query = `${INSERT_ENTITY_QUERY}${suffix}`;
   }
 
-  await conn.submit(query, bindings);
+  return { query, bindings };
 }
 
 /**
- * Insert a relationship directly — assumes it does not exist.
+ * Build the statement that inserts a relationship directly — assumes it does not exist.
  *
  * User-property dual-write contract: same shape as `insertEntity` above —
  * native-storable values in `relationship.properties` project to per-key
@@ -307,11 +402,10 @@ async function insertEntity(
  * `addE(edgeLabel)`. Empty-properties insert hits the byte-identical
  * fixed `INSERT_RELATIONSHIP_QUERY` string.
  */
-async function insertRelationship(
-  conn: CosmosDbConnection,
+function insertRelationshipStatement(
   repositoryId: string,
   rel: StoredRelationship,
-): Promise<void> {
+): GremlinStatement {
   const bindings: Record<string, unknown> = {
     rid: repositoryId,
     relId: rel.id,
@@ -335,13 +429,13 @@ async function insertRelationship(
     query = `${INSERT_RELATIONSHIP_QUERY}${suffix}`;
   }
 
-  await conn.submit(query, bindings);
+  return { query, bindings };
 }
 
 // ─── Atomic upsert (single query with coalesce) ─────────────────
 
 /**
- * Upsert an entity using Gremlin's coalesce pattern — single query.
+ * Build the statement that upserts an entity using Gremlin's coalesce pattern — single query.
  * Replaces the old 2-query check-then-create/update approach.
  *
  * Both branches share the same fixed-shape entity ladder (which omits `id`
@@ -369,11 +463,10 @@ async function insertRelationship(
  * exact drop-on-omit semantics from a bulk path should fall back to
  * per-entity `updateEntity` instead.
  */
-async function upsertEntity(
-  conn: CosmosDbConnection,
+function upsertEntityStatement(
   repositoryId: string,
   entity: StoredEntity,
-): Promise<void> {
+): GremlinStatement {
   const bindings: Record<string, unknown> = {
     rid: repositoryId,
     vid: entity.id,
@@ -395,11 +488,11 @@ async function upsertEntity(
     query = `${UPSERT_ENTITY_OPEN}${suffix}${UPSERT_ENTITY_CREATE_BRANCH}${suffix})`;
   }
 
-  await conn.submit(query, bindings);
+  return { query, bindings };
 }
 
 /**
- * Upsert a relationship using Gremlin's coalesce pattern — single query.
+ * Build the statement that upserts a relationship using Gremlin's coalesce pattern — single query.
  * Replaces the old 2-query check-then-create/update approach.
  *
  * The E() lookup is scoped by repositoryId so an edge with the same id in a
@@ -416,11 +509,10 @@ async function upsertEntity(
  * read. The canonical JSON `properties` blob remains the read-side source
  * of truth.
  */
-async function upsertRelationship(
-  conn: CosmosDbConnection,
+function upsertRelationshipStatement(
   repositoryId: string,
   rel: StoredRelationship,
-): Promise<void> {
+): GremlinStatement {
   const bindings: Record<string, unknown> = {
     rid: repositoryId,
     relId: rel.id,
@@ -444,5 +536,5 @@ async function upsertRelationship(
     query = `${UPSERT_RELATIONSHIP_OPEN}${suffix}${UPSERT_RELATIONSHIP_CREATE_BRANCH}${suffix})`;
   }
 
-  await conn.submit(query, bindings);
+  return { query, bindings };
 }

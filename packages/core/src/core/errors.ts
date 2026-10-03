@@ -5,6 +5,7 @@ export type DeepMemoryErrorCode =
   | 'INVALID_INPUT'
   | 'ENTITY_NOT_FOUND'
   | 'ENTITY_ALREADY_EXISTS'
+  | 'SLUG_CONFLICT'
   | 'RELATIONSHIP_NOT_FOUND'
   | 'RELATIONSHIP_ALREADY_EXISTS'
   | 'REPOSITORY_NOT_FOUND'
@@ -26,6 +27,23 @@ export type DeepMemoryErrorCode =
   | 'TRAVERSAL_TIMEOUT'
   | 'QUERY_TIMEOUT'
   | 'UNSUPPORTED_QUERY';
+
+/**
+ * True when `err` is an error carrying the Deep Memory `code`.
+ *
+ * Matches on the code rather than `instanceof`: errors raised by a storage
+ * provider may come from the provider's own copy of this package (a
+ * duplicated install, or a bundled build), and an error from another copy is
+ * not an instance of this copy's class.
+ */
+export function hasErrorCode(err: unknown, code: DeepMemoryErrorCode): boolean {
+  return err instanceof Error && 'code' in err && err.code === code;
+}
+
+/** True when `err` reports a slug held by another entity (see {@link SlugConflictError}). */
+export function isSlugConflict(err: unknown): boolean {
+  return hasErrorCode(err, 'SLUG_CONFLICT');
+}
 
 /** Base error class for all Deep Memory errors */
 export class DeepMemoryError extends Error {
@@ -81,14 +99,55 @@ export class EntityNotFoundError extends DeepMemoryError {
 export class DuplicateEntityError extends DeepMemoryError {
   readonly id: string;
 
-  constructor(id: string) {
+  constructor(id: string, options?: ErrorOptions) {
     super(
       'ENTITY_ALREADY_EXISTS',
       `Entity "${id}" already exists`,
       `Use updateEntity() to modify an existing entity, or omit id to auto-generate a unique one.`,
+      options,
     );
     this.name = 'DuplicateEntityError';
     this.id = id;
+  }
+}
+
+/**
+ * Attempted to create or update an entity with a slug already held by a
+ * different entity in the same repository.
+ *
+ * Slugs are derived from the entity type and label and are unique per
+ * repository. The engine picks a free slug before it writes, but that check
+ * and the write are separate steps, so two concurrent writes with the same
+ * type and label can pick the same candidate; the store's uniqueness rule
+ * then refuses the second. The refusal is about the slug, not the entity's
+ * id, which is why this is not a `DuplicateEntityError`. Entity create and
+ * update retry with the next free slug before letting this error reach the
+ * caller.
+ */
+export class SlugConflictError extends DeepMemoryError {
+  readonly slug: string;
+  readonly entityType?: string;
+  readonly label?: string;
+
+  constructor(
+    slug: string,
+    details: { entityType?: string; label?: string } = {},
+    options?: ErrorOptions,
+  ) {
+    const subject =
+      details.entityType !== undefined && details.label !== undefined
+        ? ` for ${details.entityType} "${details.label}"`
+        : '';
+    super(
+      'SLUG_CONFLICT',
+      `Slug "${slug}"${subject} is already taken by another entity in this repository`,
+      `Retry the write: a new attempt picks the next free slug. Repeated conflicts mean other writers are creating or renaming entities to the same type and label at the same time.`,
+      options,
+    );
+    this.name = 'SlugConflictError';
+    this.slug = slug;
+    this.entityType = details.entityType;
+    this.label = details.label;
   }
 }
 
@@ -111,11 +170,12 @@ export class RelationshipNotFoundError extends DeepMemoryError {
 export class DuplicateRelationshipError extends DeepMemoryError {
   readonly relationshipId: string;
 
-  constructor(relationshipId: string) {
+  constructor(relationshipId: string, options?: ErrorOptions) {
     super(
       'RELATIONSHIP_ALREADY_EXISTS',
       `Relationship "${relationshipId}" already exists`,
       `Omit relationshipId to auto-generate a unique one, or use a different explicit ID.`,
+      options,
     );
     this.name = 'DuplicateRelationshipError';
     this.relationshipId = relationshipId;
@@ -141,11 +201,12 @@ export class RepositoryNotFoundError extends DeepMemoryError {
 export class DuplicateRepositoryError extends DeepMemoryError {
   readonly repositoryId: string;
 
-  constructor(repositoryId: string) {
+  constructor(repositoryId: string, options?: ErrorOptions) {
     super(
       'REPOSITORY_ALREADY_EXISTS',
       `Repository "${repositoryId}" already exists`,
       `Use openRepository() to access an existing repository, or choose a different ID.`,
+      options,
     );
     this.name = 'DuplicateRepositoryError';
     this.repositoryId = repositoryId;
@@ -303,11 +364,12 @@ export class EmbeddingProviderRequiredError extends DeepMemoryError {
 
 /** Error during import operations */
 export class ImportError extends DeepMemoryError {
-  constructor(message: string, suggestion?: string) {
+  constructor(message: string, suggestion?: string, options?: ErrorOptions) {
     super(
       'IMPORT_ERROR',
       message,
       suggestion ?? `Verify the archive format and check that the target repository is accessible.`,
+      options,
     );
     this.name = 'ImportError';
   }

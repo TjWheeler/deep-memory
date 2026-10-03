@@ -16,6 +16,7 @@ import {
   buildEdgeProjectChain,
 } from '@utaba/deep-memory';
 import { repoVertexId } from './ids.js';
+import { submitCreate } from './create.js';
 
 // Sentinels the create query returns in place of the new edge; the caller
 // translates them — single round-trip either way. Mirrors entity.ts:
@@ -109,7 +110,12 @@ export async function createRelationship(
     query = `${RELATIONSHIP_CREATE_PREFIX}${suffix}${RELATIONSHIP_CREATE_CLOSE}`;
   }
 
-  const result = await conn.submit(query, bindings);
+  const result = await submitCreate(
+    conn,
+    query,
+    bindings,
+    (cause) => new DuplicateRelationshipError(relationship.id, { cause }),
+  );
 
   if (result.items[0] === NO_REPOSITORY_SENTINEL) {
     throw new RepositoryNotFoundError(repositoryId);

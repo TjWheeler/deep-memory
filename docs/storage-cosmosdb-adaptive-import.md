@@ -12,9 +12,9 @@ A naïve fixed-concurrency import gets into a doom loop on these tiers:
 2. All N hit 429.
 3. The connection layer retries with exponential backoff — **simultaneously**, because they all started at the same time.
 4. Retry waves trigger another 429, and another. The cluster never gets a chance to scale up.
-5. Some retries eventually exhaust their budget and the corresponding items become permanent errors.
+5. Some retries eventually exhaust their budget, and the import is left choosing between dropping rows and giving up.
 
-The adaptive import runner replaces fixed concurrency with a closed-loop controller that **reduces concurrency on the first sign of throttling**, gives autoscale time to ramp, then carefully grows back when the cluster is keeping up.
+The adaptive import runner replaces fixed concurrency with a closed-loop controller that **reduces concurrency on the first sign of throttling**, gives autoscale time to ramp, then carefully grows back when the cluster is keeping up. A row whose retries run out is not dropped: it is sent again once the controller has backed off (see [§Throttle-exhausted rows are re-queued](#throttle-exhausted-rows-are-re-queued)).
 
 ## Where it lives
 
@@ -105,6 +105,20 @@ parent.retries += taskAcc.retries;
 ```
 
 A non-zero retry count is an unambiguous throttle signal — the connection layer only retries on transient (429/503) errors. Importantly, this catches **recovered** throttles as well as fatal ones, so the controller reacts before the connection's retry budget is exhausted.
+
+### Throttle-exhausted rows are re-queued
+
+When a row's 429/503 outlives the connection's own retries, `submit` rejects with the transient error. The row's write rethrows it unchanged (it is not recorded as a row error), and `runAdaptive` treats it as a throttle:
+
+- it calls `controller.noteThrottle()`, so concurrency halves and the cooldown starts;
+- it puts the row on a retry queue, which workers drain **before** dispatching new rows, behind the same cooldown gate;
+- it checks the circuit breaker, so a re-queued row at `min` concurrency counts toward `maxConsecutiveThrottlesAtMin`.
+
+The circuit breaker (`ImportThrottleAbortError`) is therefore the **only** way throttling stops an import. Throttling never turns a row into a permanent error, and no row is skipped while the import keeps going.
+
+Other failures are classified per row. A row-shaped status (400 refused value, 409 id already taken, 413 document too large) becomes an entry in `result.errors` with a `code`, and the import continues. Anything else, such as a 404 (database or container gone) or a connection failure, stops the import: no new rows are dispatched, in-flight rows are awaited, and the import rejects with a `ProviderError` carrying the driver error as `cause`.
+
+> **Insert mode and 503.** In insert mode (`skipExistenceCheck: true`) every row is a plain `addV`/`addE`. A 503 can arrive *after* Cosmos applied the write. The retry then hits a document that already exists, so a row that was in fact written can be reported as an `ENTITY_ALREADY_EXISTS` (or `RELATIONSHIP_ALREADY_EXISTS`) row error. Before treating such a row as lost, check whether the stored document is the one the import sent. With `skipExistenceCheck: false` each row is a `fold().coalesce(...)` upsert, so a retried write converges and this ambiguity does not arise.
 
 ## Circuit breaker
 

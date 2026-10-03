@@ -5,6 +5,7 @@ import type { EnrichedRelationship, StoredRelationship } from './relationships.j
 import type { ResolvedVocabulary } from './vocabulary.js';
 import type { RepositoryStats } from './repositories.js';
 import type { ValidationError } from '../vocabulary/VocabularyValidator.js';
+import type { DeepMemoryErrorCode } from '../core/errors.js';
 
 /**
  * Paginated result wrapper.
@@ -187,11 +188,32 @@ export interface SearchHit {
   highlights?: Record<string, string[]>;
 }
 
-/** Result of a bulk import operation */
+/** One row that a bulk import could not write */
+export interface BulkImportItemError {
+  /** The row that failed, e.g. `entity:<id>` or `relationship:<id>` */
+  item: string;
+  /** Human-readable reason */
+  error: string;
+  /**
+   * Code of the typed error the row failed with (e.g. `ENTITY_ALREADY_EXISTS`,
+   * `SLUG_CONFLICT`), when the provider classified the failure.
+   */
+  code?: DeepMemoryErrorCode;
+}
+
+/**
+ * Result of a bulk import operation.
+ *
+ * `errors` lists rows that failed on their own (a duplicate key, a value the
+ * store rejects). A failure of the store itself — a timeout, a lost
+ * connection — is not a row error: the import rejects with the typed error.
+ * A provider whose import is a single transaction rolls back on any failed
+ * row and rejects with an error naming that row.
+ */
 export interface BulkImportResult {
   entitiesImported: number;
   relationshipsImported: number;
-  errors: Array<{ item: string; error: string }>;
+  errors: BulkImportItemError[];
 }
 
 /** Result of a re-embedding operation */

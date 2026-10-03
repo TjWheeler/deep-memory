@@ -99,6 +99,7 @@ export type {
   StorageTimelineResult,
   SearchHit,
   BulkImportResult,
+  BulkImportItemError,
   ReembedResult,
   EntityValidationIssue,
   RelationshipValidationIssue,

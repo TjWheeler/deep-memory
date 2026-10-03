@@ -427,6 +427,7 @@ export class DeepMemory {
           itemId: failure.itemId,
           itemType: failure.itemType,
           error: failure.error,
+          code: failure.code,
         }),
       signal: options.signal,
     });
@@ -546,6 +547,7 @@ export class DeepMemory {
           itemId: failure.itemId,
           itemType: failure.itemType,
           error: failure.error,
+          code: failure.code,
         }),
       signal: options.signal,
     });

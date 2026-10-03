@@ -20,18 +20,23 @@ import {
   DuplicateEntityError,
   EntityNotFoundError,
   RepositoryNotFoundError,
+  SlugConflictError,
   buildVertexProjectChain,
   matchesPropertyFilters,
 } from '@utaba/deep-memory';
 import { repoVertexId } from './ids.js';
+import { submitCreate } from './create.js';
 
 // Sentinels the create query returns in place of the new vertex; the caller
 // translates them into typed errors — single round-trip either way:
 //   - DUPLICATE_SENTINEL: a vertex with the requested id already exists in
 //     the repository's partition.
+//   - SLUG_TAKEN_SENTINEL: another entity in the partition already holds the
+//     requested slug, so nothing was written.
 //   - NO_REPOSITORY_SENTINEL: the repository's `_repository` marker vertex is
 //     absent, so nothing was written.
 const DUPLICATE_SENTINEL = '__duplicate';
+const SLUG_TAKEN_SENTINEL = '__slug_taken';
 const NO_REPOSITORY_SENTINEL = '__no_repository';
 
 // Prefix shared by every entity-create query, built as two nested coalesces:
@@ -42,11 +47,19 @@ const NO_REPOSITORY_SENTINEL = '__no_repository';
 //      writes nothing. Checking the marker in the same traversal as the
 //      `addV`, rather than in a separate round-trip, leaves no gap between
 //      the check and the write for the drop to land in.
-//   2. Inner duplicate check + create, run once per marker traverser. The
-//      `map(__.V()…fold())` step looks the entity id up (partition-scoped)
-//      and hands the inner coalesce a list: an existing vertex yields the
-//      duplicate sentinel, otherwise `addV` writes the vertex with the
-//      schema-managed property ladder.
+//   2. Inner duplicate check + slug check + create, run once per marker
+//      traverser. The `map(__.V()…fold())` step looks the entity id up
+//      (partition-scoped) and hands the inner coalesce a list: an existing
+//      vertex yields the duplicate sentinel; otherwise an entity already
+//      holding the slug yields the slug-taken sentinel; otherwise `addV`
+//      writes the vertex with the schema-managed property ladder.
+//
+//      The slug check runs in the same request as the write but Cosmos
+//      Gremlin is not transactional: two creates in flight with the same
+//      slug can both pass it and both write. Id uniqueness, by contrast, is
+//      enforced by Cosmos itself (one document per id per partition), so a
+//      racing duplicate id is refused with a 409 that `createEntity` maps to
+//      DuplicateEntityError.
 //
 //      The lookup must sit inside `map()`. Written as a plain chain,
 //      `unfold().V()…fold()`, the `fold()` is a barrier that emits an empty
@@ -69,6 +82,7 @@ const ENTITY_CREATE_PREFIX =
   `g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(` +
   `unfold().map(__.V().has('repositoryId', rid).hasId(vid).fold()).coalesce(` +
   `unfold().constant('${DUPLICATE_SENTINEL}'),` +
+  `__.V().has('repositoryId', rid).has('slug', slugVal).has('entityType').limit(1).constant('${SLUG_TAKEN_SENTINEL}'),` +
   `addV(vertexLabel).property('id', vid).property('repositoryId', rid)${buildEntityPropertyLadder()}`;
 
 // Closes the inner (duplicate / create) coalesce, then supplies the outer
@@ -90,6 +104,7 @@ export async function createEntity(
     repoVid: repoVertexId(repositoryId),
     vid: entity.id,
     vertexLabel: entity.entityType,
+    slugVal: entity.slug,
     ...entityToLadderBindings(entity),
   };
 
@@ -112,13 +127,16 @@ export async function createEntity(
     query = `${ENTITY_CREATE_PREFIX}${suffix}${ENTITY_CREATE_CLOSE}`;
   }
 
-  const result = await conn.submit(query, bindings);
+  const result = await submitCreate(conn, query, bindings, (cause) => new DuplicateEntityError(entity.id, { cause }));
 
   if (result.items[0] === NO_REPOSITORY_SENTINEL) {
     throw new RepositoryNotFoundError(repositoryId);
   }
   if (result.items[0] === DUPLICATE_SENTINEL) {
     throw new DuplicateEntityError(entity.id);
+  }
+  if (result.items[0] === SLUG_TAKEN_SENTINEL) {
+    throw new SlugConflictError(entity.slug, { entityType: entity.entityType, label: entity.label });
   }
 
   return entity;
@@ -241,6 +259,37 @@ export async function updateEntity(
     updates.properties !== undefined
       ? entityUserPropertyParams(updates.properties)
       : null;
+
+  // Slugs are unique per repository. Only an update that sets a slug pays
+  // for this lookup; like the create-time check it is not transactional, so
+  // two updates in flight onto the same slug can both pass it. An entity that
+  // already holds the slug keeps it, even if another entity holds it too
+  // (data written before uniqueness was enforced): the update takes nothing
+  // from anyone.
+  if (updates.slug !== undefined) {
+    const holders = await conn.submit(
+      "g.V().has('repositoryId', rid).has('slug', slugVal).has('entityType').id()",
+      { rid: repositoryId, slugVal: updates.slug },
+    );
+    if (holders.items.length > 0 && !holders.items.includes(entityId)) {
+      // One read both reports a missing entity as such (rather than as a slug
+      // clash) and supplies the type and label the update leaves unchanged.
+      const target = await conn.submit(
+        "g.V().has('repositoryId', rid).hasId(eid).has('entityType')" +
+          ".project('entityType','label').by(values('entityType')).by(coalesce(values('entityLabel'), constant('')))",
+        { rid: repositoryId, eid: entityId },
+      );
+      const current = target.items[0];
+      if (current === null || typeof current !== 'object') throw new EntityNotFoundError(entityId);
+      // The driver hands a projection back as a Map or a plain object.
+      const field = (key: string): string =>
+        String(current instanceof Map ? current.get(key) : (current as Record<string, unknown>)[key]);
+      throw new SlugConflictError(updates.slug, {
+        entityType: updates.entityType ?? field('entityType'),
+        label: updates.label ?? field('label'),
+      });
+    }
+  }
 
   let droppedUserKeys: string[] = [];
   if (updates.properties !== undefined) {

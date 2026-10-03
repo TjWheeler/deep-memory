@@ -33,7 +33,13 @@ import type {
   BulkImportResult,
   UsageSink,
 } from '@utaba/deep-memory/types';
-import type { ExportChunk, ImportChunk } from '@utaba/deep-memory/types';
+import type {
+  BulkImportOptions,
+  DeleteProgressCallback,
+  ExportChunk,
+  ImportChunk,
+  ProvenanceFilter,
+} from '@utaba/deep-memory/types';
 import type { Provenance } from '@utaba/deep-memory/types';
 import {
   RepositoryNotFoundError,
@@ -49,8 +55,21 @@ import {
   createSafeSink,
 } from '@utaba/deep-memory';
 import { getSchemaSQL, SCHEMA_VERSION } from './schema.js';
+import { importFailure, mapUniqueViolation, type ImportRow, type UniqueViolationContext } from './errors.js';
 
 const PROVIDER_NAME = 'sqlserver';
+
+/**
+ * Rejection handler for a create's INSERT or an entity UPDATE: a unique-key
+ * violation (a concurrent writer took the key after the existence check, or
+ * an update moved onto a slug another entity holds) becomes its typed error
+ * with the SQL Server error as `cause`; anything else propagates unchanged.
+ */
+function rethrowUniqueViolation(context: UniqueViolationContext): (err: unknown) => never {
+  return (err: unknown): never => {
+    throw mapUniqueViolation(err, context) ?? err;
+  };
+}
 
 /**
  * Public StorageProvider methods that are tracked for usage reporting.
@@ -147,7 +166,7 @@ function provenanceFromRow(row: sql.IRecordSet<unknown>[number]): Provenance {
  */
 function addProvenanceConditions(
   req: sql.Request,
-  prov: import('@utaba/deep-memory').ProvenanceFilter,
+  prov: ProvenanceFilter,
   conditions: string[],
   prefix: string,
 ): void {
@@ -467,7 +486,8 @@ export class SqlServerStorageProvider implements StorageProvider {
         INSERT INTO ${this.t('dm_repositories')}
           ([repository_id], [type], [label], [description], [legal], [owner], [governance_config], [metadata], [created_at], [created_by])
         VALUES (@id, @type, @label, @description, @legal, @owner, @governanceConfig, @metadata, @createdAt, @createdBy)
-      `);
+      `)
+      .catch(rethrowUniqueViolation({ kind: 'repository', repositoryId: config.repositoryId }));
 
     // Seed the repository's only vocabulary row. saveVocabulary never inserts,
     // so this is where the first stored version comes from.
@@ -631,7 +651,7 @@ export class SqlServerStorageProvider implements StorageProvider {
     return updated;
   }
 
-  async deleteRepository(repositoryId: string, _onProgress?: import('@utaba/deep-memory/types').DeleteProgressCallback): Promise<void> {
+  public async deleteRepository(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<void> {
     const pool = this.getPool();
     const result = await pool.request()
       .input('id', sql.UniqueIdentifier, repositoryId)
@@ -642,7 +662,7 @@ export class SqlServerStorageProvider implements StorageProvider {
     }
   }
 
-  async deleteAllContents(repositoryId: string, _onProgress?: import('@utaba/deep-memory/types').DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+  public async deleteAllContents(repositoryId: string, _onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
     await this.assertRepository(repositoryId);
     const pool = this.getPool();
 
@@ -840,7 +860,7 @@ export class SqlServerStorageProvider implements StorageProvider {
 
   // ─── Entities ────────────────────────────────────────────────────
 
-  async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
+  public async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
     await this.assertRepository(repositoryId);
     const pool = this.getPool();
 
@@ -887,7 +907,13 @@ export class SqlServerStorageProvider implements StorageProvider {
         @modifiedBy, @modifiedByType, @modifiedAt,
         @modifiedInConversation, @modifiedFromMessage
       )
-    `);
+    `).catch(rethrowUniqueViolation({
+      kind: 'entity',
+      entityId: entity.id,
+      slug: entity.slug,
+      entityType: entity.entityType,
+      label: entity.label,
+    }));
 
     return entity;
   }
@@ -952,7 +978,7 @@ export class SqlServerStorageProvider implements StorageProvider {
     return result;
   }
 
-  async updateEntity(
+  public async updateEntity(
     repositoryId: string,
     entityId: string,
     updates: StoredEntityUpdate,
@@ -1012,7 +1038,13 @@ export class SqlServerStorageProvider implements StorageProvider {
         [modified_in_conversation] = @modifiedInConversation,
         [modified_from_message] = @modifiedFromMessage
       WHERE [repository_id] = @repoId AND [entity_id] = @entityId
-    `);
+    `).catch(rethrowUniqueViolation({
+      kind: 'entity',
+      entityId,
+      slug: updated.slug,
+      entityType: updated.entityType,
+      label: updated.label,
+    }));
 
     return updated;
   }
@@ -1231,7 +1263,7 @@ export class SqlServerStorageProvider implements StorageProvider {
 
   // ─── Relationships ──────────────────────────────────────────────
 
-  async createRelationship(
+  public async createRelationship(
     repositoryId: string,
     relationship: StoredRelationship,
   ): Promise<StoredRelationship> {
@@ -1278,7 +1310,7 @@ export class SqlServerStorageProvider implements StorageProvider {
         @modifiedBy, @modifiedByType, @modifiedAt,
         @modifiedInConversation, @modifiedFromMessage
       )
-    `);
+    `).catch(rethrowUniqueViolation({ kind: 'relationship', relationshipId: relationship.id }));
 
     return relationship;
   }
@@ -1808,22 +1840,37 @@ export class SqlServerStorageProvider implements StorageProvider {
     }
   }
 
-  async importBulk(
+  public async importBulk(
     repositoryId: string,
     data: ImportChunk[],
-    _options?: import('@utaba/deep-memory/types').BulkImportOptions,
+    _options?: BulkImportOptions,
   ): Promise<BulkImportResult> {
     await this.assertRepository(repositoryId);
     const pool = this.getPool();
     let entitiesImported = 0;
     let relationshipsImported = 0;
 
+    // One transaction for the whole import: either every row lands or none
+    // does, so a failed import never leaves a partial repository behind and
+    // re-running it starts from a clean slate. The row being written is
+    // tracked so a failure can name it.
+    let current: ImportRow | undefined;
     const transaction = pool.transaction();
     await transaction.begin();
     try {
       for (const chunk of data) {
         if (chunk.entities) {
           for (const entity of chunk.entities) {
+            current = {
+              item: `entity:${entity.id}`,
+              context: {
+                kind: 'entity',
+                entityId: entity.id,
+                slug: entity.slug,
+                entityType: entity.entityType,
+                label: entity.label,
+              },
+            };
             const req = transaction.request()
               .input('repoId', sql.UniqueIdentifier, repositoryId)
               .input('entityId', sql.NVarChar, entity.id)
@@ -1871,6 +1918,10 @@ export class SqlServerStorageProvider implements StorageProvider {
 
         if (chunk.relationships) {
           for (const rel of chunk.relationships) {
+            current = {
+              item: `relationship:${rel.id}`,
+              context: { kind: 'relationship', relationshipId: rel.id },
+            };
             const req = transaction.request()
               .input('repoId', sql.UniqueIdentifier, repositoryId)
               .input('relId', sql.NVarChar, rel.id)
@@ -1913,10 +1964,18 @@ export class SqlServerStorageProvider implements StorageProvider {
           }
         }
       }
+      current = undefined;
       await transaction.commit();
     } catch (err) {
-      await transaction.rollback();
-      throw err;
+      let rollbackError: unknown;
+      try {
+        await transaction.rollback();
+      } catch (rollbackErr) {
+        // Reported inside the import error below; it must not replace the
+        // failure that caused the rollback.
+        rollbackError = rollbackErr;
+      }
+      throw importFailure(err, current, rollbackError);
     }
 
     return { entitiesImported, relationshipsImported, errors: [] };

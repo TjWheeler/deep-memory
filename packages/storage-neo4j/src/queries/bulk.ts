@@ -31,6 +31,8 @@
 //     back to a per-row CREATE for that chunk so good rows still land. The
 //     downside is one extra round-trip per failed-chunk; the upside is that
 //     the success path is one round-trip per chunk regardless of chunk size.
+//     Only row-shaped failures take the fallback; a timeout or connection
+//     failure stops the import with its typed error.
 //   - `skipExistenceCheck: false` uses the MERGE branch. `NodeUniqueIndexSeek`
 //     on the `(repositoryId, id)` constraint backs the MERGE so the per-row
 //     cost is O(log n) — re-imports are idempotent without paying a full scan.
@@ -46,9 +48,10 @@
 //     adaptive-concurrency controller the Cosmos provider needs has no
 //     analog. Chunks complete independently; their results aggregate into a
 //     single `BulkImportResult` at the end. Per-row errors are collected per
-//     chunk, never swallowed.
+//     chunk, never swallowed. The first chunk that rejects stops dispatch.
 
 import type {
+  BulkImportItemError,
   BulkImportOptions,
   BulkImportResult,
   ExportChunk,
@@ -68,7 +71,15 @@ import {
   relationshipFromRecord,
   relationshipToParams,
 } from '../mapping.js';
-import { ProviderError } from '@utaba/deep-memory';
+import { DeepMemoryError, ProviderError } from '@utaba/deep-memory';
+import {
+  isMemoryLimitFailure,
+  isRowShapedFailure,
+  isTransactionMemoryLimit,
+  mapDriverError,
+  toTypedError,
+  type DriverErrorContext,
+} from '../errors.js';
 
 /**
  * Streaming-export chunk size. Each yielded `ExportChunk` carries at most
@@ -322,7 +333,7 @@ SET n += row.userProperties
  * Build the relationship import Cypher for a given relationship type. Cypher
  * 25 cannot parameterise the relationship-type slot, so each distinct type
  * compiles to its own plan-cache entry. The vocabulary bounds the per-type
- * cardinality (same trade-off as `createRelationship` in Phase 7).
+ * cardinality (the same trade-off `createRelationship` makes).
  *
  * `MATCH (s)` and `MATCH (t)` find the endpoint entities under the repository
  * scope before the edge is created; an endpoint outside the repository fails
@@ -405,10 +416,22 @@ RETURN row.id AS id
  * the whole input — relationship MATCH on the source/target entities requires
  * those entities to exist, so cross-phase parallelism is not safe.
  *
- * Error policy: a chunk-level failure (e.g. one duplicate row in a CREATE
- * chunk under `skipExistenceCheck: true`) falls back to per-row CREATE so
- * the surviving rows still land. Per-row errors land in `result.errors`;
- * successful rows count toward `entitiesImported` / `relationshipsImported`.
+ * Error policy:
+ * - A row the mapping refuses (an unsafe or reserved property key, a
+ *   relationship type that is not a safe identifier) is recorded in
+ *   `result.errors` with the typed error's `code` and left out of the write.
+ * - A chunk that fails because of its rows (a uniqueness clash, a value the
+ *   server refuses — see `isRowShapedFailure`) or runs out of transaction
+ *   memory is retried row by row so the surviving rows still land; each
+ *   failing row is recorded with its `code`. A single row over the
+ *   per-transaction memory limit is a row error; an exhausted server-wide
+ *   memory pool is a store failure.
+ * - Any other failure — a `QueryTimeoutError`, an unavailable or expired
+ *   connection — means the store itself is failing: retrying every row would
+ *   multiply the load and hide the cause, so the import stops dispatching
+ *   chunks (and per-row fallbacks already running stop at their next row) and
+ *   rejects with the typed error. Rows written before that point stay
+ *   written.
  */
 export async function importBulk(
   conn: Neo4jConnection,
@@ -428,7 +451,16 @@ export async function importBulk(
     if (chunk.relationships) allRelationships.push(...chunk.relationships);
   }
 
-  const errors: Array<{ item: string; error: string }> = [];
+  const errors: BulkImportItemError[] = [];
+  const run: ImportRun = { stopped: false };
+  const stopOnFailure = <T, R>(fn: (item: T) => Promise<R>) => async (item: T): Promise<R> => {
+    try {
+      return await fn(item);
+    } catch (err) {
+      run.stopped = true;
+      throw err;
+    }
+  };
 
   // Entity phase. Slice the flat list into UNWIND chunks; submit through the
   // bounded pool. The pool size is fixed (no adaptive controller — Neo4j has
@@ -437,7 +469,7 @@ export async function importBulk(
   const entityResults = await runBounded(
     entityChunks,
     concurrency,
-    (chunk) => importEntityChunk(conn, repositoryId, chunk, skipCheck),
+    stopOnFailure((chunk: StoredEntity[]) => importEntityChunk(conn, repositoryId, chunk, skipCheck, run)),
   );
 
   let entitiesImported = 0;
@@ -450,7 +482,9 @@ export async function importBulk(
   const relationshipResults = await runBounded(
     relationshipChunks,
     concurrency,
-    (group) => importRelationshipChunk(conn, repositoryId, group, skipCheck),
+    stopOnFailure((group: RelationshipChunk) =>
+      importRelationshipChunk(conn, repositoryId, group, skipCheck, run),
+    ),
   );
 
   let relationshipsImported = 0;
@@ -464,7 +498,7 @@ export async function importBulk(
 
 interface ChunkResult {
   imported: number;
-  errors: Array<{ item: string; error: string }>;
+  errors: BulkImportItemError[];
 }
 
 interface RelationshipChunk {
@@ -472,72 +506,129 @@ interface RelationshipChunk {
   rows: StoredRelationship[];
 }
 
-async function importEntityChunk(
-  conn: Neo4jConnection,
-  repositoryId: string,
-  entities: StoredEntity[],
-  skipCheck: boolean,
-): Promise<ChunkResult> {
-  if (entities.length === 0) return { imported: 0, errors: [] };
+/**
+ * Shared by every chunk of one import. Set once any chunk rejects, so a
+ * sibling chunk's per-row fallback stops at its next row instead of writing
+ * on against a failing store.
+ */
+interface ImportRun {
+  stopped: boolean;
+}
 
-  // `repositoryId` is bound globally via the chokepoint's `$rid`; the row
-  // map only carries per-entity fields. Keeping it off the row keeps the
-  // Bolt payload smaller on large chunks.
-  const rows = entities.map((entity) => ({
-    ...entityToParams(entity),
-    userProperties: entityUserPropertyParams(entity.properties),
-  }));
-  const query = skipCheck ? INSERT_ENTITIES_QUERY : UPSERT_ENTITIES_QUERY;
-
-  try {
-    await conn.executeQuery(query, { rows }, { repositoryId });
-    return { imported: entities.length, errors: [] };
-  } catch (err) {
-    return fallbackPerEntity(conn, repositoryId, entities, skipCheck, err);
+/**
+ * After a whole-chunk write fails: rethrow `error` as a typed error unless
+ * writing the rows one at a time can help — a row-shaped failure, or the
+ * chunk running out of transaction memory (a single row needs far less).
+ */
+function rethrowUnlessChunkCanFallBack(error: unknown): void {
+  if (!isRowShapedFailure(error) && !isMemoryLimitFailure(error)) {
+    mapDriverError(error, { operation: 'importBulk' });
   }
 }
 
 /**
- * When a whole-chunk write fails (e.g. one constraint violation aborts the
- * entire MERGE/CREATE transaction), retry the chunk row-by-row so the rows
- * that would have succeeded still land. The per-row path is slower per call
- * but only runs when a chunk actually failed.
+ * After a single-row write fails: rethrow `error` as a typed error unless it
+ * belongs to that row — a row-shaped failure, or the row alone exceeding the
+ * per-transaction memory limit. An exhausted server-wide memory pool is a
+ * state of the store, so it stops the import.
+ */
+function rethrowUnlessRowFailure(error: unknown): void {
+  if (!isRowShapedFailure(error) && !isTransactionMemoryLimit(error)) {
+    mapDriverError(error, { operation: 'importBulk' });
+  }
+}
+
+/** A per-row error record carrying the typed error's message and code. */
+function rowError(item: string, error: unknown, context: DriverErrorContext): BulkImportItemError {
+  const typed = toTypedError(error, { ...context, operation: 'importBulk' });
+  return { item, error: typed.message, code: typed.code };
+}
+
+/** A row the mapping refused before any round-trip. */
+function refusedRow(item: string, error: DeepMemoryError): BulkImportItemError {
+  return { item, error: error.message, code: error.code };
+}
+
+async function importEntityChunk(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  chunk: StoredEntity[],
+  skipCheck: boolean,
+  run: ImportRun,
+): Promise<ChunkResult> {
+  if (chunk.length === 0) return { imported: 0, errors: [] };
+
+  // Build each row's params on its own so a row the mapping refuses (an
+  // unsafe or reserved property key) is recorded against that row and the
+  // rest of the chunk still lands. `repositoryId` is bound globally via the
+  // chokepoint's `$rid`; the row map only carries per-entity fields, which
+  // keeps the Bolt payload smaller on large chunks.
+  const errors: BulkImportItemError[] = [];
+  const prepared: Array<PreparedRow<StoredEntity>> = [];
+  for (const entity of chunk) {
+    try {
+      prepared.push({
+        item: entity,
+        params: { ...entityToParams(entity), userProperties: entityUserPropertyParams(entity.properties) },
+      });
+    } catch (err) {
+      if (!(err instanceof DeepMemoryError)) throw err;
+      errors.push(refusedRow(`entity:${entity.id}`, err));
+    }
+  }
+  if (prepared.length === 0) return { imported: 0, errors };
+  const query = skipCheck ? INSERT_ENTITIES_QUERY : UPSERT_ENTITIES_QUERY;
+
+  try {
+    await conn.executeQuery(query, { rows: prepared.map((row) => row.params) }, { repositoryId });
+    return { imported: prepared.length, errors };
+  } catch (err) {
+    rethrowUnlessChunkCanFallBack(err);
+    const fallback = await fallbackPerEntity(conn, repositoryId, prepared, query, run);
+    return { imported: fallback.imported, errors: [...errors, ...fallback.errors] };
+  }
+}
+
+/** A row to import, paired with the Cypher params built from it. */
+interface PreparedRow<T> {
+  item: T;
+  params: Record<string, unknown>;
+}
+
+/**
+ * When a whole-chunk write fails because of its rows (e.g. one constraint
+ * violation aborts the entire MERGE/CREATE transaction), retry the chunk
+ * row-by-row so the rows that would have succeeded still land. The per-row
+ * path is slower per call but only runs when a chunk actually failed. A
+ * store failure on any row stops the fallback and propagates; so does a
+ * failure in a sibling chunk (the fallback stops at its next row).
  */
 async function fallbackPerEntity(
   conn: Neo4jConnection,
   repositoryId: string,
-  entities: StoredEntity[],
-  skipCheck: boolean,
-  chunkError: unknown,
+  prepared: ReadonlyArray<PreparedRow<StoredEntity>>,
+  query: string,
+  run: ImportRun,
 ): Promise<ChunkResult> {
-  const errors: Array<{ item: string; error: string }> = [];
+  const errors: BulkImportItemError[] = [];
   let imported = 0;
-  const query = skipCheck ? INSERT_ENTITIES_QUERY : UPSERT_ENTITIES_QUERY;
-  for (const entity of entities) {
+  for (const { item: entity, params } of prepared) {
+    if (run.stopped) break;
     try {
-      const rows = [
-        {
-          ...entityToParams(entity),
-          userProperties: entityUserPropertyParams(entity.properties),
-        },
-      ];
-      await conn.executeQuery(query, { rows }, { repositoryId });
+      await conn.executeQuery(query, { rows: [params] }, { repositoryId });
       imported++;
     } catch (rowErr) {
-      errors.push({
-        item: `entity:${entity.id}`,
-        error: rowErr instanceof Error ? rowErr.message : String(rowErr),
-      });
+      rethrowUnlessRowFailure(rowErr);
+      errors.push(
+        rowError(`entity:${entity.id}`, rowErr, {
+          kind: 'entity',
+          entityId: entity.id,
+          slug: entity.slug,
+          entityType: entity.entityType,
+          label: entity.label,
+        }),
+      );
     }
-  }
-  // If we successfully fell back and at least one row failed AND no errors
-  // were collected, attach the original chunk error so the caller still gets
-  // a signal. Otherwise the per-row errors are the actionable surface.
-  if (errors.length === 0 && imported < entities.length) {
-    errors.push({
-      item: `entity-chunk`,
-      error: chunkError instanceof Error ? chunkError.message : String(chunkError),
-    });
   }
   return { imported, errors };
 }
@@ -547,76 +638,85 @@ async function importRelationshipChunk(
   repositoryId: string,
   group: RelationshipChunk,
   skipCheck: boolean,
+  run: ImportRun,
 ): Promise<ChunkResult> {
   if (group.rows.length === 0) return { imported: 0, errors: [] };
 
+  // The relationship type is compiled into the Cypher, so a type the guard
+  // refuses fails every row of its group: record each one and write none.
+  let query: string;
+  try {
+    query = skipCheck
+      ? buildInsertRelationshipsQuery(group.relationshipType)
+      : buildUpsertRelationshipsQuery(group.relationshipType);
+  } catch (err) {
+    if (!(err instanceof DeepMemoryError)) throw err;
+    return {
+      imported: 0,
+      errors: group.rows.map((rel) => refusedRow(`relationship:${rel.id}`, err)),
+    };
+  }
+
   // `repositoryId` is bound globally via the chokepoint's `$rid`; rows carry
   // only per-edge fields.
-  const rows = group.rows.map((rel) => relationshipToParams(rel));
-  const query = skipCheck
-    ? buildInsertRelationshipsQuery(group.relationshipType)
-    : buildUpsertRelationshipsQuery(group.relationshipType);
+  const prepared = group.rows.map((rel) => ({ item: rel, params: relationshipToParams(rel) }));
 
   try {
-    const result = await conn.executeQuery(query, { rows }, { repositoryId });
+    const result = await conn.executeQuery(query, { rows: prepared.map((row) => row.params) }, { repositoryId });
     const importedIds = new Set<string>();
     for (const record of result.records) {
       const id = record.get('id');
       if (typeof id === 'string') importedIds.add(id);
     }
-    const errors: Array<{ item: string; error: string }> = [];
+    const errors: BulkImportItemError[] = [];
     for (const rel of group.rows) {
-      if (!importedIds.has(rel.id)) {
-        errors.push({
-          item: `relationship:${rel.id}`,
-          error: `endpoint not found in repository (source=${rel.sourceEntityId}, target=${rel.targetEntityId})`,
-        });
-      }
+      if (!importedIds.has(rel.id)) errors.push(missingEndpointError(rel));
     }
     return { imported: importedIds.size, errors };
   } catch (err) {
-    return fallbackPerRelationship(conn, repositoryId, group, skipCheck, err);
+    rethrowUnlessChunkCanFallBack(err);
+    return fallbackPerRelationship(conn, repositoryId, prepared, query, run);
   }
 }
 
 async function fallbackPerRelationship(
   conn: Neo4jConnection,
   repositoryId: string,
-  group: RelationshipChunk,
-  skipCheck: boolean,
-  chunkError: unknown,
+  prepared: ReadonlyArray<PreparedRow<StoredRelationship>>,
+  query: string,
+  run: ImportRun,
 ): Promise<ChunkResult> {
-  const errors: Array<{ item: string; error: string }> = [];
+  const errors: BulkImportItemError[] = [];
   let imported = 0;
-  const query = skipCheck
-    ? buildInsertRelationshipsQuery(group.relationshipType)
-    : buildUpsertRelationshipsQuery(group.relationshipType);
-  for (const rel of group.rows) {
+  for (const { item: rel, params } of prepared) {
+    if (run.stopped) break;
     try {
-      const rows = [relationshipToParams(rel)];
-      const result = await conn.executeQuery(query, { rows }, { repositoryId });
+      const result = await conn.executeQuery(query, { rows: [params] }, { repositoryId });
       if (result.records.length === 1) {
         imported++;
       } else {
-        errors.push({
-          item: `relationship:${rel.id}`,
-          error: `endpoint not found in repository (source=${rel.sourceEntityId}, target=${rel.targetEntityId})`,
-        });
+        errors.push(missingEndpointError(rel));
       }
     } catch (rowErr) {
-      errors.push({
-        item: `relationship:${rel.id}`,
-        error: rowErr instanceof Error ? rowErr.message : String(rowErr),
-      });
+      rethrowUnlessRowFailure(rowErr);
+      errors.push(
+        rowError(`relationship:${rel.id}`, rowErr, {
+          kind: 'relationship',
+          relationshipId: rel.id,
+        }),
+      );
     }
   }
-  if (errors.length === 0 && imported < group.rows.length) {
-    errors.push({
-      item: `relationship-chunk:${group.relationshipType}`,
-      error: chunkError instanceof Error ? chunkError.message : String(chunkError),
-    });
-  }
   return { imported, errors };
+}
+
+/** Row record for a relationship whose source or target is not in the repository. */
+function missingEndpointError(rel: StoredRelationship): BulkImportItemError {
+  return {
+    item: `relationship:${rel.id}`,
+    error: `endpoint not found in repository (source=${rel.sourceEntityId}, target=${rel.targetEntityId})`,
+    code: 'ENTITY_NOT_FOUND',
+  };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -664,9 +764,11 @@ function groupRelationshipsByTypeIntoChunks(
  * array preserves the input order so callers can pair results with inputs.
  *
  * Concurrency is the maximum number of in-flight tasks at any point. With
- * concurrency 1 this degenerates to sequential execution. Errors thrown by
- * `fn` reject the returned promise; the caller is responsible for catching
- * within `fn` if partial success is desired.
+ * concurrency 1 this degenerates to sequential execution. The first error
+ * thrown by `fn` stops dispatch of further items; tasks already in flight
+ * are awaited (so nothing keeps writing after the call settles) and the
+ * returned promise then rejects with that first error. The caller is
+ * responsible for catching within `fn` if partial success is desired.
  */
 export async function runBounded<T, R>(
   items: T[],
@@ -680,19 +782,25 @@ export async function runBounded<T, R>(
   const cap = Math.min(concurrency, items.length);
   const results: R[] = new Array(items.length);
   let nextIndex = 0;
+  let failure: { error: unknown } | undefined;
   const workers: Array<Promise<void>> = [];
   for (let w = 0; w < cap; w++) {
     workers.push(
       (async (): Promise<void> => {
-        while (true) {
+        while (failure === undefined) {
           const i = nextIndex++;
           if (i >= items.length) return;
-          results[i] = await fn(items[i]!);
+          try {
+            results[i] = await fn(items[i]!);
+          } catch (err) {
+            failure ??= { error: err };
+          }
         }
       })(),
     );
   }
   await Promise.all(workers);
+  if (failure !== undefined) throw failure.error;
   return results;
 }
 

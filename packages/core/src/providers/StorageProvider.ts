@@ -146,7 +146,17 @@ export interface StorageProvider {
   ): Promise<PaginatedResult<VocabularyChangeRecord>>;
 
   // ─── Entities ──────────────────────────────────────────────────────
+  //
+  // An entity's slug is unique within its repository.
 
+  /**
+   * Store a new entity.
+   *
+   * @throws DuplicateEntityError when an entity with `entity.id` already
+   *   exists in the repository (and only then).
+   * @throws SlugConflictError when a different entity already holds
+   *   `entity.slug`; nothing is written.
+   */
   createEntity(
     repositoryId: string,
     entity: StoredEntity,
@@ -156,6 +166,7 @@ export interface StorageProvider {
     entityId: string,
     options?: EntityReadOptions,
   ): Promise<StoredEntity | null>;
+  /** The entity holding `slug` in the repository (slugs are unique per repository), or `null`. */
   getEntityBySlug(
     repositoryId: string,
     slug: string,
@@ -166,6 +177,14 @@ export interface StorageProvider {
     entityIds: string[],
     options?: EntityReadOptions,
   ): Promise<Map<string, StoredEntity>>;
+  /**
+   * Apply `updates` to an existing entity.
+   *
+   * @throws EntityNotFoundError when no entity has `entityId`.
+   * @throws SlugConflictError when `updates.slug` is held by a different
+   *   entity; the entity is left unchanged. Its own current slug is never a
+   *   conflict.
+   */
   updateEntity(
     repositoryId: string,
     entityId: string,

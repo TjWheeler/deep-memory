@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { CypherCompiler } from './CypherCompiler.js';
-import type { TraversalSpec } from '../../types/traversal.js';
+import { TraversalValidationError } from '../../core/errors.js';
+import type { TraversalSpec, TraversalStep } from '../../types/traversal.js';
 import type { MemoryVocabulary } from '../../types/vocabulary.js';
+import type { PropertyFilter } from '../../types/queries.js';
 
 const compiler = new CypherCompiler();
 
@@ -315,6 +317,193 @@ describe('CypherCompiler', () => {
       const result = compiler.compile(spec, emptyVocab);
       expect(result.query).not.toContain('count(*)');
       expect(result.query).toMatch(/RETURN DISTINCT n0, n1, r0/);
+    });
+  });
+
+  describe('identifier safety', () => {
+    // Untyped input (e.g. parsed JSON from a tool call) can carry a value of
+    // the wrong runtime type into a typed spec field.
+    const asNumber = (value: number | string): number => value as number;
+    const asStringList = (value: string[] | string): string[] => value as string[];
+    const asFilters = (value: PropertyFilter[] | PropertyFilter | string | null[]): PropertyFilter[] => value as PropertyFilter[];
+    const asStep = (value: TraversalStep | null): TraversalStep => value as TraversalStep;
+    const asSteps = (value: TraversalStep[] | TraversalStep): TraversalStep[] => value as TraversalStep[];
+
+    const filterKeyInjection = 'id IS NOT NULL OR true OR n0.id';
+    const relTypeInjection = 'KNOWS]-() WITH 1 AS x MATCH (m:_Entity) RETURN m //';
+
+    function compileWithFilter(key: string, where: 'start' | 'entity' | 'relationship'): () => void {
+      const filter = [{ key, operator: 'eq' as const, value: 'x' }];
+      const spec: TraversalSpec = {
+        start: where === 'start' ? { entityId: 'a', filter } : { entityId: 'a' },
+        steps: [
+          {
+            direction: 'out',
+            ...(where === 'entity' ? { entityFilter: filter } : {}),
+            ...(where === 'relationship' ? { relationshipFilter: filter } : {}),
+          },
+        ],
+        returnMode: 'terminal',
+      };
+      return () => compiler.compile(spec, emptyVocab);
+    }
+
+    function compileWithDepth(maxDepth: number): () => void {
+      return () =>
+        compiler.compile(
+          {
+            start: { entityId: 'a' },
+            steps: [{ direction: 'out', repeat: { maxDepth } }],
+            returnMode: 'terminal',
+          },
+          emptyVocab,
+        );
+    }
+
+    it.each(['start', 'entity', 'relationship'] as const)(
+      'rejects an injected %s filter key with TraversalValidationError',
+      (where) => {
+        const run = compileWithFilter(filterKeyInjection, where);
+        expect(run).toThrow(TraversalValidationError);
+        expect(run).toThrow(/Unsafe property filter key/);
+      },
+    );
+
+    it('rejects an injected relationship type with TraversalValidationError', () => {
+      const run = () =>
+        compiler.compile(
+          {
+            start: { entityId: 'a' },
+            steps: [{ direction: 'out', relationshipTypes: ['KNOWS', relTypeInjection] }],
+            returnMode: 'terminal',
+          },
+          emptyVocab,
+        );
+      expect(run).toThrow(TraversalValidationError);
+      expect(run).toThrow(/Unsafe relationship type in steps\[0\]/);
+    });
+
+    it('rejects the injection strings in the other position too', () => {
+      expect(compileWithFilter(relTypeInjection, 'relationship')).toThrow(TraversalValidationError);
+      expect(() =>
+        compiler.compile(
+          {
+            start: { entityId: 'a' },
+            steps: [{ direction: 'both', relationshipTypes: [filterKeyInjection] }],
+            returnMode: 'terminal',
+          },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it('rejects a hyphenated filter key', () => {
+      expect(compileWithFilter('start-date', 'entity')).toThrow(TraversalValidationError);
+    });
+
+    it('rejects an unsafe projection property name with TraversalValidationError', () => {
+      expect(() =>
+        compiler.compile(
+          {
+            start: { entityType: 'Organization' },
+            returnMode: 'terminal',
+            projection: { properties: ['start-date'] },
+          },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it.each([
+      ['a fractional depth', 1.5],
+      ['a numeric string', asNumber('3')],
+      ['NaN', Number.NaN],
+      ['zero', 0],
+      ['a negative depth', -2],
+      ['Infinity', Number.POSITIVE_INFINITY],
+      ['an unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+    ])('rejects repeat.maxDepth of %s', (_label, maxDepth) => {
+      const run = compileWithDepth(maxDepth);
+      expect(run).toThrow(TraversalValidationError);
+      expect(run).toThrow(/steps\[0\]\.repeat\.maxDepth must be a positive integer/);
+    });
+
+    it('rejects an unknown step direction rather than emitting a malformed pattern', () => {
+      expect(() =>
+        compiler.compile(
+          {
+            start: { entityId: 'a' },
+            steps: [{ direction: 'sideways' as 'out' }],
+            returnMode: 'terminal',
+          },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it('rejects an unknown filter operator rather than emitting a malformed clause', () => {
+      expect(() =>
+        compiler.compile(
+          {
+            start: { entityId: 'a', filter: [{ key: 'name', operator: 'like' as 'eq', value: 'x' }] },
+            returnMode: 'terminal',
+          },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it('still compiles safe identifiers and depths', () => {
+      const result = compiler.compile(
+        {
+          start: { entityId: 'a', filter: [{ key: '_status', operator: 'eq', value: 'active' }] },
+          steps: [
+            {
+              direction: 'out',
+              relationshipTypes: ['HAS_COMPONENT', 'part_of2'],
+              entityFilter: [{ key: 'startDate', operator: 'isNotNull' }],
+              relationshipFilter: [{ key: 'weight', operator: 'gte', value: 2 }],
+              repeat: { maxDepth: 4 },
+            },
+          ],
+          returnMode: 'terminal',
+        },
+        emptyVocab,
+      );
+      expect(result.query).toContain('n0._status = $');
+      expect(result.query).toContain('-[r0:HAS_COMPONENT|part_of2*1..4]->(n1)');
+      expect(result.query).toContain('n1.startDate IS NOT NULL');
+      expect(result.query).toContain('r0.weight >= $');
+    });
+
+    it.each([
+      ['relationshipTypes', { direction: 'out' as const, relationshipTypes: asStringList('KNOWS') }],
+      ['entityTypes', { direction: 'out' as const, entityTypes: asStringList('Person') }],
+      ['entityFilter', { direction: 'out' as const, entityFilter: asFilters('name') }],
+      ['relationshipFilter', { direction: 'out' as const, relationshipFilter: asFilters('since') }],
+      ['a null filter element', { direction: 'out' as const, relationshipFilter: asFilters([null]) }],
+    ])('rejects a non-array or malformed %s with TraversalValidationError', (_label, step) => {
+      expect(() =>
+        compiler.compile({ start: { entityId: 'a' }, steps: [step], returnMode: 'terminal' }, emptyVocab),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it.each([
+      ['a non-array steps', asSteps({ direction: 'out' })],
+      ['a null step element', [{ direction: 'out' as const }, asStep(null)]],
+    ])('rejects %s with TraversalValidationError', (_label, steps) => {
+      expect(() =>
+        compiler.compile({ start: { entityId: 'a' }, steps, returnMode: 'all' }, emptyVocab),
+      ).toThrow(TraversalValidationError);
+    });
+
+    it('rejects a non-array projection.properties', () => {
+      expect(() =>
+        compiler.compile(
+          { start: { entityId: 'a' }, returnMode: 'terminal', projection: { properties: asStringList('name') } },
+          emptyVocab,
+        ),
+      ).toThrow(TraversalValidationError);
     });
   });
 });

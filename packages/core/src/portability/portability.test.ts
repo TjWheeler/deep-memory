@@ -9,7 +9,13 @@ import {
 } from '../core/errors.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
 import type { MemoryRepository } from '../core/MemoryRepository.js';
-import type { ExportArchive, ExportStreamItem, ImportChunk } from '../types/portability.js';
+import type {
+  BulkImportOptions,
+  ExportArchive,
+  ExportStreamItem,
+  ImportChunk,
+} from '../types/portability.js';
+import type { BulkImportItemError, BulkImportResult } from '../types/results.js';
 
 const vocabulary = {
   entityTypes: [
@@ -342,6 +348,37 @@ describe('Portability', () => {
       expect(renamed).not.toBeNull();
     });
 
+    it('picks a free slug when the same entity is renamed on a second import', async () => {
+      const targetId = '10000000-0000-4000-a000-000000000004';
+      const aliceOnly = {
+        ...archive,
+        entities: [archive.entities.find((e) => e.slug === 'person:alice')!],
+        relationships: [],
+      };
+      await memory.importRepository(aliceOnly, { target: { mode: 'merge', repositoryId: targetId }, vocabularyConflict: 'extend' });
+
+      const first = await memory.importRepository(aliceOnly, {
+        target: { mode: 'merge', repositoryId: targetId },
+        vocabularyConflict: 'extend',
+        entityConflict: 'rename',
+      });
+      const second = await memory.importRepository(aliceOnly, {
+        target: { mode: 'merge', repositoryId: targetId },
+        vocabularyConflict: 'extend',
+        entityConflict: 'rename',
+      });
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(true);
+      const target = await memory.openRepository(targetId);
+      const firstRename = await target.getBySlug('person:alice-imported');
+      const secondRename = await target.getBySlug('person:alice-imported-2');
+      expect(firstRename).not.toBeNull();
+      expect(secondRename).not.toBeNull();
+      expect(secondRename!.id).not.toBe(firstRename!.id);
+      expect(second.warnings.find((w) => w.code === 'entity_renamed')?.message).toContain('person:alice-imported-2');
+    });
+
     it('treats DuplicateRelationshipError from createRelationship as skip+warning', async () => {
       // Simulate a storage layer (e.g. SQL Server) that enforces a composite
       // unique constraint beyond relationship ID — so getRelationship() returns
@@ -510,6 +547,85 @@ describe('Portability', () => {
       });
 
       expect(events).toEqual(['import:completed']);
+    });
+
+    it('reports bulk row errors as warnings and import:item-failed events with type, id and code', async () => {
+      const rowErrors: BulkImportItemError[] = [
+        { item: 'relationship:r1', error: 'source entity missing', code: 'ENTITY_NOT_FOUND' },
+        { item: 'e1', error: 'refused value', code: 'PROVIDER_ERROR' },
+      ];
+      // Reports the row errors on the first chunk only; the importer calls
+      // importBulk once per chunk.
+      class RowErrorStorage extends InMemoryStorageProvider {
+        private reported = false;
+
+        public override async importBulk(
+          repositoryId: string,
+          data: ImportChunk[],
+          options?: BulkImportOptions,
+        ): Promise<BulkImportResult> {
+          const result = await super.importBulk(repositoryId, data, options);
+          if (this.reported) return result;
+          this.reported = true;
+          return { ...result, errors: [...result.errors, ...rowErrors] };
+        }
+      }
+      const source = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
+      const failingMemory = new DeepMemory({
+        storage: new RowErrorStorage(),
+        provenance: { actorId: 'test-agent', actorType: 'agent' },
+      });
+      const failed: Array<{ itemId: string; itemType: string; code?: string }> = [];
+      failingMemory.on('import:item-failed', (e) => {
+        failed.push({ itemId: e.payload.itemId, itemType: e.payload.itemType, code: e.payload.code });
+      });
+
+      const result = await failingMemory.importRepository(
+        { ...source, relationships: [] },
+        {
+          target: {
+            mode: 'create',
+            repositoryId: '10000000-0000-4000-a000-0000000000e1',
+            config: { repositoryId: '10000000-0000-4000-a000-0000000000e1', label: 'Row errors' },
+          },
+        },
+      );
+
+      const importErrors = result.warnings.filter((w) => w.code === 'import_error');
+      expect(importErrors.map((w) => ({ id: w.id, errorCode: w.errorCode }))).toEqual([
+        { id: 'r1', errorCode: 'ENTITY_NOT_FOUND' },
+        { id: 'e1', errorCode: 'PROVIDER_ERROR' },
+      ]);
+      expect(failed).toEqual([
+        { itemId: 'r1', itemType: 'relationship', code: 'ENTITY_NOT_FOUND' },
+        // No prefix: the item is looked up in the chunk and defaults to an entity.
+        { itemId: 'e1', itemType: 'entity', code: 'PROVIDER_ERROR' },
+      ]);
+    });
+
+    it('InMemory names a failed row with its entity:/relationship: prefix', async () => {
+      const storage = new InMemoryStorageProvider();
+      const repositoryId = '10000000-0000-4000-a000-0000000000e2';
+      await storage.createRepository({
+        repositoryId,
+        label: 'Prefix',
+        governanceConfig: { mode: 'open' },
+        createdAt: new Date().toISOString(),
+        createdBy: 'test-agent',
+      });
+      const source = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
+      const orphan = { ...source.relationships[0]!, id: 'orphan-rel', sourceEntityId: 'no-such-entity' };
+
+      const result = await storage.importBulk(repositoryId, [
+        { entities: source.entities },
+        { relationships: [orphan] },
+      ]);
+
+      expect(result.entitiesImported).toBe(source.entities.length);
+      expect(result.relationshipsImported).toBe(0);
+      expect(result.errors).toEqual([
+        expect.objectContaining({ item: 'relationship:orphan-rel', code: 'ENTITY_NOT_FOUND' }),
+      ]);
     });
 
     it('emits import:failed event on failure', async () => {

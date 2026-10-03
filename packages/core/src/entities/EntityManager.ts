@@ -24,8 +24,18 @@ import {
   OperationCancelledError,
   OperationAbortedError,
   EmbeddingProviderRequiredError,
+  isSlugConflict,
 } from '../core/errors.js';
 import { getEntityTypeDef } from '../vocabulary/VocabularyValidator.js';
+
+/**
+ * How many times a create or update re-picks a slug after the store refuses one as
+ * taken. Each conflict means another writer committed the same type and label
+ * in the window between the free-slug check and the write; a handful of
+ * retries absorbs ordinary contention without looping under a pathological
+ * burst.
+ */
+const MAX_SLUG_CONFLICT_RETRIES = 3;
 
 export class EntityManager {
   private embedding?: EmbeddingProvider;
@@ -47,7 +57,7 @@ export class EntityManager {
   }
 
   /** Create one or more entities with vocabulary validation, ID generation, provenance, and events */
-  async create(inputs: CreateEntityInput[]): Promise<Entity[]> {
+  public async create(inputs: CreateEntityInput[]): Promise<Entity[]> {
     const results: Entity[] = [];
 
     for (const input of inputs) {
@@ -78,14 +88,8 @@ export class EntityManager {
       const id = input.id ?? generateEntityId();
 
       // Generate unique slug
-      const slug = await generateUniqueSlug(
-        input.entityType,
-        input.label,
-        async (candidateSlug) => {
-          const existing = await this.storage.getEntityBySlug(this.repositoryId, candidateSlug);
-          return existing !== null;
-        },
-      );
+      const pickSlug = this.createSlugPicker(input.entityType, input.label);
+      const slug = await pickSlug();
 
       // Stamp provenance
       const provenance = this.provenanceTracker.stampCreate();
@@ -107,8 +111,13 @@ export class EntityManager {
         embedding: entityEmbedding,
       };
 
-      // Persist
-      const created = await this.storage.createEntity(this.repositoryId, storedEntity);
+      // Persist, re-picking the slug if a concurrent writer claimed it first.
+      const created = await this.writeWithSlugRetry(
+        slug,
+        (candidateSlug) =>
+          this.storage.createEntity(this.repositoryId, { ...storedEntity, slug: candidateSlug }),
+        pickSlug,
+      );
 
       // Map to public type
       const entity = storedToEntity(created);
@@ -122,8 +131,56 @@ export class EntityManager {
     return results;
   }
 
+  /**
+   * A free-slug picker for one write. Called with no argument it returns the
+   * first free candidate; called with a slug the store refused, it records
+   * that slug as taken and returns the next free one. A refused slug counts
+   * as taken even before the competing write is visible to a read, so every
+   * retry moves on to a new candidate. `ownSlug` (the entity's current slug,
+   * on update) is never a conflict.
+   */
+  private createSlugPicker(
+    entityType: string,
+    label: string,
+    ownSlug?: string,
+  ): (refusedSlug?: string) => Promise<string> {
+    const refused = new Set<string>();
+    return async (refusedSlug) => {
+      if (refusedSlug !== undefined) refused.add(refusedSlug);
+      return generateUniqueSlug(entityType, label, async (candidateSlug) => {
+        if (refused.has(candidateSlug)) return true;
+        if (candidateSlug === ownSlug) return false;
+        const holder = await this.storage.getEntityBySlug(this.repositoryId, candidateSlug);
+        return holder !== null;
+      });
+    };
+  }
+
+  /**
+   * Run a write that stores `slug`, re-picking the slug when the store
+   * reports it as held by another entity. The free-slug check and the write
+   * are separate steps, so a concurrent writer with the same type and label
+   * can claim the slug in between; a bounded number of retries absorbs that.
+   * Any other error, and the conflict after the last retry, propagates.
+   */
+  private async writeWithSlugRetry<T>(
+    slug: string,
+    write: (slug: string) => Promise<T>,
+    pickSlug: (refusedSlug: string) => Promise<string>,
+  ): Promise<T> {
+    let candidate = slug;
+    for (let retry = 0; ; retry++) {
+      try {
+        return await write(candidate);
+      } catch (err) {
+        if (!isSlugConflict(err) || retry >= MAX_SLUG_CONFLICT_RETRIES) throw err;
+        candidate = await pickSlug(candidate);
+      }
+    }
+  }
+
   /** Update an existing entity */
-  async update(entityId: string, updates: UpdateEntityInput): Promise<Entity> {
+  public async update(entityId: string, updates: UpdateEntityInput): Promise<Entity> {
     // Get existing entity to determine its type for validation
     const existing = await this.storage.getEntity(this.repositoryId, entityId);
     if (!existing) {
@@ -175,18 +232,14 @@ export class EntityManager {
     const typeChanged = updates.entityType !== undefined && updates.entityType !== existing.entityType;
     const labelChanged = updates.label !== undefined && updates.label !== existing.label;
     let newSlug: string | undefined;
+    let pickSlug: ((refusedSlug?: string) => Promise<string>) | undefined;
     if (typeChanged || labelChanged) {
-      const nextType = updates.entityType ?? existing.entityType;
-      const nextLabel = updates.label ?? existing.label;
-      newSlug = await generateUniqueSlug(
-        nextType,
-        nextLabel,
-        async (candidateSlug) => {
-          if (candidateSlug === existing.slug) return false; // the entity's own slug isn't a conflict
-          const other = await this.storage.getEntityBySlug(this.repositoryId, candidateSlug);
-          return other !== null;
-        },
+      pickSlug = this.createSlugPicker(
+        updates.entityType ?? existing.entityType,
+        updates.label ?? existing.label,
+        existing.slug,
       );
+      newSlug = await pickSlug();
     }
 
     // Regenerate embedding if label/summary changed or reembed explicitly requested.
@@ -199,18 +252,24 @@ export class EntityManager {
       ? await this.generateEmbedding(updates.label ?? existing.label, nextSummary, mergedProperties, nextEntityType)
       : undefined; // undefined preserves the existing embedding in storage
 
-    // Persist
-    const updated = await this.storage.updateEntity(this.repositoryId, entityId, {
-      entityType: typeChanged ? updates.entityType : undefined,
-      label: updates.label,
-      slug: newSlug,
-      summary: updates.summary,
-      properties: updates.properties ? mergedProperties : undefined,
-      data: updates.data,
-      dataFormat: updates.dataFormat,
-      provenance,
-      embedding: entityEmbedding,
-    });
+    // Persist. When the slug changes, re-pick it if a concurrent writer
+    // claimed it first.
+    const write = (slug: string | undefined): Promise<StoredEntity> =>
+      this.storage.updateEntity(this.repositoryId, entityId, {
+        entityType: typeChanged ? updates.entityType : undefined,
+        label: updates.label,
+        slug,
+        summary: updates.summary,
+        properties: updates.properties ? mergedProperties : undefined,
+        data: updates.data,
+        dataFormat: updates.dataFormat,
+        provenance,
+        embedding: entityEmbedding,
+      });
+    const updated =
+      newSlug !== undefined && newSlug !== existing.slug && pickSlug !== undefined
+        ? await this.writeWithSlugRetry(newSlug, write, pickSlug)
+        : await write(newSlug);
 
     const entity = storedToEntity(updated);
     await this.eventBus.emit('entity:updated', { entity });

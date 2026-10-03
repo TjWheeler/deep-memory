@@ -1,17 +1,32 @@
 // CypherCompiler — compiles TraversalSpec to Cypher query strings
 // Zero runtime dependencies — pure string construction with parameterized bindings.
+//
+// Values are always bound as parameters. Cypher cannot parameterise
+// identifier positions, so property keys, relationship type names and
+// projection columns are written into the query text; every one is checked
+// against the safe-identifier rule first, and repeat depths must be positive
+// integers. The compiler enforces this itself because it is the last step
+// before the query reaches the database, whatever entry point built the spec.
 
 import type { TraversalSpec } from '../../types/traversal.js';
 import type { MemoryVocabulary } from '../../types/vocabulary.js';
 import type { PropertyFilter } from '../../types/queries.js';
 import type { TraversalCompiler, CompiledQuery } from './TraversalCompiler.js';
+import {
+  assertList,
+  assertPositiveSafeInteger,
+  assertPropertyFilterList,
+  assertSafeIdentifier,
+  assertStepList,
+  rejectUnsupported,
+} from './compilerGuards.js';
 
 const DEFAULT_ESTIMATED_FANOUT_PER_HOP = 10;
 
 export class CypherCompiler implements TraversalCompiler {
   readonly language = 'cypher' as const;
 
-  compile(spec: TraversalSpec, _vocabulary: MemoryVocabulary): CompiledQuery {
+  public compile(spec: TraversalSpec, _vocabulary: MemoryVocabulary): CompiledQuery {
     const params: Record<string, unknown> = {};
     let paramIndex = 0;
     let estimatedFanOut = 1;
@@ -41,6 +56,7 @@ export class CypherCompiler implements TraversalCompiler {
     }
 
     if (spec.start.filter) {
+      assertPropertyFilterList(spec.start.filter, 'start.filter');
       for (const f of spec.start.filter) {
         whereClauses.push(compilePropertyFilterCypher(startNode, f, nextParam));
       }
@@ -50,19 +66,31 @@ export class CypherCompiler implements TraversalCompiler {
 
     let lastNode = startNode;
     const steps = spec.steps ?? [];
+    assertStepList(steps, 'steps');
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i]!;
       const targetNode = `n${nodeIndex++}`;
       const relAlias = `r${i}`;
 
-      // Relationship type pattern
+      // Relationship type pattern — type names are emitted inline.
+      if (step.relationshipTypes) {
+        assertList(step.relationshipTypes, `steps[${i}].relationshipTypes`);
+      }
       const relTypes = step.relationshipTypes?.length
-        ? step.relationshipTypes.join('|')
+        ? step.relationshipTypes
+            .map((rt) => {
+              assertSafeIdentifier(rt, `relationship type in steps[${i}]`);
+              return rt;
+            })
+            .join('|')
         : '';
       const relTypePattern = relTypes ? `:${relTypes}` : '';
 
-      // Repeat — variable-length path
+      // Repeat — variable-length path. The upper bound is a literal.
+      if (step.repeat) {
+        assertPositiveSafeInteger(step.repeat.maxDepth, `steps[${i}].repeat.maxDepth`);
+      }
       const depthPattern = step.repeat
         ? `*1..${step.repeat.maxDepth}`
         : '';
@@ -79,6 +107,8 @@ export class CypherCompiler implements TraversalCompiler {
         case 'both':
           pattern = `-[${relAlias}${relTypePattern}${depthPattern}]-(${targetNode})`;
           break;
+        default:
+          rejectUnsupported(step.direction, `steps[${i}].direction`);
       }
 
       matchParts.push(pattern);
@@ -86,7 +116,10 @@ export class CypherCompiler implements TraversalCompiler {
         ? step.repeat.maxDepth * DEFAULT_ESTIMATED_FANOUT_PER_HOP
         : DEFAULT_ESTIMATED_FANOUT_PER_HOP;
 
-      // Entity type filter
+      // Entity type filter — bound as a single list parameter.
+      if (step.entityTypes) {
+        assertList(step.entityTypes, `steps[${i}].entityTypes`);
+      }
       if (step.entityTypes && step.entityTypes.length > 0) {
         const typeParam = nextParam(step.entityTypes);
         whereClauses.push(`${targetNode}.entityType IN ${typeParam}`);
@@ -94,6 +127,7 @@ export class CypherCompiler implements TraversalCompiler {
 
       // Entity property filters
       if (step.entityFilter) {
+        assertPropertyFilterList(step.entityFilter, `steps[${i}].entityFilter`);
         for (const f of step.entityFilter) {
           whereClauses.push(compilePropertyFilterCypher(targetNode, f, nextParam));
         }
@@ -101,6 +135,7 @@ export class CypherCompiler implements TraversalCompiler {
 
       // Relationship property filters
       if (step.relationshipFilter) {
+        assertPropertyFilterList(step.relationshipFilter, `steps[${i}].relationshipFilter`);
         for (const f of step.relationshipFilter) {
           whereClauses.push(compilePropertyFilterCypher(relAlias, f, nextParam));
         }
@@ -128,9 +163,9 @@ export class CypherCompiler implements TraversalCompiler {
     let returnClause: string;
     // Server-side projection is only emitted for terminal-mode queries — the
     // anchor (lastNode) is unambiguous there. For 'all' / 'path' modes the
-    // emission stays vertex/edge-oriented and projection is dropped silently
-    // (the bug repro is terminal mode; multi-anchor projection over the
-    // walked set is a separate concern).
+    // emission stays vertex/edge-oriented and projection is dropped silently:
+    // those modes walk several anchors, and projecting over the walked set
+    // would need a per-alias column scheme the executor does not parse.
     const emitProjection =
       spec.projection !== undefined && spec.returnMode !== 'path' && spec.returnMode !== 'all';
 
@@ -141,11 +176,11 @@ export class CypherCompiler implements TraversalCompiler {
 
       // Each projected property becomes one column aliased to its own name so
       // the executor can rebuild { [prop]: value } maps positionally. Property
-      // keys are validated against the same identifier rule used for filter
-      // emission upstream (compilePropertyFilterCypher); user-supplied data
-      // never reaches Cypher unparameterised.
+      // names are emitted inline (as both the key and the column alias), so
+      // they pass the same identifier rule as filter keys.
+      assertList(projection.properties, 'projection.properties');
       const projectionColumns = projection.properties.map((prop) => {
-        assertSafeProjectionKey(prop);
+        assertSafeIdentifier(prop, 'projection property name');
         return `${lastNode}.${prop} AS ${prop}`;
       });
 
@@ -199,29 +234,17 @@ export class CypherCompiler implements TraversalCompiler {
   }
 }
 
-const SAFE_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
 /**
- * Guard against Cypher injection through projection property names. Projection
- * keys are emitted inline (Cypher does not parameterise identifier positions),
- * so they must look like ordinary identifiers — letters, digits, underscores,
- * starting with a non-digit. The same rule is enforced upstream when a key
- * lands on the wire via the storage layer's safe-key validator.
+ * Compile a single property filter to a Cypher WHERE clause fragment. The key
+ * is emitted inline as `alias.key`, so it must be a safe identifier; the value
+ * is always bound as a parameter.
  */
-function assertSafeProjectionKey(key: string): void {
-  if (!SAFE_KEY_RE.test(key)) {
-    throw new Error(
-      `Unsafe projection property name: "${key}". Property names must match ${SAFE_KEY_RE.source}.`,
-    );
-  }
-}
-
-/** Compile a single property filter to a Cypher WHERE clause fragment. */
 function compilePropertyFilterCypher(
   nodeAlias: string,
   filter: PropertyFilter,
   nextParam: (value: unknown) => string,
 ): string {
+  assertSafeIdentifier(filter.key, 'property filter key');
   const prop = `${nodeAlias}.${filter.key}`;
 
   switch (filter.operator) {
@@ -243,5 +266,7 @@ function compilePropertyFilterCypher(
       return `${prop} IS NULL`;
     case 'isNotNull':
       return `${prop} IS NOT NULL`;
+    default:
+      return rejectUnsupported(filter.operator, 'property filter operator');
   }
 }

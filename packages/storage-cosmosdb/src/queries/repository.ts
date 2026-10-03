@@ -23,6 +23,7 @@ import {
   createEmptyVocabulary,
 } from '@utaba/deep-memory';
 import { repoVertexId, vocabVertexId } from './ids.js';
+import { submitCreate } from './create.js';
 
 const REPO_LABEL = '_repository';
 
@@ -205,12 +206,21 @@ export async function createRepository(
 
   // Vocabulary first — see the ordering note above.
   const initialVocabulary = config.vocabulary ?? createEmptyVocabulary(config.createdBy);
-  await conn.submit(VOCABULARY_CREATE_QUERY, {
-    vid: vocabVertexId(config.repositoryId),
-    rid: config.repositoryId,
-    vocabVersion: initialVocabulary.version,
-    vocabJson: JSON.stringify(initialVocabulary),
-  });
+  // A 409 on either write means a concurrent create of the same repository
+  // got there first.
+  const duplicate = (cause: unknown): DuplicateRepositoryError =>
+    new DuplicateRepositoryError(config.repositoryId, { cause });
+  await submitCreate(
+    conn,
+    VOCABULARY_CREATE_QUERY,
+    {
+      vid: vocabVertexId(config.repositoryId),
+      rid: config.repositoryId,
+      vocabVersion: initialVocabulary.version,
+      vocabJson: JSON.stringify(initialVocabulary),
+    },
+    duplicate,
+  );
 
   // Compute the updated sentinel array client-side before the atomic write.
   // One extra round-trip (the sentinel read), but it lets the actual create
@@ -230,7 +240,7 @@ export async function createRepository(
     ...repositoryConfigToLadderBindings(config),
   };
 
-  await conn.submit(REPOSITORY_CREATE_QUERY, bindings);
+  await submitCreate(conn, REPOSITORY_CREATE_QUERY, bindings, duplicate);
 
   return {
     repositoryId: config.repositoryId,

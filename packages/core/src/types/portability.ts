@@ -1,5 +1,6 @@
 // Portability types — export/import of memory repositories
 
+import type { DeepMemoryErrorCode } from '../core/errors.js';
 import type { GovernanceMode } from './vocabulary.js';
 import type { MemoryVocabulary } from './vocabulary.js';
 import type { StoredEntity } from './entities.js';
@@ -308,6 +309,8 @@ export interface ImportWarning {
   message: string;
   id?: string;
   relationshipId?: string;
+  /** Code of the typed error behind the warning, when the storage layer classified it. */
+  errorCode?: DeepMemoryErrorCode;
 }
 
 /** Result of an import operation */

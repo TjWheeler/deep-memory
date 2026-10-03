@@ -5,6 +5,15 @@ import type { TraversalProjection, TraversalSpec, TraversalStep } from '../../ty
 import type { MemoryVocabulary } from '../../types/vocabulary.js';
 import type { PropertyFilter } from '../../types/queries.js';
 import type { TraversalCompiler, CompiledQuery } from './TraversalCompiler.js';
+import { TraversalValidationError } from '../../core/errors.js';
+import {
+  assertList,
+  assertPositiveSafeInteger,
+  assertPropertyFilterList,
+  assertSafeIdentifier,
+  assertStepList,
+  rejectUnsupported,
+} from './compilerGuards.js';
 
 const DEFAULT_ESTIMATED_FANOUT_PER_HOP = 10;
 
@@ -14,8 +23,8 @@ const DEFAULT_ESTIMATED_FANOUT_PER_HOP = 10;
 // every traversal. We emit explicit project chains listing only the keys the
 // storage-cosmosdb mappers consume.
 //
-// CosmosDB Gremlin shape constraints (live-validated 2026-05-25 against the
-// emulator):
+// CosmosDB Gremlin shape constraints (each one breaks the query or the row on
+// CosmosDB if ignored; see docs/cosmosdb-gremlin-compatibility.md):
 //
 //   1. A single `.path().by(project(...))` across mixed vertex+edge objects
 //      crashes when an edge lacks a vertex-only key. The working form is two
@@ -149,7 +158,7 @@ export function buildEdgeProjectChain(): string {
 export class GremlinCompiler implements TraversalCompiler {
   readonly language = 'gremlin' as const;
 
-  compile(spec: TraversalSpec, _vocabulary: MemoryVocabulary): CompiledQuery {
+  public compile(spec: TraversalSpec, _vocabulary: MemoryVocabulary): CompiledQuery {
     const parts: string[] = [];
     const params: Record<string, unknown> = {};
     let paramIndex = 0;
@@ -178,6 +187,7 @@ export class GremlinCompiler implements TraversalCompiler {
     }
 
     if (spec.start.filter) {
+      assertPropertyFilterList(spec.start.filter, 'start.filter');
       for (const f of spec.start.filter) {
         parts.push(compilePropertyFilter(f, nextParam));
       }
@@ -186,28 +196,31 @@ export class GremlinCompiler implements TraversalCompiler {
     // ─── Mode-specific emission ─────────────────────────────────
 
     const steps = spec.steps ?? [];
+    assertStepList(steps, 'steps');
     const returnMode = spec.returnMode ?? 'terminal';
 
     if (returnMode === 'all') {
       // Server-side union of every depth's edges and vertices, then dedup.
       // Each unique element is serialised once regardless of how many walks
-      // visit it — large RU saving vs path()+client-dedup at depth ≥ 2.
-      // See plan §3 (revised) for the construction.
+      // visit it — large RU saving vs path()+client-dedup at depth ≥ 2. The
+      // union carries one vertex branch and one edge branch per depth, so
+      // every depth has to be a distinct, explicit step.
       if (steps.some((s) => s.repeat)) {
-        throw new Error(
-          "GremlinCompiler: 'all' returnMode does not support repeat steps. Use 'terminal' or 'path' mode, or unroll the repeat into explicit steps.",
-        );
+        throw new TraversalValidationError([
+          "'all' returnMode does not support repeat steps. Use 'terminal' or 'path' mode, or unroll the repeat into explicit steps.",
+        ]);
       }
 
       // Pre-compile each step's edge and vertex strings ONCE so params are
       // allocated once and shared across the branches that reference them.
-      const compiledSteps = steps.map((step) => ({
-        edge: compileEdgeOnly(step, nextParam),
-        vertex: compileVertexHop(step),
-        // Per plan §3: entity-type/property filters apply only on branches
-        // ending at that depth's vertex. They are NOT included in the prefix
-        // that deeper branches traverse through.
-        entityFilters: compileEntityFilters(step, nextParam),
+      const compiledSteps = steps.map((step, i) => ({
+        edge: compileEdgeOnly(step, i, nextParam),
+        vertex: compileVertexHop(step, i),
+        // Entity-type/property filters apply only on branches ending at that
+        // depth's vertex. They are NOT included in the prefix that deeper
+        // branches traverse through, so a filter on one depth's entities
+        // never prunes the walk to the next depth.
+        entityFilters: compileEntityFilters(step, i, nextParam),
       }));
 
       // Branches inside .union(...) are anonymous traversals — each must be
@@ -258,31 +271,27 @@ export class GremlinCompiler implements TraversalCompiler {
       // whether they use edge-explicit emission and in their projection.
       const useEdgeEmission = returnMode === 'path';
 
-      for (const step of steps) {
+      for (const [i, step] of steps.entries()) {
+        // The relationship filter decides which emission branch runs (and
+        // the repeat branch reads it too), so check its shape first: a
+        // non-array value would otherwise read as "no filter" and be dropped.
+        if (step.relationshipFilter != null) {
+          assertPropertyFilterList(step.relationshipFilter, `steps[${i}].relationshipFilter`);
+        }
         if (step.repeat) {
-          parts.push(compileRepeatStep(step, nextParam, useEdgeEmission));
+          parts.push(compileRepeatStep(step, i, nextParam, useEdgeEmission));
           estimatedFanOut *= step.repeat.maxDepth * DEFAULT_ESTIMATED_FANOUT_PER_HOP;
         } else if (useEdgeEmission || (step.relationshipFilter && step.relationshipFilter.length > 0)) {
           // Edge-explicit traversal — required for path-walking, or for relationship property filters
-          parts.push(compileEdgeStep(step, nextParam));
+          parts.push(compileEdgeStep(step, i, nextParam));
           estimatedFanOut *= DEFAULT_ESTIMATED_FANOUT_PER_HOP;
         } else {
-          parts.push(compileSimpleStep(step, nextParam));
+          parts.push(compileSimpleStep(step, i, nextParam));
           estimatedFanOut *= DEFAULT_ESTIMATED_FANOUT_PER_HOP;
         }
 
-        // Entity type filter on target vertices
-        if (step.entityTypes && step.entityTypes.length > 0) {
-          const typeParams = step.entityTypes.map((t) => nextParam(t));
-          parts.push(`.has('entityType', within(${typeParams.join(', ')}))`);
-        }
-
-        // Entity property filters on target vertices
-        if (step.entityFilter) {
-          for (const f of step.entityFilter) {
-            parts.push(compilePropertyFilter(f, nextParam));
-          }
-        }
+        // Entity type and property filters on target vertices
+        parts.push(compileEntityFilters(step, i, nextParam));
       }
 
       // Server-side projection replaces the vertex-projected terminal with a
@@ -307,8 +316,7 @@ export class GremlinCompiler implements TraversalCompiler {
       // emits walks-with-cycles (A→B→A→B…) that inflate the result set
       // O(fanout^maxDepth) and are not paths in any sensible sense. simplePath()
       // must be placed BEFORE .path() so it filters traversers; placed after,
-      // it would (incorrectly) operate on the collected Path objects. Live-
-      // probed against the Cosmos emulator 2026-05-25 — see
+      // it would (incorrectly) operate on the collected Path objects. See
       // docs/cosmosdb-gremlin-compatibility.md §Repeat/variable-depth.
       // Not emitted for 'terminal' (no walk context) or 'all' (no path).
       if (returnMode === 'path') {
@@ -360,10 +368,11 @@ export class GremlinCompiler implements TraversalCompiler {
 /** Compile a simple vertex-to-vertex step (no relationship property filters). */
 function compileSimpleStep(
   step: TraversalStep,
+  stepIndex: number,
   nextParam: (value: unknown) => string,
 ): string {
   const types = step.relationshipTypes;
-  const typeArgs = types ? types.map((t) => nextParam(t)).join(', ') : '';
+  const typeArgs = compileRelationshipTypeArgs(step, stepIndex, nextParam);
 
   switch (step.direction) {
     case 'out':
@@ -372,17 +381,32 @@ function compileSimpleStep(
       return types ? `.in(${typeArgs})` : '.in()';
     case 'both':
       return types ? `.both(${typeArgs})` : '.both()';
+    default:
+      return rejectUnsupported(step.direction, `steps[${stepIndex}].direction`);
   }
+}
+
+/** Bind each relationship type name as a parameter and return the argument list. */
+function compileRelationshipTypeArgs(
+  step: TraversalStep,
+  stepIndex: number,
+  nextParam: (value: unknown) => string,
+): string {
+  const types = step.relationshipTypes;
+  if (!types) return '';
+  assertList(types, `steps[${stepIndex}].relationshipTypes`);
+  return types.map((t) => nextParam(t)).join(', ');
 }
 
 /** Compile the edge portion of an edge-explicit step (no vertex hop). */
 function compileEdgeOnly(
   step: TraversalStep,
+  stepIndex: number,
   nextParam: (value: unknown) => string,
 ): string {
   const parts: string[] = [];
   const types = step.relationshipTypes;
-  const typeArgs = types ? types.map((t) => nextParam(t)).join(', ') : '';
+  const typeArgs = compileRelationshipTypeArgs(step, stepIndex, nextParam);
 
   switch (step.direction) {
     case 'out':
@@ -394,9 +418,12 @@ function compileEdgeOnly(
     case 'both':
       parts.push(types ? `.bothE(${typeArgs})` : '.bothE()');
       break;
+    default:
+      rejectUnsupported(step.direction, `steps[${stepIndex}].direction`);
   }
 
   if (step.relationshipFilter) {
+    assertPropertyFilterList(step.relationshipFilter, `steps[${stepIndex}].relationshipFilter`);
     for (const f of step.relationshipFilter) {
       parts.push(compilePropertyFilter(f, nextParam));
     }
@@ -406,7 +433,7 @@ function compileEdgeOnly(
 }
 
 /** Compile the vertex-hop portion of an edge-explicit step. */
-function compileVertexHop(step: TraversalStep): string {
+function compileVertexHop(step: TraversalStep, stepIndex: number): string {
   switch (step.direction) {
     case 'out':
       return '.inV()';
@@ -414,22 +441,29 @@ function compileVertexHop(step: TraversalStep): string {
       return '.outV()';
     case 'both':
       return '.otherV()';
+    default:
+      return rejectUnsupported(step.direction, `steps[${stepIndex}].direction`);
   }
 }
 
 /** Compile entity-type and entity-property filters that apply to a target vertex. */
 function compileEntityFilters(
   step: TraversalStep,
+  stepIndex: number,
   nextParam: (value: unknown) => string,
 ): string {
   const parts: string[] = [];
 
+  if (step.entityTypes) {
+    assertList(step.entityTypes, `steps[${stepIndex}].entityTypes`);
+  }
   if (step.entityTypes && step.entityTypes.length > 0) {
     const typeParams = step.entityTypes.map((t) => nextParam(t));
     parts.push(`.has('entityType', within(${typeParams.join(', ')}))`);
   }
 
   if (step.entityFilter) {
+    assertPropertyFilterList(step.entityFilter, `steps[${stepIndex}].entityFilter`);
     for (const f of step.entityFilter) {
       parts.push(compilePropertyFilter(f, nextParam));
     }
@@ -441,21 +475,23 @@ function compileEntityFilters(
 /** Compile an edge-explicit step for relationship property filtering. */
 function compileEdgeStep(
   step: TraversalStep,
+  stepIndex: number,
   nextParam: (value: unknown) => string,
 ): string {
-  return compileEdgeOnly(step, nextParam) + compileVertexHop(step);
+  return compileEdgeOnly(step, stepIndex, nextParam) + compileVertexHop(step, stepIndex);
 }
 
 /** Compile a repeat/loop step. */
 function compileRepeatStep(
   step: TraversalStep,
+  stepIndex: number,
   nextParam: (value: unknown) => string,
   useEdgeEmission: boolean,
 ): string {
   const parts: string[] = [];
   const innerStep = (useEdgeEmission || step.relationshipFilter?.length)
-    ? compileEdgeStep({ ...step, repeat: undefined }, nextParam)
-    : compileSimpleStep(step, nextParam);
+    ? compileEdgeStep({ ...step, repeat: undefined }, stepIndex, nextParam)
+    : compileSimpleStep(step, stepIndex, nextParam);
 
   // emit() placement: before repeat for intermediates, after for terminal-only
   if (step.repeat?.emitIntermediates !== false) {
@@ -465,6 +501,9 @@ function compileRepeatStep(
   parts.push(`.repeat(${innerStep.startsWith('.') ? `__${innerStep}` : innerStep})`);
 
   // Until condition
+  if (step.repeat?.until) {
+    assertPropertyFilterList(step.repeat.until, `steps[${stepIndex}].repeat.until`);
+  }
   if (step.repeat?.until && step.repeat.until.length > 0) {
     const untilParts = step.repeat.until.map((f) => compilePropertyFilter(f, nextParam));
     parts.push(`.until(${untilParts.join('')})`);
@@ -478,11 +517,7 @@ function compileRepeatStep(
   // `maxDepth` is required on the repeat object — so an unset value here
   // would already be a type error upstream.
   const n = step.repeat!.maxDepth;
-  if (!Number.isInteger(n) || n < 1) {
-    throw new Error(
-      `GremlinCompiler: repeat.maxDepth must be a positive integer; got ${n}`,
-    );
-  }
+  assertPositiveSafeInteger(n, `steps[${stepIndex}].repeat.maxDepth`);
   parts.push(`.times(${n})`);
 
   if (step.repeat?.emitIntermediates === false) {
@@ -490,23 +525,6 @@ function compileRepeatStep(
   }
 
   return parts.join('');
-}
-
-const SAFE_PROJECTION_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/**
- * Guard against Gremlin injection through projection property names.
- * Property names land inline in `values('p')` / `project('p')` steps —
- * Gremlin does not parameterise identifier positions — so they must look
- * like ordinary identifiers (letters, digits, underscores, leading non-digit).
- * Same rule and error shape the sibling CypherCompiler enforces for symmetry.
- */
-function assertSafeProjectionKey(key: string): void {
-  if (!SAFE_PROJECTION_KEY_RE.test(key)) {
-    throw new Error(
-      `Unsafe projection property name: "${key}". Property names must match ${SAFE_PROJECTION_KEY_RE.source}.`,
-    );
-  }
 }
 
 /**
@@ -525,16 +543,18 @@ function assertSafeProjectionKey(key: string): void {
  * Map keyed by property name — the parser walks the same Map shape in either
  * mode and a single property still wraps to `{ p: scalar }` downstream.
  *
- * Property names are validated with `assertSafeProjectionKey` because they
- * cannot be parameterised in Gremlin.
+ * Property names land inline in `values('p')` / `project('p')` steps —
+ * Gremlin does not parameterise identifier positions — so each one must be a
+ * safe identifier, the same rule the sibling CypherCompiler applies.
  */
 function emitProjectionTerminal(projection: TraversalProjection): string {
   const properties = projection.properties;
   const mode = projection.mode ?? 'values';
   const distinct = projection.distinct ?? false;
 
+  assertList(properties, 'projection.properties');
   for (const prop of properties) {
-    assertSafeProjectionKey(prop);
+    assertSafeIdentifier(prop, 'projection property name');
   }
 
   const singleProperty = properties.length === 1;
@@ -598,5 +618,7 @@ function compilePropertyFilter(
       return `.hasNot(${key})`;
     case 'isNotNull':
       return `.has(${key})`;
+    default:
+      return rejectUnsupported(filter.operator, 'property filter operator');
   }
 }

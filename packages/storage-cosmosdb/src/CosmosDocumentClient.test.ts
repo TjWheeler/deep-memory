@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { ProviderError } from '@utaba/deep-memory';
 import { CosmosDocumentClient } from './CosmosDocumentClient.js';
 import { usageScope, type UsageAccumulator } from './usage.js';
 
@@ -160,9 +161,9 @@ describe('CosmosDocumentClient.query', () => {
       }),
     );
     const client = new CosmosDocumentClient({ ...baseConfig, maxRetries: 1 }, fetchStub);
-    await expect(
-      client.query('SELECT * FROM c', [], { partitionKey: 'rid-1' }),
-    ).rejects.toThrow(/429/);
+    const query = client.query('SELECT * FROM c', [], { partitionKey: 'rid-1' });
+    await expect(query).rejects.toBeInstanceOf(ProviderError);
+    await expect(query).rejects.toThrow(/429/);
     expect(fetchStub).toHaveBeenCalledTimes(2); // initial + 1 retry
   });
 
@@ -171,9 +172,10 @@ describe('CosmosDocumentClient.query', () => {
       makeResponse({ status: 400, bodyText: 'syntax error in query' }),
     );
     const client = new CosmosDocumentClient(baseConfig, fetchStub);
-    await expect(
-      client.query('SELECT BROKEN', [], { partitionKey: 'rid-1' }),
-    ).rejects.toThrow(/400.*syntax error/);
+    const query = client.query('SELECT BROKEN', [], { partitionKey: 'rid-1' });
+    await expect(query).rejects.toBeInstanceOf(ProviderError);
+    await expect(query).rejects.toMatchObject({ cause: { status: 400, body: 'syntax error in query' } });
+    await expect(query).rejects.toThrow(/400.*syntax error/);
     expect(fetchStub).toHaveBeenCalledTimes(1);
   });
 });

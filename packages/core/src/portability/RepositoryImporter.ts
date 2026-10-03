@@ -18,6 +18,7 @@ import {
   hasErrorCode,
   InvalidInputError,
   OperationAbortedError,
+  RepositoryNotFoundError,
   type DeepMemoryErrorCode,
 } from '../core/errors.js';
 import {
@@ -289,15 +290,11 @@ export class RepositoryImporter {
     const target = options.target as { mode: 'merge'; repositoryId: string };
     const repositoryId = target.repositoryId;
 
-    // Verify target exists
+    // Merging needs an existing target. A missing repository is an error like
+    // any other repository-scoped call, not an unsuccessful import result.
     const existingRepo = await this.storage.getRepository(repositoryId);
     if (!existingRepo) {
-      return {
-        success: false,
-        repositoryId,
-        statistics: { entitiesImported: 0, entitiesSkipped: 0, relationshipsImported: 0, relationshipsSkipped: 0, vocabularyExtensions: 0 },
-        warnings: [{ code: 'repository_not_found', message: `Repository "${repositoryId}" not found` }],
-      };
+      throw new RepositoryNotFoundError(repositoryId);
     }
 
     // Handle vocabulary migration

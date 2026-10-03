@@ -104,6 +104,7 @@ Verified either by live probe (cited below) or by being in production code that 
 | `coalesce(<traversal>, <fallback>)` | First-non-empty. Used at both the by-modulator level (for missing-field defaults) and the query level (for upsert via `fold().coalesce(unfold(), addV(...))`). |
 | `fold()` | Collapses a stream to a single list-valued traverser. Idiom for upsert: `g.V().has(...).fold().coalesce(unfold()..., addV(...)...)`. |
 | `unfold()` | Inverse of `fold()` — emits each list element as a separate traverser. |
+| `where(<traversal>)` | Filter a traverser by whether a child traversal emits anything. Works (2026-10-03, emulator). `filter(<traversal>)` does not: see [§Constraints](#filtertraversal). |
 | `choose(<predicateTraversal>, <true-branch>, <false-branch>)` | Conditional execution. **Verified working** — live-validated 2026-05-26. Used for the "fixed-shape property ladder" pattern: `.choose(__.constant(vN).is(neq(absentSentinel)), __.property('key', vN), __.identity())` skips a `.property(...)` write at runtime when the binding equals the sentinel. All three sub-traversals must be anonymous (`__.` prefix). Composes inside `addV().property(...).choose(...)` chains and survives across the `fold().coalesce(unfold()..., addV()...)` upsert shape. |
 
 ### Repeat / variable-depth
@@ -128,7 +129,7 @@ Verified either by live probe (cited below) or by being in production code that 
 | `.drop()` | Delete vertex or edge. On a vertex, also drops incident edges. |
 | `fold().coalesce(unfold().<update-chain>, <create-chain>)` | Atomic upsert pattern. Production use in [packages/storage-cosmosdb/src/queries/bulk.ts:246-303](../packages/storage-cosmosdb/src/queries/bulk.ts#L246-L303). |
 | `coalesce(unfold().constant('__duplicate'), __.V().has('repositoryId', rid).has('slug', s).has('entityType').limit(1).constant('__slug_taken'), addV(...))` | **Three-branch guarded create** (id check, slug check, write) in one submit. Live-validated 2026-10-03 against the emulator: a free slug writes the vertex; a slug another entity holds returns `__slug_taken` and writes nothing (`SlugConflictError`); a taken id still returns `__duplicate` (`DuplicateEntityError`), and wins when both id and slug are taken; the outer `_repository` marker branch still yields `__no_repository`. A mid-traversal `__.V()` that finds nothing yields no traverser, so `coalesce` falls through to `addV`. **Not transactional:** two creates in flight with the same slug can both pass the slug branch and both write. Id uniqueness is backed by the store itself (409 on a second document with the same id in the partition). Used by `createEntity` in [packages/storage-cosmosdb/src/queries/entity.ts](../packages/storage-cosmosdb/src/queries/entity.ts). |
-| `<marker>.fold().coalesce(unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(l).to(<target>)..., unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').constant('__no_target'), unfold().constant('__no_source'), constant('__no_repository'))` | **Guarded edge create that names the missing precondition** in one submit. Live-validated 2026-10-03 against the emulator (CosmosDB conformance 62/62, including the missing-source and missing-target cases). `addE(l).to(<traversal>)` whose target traversal finds nothing emits no traverser and raises no error, so the create branch is empty and `coalesce` falls through. The fallbacks are tried in order: the marker unfolds and the source is found, so the target was missing (`__no_target`); the marker unfolds, so the source was missing (`__no_source`); nothing to unfold, so the marker is absent (`__no_repository`). Each fallback writes nothing; the source lookup is partition-scoped and runs only on this failure path. The whole shape sits inside the outer edge-id duplicate check (`g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(unfold().constant('__duplicate'), ...)`). Used by `createRelationship` in [packages/storage-cosmosdb/src/queries/relationship.ts](../packages/storage-cosmosdb/src/queries/relationship.ts). |
+| `g.V().has('repositoryId', rid).hasId(within(repoVid, srcId, tgtId)).fold().as('vs').coalesce(__.unfold().hasLabel('_repository').hasNot('entityType').coalesce(__.select('vs').unfold().hasId(tgtId).has('entityType').as('t').select('vs').unfold().hasId(srcId).has('entityType').addE(l).to('t')..., __.select('vs').unfold().hasId(srcId).has('entityType').constant('__no_target'), __.constant('__no_source')), __.constant('__no_repository'))` | **Guarded edge create from one indexed lookup** that names the missing precondition. Live-validated 2026-10-03 against the emulator. The marker, the source and the target are fetched by id in the first step and folded; past the marker, the target is labelled `t` and `addE(l).to('t')` runs from the source, both re-emitted from the list with `select('vs').unfold()`. A missing source or target leaves the create branch empty and `coalesce` falls through: the source is in the list, so the target was missing (`__no_target`); otherwise `__no_source`; no marker, `__no_repository`. A self-loop (source = target) works: the one vertex serves both. `select('vs')` of a label set outside a `coalesce` works inside its branches. There is no edge-id check in the statement: a repository's vertices and edges share its partition, so a reused id is refused by the store with a 409 (`ConflictException`) when both endpoints exist, mapped to `DuplicateRelationshipError`; when an endpoint is missing, the provider reads `SELECT VALUE COUNT(1) FROM c WHERE c.id = @relId` through the Document endpoint, pinned to the repository's partition (3.09 RU hit / 2.89 miss, flat at 10 and 5,000 entities), to keep the precedence repository → id → source → target. The read counts every document in the partition — edges, entities, the marker, the vocabulary — because the store's 409 refuses an edge id equal to any of them; an edge-only read would answer `EntityNotFoundError` for an id the store would refuse once both endpoints existed. Same statement whether core minted the id or the caller supplied it. Used by `createRelationship` in [packages/storage-cosmosdb/src/queries/relationship.ts](../packages/storage-cosmosdb/src/queries/relationship.ts). The statement it replaced is described under [§Mid-traversal `V()`](#mid-traversal-v-after-aggregatefold-costs-ru-in-proportion-to-the-partition). |
 
 ### Side-effect collectors
 
@@ -145,6 +146,14 @@ Verified either by live probe (cited below) or by being in production code that 
 ## Constraints — patterns that fail
 
 Each entry: the pattern, the symptom (with the literal error text where available), and the workaround.
+
+### `filter(<traversal>)`
+
+**Pattern:** `.filter(__.<child traversal>)` to keep a traverser only when the child traversal emits something.
+
+**Symptom:** the query fails to compile with `GraphCompileException` (2026-10-03, emulator).
+
+**Workaround:** `.where(__.<child traversal>)`, which has the same meaning and works ([§Set algebra and branching](#set-algebra-and-branching)).
 
 ### Path `.by()` with a single project across mixed vertex+edge objects
 
@@ -355,7 +364,65 @@ Every entity vertex carries `entityType` and the system vertices never do, so th
 
 **Bucket entry lost ahead of an empty mid-traversal `V()`** (2026-10-03, emulator): `g.V()…hasId('e1').aggregate('found').by('id').V()…hasId(mid).hasLabel('_repository').aggregate('found').by('id').cap('found')` returns `[[]]` when the marker is absent — the `e1` entry aggregated *before* the `V()` that matches nothing does not reach `cap` (with the marker present it returns both ids). Inserting `fold().as('t')` between the first `aggregate` and the `V()` keeps it: `[["e1"]]`. The chosen shapes above have no mid-traversal `V()`, so they do not depend on this.
 
-**Not yet re-measured:** the guarded `createRelationship` shape (`<marker>.fold().coalesce(unfold().V()…hasId(srcId)…addE(…)…)`) measured 25.44 RU on the small repository and 205.24 RU on the 5,000-entity one through the provider (2026-10-03), consistent with the same mid-traversal `V()` cost; `createEntity` stayed flat (30.35 / 30.73).
+**`createRelationship` re-measured** (2026-10-03, emulator, 10-entity and 5,000-entity repositories in one container). The earlier shape (an outer `g.E()…hasId(relId).fold().coalesce(` id check, then a nested `g.V()…hasId(repoVid)` marker step and `unfold().V()…hasId(srcId)` / `.to(g.V()…hasId(tgtId))` endpoint lookups) measured 25.44 RU on the small repository and 205.24 on the large one through the provider. Re-run raw with a reduced property set it cost **202.84 RU on both** repositories once the container held the 5,000-entity one: the nested `V()` steps cost in proportion to more than the repository's own partition. The shape that fetches the marker and both endpoints in the first step ([§Mutation](#mutation)) costs 13.12 RU raw on both, and through the provider (full property ladder):
+
+| `createRelationship` through the provider | 10 entities | 5,000 entities |
+|---|---|---|
+| Success, id minted by core | 15.98 | 15.98 |
+| Success, caller-supplied id | 15.98 | 15.98 |
+| Missing source (create + partition id read) → `EntityNotFoundError` | 6.26 | 6.26 |
+| Reused edge id, missing source (create + partition id read) → `DuplicateRelationshipError` | 6.46 | 6.46 |
+| Id equal to an entity's id, missing source (create + partition id read) → `DuplicateRelationshipError` | 6.46 | 6.46 |
+| Reused id, endpoints present → 409 → `DuplicateRelationshipError` | no charge reported | no charge reported |
+| Marker absent → `RepositoryNotFoundError` | 3.09 | 3.09 |
+
+`createEntity` stayed flat (30.35 / 30.73).
+
+### Repository-marker checks on reads, traversals, by-type deletes and import
+
+Every repository-scoped call refuses a repository whose `_repository` marker is gone (`RepositoryNotFoundError`), including a call that would find data a stopped delete left behind. Measured 2026-10-03 on the emulator; raw shapes compared side by side at 10 and 5,000 entities, and against a repository with data whose marker was dropped ("gone"):
+
+| Shape | 10 | 5,000 | gone |
+|---|---|---|---|
+| `getEntity` unguarded: `g.V().has('repositoryId', rid).hasId(eid).has('entityType').<project>` | 3.33 | 3.33 | 3.33 (returns the row) |
+| `getEntity` (chosen): `g.V().has('repositoryId', rid).hasId(within(mid, eid)).union(__.hasLabel('_repository').hasNot('entityType').constant('__repository'), __.has('entityType').<project>)` | 3.27 | 3.27 | 3.23 (no `__repository` row) |
+| Same, entity missing | 3.23 | 3.23 | 2.89 |
+| `getEntities` of 3 ids, unguarded / chosen (`hasId(within(mid, …))` + the same `union`) | 3.57 / 3.51 | 3.57 / 3.51 | 3.53 / 3.43 |
+| `getEntityBySlug` unguarded: `…has('slug', s).has('entityType')…` | 3.33 | 3.33 | 3.33 |
+| `getEntityBySlug` (chosen): `g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('slug', s)).union(<marker branch>, __.has('entityType').<project>)` | 3.27 | 3.27 | 3.23 |
+| `getEntityRelationships` page, unguarded / chosen (`hasId(within(mid, eid)).union(<marker branch>, __.has('entityType').bothE().dedup().range(…).<project>)`) | 9.59 / 9.53 | 9.59 / 9.53 | 9.25 / 9.15 |
+| `getTimeline` entity read, unguarded / chosen (same `union`, `valueMap('createdAt', 'modifiedAt')`) | 3.33 / 3.27 | 3.33 / 3.27 | 3.33 / 3.23 |
+| `deleteEntitiesByType` of 3 entities, unguarded: `g.V()…has('entityType', etype).aggregate('found').by('id').drop().cap('found')` | 84.85 | 84.85 | 30.34 (**drops** the survivor) |
+| `deleteEntitiesByType` (chosen): `g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('entityType', etype)).fold().as('vs').unfold().hasLabel('_repository').hasNot('entityType').aggregate('found').by('id').select('vs').unfold().has('entityType', etype).aggregate('found').by('id').drop().cap('found')` | 84.99 | 84.99 | 2.99 (`[[]]`, nothing dropped) |
+| Same, no entity of the type | 3.23 | 3.23 | 2.89 |
+| Marker point read `REPOSITORY_MARKER_COUNT_QUERY` | 3.59 | 3.59 | 2.80 |
+| Marker through the Document endpoint: `SELECT c.id FROM c WHERE c.id = @mid AND c.label = '_repository' AND NOT IS_DEFINED(c.entityType)` (partition-pinned) | 3.22 | 3.22 | 2.80 |
+
+Findings: a `union` whose marker branch emits a constant costs nothing over the unguarded read; `or(__.hasId(x), __.has(k, v))` in the first step is served as cheaply as the bare property lookup and stays flat; and the guarded by-type delete keeps the `cap`-emits-an-empty-bucket behaviour, so a bucket without the marker id means nothing was dropped. Where a call cannot fetch the marker in its first step (an edge start: `getRelationship`, `deleteRelationshipsByType`; a label start: `getVocabularyChangeLog`; the Document-endpoint `findEntities`; a streamed export; an import; a traversal compiled by `GremlinCompiler`) it uses a marker point read, run concurrently with the read where there is one (`getRelationship`, the change log, `findEntities`, warm-cache traversals), so it adds no latency.
+
+Through the provider (RU per call, flat between sizes):
+
+| Call | 10 entities | 5,000 entities | Marker check |
+|---|---|---|---|
+| `getEntity` hit / miss | 3.27 / 3.23 | 3.27 / 3.23 | same request |
+| `getEntityBySlug` | 3.27 | 3.27 | same request |
+| `getEntities` of 3 ids / of none | 3.51 / 3.59 | 3.51 / 3.59 | same request / point read |
+| `findEntities`, no filter | 10.14 | 10.23 | Document-endpoint read alongside (+3.22) |
+| `getRelationship` | 9.75 | 9.75 | point read alongside (+3.59) |
+| `getEntityRelationships` both / out | 19.12 / 19.24 | 19.12 / 19.24 | same request (the page) |
+| `getTimeline` | 12.86 | 12.86 | same request (the entity read) |
+| `getVocabularyChangeLog` | 9.19 | 9.19 | point read alongside |
+| `deleteEntitiesByType` of 3 | 84.99 | 84.99 | same request |
+| `deleteRelationshipsByType` of 2 | 35.07 | 35.07 | point read first (+3.59) |
+| `importBulk([])` (the gate alone) | 3.59 | 3.59 | point read per chunk |
+| `traverse` from an id, cold cache / warm cache | 13.26 / 13.18 | 13.26 / 13.18 | vocabulary read / point read alongside |
+| `exploreNeighborhood` depth 1, warm | 16.26 | 16.26 | point read alongside |
+| `findPaths` depth 2, warm | 26.22 | 26.08 | point read alongside |
+
+`findEntities` with a type filter or a search term, and a traversal started by type, grow with the matched population (160 / 72 / 164 RU at 5,000 entities, from the `COUNT` and the type scan); that is the existing cost of those reads, and the marker read adds 3.22–3.59 RU to it. A traversal is guarded by a point read rather than inside its compiled statement because the compiler's output (a `union` of per-depth branches, `repeat`/`emit`, `path().by().by()`) would have to be split at its start step to fit a marker branch, and `path()` would record the folded list.
+
+Not atomic: `deleteRelationship`, `deleteRelationships` and `deleteRelationshipsByType` read the marker, then drop in a second request; a `deleteRepository` landing between the two lets the drop remove edges its drain would have removed and report them. `importBulk` reads the marker before each chunk but does not gate its row writes; a chunk in flight when the marker is dropped finishes writing, and rows that land after the drain has passed stay until `deleteRepository` runs again. `exportAll` reads the marker once, before its first page.
+
 
 ### `valueMap(true)` ships every property
 

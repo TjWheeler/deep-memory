@@ -447,6 +447,57 @@ describe('importBulk failure handling', () => {
     ).rejects.toMatchObject({ name: 'RepositoryNotFoundError', code: 'REPOSITORY_NOT_FOUND' });
   });
 
+  it('reads the marker when every row is refused before any write, and answers a missing repository', async () => {
+    const reserved: StoredEntity = { ...entity('e1'), properties: { repositoryId: 'other' } };
+    const unsafe: StoredRelationship = { ...relationship('r1'), relationshipType: 'NOT SAFE' };
+    for (const markerExists of [false, true]) {
+      const cyphers: string[] = [];
+      const fake = {
+        async executeQuery(cypher: string) {
+          cyphers.push(cypher);
+          return { records: [record({ repositoryExists: markerExists })] };
+        },
+      };
+      const run = importBulk(
+        fake as unknown as Neo4jConnection,
+        RID,
+        [{ entities: [reserved], relationships: [unsafe] }],
+        options(10),
+      );
+      if (markerExists) {
+        const result = await run;
+        expect(result.entitiesImported).toBe(0);
+        expect(result.relationshipsImported).toBe(0);
+        expect(result.errors.map((e) => e.item)).toEqual(['entity:e1', 'relationship:r1']);
+      } else {
+        await expect(run).rejects.toMatchObject({ name: 'RepositoryNotFoundError', code: 'REPOSITORY_NOT_FOUND' });
+      }
+      expect(cyphers).toHaveLength(1);
+      expect(cyphers[0]).toContain('AS repositoryExists');
+    }
+  });
+
+  it('does not read the marker separately once a chunk statement ran', async () => {
+    const reserved: StoredEntity = { ...entity('e1'), properties: { repositoryId: 'other' } };
+    const cyphers: string[] = [];
+    const fake = {
+      async executeQuery(cypher: string, params: { rows: Row[] }) {
+        cyphers.push(cypher);
+        return { records: successRecords(cypher, params.rows) };
+      },
+    };
+
+    const result = await importBulk(
+      fake as unknown as Neo4jConnection,
+      RID,
+      [{ entities: [reserved, entity('e2')] }],
+      options(10),
+    );
+    expect(result.entitiesImported).toBe(1);
+    expect(cyphers).toHaveLength(1);
+    expect(cyphers[0]).not.toContain('AS repositoryExists');
+  });
+
   it('opens every import template with the repository-marker lock', async () => {
     const cyphers: string[] = [];
     const fake = {

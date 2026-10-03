@@ -65,6 +65,7 @@ import * as relQueries from './queries/relationship.js';
 import * as timelineQueries from './queries/timeline.js';
 import * as bulkQueries from './queries/bulk.js';
 import * as deleteQueries from './queries/deleteByIds.js';
+import { alongsideMarkerRead } from './queries/marker.js';
 
 /** Configuration for CosmosDbProvider. */
 export interface CosmosDbProviderConfig {
@@ -182,7 +183,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   private readonly reportUsage: UsageSink | undefined;
   /**
    * Per-process vocabulary cache, keyed by repositoryId. Read lazily by
-   * `traverseImpl` via `getVocabularyCached`; refreshed by
+   * traversal compilation via `getVocabularyCached`; refreshed by
    * `getVocabulary({ fresh: true })`; invalidated by `saveVocabulary` (on
    * success and on a version conflict), `createRepository` and
    * `deleteRepository`.
@@ -546,11 +547,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    * Throws `RepositoryNotFoundError` when the repository marker is absent,
    * as does every other call here that finds the marker gone; each drops the
    * repository's traversal cache entry as it throws, and this provider's own
-   * `deleteRepository` drops it too. A traversal served from the cache within
-   * the TTL is not checked against the database, so it can still compile
-   * against the vocabulary of a repository another process has deleted (and
-   * then match nothing). Closing that window would cost a round trip on every
-   * cached read, which is what the cache exists to avoid.
+   * `deleteRepository` drops it too. A traversal that compiles against a
+   * cached vocabulary still checks the marker, with a point read alongside
+   * the traversal, so a repository another process has deleted is refused
+   * within the TTL as well.
    */
   public async getVocabulary(
     repositoryId: string,
@@ -620,6 +620,52 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   }
 
   /**
+   * The iterable form of `forgetMissingRepository`, for streamed reads.
+   */
+  private async *forgetMissingRepositoryWhileIterating<T>(
+    repositoryId: string,
+    source: AsyncIterable<T>,
+  ): AsyncGenerator<T> {
+    try {
+      yield* source;
+    } catch (err) {
+      if (err instanceof RepositoryNotFoundError) this.invalidateVocabularyCache(repositoryId);
+      throw err;
+    }
+  }
+
+  /**
+   * Whether a live (unexpired) vocabulary cache entry exists for the
+   * repository.
+   */
+  private hasCachedVocabulary(repositoryId: string): boolean {
+    const cached = this.vocabularyCache.get(repositoryId);
+    return cached !== undefined && cached.expiresAt > Date.now();
+  }
+
+  /**
+   * Run a traversal entry point (`traverse`, `exploreNeighborhood`,
+   * `findPaths`) only for an existing repository, whether or not the
+   * vocabulary it compiles against comes from the cache. A traversal is
+   * compiled elsewhere and cannot fetch the marker in its first step, so:
+   *   - on a cache miss, the vocabulary read checks the marker before
+   *     anything else runs;
+   *   - on a cache hit, a marker point read runs alongside the traversal
+   *     and a missing marker wins over its result.
+   * Either way the repository's cache entry is dropped when the marker is
+   * gone.
+   */
+  private async withRepositoryCheck<T>(repositoryId: string, run: () => Promise<T>): Promise<T> {
+    return this.forgetMissingRepository(repositoryId, async () => {
+      if (!this.hasCachedVocabulary(repositoryId)) {
+        await this.getVocabularyCached(repositoryId);
+        return run();
+      }
+      return alongsideMarkerRead(this.conn, repositoryId, run);
+    });
+  }
+
+  /**
    * Compare-and-set write of the vocabulary — lands only when the stored
    * version equals `expectedVersion`. Throws `VocabularyVersionConflictError`
    * on a mismatch and `RepositoryNotFoundError` when the repository's
@@ -649,10 +695,16 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     });
   }
 
-  async getVocabularyChangeLog(repositoryId: string, options?: PaginationOptions): Promise<PaginatedResult<VocabularyChangeRecord>> {
+  public async getVocabularyChangeLog(repositoryId: string, options?: PaginationOptions): Promise<PaginatedResult<VocabularyChangeRecord>> {
     this.assertValidRepositoryId(repositoryId);
+    // The change-log read starts from a label, not an id, so a marker point
+    // read runs alongside it.
     return this.track('getVocabularyChangeLog', repositoryId, () =>
-      vocabQueries.getVocabularyChangeLog(this.conn, repositoryId, options),
+      this.forgetMissingRepository(repositoryId, () =>
+        alongsideMarkerRead(this.conn, repositoryId, () =>
+          vocabQueries.getVocabularyChangeLog(this.conn, repositoryId, options),
+        ),
+      ),
     );
   }
 
@@ -665,24 +717,24 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async getEntity(repositoryId: string, entityId: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
+  public async getEntity(repositoryId: string, entityId: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntity', repositoryId, () =>
-      entityQueries.getEntity(this.conn, repositoryId, entityId, options),
+      this.forgetMissingRepository(repositoryId, () => entityQueries.getEntity(this.conn, repositoryId, entityId, options)),
     );
   }
 
-  async getEntityBySlug(repositoryId: string, slug: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
+  public async getEntityBySlug(repositoryId: string, slug: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntityBySlug', repositoryId, () =>
-      entityQueries.getEntityBySlug(this.conn, repositoryId, slug, options),
+      this.forgetMissingRepository(repositoryId, () => entityQueries.getEntityBySlug(this.conn, repositoryId, slug, options)),
     );
   }
 
-  async getEntities(repositoryId: string, entityIds: string[], options?: EntityReadOptions): Promise<Map<string, StoredEntity>> {
+  public async getEntities(repositoryId: string, entityIds: string[], options?: EntityReadOptions): Promise<Map<string, StoredEntity>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntities', repositoryId, () =>
-      entityQueries.getEntities(this.conn, repositoryId, entityIds, options),
+      this.forgetMissingRepository(repositoryId, () => entityQueries.getEntities(this.conn, repositoryId, entityIds, options)),
     );
   }
 
@@ -721,26 +773,28 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async deleteEntitiesByType(repositoryId: string, entityType: string): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
+  public async deleteEntitiesByType(repositoryId: string, entityType: string): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteEntitiesByType', repositoryId, () =>
-      entityQueries.deleteEntitiesByType(this.conn, repositoryId, entityType),
+      this.forgetMissingRepository(repositoryId, () => entityQueries.deleteEntitiesByType(this.conn, repositoryId, entityType)),
     );
   }
 
-  async findEntities(repositoryId: string, query: StorageFindQuery, options?: EntityReadOptions): Promise<PaginatedResult<StoredEntity>> {
+  public async findEntities(repositoryId: string, query: StorageFindQuery, options?: EntityReadOptions): Promise<PaginatedResult<StoredEntity>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('findEntities', repositoryId, () =>
-      entityQueries.findEntities(this.docClient, repositoryId, query, options),
+      this.forgetMissingRepository(repositoryId, () => entityQueries.findEntities(this.docClient, repositoryId, query, options)),
     );
   }
 
   // ─── Relationships ─────────────────────────────────────────────────
 
   /**
-   * The id check is a partition-scoped edge lookup inside the create's single
-   * traversal, so it costs no extra round trip, and the create runs it
-   * whatever `options.idMinted` says.
+   * One request on the success path: the marker, the source and the target
+   * come from one indexed lookup, and a reused id is refused by the store
+   * (409). The outcome precedence (repository → id → source → target) is the
+   * same whatever `options.idMinted` says — see
+   * `relQueries.createRelationship`.
    */
   public async createRelationship(
     repositoryId: string,
@@ -749,21 +803,21 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   ): Promise<StoredRelationship> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('createRelationship', repositoryId, () =>
-      this.forgetMissingRepository(repositoryId, () => relQueries.createRelationship(this.conn, repositoryId, relationship)),
+      this.forgetMissingRepository(repositoryId, () => relQueries.createRelationship(this.conn, this.docClient, repositoryId, relationship)),
     );
   }
 
-  async getRelationship(repositoryId: string, relationshipId: string): Promise<StoredRelationship | null> {
+  public async getRelationship(repositoryId: string, relationshipId: string): Promise<StoredRelationship | null> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getRelationship', repositoryId, () =>
-      relQueries.getRelationship(this.conn, repositoryId, relationshipId),
+      this.forgetMissingRepository(repositoryId, () => relQueries.getRelationship(this.conn, repositoryId, relationshipId)),
     );
   }
 
-  async getEntityRelationships(repositoryId: string, entityId: string, options?: RelationshipQueryOptions): Promise<PaginatedResult<StoredRelationship>> {
+  public async getEntityRelationships(repositoryId: string, entityId: string, options?: RelationshipQueryOptions): Promise<PaginatedResult<StoredRelationship>> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getEntityRelationships', repositoryId, () =>
-      relQueries.getEntityRelationships(this.conn, repositoryId, entityId, options),
+      this.forgetMissingRepository(repositoryId, () => relQueries.getEntityRelationships(this.conn, repositoryId, entityId, options)),
     );
   }
 
@@ -796,19 +850,19 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async deleteRelationshipsByType(repositoryId: string, relationshipType: string): Promise<{ deletedRelationships: number }> {
+  public async deleteRelationshipsByType(repositoryId: string, relationshipType: string): Promise<{ deletedRelationships: number }> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteRelationshipsByType', repositoryId, () =>
-      relQueries.deleteRelationshipsByType(this.conn, repositoryId, relationshipType),
+      this.forgetMissingRepository(repositoryId, () => relQueries.deleteRelationshipsByType(this.conn, repositoryId, relationshipType)),
     );
   }
 
   // ─── Graph Traversal (StorageProvider) ─────────────────────────────
 
-  async exploreNeighborhood(repositoryId: string, entityId: string, options: StorageExploreOptions): Promise<StorageNeighborhood> {
+  public async exploreNeighborhood(repositoryId: string, entityId: string, options: StorageExploreOptions): Promise<StorageNeighborhood> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('exploreNeighborhood', repositoryId, () =>
-      this.exploreNeighborhoodImpl(repositoryId, entityId, options),
+      this.withRepositoryCheck(repositoryId, () => this.exploreNeighborhoodImpl(repositoryId, entityId, options)),
     );
   }
 
@@ -969,10 +1023,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return { centerId: entityId, layers };
   }
 
-  async findPaths(repositoryId: string, sourceId: string, targetId: string, options: StoragePathOptions): Promise<StoragePathResult> {
+  public async findPaths(repositoryId: string, sourceId: string, targetId: string, options: StoragePathOptions): Promise<StoragePathResult> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('findPaths', repositoryId, () =>
-      this.findPathsImpl(repositoryId, sourceId, targetId, options),
+      this.withRepositoryCheck(repositoryId, () => this.findPathsImpl(repositoryId, sourceId, targetId, options)),
     );
   }
 
@@ -1072,23 +1126,27 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
   // ─── Timeline ──────────────────────────────────────────────────────
 
-  async getTimeline(repositoryId: string, entityId: string, options: StorageTimelineOptions): Promise<StorageTimelineResult> {
+  public async getTimeline(repositoryId: string, entityId: string, options: StorageTimelineOptions): Promise<StorageTimelineResult> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getTimeline', repositoryId, () =>
-      timelineQueries.getTimeline(this.conn, repositoryId, entityId, options),
+      this.forgetMissingRepository(repositoryId, () => timelineQueries.getTimeline(this.conn, repositoryId, entityId, options)),
     );
   }
 
   // ─── Bulk Operations ───────────────────────────────────────────────
 
-  exportAll(repositoryId: string): AsyncIterable<ExportChunk> {
+  public exportAll(repositoryId: string): AsyncIterable<ExportChunk> {
     this.assertValidRepositoryId(repositoryId);
     // exportAll is a streaming iterator — each chunk consumed drives new
     // submits. Wrapping the entire iteration in a single usage scope would
     // require holding the scope open across consumer awaits, which breaks
     // the AsyncLocalStorage contract. Instead, wrap each submit as its own
     // sub-operation by running the iterator generator inside the scope.
-    return this.trackIterable('exportAll', repositoryId, bulkQueries.exportAll(this.conn, repositoryId));
+    return this.trackIterable(
+      'exportAll',
+      repositoryId,
+      this.forgetMissingRepositoryWhileIterating(repositoryId, bulkQueries.exportAll(this.conn, repositoryId)),
+    );
   }
 
   public async importBulk(repositoryId: string, data: ImportChunk[], options?: BulkImportOptions): Promise<BulkImportResult> {
@@ -1101,7 +1159,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   /**
    * Wrap an AsyncIterable so every emitted chunk is generated inside the
    * usage scope. On each iteration step, the scope aggregates charges from
-   * the next chunk's submits; when the iterator completes (or is closed), a
+   * the next chunk's submits; when the iterator completes, fails or is closed, a
    * single usage record is emitted for the whole stream.
    */
   private trackIterable<T>(operation: string, repositoryId: string, source: AsyncIterable<T>): AsyncIterable<T> {
@@ -1129,7 +1187,14 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
         };
         return {
           async next(): Promise<IteratorResult<T>> {
-            const step = await usageScope.run(acc, () => iter.next());
+            let step: IteratorResult<T>;
+            try {
+              step = await usageScope.run(acc, () => iter.next());
+            } catch (err) {
+              // A failed step ends the stream: report what it consumed so far.
+              emit();
+              throw err;
+            }
             if (step.done) emit();
             return step;
           },
@@ -1165,17 +1230,18 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   }
 
   /**
-   * Execute a `TraversalSpec` against this repository's subgraph. On a
-   * deleted repository it throws `RepositoryNotFoundError` when the
-   * vocabulary cache is cold; within the cache TTL it may answer as it does
-   * for a missing start entity.
+   * Execute a `TraversalSpec` against this repository's subgraph. Throws
+   * `RepositoryNotFoundError` for a deleted repository, with the vocabulary
+   * cache cold or warm (see `withRepositoryCheck`).
    */
   public async traverse(
     repositoryId: string,
     spec: TraversalSpec,
   ): Promise<TraversalResult> {
     this.assertValidRepositoryId(repositoryId);
-    return this.track('traverse', repositoryId, () => this.traverseInternal(repositoryId, spec));
+    return this.track('traverse', repositoryId, () =>
+      this.withRepositoryCheck(repositoryId, () => this.traverseInternal(repositoryId, spec)),
+    );
   }
 
   /**

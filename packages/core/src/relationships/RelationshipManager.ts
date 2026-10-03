@@ -19,7 +19,6 @@ import {
   VocabularyValidationError,
   OperationCancelledError,
   SelfReferentialRelationshipError,
-  RepositoryNotFoundError,
 } from '../core/errors.js';
 
 export class RelationshipManager {
@@ -33,8 +32,9 @@ export class RelationshipManager {
 
   /**
    * Create one or more relationships with vocabulary validation, provenance,
-   * and events. A missing endpoint checks the repository first: a deleted
-   * repository answers `RepositoryNotFoundError`, not a missing entity.
+   * and events. Storage's entity read answers a deleted repository with
+   * `RepositoryNotFoundError` before any miss, so a missing endpoint is
+   * reported as `EntityNotFoundError`.
    */
   public async create(inputs: CreateRelationshipInput[]): Promise<Relationship[]> {
     const results: Relationship[] = [];
@@ -47,12 +47,12 @@ export class RelationshipManager {
       // Resolve source and target entity types for constraint validation
       const sourceEntity = await this.storage.getEntity(this.repositoryId, input.sourceEntityId);
       if (!sourceEntity) {
-        throw await this.endpointMissError(input.sourceEntityId);
+        throw new EntityNotFoundError(input.sourceEntityId);
       }
 
       const targetEntity = await this.storage.getEntity(this.repositoryId, input.targetEntityId);
       if (!targetEntity) {
-        throw await this.endpointMissError(input.targetEntityId);
+        throw new EntityNotFoundError(input.targetEntityId);
       }
 
       // Validate against vocabulary
@@ -128,18 +128,6 @@ export class RelationshipManager {
     }
 
     return results;
-  }
-
-  /**
-   * The error for an endpoint entity that was not found. Database-backed
-   * stores answer an entity read on a deleted repository with no row, so the
-   * miss reads the repository before blaming the entity.
-   */
-  private async endpointMissError(entityId: string): Promise<RepositoryNotFoundError | EntityNotFoundError> {
-    if ((await this.storage.getRepository(this.repositoryId)) === null) {
-      return new RepositoryNotFoundError(this.repositoryId);
-    }
-    return new EntityNotFoundError(entityId);
   }
 
   /** Remove one or more relationships in a single batch storage operation */

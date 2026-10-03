@@ -10,11 +10,12 @@ const CONFLICT_STATUS = 409;
  * Submit a create statement, turning a 409 into the caller's duplicate
  * error with the driver error as `cause`.
  *
- * Cosmos enforces one document per id per partition itself. A create's own
- * existence check runs in the same request but is not transactional, so a
- * create racing another with the same id can pass the check and still be
- * refused by the store with a 409 — which is the same outcome the check
- * reports, and is mapped to the same typed error.
+ * Cosmos enforces one document per id per partition itself, and refuses a
+ * second one with a 409. A relationship create relies on that 409 alone to
+ * refuse a taken id. An entity create also checks its id in the same request,
+ * but that check is not transactional, so a create racing another with the
+ * same id can pass it and still be refused by the store — the same outcome
+ * the check reports, mapped to the same typed error.
  */
 export async function submitCreate(
   conn: CosmosDbConnection,

@@ -5,15 +5,18 @@
 // `createRelationship` and the upsert import template, the lookups and
 // deletes by relationship id, and the batched drains of `deleteRepository` /
 // `deleteAllContents` and the `getRepositoryStats` counts are anchored on
-// the repository's entities. The anchor
-// must reach them through the `(repositoryId, id)` unique index; a plan that
-// scans every `_Entity` in the database, or every relationship, makes each
-// call pay for every repository in the store. The write-token read-backs that
-// answer a re-run of a committed create are held to the same rule, and a
-// create with an engine-minted id must not expand the repository's edges at
-// all. Statements that refuse a deleted repository check its marker through
-// the marker's unique constraint index. EXPLAIN plans the statements without
-// running them, so this checks the operators the server would use.
+// the repository's entities. The anchor must reach them through the
+// `(repositoryId, id)` unique index; a plan that scans every `_Entity` in
+// the database, or every relationship, makes each call pay for every
+// repository in the store. The write-token read-backs that answer a re-run of
+// a committed create are held to the same rule, and a create with an
+// engine-minted id must not expand the repository's edges at all.
+// Statements that refuse a deleted repository — writes, entity and
+// relationship reads, page counts, type deletes and compiled traversals —
+// check its marker through the marker's unique constraint index, and the
+// entity reads they guard keep to the entity indexes. EXPLAIN plans the
+// statements without running them, so this checks the operators the server
+// would use.
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run. Skipped otherwise so
 // CI builds without a live Neo4j stay green.
@@ -23,6 +26,8 @@ import { Neo4jConnection } from './Neo4jConnection.js';
 import {
   buildCreateMintedRelationshipQuery,
   buildCreateRelationshipQuery,
+  buildDeleteRelationshipsByTypeQuery,
+  buildEntityRelationshipQueries,
   RELATIONSHIP_DELETE_MANY_QUERY,
   RELATIONSHIP_GET_QUERY,
   RELATIONSHIP_WRITE_ATTEMPT_QUERY,
@@ -33,8 +38,21 @@ import {
   REPOSITORY_MARKER_EXISTS_QUERY,
 } from './queries/repositoryDrain.js';
 import { ENTITY_STATS_QUERY, RELATIONSHIP_STATS_QUERY } from './queries/repository.js';
-import { ENTITY_DELETE_MANY_QUERY, UPDATE_ENTITY_MATCH } from './queries/entity.js';
-import { VOCABULARY_READ_QUERY } from './queries/vocabulary.js';
+import {
+  buildFindCountQuery,
+  buildFindEntitiesWhere,
+  buildMatchFindQuery,
+  ENTITY_DELETE_BY_TYPE_QUERY,
+  ENTITY_DELETE_MANY_QUERY,
+  ENTITY_GET_BY_SLUG_QUERY_LIGHT,
+  ENTITY_GET_MANY_QUERY_LIGHT,
+  ENTITY_GET_QUERY_LIGHT,
+  UPDATE_ENTITY_MATCH,
+} from './queries/entity.js';
+import { TIMELINE_QUERY } from './queries/timeline.js';
+import { VOCABULARY_CHANGE_LOG_COUNT_QUERY, VOCABULARY_READ_QUERY } from './queries/vocabulary.js';
+import { Neo4jTraversalExecutor } from './Neo4jTraversalExecutor.js';
+import type { MemoryVocabulary, TraversalSpec } from '@utaba/deep-memory/types';
 import {
   buildInsertRelationshipsQuery,
   buildUpsertRelationshipsQuery,
@@ -107,6 +125,15 @@ const PROVENANCE_PARAMS = {
   modifiedAt: '2026-01-01T00:00:00.000Z',
   modifiedInConversation: null,
   modifiedFromMessage: null,
+};
+
+/** Compile-time vocabulary for the traversal plans; these specs name no types. */
+const PLAN_VOCABULARY: MemoryVocabulary = {
+  version: '1.0.0',
+  lastModified: '',
+  modifiedBy: '',
+  entityTypes: [],
+  relationshipTypes: [],
 };
 
 const ROW = {
@@ -308,6 +335,187 @@ if (NEO4J_URI) {
         expect(op).toContain('(s)-[r:KNOWS]->(t)');
       }
     });
+
+    // ─── Reads, type deletes and traversals that refuse a deleted repository ───
+
+    /** No whole-store scan of any kind. */
+    function expectNoWholeStoreScan(ops: string[]): void {
+      const names = ops.map(operatorName);
+      for (const scan of WHOLE_STORE_SCANS) expect(names).not.toContain(scan);
+    }
+
+    it('getEntity seeks the marker and the entity by id', async () => {
+      const ops = await explain(ENTITY_GET_QUERY_LIGHT, { id: 'plan-a' });
+      expectEntityIdSeek(ops);
+      expectMarkerSeek(ops);
+    });
+
+    it('getEntityBySlug seeks the marker and the entity by slug', async () => {
+      const ops = await explain(ENTITY_GET_BY_SLUG_QUERY_LIGHT, { slug: 'thing:plan-a' });
+      expectNoWholeStoreScan(ops);
+      expectMarkerSeek(ops);
+      expect(ops.some((op) => op.startsWith('NodeUniqueIndexSeek') && op.includes(':_Entity(repositoryId, slug)'))).toBe(true);
+    });
+
+    it('getEntities seeks the marker and each entity by id', async () => {
+      const ops = await explain(ENTITY_GET_MANY_QUERY_LIGHT, { ids: ['plan-a', 'plan-b'] });
+      expectEntityIdSeek(ops);
+      expectMarkerSeek(ops);
+    });
+
+    it('findEntities without filters reads the entity index for its page and its count', async () => {
+      const where = buildFindEntitiesWhere({ limit: 10, offset: 0 }, { alias: 'n', includeRepositoryPredicate: true });
+      const page = await explain(buildMatchFindQuery(where.cypherWhere, 'n.id AS id'), { skip: 0n, limit: 10n });
+      expectIndexAnchoredPlan(page);
+      const count = await explain(buildFindCountQuery(`MATCH (n:_Entity) ${where.cypherWhere}`, 'n'), {});
+      expectIndexAnchoredPlan(count);
+      expectMarkerSeek(count);
+    });
+
+    it('findEntities with a type filter reads an entity index for its page and its count', async () => {
+      const where = buildFindEntitiesWhere(
+        { limit: 10, offset: 0, entityTypes: ['thing'] },
+        { alias: 'n', includeRepositoryPredicate: true },
+      );
+      const page = await explain(buildMatchFindQuery(where.cypherWhere, 'n.id AS id'), { ...where.params, skip: 0n, limit: 10n });
+      const count = await explain(buildFindCountQuery(`MATCH (n:_Entity) ${where.cypherWhere}`, 'n'), where.params);
+      for (const ops of [page, count]) {
+        expectNoWholeStoreScan(ops);
+        expect(ops.some((op) => /^Node(Unique)?IndexSeek/.test(op) && op.includes(':_Entity(repositoryId, '))).toBe(true);
+      }
+      expectMarkerSeek(count);
+    });
+
+    it('findEntities with property filters only reads the entity index for its page and its count', async () => {
+      const where = buildFindEntitiesWhere(
+        { limit: 10, offset: 0, properties: { colour: 'red' } },
+        { alias: 'n', includeRepositoryPredicate: true },
+      );
+      const page = await explain(buildMatchFindQuery(where.cypherWhere, 'n.id AS id'), { ...where.params, skip: 0n, limit: 10n });
+      const count = await explain(buildFindCountQuery(`MATCH (n:_Entity) ${where.cypherWhere}`, 'n'), where.params);
+      for (const ops of [page, count]) {
+        expectNoWholeStoreScan(ops);
+        expect(ops.some((op) => /^Node(Unique)?IndexSeek/.test(op) && op.includes(':_Entity(repositoryId, '))).toBe(true);
+      }
+      expectMarkerSeek(count);
+    });
+
+    it('findEntities with a search term counts through the fulltext index and seeks the marker', async () => {
+      const ops = await explain(
+        buildFindCountQuery(
+          "CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node WHERE node.repositoryId = $rid",
+          'node',
+        ),
+        { term: 'plan' },
+      );
+      expectNoWholeStoreScan(ops);
+      expectMarkerSeek(ops);
+    });
+
+    it('getRelationship checks the repository marker through its constraint index', async () => {
+      expectMarkerSeek(await explain(RELATIONSHIP_GET_QUERY, { relId: ROW.id }));
+    });
+
+    for (const direction of ['both', 'out', 'in'] as const) {
+      it(`getEntityRelationships (${direction}) seeks the marker and the entity by id`, async () => {
+        const { dataCypher, countCypher } = buildEntityRelationshipQueries(direction, ' WHERE type(r) IN $relTypes');
+        const params = { eid: 'plan-a', relTypes: ['KNOWS'], offset: 0n, limit: 10n };
+        const data = await explain(dataCypher, params);
+        expectEntityIdSeek(data);
+        expectMarkerSeek(data);
+        expectEntityIdSeek(await explain(countCypher, params));
+      });
+
+      it(`getEntityRelationships (${direction}) without a type filter seeks the marker and the entity by id`, async () => {
+        const { dataCypher, countCypher } = buildEntityRelationshipQueries(direction, '');
+        const params = { eid: 'plan-a', offset: 0n, limit: 10n };
+        const data = await explain(dataCypher, params);
+        expectEntityIdSeek(data);
+        expectMarkerSeek(data);
+        expectEntityIdSeek(await explain(countCypher, params));
+      });
+    }
+
+    it('deleteEntitiesByType seeks the marker and the entity type index', async () => {
+      const ops = await explain(ENTITY_DELETE_BY_TYPE_QUERY, { entityType: 'thing' });
+      expectNoWholeStoreScan(ops);
+      expectMarkerSeek(ops);
+      expect(ops.some((op) => op.startsWith('NodeIndexSeek') && op.includes(':_Entity(repositoryId, entityType)'))).toBe(true);
+    });
+
+    it('deleteRelationshipsByType seeks the marker and reaches the edges from the entity index anchor', async () => {
+      const ops = await explain(buildDeleteRelationshipsByTypeQuery('KNOWS'), {});
+      expectIndexAnchoredPlan(ops);
+      expectMarkerSeek(ops);
+    });
+
+    it('getVocabularyChangeLog counts after a seek of the repository marker', async () => {
+      const ops = await explain(VOCABULARY_CHANGE_LOG_COUNT_QUERY, {});
+      const names = ops.map(operatorName);
+      for (const scan of ['AllNodesScan', 'AllRelationshipsScan']) expect(names).not.toContain(scan);
+      // `_VocabularyChangeLog` has no repository index; no `_Entity` is scanned.
+      expect(ops.some((op) => op.startsWith('NodeByLabelScan') && op.includes(':_Entity'))).toBe(false);
+      expectMarkerSeek(ops);
+    });
+
+    it('getTimeline seeks the marker and the centre entity by id', async () => {
+      const ops = await explain(TIMELINE_QUERY, { id: 'plan-a' });
+      expectEntityIdSeek(ops);
+      expectMarkerSeek(ops);
+    });
+
+    /** The statement and parameters the traversal executor ships for a spec. */
+    async function shippedTraversal(spec: TraversalSpec): Promise<{ cypher: string; params: Record<string, unknown> }> {
+      let shipped: { cypher: string; params: Record<string, unknown> } | undefined;
+      const recorder = {
+        executeQuery: async (cypher: string, params: Record<string, unknown>) => {
+          shipped = { cypher, params };
+          return {
+            records: [{ keys: ['dm-repository-exists'], get: (key: string) => key === 'dm-repository-exists' }],
+            summary: {},
+          };
+        },
+      } as unknown as Neo4jConnection;
+      await new Neo4jTraversalExecutor(recorder, { profileTraversals: false }).execute('plan-check', spec, PLAN_VOCABULARY);
+      if (shipped === undefined) throw new Error('the executor shipped no statement');
+      return shipped;
+    }
+
+    const TRAVERSAL_SPECS: Array<[string, TraversalSpec]> = [
+      ['traverse (terminal)', { start: { entityId: 'plan-a' }, steps: [{ direction: 'out' }], returnMode: 'terminal' }],
+      [
+        'exploreNeighborhood (all, two steps)',
+        { start: { entityId: 'plan-a' }, steps: [{ direction: 'both' }, { direction: 'both' }], returnMode: 'all', limit: 10_000 },
+      ],
+      [
+        'findPaths (path, variable length)',
+        {
+          start: { entityId: 'plan-a' },
+          steps: [{ direction: 'both', repeat: { maxDepth: 3, emitIntermediates: true } }],
+          returnMode: 'path',
+        },
+      ],
+      [
+        'traverse with a count projection',
+        {
+          start: { entityId: 'plan-a' },
+          steps: [{ direction: 'out' }],
+          returnMode: 'terminal',
+          projection: { properties: ['entityType'], mode: 'count' },
+        },
+      ],
+    ];
+
+    for (const [name, spec] of TRAVERSAL_SPECS) {
+      it(`${name} seeks the marker and the start entity by id in one statement`, async () => {
+        const { cypher, params } = await shippedTraversal(spec);
+        const result = await conn.executeQuery(`EXPLAIN ${cypher}`, params, { repositoryId: 'plan-check' });
+        expect(result.summary.plan).not.toBe(false);
+        const ops = operators(result.summary.plan as PlanNode);
+        expectEntityIdSeek(ops);
+        expectMarkerSeek(ops);
+      });
+    }
   });
 } else {
   describe('repository-scoped relationship statements — query plans', () => {

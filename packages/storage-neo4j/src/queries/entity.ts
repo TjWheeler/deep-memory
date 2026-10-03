@@ -65,6 +65,7 @@ import {
   assertSafeUserPropertyKey,
   bigintToSafeNumber,
   buildEntityProjection,
+  type DriverRecord,
   entityFromRecord,
   entityToParams,
   entityUserPropertyParams,
@@ -72,7 +73,7 @@ import {
   RESERVED_ENTITY_PROPERTY_KEYS,
   WRITE_ATTEMPT_PROPERTY,
 } from '../mapping.js';
-import { isDeletedEntityFailure, mapDriverError, toTypedError } from '../errors.js';
+import { isDeletedEntityFailure, mapDriverError, settledValue, toTypedError } from '../errors.js';
 import { LOCK_REPOSITORY_MARKER } from './repositoryLock.js';
 import { deleteByIds } from './deleteByIds.js';
 import {
@@ -153,17 +154,54 @@ const ENTITY_WRITE_ATTEMPT_QUERY = `MATCH (n:_Entity {repositoryId: $rid, id: $i
 const ENTITY_PROJECTION_LIGHT = buildEntityProjection();
 const ENTITY_PROJECTION_FULL = buildEntityProjection({ loadEmbeddings: true });
 
-const ENTITY_GET_QUERY_LIGHT = `MATCH (n:_Entity {repositoryId: $rid, id: $id}) RETURN ${ENTITY_PROJECTION_LIGHT}`;
-const ENTITY_GET_QUERY_FULL = `MATCH (n:_Entity {repositoryId: $rid, id: $id}) RETURN ${ENTITY_PROJECTION_FULL}`;
+/**
+ * Opening of every entity read: the repository marker, a seek of its unique
+ * constraint index. The match is optional so the statement returns a row
+ * whether or not the marker exists, and the entity match after it carries
+ * `WHERE repo IS NOT NULL`, so a deleted repository reads as deleted
+ * (`repositoryExists` false) rather than as a missing entity, even while a
+ * delete still in progress has left entities behind.
+ */
+const ENTITY_READ_MARKER = 'OPTIONAL MATCH (repo:_Repository {repositoryId: $rid}) ';
 
-const ENTITY_GET_BY_SLUG_QUERY_LIGHT = `MATCH (n:_Entity {repositoryId: $rid, slug: $slug}) RETURN ${ENTITY_PROJECTION_LIGHT}`;
-const ENTITY_GET_BY_SLUG_QUERY_FULL = `MATCH (n:_Entity {repositoryId: $rid, slug: $slug}) RETURN ${ENTITY_PROJECTION_FULL}`;
+/** Columns ahead of the entity projection on every entity read row. */
+const ENTITY_READ_FLAGS = 'repo IS NOT NULL AS repositoryExists, n IS NOT NULL AS entityFound';
 
-// Batch get — single round-trip via `WHERE n.id IN $ids`. Caller drives any
-// not-found discrimination via map lookup (the public `getEntities` contract
-// returns a `Map<string, StoredEntity>` whose absent keys signal not-found).
-const ENTITY_GET_MANY_QUERY_LIGHT = `MATCH (n:_Entity {repositoryId: $rid}) WHERE n.id IN $ids RETURN ${ENTITY_PROJECTION_LIGHT}`;
-const ENTITY_GET_MANY_QUERY_FULL = `MATCH (n:_Entity {repositoryId: $rid}) WHERE n.id IN $ids RETURN ${ENTITY_PROJECTION_FULL}`;
+/**
+ * Single read by id: the marker, then the entity through the
+ * `(repositoryId, id)` unique index. Always one row.
+ */
+export const ENTITY_GET_QUERY_LIGHT =
+  `${ENTITY_READ_MARKER}OPTIONAL MATCH (n:_Entity {repositoryId: $rid, id: $id}) WHERE repo IS NOT NULL ` +
+  `RETURN ${ENTITY_READ_FLAGS}, ${ENTITY_PROJECTION_LIGHT}`;
+const ENTITY_GET_QUERY_FULL =
+  `${ENTITY_READ_MARKER}OPTIONAL MATCH (n:_Entity {repositoryId: $rid, id: $id}) WHERE repo IS NOT NULL ` +
+  `RETURN ${ENTITY_READ_FLAGS}, ${ENTITY_PROJECTION_FULL}`;
+
+/**
+ * Single read by slug: the marker, then the entity through the
+ * `(repositoryId, slug)` unique index. Always one row.
+ */
+export const ENTITY_GET_BY_SLUG_QUERY_LIGHT =
+  `${ENTITY_READ_MARKER}OPTIONAL MATCH (n:_Entity {repositoryId: $rid, slug: $slug}) WHERE repo IS NOT NULL ` +
+  `RETURN ${ENTITY_READ_FLAGS}, ${ENTITY_PROJECTION_LIGHT}`;
+const ENTITY_GET_BY_SLUG_QUERY_FULL =
+  `${ENTITY_READ_MARKER}OPTIONAL MATCH (n:_Entity {repositoryId: $rid, slug: $slug}) WHERE repo IS NOT NULL ` +
+  `RETURN ${ENTITY_READ_FLAGS}, ${ENTITY_PROJECTION_FULL}`;
+
+/**
+ * Batch read: the marker, then each id through the `(repositoryId, id)`
+ * unique index. One row per entity found, or a single row with
+ * `entityFound` false when none is (including for an empty id list), so the
+ * marker is reported either way. The caller drives not-found discrimination
+ * via map lookup (absent keys in the returned `Map` signal not-found).
+ */
+export const ENTITY_GET_MANY_QUERY_LIGHT =
+  `${ENTITY_READ_MARKER}OPTIONAL MATCH (n:_Entity {repositoryId: $rid}) WHERE repo IS NOT NULL AND n.id IN $ids ` +
+  `RETURN ${ENTITY_READ_FLAGS}, ${ENTITY_PROJECTION_LIGHT}`;
+const ENTITY_GET_MANY_QUERY_FULL =
+  `${ENTITY_READ_MARKER}OPTIONAL MATCH (n:_Entity {repositoryId: $rid}) WHERE repo IS NOT NULL AND n.id IN $ids ` +
+  `RETURN ${ENTITY_READ_FLAGS}, ${ENTITY_PROJECTION_FULL}`;
 
 /**
  * Create a new entity via fixed-shape `CREATE` + catch on the uniqueness
@@ -253,8 +291,23 @@ export async function readEntityWriteAttempt(
 }
 
 /**
- * Read a single entity by id. Returns `null` when no row matches — the public
- * contract is `null`-on-miss, not throw.
+ * The entities on the rows of an entity read (`ENTITY_READ_FLAGS` ahead of
+ * the projection). Throws `RepositoryNotFoundError` when the marker is
+ * absent; a statement that returned no row at all is a provider fault.
+ */
+function entitiesFromReadRows(
+  records: ReadonlyArray<DriverRecord>,
+  repositoryId: string,
+): StoredEntity[] {
+  const first = records[0];
+  if (first === undefined) throw new ProviderError('Neo4j entity read returned no row.');
+  if (first.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  return records.filter((record) => record.get('entityFound') === true).map((record) => entityFromRecord(record));
+}
+
+/**
+ * Read a single entity by id. Returns `null` when no entity has the id;
+ * throws `RepositoryNotFoundError` when the repository marker is absent.
  */
 export async function getEntity(
   conn: Neo4jConnection,
@@ -269,15 +322,14 @@ export async function getEntity(
     { id: entityId },
     { repositoryId, routing: 'READ' },
   );
-  const record = result.records[0];
-  if (record === undefined) return null;
-  return entityFromRecord(record);
+  return entitiesFromReadRows(result.records, repositoryId)[0] ?? null;
 }
 
 /**
  * Read a single entity by slug. Slugs are unique within a repository via the
  * `dm_entity_slug_unique` constraint, so the lookup hits the constraint's
- * backing index. Returns `null` when no row matches.
+ * backing index. Returns `null` when no entity has the slug; throws
+ * `RepositoryNotFoundError` when the repository marker is absent.
  */
 export async function getEntityBySlug(
   conn: Neo4jConnection,
@@ -294,15 +346,15 @@ export async function getEntityBySlug(
     { slug },
     { repositoryId, routing: 'READ' },
   );
-  const record = result.records[0];
-  if (record === undefined) return null;
-  return entityFromRecord(record);
+  return entitiesFromReadRows(result.records, repositoryId)[0] ?? null;
 }
 
 /**
  * Batch read by ids. Single round-trip via `WHERE n.id IN $ids`; absent ids
- * simply don't appear in the returned `Map`. Empty input → empty map, no
- * round-trip.
+ * simply don't appear in the returned `Map`. Throws
+ * `RepositoryNotFoundError` when the repository marker is absent. Empty
+ * input still reads the marker, so a deleted repository is reported for an
+ * empty list too.
  */
 export async function getEntities(
   conn: Neo4jConnection,
@@ -310,9 +362,6 @@ export async function getEntities(
   entityIds: string[],
   options?: EntityReadOptions,
 ): Promise<Map<string, StoredEntity>> {
-  const map = new Map<string, StoredEntity>();
-  if (entityIds.length === 0) return map;
-
   const query =
     options?.loadEmbeddings === true
       ? ENTITY_GET_MANY_QUERY_FULL
@@ -322,8 +371,8 @@ export async function getEntities(
     { ids: entityIds },
     { repositoryId, routing: 'READ' },
   );
-  for (const record of result.records) {
-    const entity = entityFromRecord(record);
+  const map = new Map<string, StoredEntity>();
+  for (const entity of entitiesFromReadRows(result.records, repositoryId)) {
     map.set(entity.id, entity);
   }
   return map;
@@ -526,7 +575,7 @@ export async function deleteEntity(
   repositoryId: string,
   entityId: string,
 ): Promise<void> {
-  const { notFound } = await deleteByIds(conn, repositoryId, ENTITY_DELETE_MANY_QUERY, [entityId]);
+  const { notFound } = await deleteByIds(conn, repositoryId, ENTITY_DELETE_MANY_QUERY, [entityId], 'deleteEntity');
   if (notFound.length > 0) throw new EntityNotFoundError(entityId);
 }
 
@@ -545,7 +594,7 @@ export async function deleteEntities(
   repositoryId: string,
   ids: string[],
 ): Promise<{ deleted: string[]; notFound: string[] }> {
-  return deleteByIds(conn, repositoryId, ENTITY_DELETE_MANY_QUERY, ids);
+  return deleteByIds(conn, repositoryId, ENTITY_DELETE_MANY_QUERY, ids, 'deleteEntities');
 }
 
 // Read-projection chains reused by `findEntities`. The non-search branch
@@ -564,8 +613,10 @@ const FIND_PROJECTION_FULL_FT = buildEntityProjection({ alias: 'node', loadEmbed
  * are guaranteed to count the same set by construction.
  *
  * `$rid` is bound by the chokepoint, not here. The non-search branch always
- * includes `<alias>.repositoryId = $rid` as the first predicate so the planner
- * picks the `(repositoryId, id)` uniqueness constraint's backing index. The
+ * opens with `<alias>.repositoryId = $rid AND <alias>.id IS NOT NULL` so the
+ * planner can seek the `(repositoryId, id)` uniqueness constraint's backing
+ * index: a bare `repositoryId` predicate has no index to use and scans every
+ * `_Entity` in the database. The
  * fulltext branch routes through `CALL db.index.fulltext.queryNodes(...) YIELD
  * node` first and adds `node.repositoryId = $rid` immediately after the YIELD,
  * so this helper omits the repository predicate in fulltext mode (the caller
@@ -591,7 +642,7 @@ export function buildFindEntitiesWhere(
   const predicates: string[] = [];
 
   if (includeRepositoryPredicate) {
-    predicates.push(`${alias}.repositoryId = $rid`);
+    predicates.push(`${alias}.repositoryId = $rid`, `${alias}.id IS NOT NULL`);
   }
 
   if (query.entityTypes && query.entityTypes.length > 0) {
@@ -738,8 +789,33 @@ export function buildFulltextFindQuery(scoring: Neo4jSearchScoring, where: strin
 }
 
 /**
+ * The non-search branch's data statement. `where` is the complete `WHERE`
+ * clause from `buildFindEntitiesWhere` (repository predicates first);
+ * `projection` reads from `n`.
+ */
+export function buildMatchFindQuery(where: string, projection: string): string {
+  return `MATCH (n:_Entity) ${where} RETURN ${projection} ORDER BY n.id SKIP $skip LIMIT $limit`;
+}
+
+/**
+ * The count statement of either branch, which also reports whether the
+ * repository marker exists. `match` is the branch's reading clause and its
+ * `WHERE` (`MATCH (n:_Entity) WHERE …` or the fulltext `CALL … YIELD node
+ * WHERE …`), and `alias` the variable it binds. The marker is a seek of its
+ * unique constraint index; the subquery skips the match when the marker is
+ * absent and aggregates, so the statement returns exactly one row either way.
+ */
+export function buildFindCountQuery(match: string, alias: 'n' | 'node'): string {
+  return (
+    'OPTIONAL MATCH (repo:_Repository {repositoryId: $rid}) ' +
+    `CALL (repo) { WITH repo WHERE repo IS NOT NULL ${match} RETURN count(${alias}) AS total } ` +
+    'RETURN repo IS NOT NULL AS repositoryExists, total'
+  );
+}
+
+/**
  * Find entities matching a `StorageFindQuery`. Returns one page plus an exact
- * total via a `Promise.all([data, count])` round-trip pair — the parallel
+ * total via a `Promise.allSettled([data, count])` round-trip pair — the parallel
  * shape saves ~1.5 ms over sequential and keeps each query's plan-cache
  * footprint to a single entry per query shape.
  *
@@ -765,6 +841,13 @@ export function buildFulltextFindQuery(scoring: Neo4jSearchScoring, where: strin
  * exact. Property filters whose value Neo4j cannot represent as a native
  * scalar (nested objects, `null`) throw `ProviderError` at predicate-build
  * time rather than silently missing matches.
+ *
+ * The count statement also reads the repository marker (`buildFindCountQuery`),
+ * so a deleted repository throws `RepositoryNotFoundError` rather than
+ * reporting an empty page, even while a delete still in progress has left
+ * entities behind. The marker rides on the count because that statement
+ * always runs and always returns one row; the data statement returns one row
+ * per entity on the page and none for an empty one.
  */
 export async function findEntities(
   conn: Neo4jConnection,
@@ -779,8 +862,8 @@ export async function findEntities(
     limit: BigInt(query.limit),
   };
 
-  let records: ReadonlyArray<{ keys: ReadonlyArray<PropertyKey>; get(k: string): unknown }>;
-  let countResult: { records: ReadonlyArray<{ get(k: string): unknown }> };
+  let dataSettled: PromiseSettledResult<Awaited<ReturnType<Neo4jConnection['executeQuery']>>>;
+  let countSettled: PromiseSettledResult<Awaited<ReturnType<Neo4jConnection['executeQuery']>>>;
 
   if (query.searchTerm !== undefined && query.searchTerm !== '') {
     const projection = loadEmbeddings ? FIND_PROJECTION_FULL_FT : FIND_PROJECTION_LIGHT_FT;
@@ -797,12 +880,12 @@ export async function findEntities(
         ? `WHERE ${repoPredicate} AND ${where.cypherWhere.slice('WHERE '.length)}`
         : `WHERE ${repoPredicate}`;
     const dataCypher = buildFulltextFindQuery(searchScoring, combinedWhere, projection);
-    const countCypher =
-      `CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node ` +
-      `${combinedWhere} ` +
-      `RETURN count(node) AS total`;
+    const countCypher = buildFindCountQuery(
+      `CALL db.index.fulltext.queryNodes('dm_entity_text', $term) YIELD node ${combinedWhere}`,
+      'node',
+    );
     const termParam = { term: escapeLuceneQuery(query.searchTerm) };
-    const [dataResult, count] = await Promise.all([
+    [dataSettled, countSettled] = await Promise.allSettled([
       conn.executeQuery(
         dataCypher,
         { ...where.params, ...termParam, ...skipLimitParams },
@@ -814,20 +897,15 @@ export async function findEntities(
         { repositoryId, routing: 'READ' },
       ),
     ]);
-    records = dataResult.records;
-    countResult = count;
   } else {
     const projection = loadEmbeddings ? FIND_PROJECTION_FULL : FIND_PROJECTION_LIGHT;
     const where = buildFindEntitiesWhere(query, {
       alias: 'n',
       includeRepositoryPredicate: true,
     });
-    const dataCypher =
-      `MATCH (n:_Entity) ${where.cypherWhere} ` +
-      `RETURN ${projection} ` +
-      `ORDER BY n.id SKIP $skip LIMIT $limit`;
-    const countCypher = `MATCH (n:_Entity) ${where.cypherWhere} RETURN count(n) AS total`;
-    const [dataResult, count] = await Promise.all([
+    const dataCypher = buildMatchFindQuery(where.cypherWhere, projection);
+    const countCypher = buildFindCountQuery(`MATCH (n:_Entity) ${where.cypherWhere}`, 'n');
+    [dataSettled, countSettled] = await Promise.allSettled([
       conn.executeQuery(
         dataCypher,
         { ...where.params, ...skipLimitParams },
@@ -835,13 +913,16 @@ export async function findEntities(
       ),
       conn.executeQuery(countCypher, where.params, { repositoryId, routing: 'READ' }),
     ]);
-    records = dataResult.records;
-    countResult = count;
   }
 
-  const items = records.map((record) => entityFromRecord(record));
-  const totalRaw = countResult.records[0]?.get('total');
-  const total = totalRaw === undefined ? 0 : bigintToSafeNumber(totalRaw);
+  // The count carries the marker check, so a missing repository is reported
+  // ahead of a failed page.
+  const context = { repositoryId, operation: 'findEntities' };
+  const countRecord = settledValue(countSettled, context).records[0];
+  if (countRecord === undefined) throw new ProviderError('Neo4j entity count returned no row.');
+  if (countRecord.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  const items = settledValue(dataSettled, context).records.map((record) => entityFromRecord(record));
+  const total = bigintToSafeNumber(countRecord.get('total') ?? 0);
   const hasMore = query.offset + items.length < total;
 
   return {
@@ -854,10 +935,12 @@ export async function findEntities(
 }
 
 /**
- * Delete every entity of a type plus their incident relationships, returning
- * exact counts in a single round-trip — strict improvement over the
- * `deletedRelationships: undefined` path Cosmos has to live with (Gremlin
- * `bothE().count()` would fan out across every partition the type touches).
+ * Delete every entity of a type plus their incident relationships, only while
+ * the repository marker exists. The marker is a seek of its unique constraint
+ * index and the entities a seek of the `(repositoryId, entityType)` index.
+ * The subquery aggregates, so the statement returns exactly one row
+ * (`repositoryExists`, `entities`, `rels`) whether or not anything matched;
+ * with no marker the subquery deletes nothing.
  *
  * Counting via `sum(count{(n)-[]-()})` double-counts any edge whose two
  * endpoints are both in the matched same-type set, because each endpoint
@@ -869,29 +952,39 @@ export async function findEntities(
  * a downstream RETURN) requires running the delete inside a `CALL` subquery
  * so the outer query can still RETURN the pre-aggregated counts.
  */
+export const ENTITY_DELETE_BY_TYPE_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+CALL (repo) {
+  MATCH (n:_Entity {repositoryId: $rid, entityType: $entityType})
+  WHERE repo IS NOT NULL
+  OPTIONAL MATCH (n)-[r]-()
+  WITH collect(DISTINCT n) AS nodes,
+       count(DISTINCT n) AS entities,
+       count(DISTINCT r) AS rels
+  CALL (nodes) {
+    UNWIND nodes AS node
+    DETACH DELETE node
+  }
+  RETURN entities, rels
+}
+RETURN repo IS NOT NULL AS repositoryExists, entities, rels`;
+
+/**
+ * Delete every entity of a type plus their incident relationships
+ * (`ENTITY_DELETE_BY_TYPE_QUERY`), returning exact counts in a single
+ * round-trip — strict improvement over the `deletedRelationships: undefined`
+ * path Cosmos has to live with (Gremlin `bothE().count()` would fan out
+ * across every partition the type touches). Throws `RepositoryNotFoundError`
+ * when the repository marker is absent, and nothing is deleted.
+ */
 export async function deleteEntitiesByType(
   conn: Neo4jConnection,
   repositoryId: string,
   entityType: string,
 ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
-  const result = await conn.executeQuery(
-    `MATCH (n:_Entity {repositoryId: $rid, entityType: $entityType})
-     OPTIONAL MATCH (n)-[r]-()
-     WITH collect(DISTINCT n) AS nodes,
-          count(DISTINCT n) AS entities,
-          count(DISTINCT r) AS rels
-     CALL (nodes) {
-       UNWIND nodes AS node
-       DETACH DELETE node
-     }
-     RETURN entities, rels`,
-    { entityType },
-    { repositoryId },
-  );
+  const result = await conn.executeQuery(ENTITY_DELETE_BY_TYPE_QUERY, { entityType }, { repositoryId });
   const record = result.records[0];
-  if (record === undefined) {
-    return { deletedEntities: 0, deletedRelationships: 0 };
-  }
+  if (record === undefined) throw new ProviderError('Neo4j delete by entity type returned no row.');
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
   const deletedEntities = bigintToSafeNumber(record.get('entities') ?? 0);
   const deletedRelationships = bigintToSafeNumber(record.get('rels') ?? 0);
   return { deletedEntities, deletedRelationships };

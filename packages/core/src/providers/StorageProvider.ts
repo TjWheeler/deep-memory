@@ -107,15 +107,40 @@ export interface RelationshipCreateOptions {
  *
  * **Deleted repositories.** A repository counts as missing once its record
  * (the marker a delete removes first) is gone, even while a delete that has
- * not finished leaves entities, relationships or a vocabulary behind. The
- * methods documented with `@throws RepositoryNotFoundError` throw it for a
- * missing repository, and do so ahead of any outcome for a particular id
- * (repository → id → source → target), so a caller can tell a deleted
- * repository from an empty one or from a missing id. Such a call changes
- * nothing, with one exception: CosmosDB runs a batch delete of more than
- * 100 ids in chunks, and the chunks deleted before a later chunk finds the
- * repository gone stay deleted (Cosmos Gremlin has no transaction across
- * requests).
+ * not finished leaves entities, relationships or a vocabulary behind. Every
+ * method that takes a repository id throws `RepositoryNotFoundError` for a
+ * missing repository — reads, searches, traversals, the change log, the
+ * timeline, export and import included — except `getRepository` (which
+ * answers `null`) and `deleteRepository` (which finishes a partial delete;
+ * see there). `GraphTraversalProvider.traverse` follows the same rule. The
+ * check runs ahead of any outcome for a particular id (repository → id →
+ * source → target) and ahead of an empty result, so a caller can tell a
+ * deleted repository from an empty one, from a missing id or from a lookup
+ * that matched nothing. Such a call changes nothing. The one documented
+ * exception is a `getVocabulary` answered from a provider's vocabulary cache
+ * (see there); traversals check the repository whatever the cache holds.
+ *
+ * CosmosDB has no transaction across Gremlin requests, so a delete of the
+ * repository that races a multi-request call opens these windows:
+ * - a batch delete of more than 100 ids runs in chunks; the chunks deleted
+ *   before a later chunk finds the repository gone stay deleted;
+ * - `deleteRelationship`, `deleteRelationships` and
+ *   `deleteRelationshipsByType` read the repository marker, then drop in a
+ *   second request, so a delete landing in between lets the drop remove
+ *   edges (which the repository delete removes anyway) and report them
+ *   instead of throwing;
+ * - `importBulk` checks the repository before each chunk but not per row,
+ *   so a delete that starts mid-chunk can let that chunk's remaining rows
+ *   land (a later `deleteRepository` removes them); a repository already
+ *   gone before the call gets nothing written;
+ * - `exportAll` checks once, before the first page, so a delete that starts
+ *   mid-export is not detected (the call only reads);
+ * - reads that check the repository with a separate request issued alongside
+ *   the data read (`getRelationship`, `getVocabularyChangeLog`,
+ *   `findEntities`, and traversals on a warm vocabulary cache) can, when a
+ *   delete lands between the two requests, answer with rows the delete has
+ *   not drained yet, or `null` / empty, instead of throwing (the call only
+ *   reads).
  */
 export interface StorageProvider {
   // ─── Lifecycle ─────────────────────────────────────────────────────
@@ -312,7 +337,11 @@ export interface StorageProvider {
    * Create a relationship. Its id must be unused in the repository: a
    * provider refuses an id already held by another relationship with
    * `DuplicateRelationshipError`, unless `options.idMinted` says the engine
-   * generated the id (see `RelationshipCreateOptions`).
+   * generated the id (see `RelationshipCreateOptions`). CosmosDB, where
+   * vertices and edges share one id space per partition, also refuses an id
+   * equal to any other document id in the repository's partition (an entity,
+   * the repository marker or a vocabulary vertex) with
+   * `DuplicateRelationshipError`.
    */
   createRelationship(
     repositoryId: string,

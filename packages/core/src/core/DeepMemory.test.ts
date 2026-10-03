@@ -839,4 +839,24 @@ describe('DeepMemory deletes and relationship id origin', () => {
       [true, { idMinted: false }],
     ]);
   });
+
+  it('answers a traversal through the fallback executor with RepositoryNotFoundError once the repository is deleted', async () => {
+    const spec = {
+      start: { entityId: aliceId },
+      steps: [{ direction: 'out' as const, relationshipTypes: ['KNOWS'] }],
+      returnMode: 'terminal' as const,
+      limit: 10,
+    };
+    // The handle validates the spec against the vocabulary it cached before
+    // the delete, so the traversal reaches the fallback executor's own reads.
+    await expect(repo.traverse(spec)).resolves.toMatchObject({ entities: [expect.objectContaining({ id: bobId })] });
+    await memory.deleteRepository(repositoryId);
+    const vocabularyRead = vi.spyOn(storage, 'getVocabulary');
+    const entityRead = vi.spyOn(storage, 'getEntity');
+
+    await expect(repo.traverse(spec)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+
+    expect(vocabularyRead).not.toHaveBeenCalled();
+    expect(entityRead).toHaveBeenCalledWith(repositoryId, aliceId);
+  });
 });

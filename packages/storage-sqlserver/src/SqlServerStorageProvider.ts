@@ -1,7 +1,7 @@
 // SqlServerStorageProvider — SQL Server implementation of StorageProvider
 
 import sql from 'mssql';
-import type { IResult } from 'mssql';
+import type { IRecordSet, IResult } from 'mssql';
 import type {
   StorageProvider,
   EnsureSchemaResult,
@@ -44,6 +44,7 @@ import type {
 } from '@utaba/deep-memory/types';
 import type { Provenance } from '@utaba/deep-memory/types';
 import {
+  DeepMemoryError,
   RepositoryNotFoundError,
   DuplicateRepositoryError,
   EntityNotFoundError,
@@ -167,6 +168,31 @@ const ENTITY_COLS_LIGHT = [
 /** All entity columns including embedding — used by getEntity, getEntities, exportAll */
 const ENTITY_COLS_FULL = `${ENTITY_COLS_LIGHT}, [embedding]`;
 
+/** The row a batch headed by `repositoryCheckSql` returns first. */
+interface RepositoryCheckRow {
+  repository_exists: number;
+}
+
+/** The calls that read entities through `readEntitiesGuarded`. */
+type GuardedEntityReadOperation =
+  | 'getEntity'
+  | 'getEntityBySlug'
+  | 'getEntities'
+  | 'exploreNeighborhood'
+  | 'findPaths'
+  | 'getTimeline';
+
+/** The calls that act on a repository check row (`assertRepositoryChecked`). */
+type RepositoryCheckedOperation =
+  | GuardedEntityReadOperation
+  | 'findEntities'
+  | 'getRelationship'
+  | 'getEntityRelationships'
+  | 'getVocabularyChangeLog'
+  | 'exportAll'
+  | 'deleteEntities'
+  | 'deleteRelationships';
+
 // ─── Row-mapping helpers ────────────────────────────────────────────
 
 function provenanceFromRow(row: sql.IRecordSet<unknown>[number]): Provenance {
@@ -185,36 +211,32 @@ function provenanceFromRow(row: sql.IRecordSet<unknown>[number]): Provenance {
   };
 }
 
-/**
- * Add provenance filter conditions to a SQL query.
- * Uses a prefix to avoid parameter name collisions across data/count requests.
- */
+/** Add provenance filter conditions to a SQL query. */
 function addProvenanceConditions(
   req: sql.Request,
   prov: ProvenanceFilter,
   conditions: string[],
-  prefix: string,
 ): void {
   if (prov.conversationIds && prov.conversationIds.length > 0) {
     const placeholders = prov.conversationIds.map((id, i) => {
-      req.input(`${prefix}ConvId${i}`, sql.NVarChar, id);
-      return `@${prefix}ConvId${i}`;
+      req.input(`provConvId${i}`, sql.NVarChar, id);
+      return `@provConvId${i}`;
     });
     const inClause = placeholders.join(',');
     conditions.push(`([created_in_conversation] IN (${inClause}) OR [modified_in_conversation] IN (${inClause}))`);
   }
   if (prov.actors && prov.actors.length > 0) {
     const placeholders = prov.actors.map((a, i) => {
-      req.input(`${prefix}Actor${i}`, sql.NVarChar, a);
-      return `@${prefix}Actor${i}`;
+      req.input(`provActor${i}`, sql.NVarChar, a);
+      return `@provActor${i}`;
     });
     const inClause = placeholders.join(',');
     conditions.push(`([created_by] IN (${inClause}) OR [modified_by] IN (${inClause}))`);
   }
   if (prov.dateRange) {
-    req.input(`${prefix}DateFrom`, sql.NVarChar, prov.dateRange.from);
-    req.input(`${prefix}DateTo`, sql.NVarChar, prov.dateRange.to);
-    conditions.push(`([created_at] >= @${prefix}DateFrom AND [created_at] <= @${prefix}DateTo) OR ([modified_at] >= @${prefix}DateFrom AND [modified_at] <= @${prefix}DateTo)`);
+    req.input('provDateFrom', sql.NVarChar, prov.dateRange.from);
+    req.input('provDateTo', sql.NVarChar, prov.dateRange.to);
+    conditions.push('([created_at] >= @provDateFrom AND [created_at] <= @provDateTo) OR ([modified_at] >= @provDateFrom AND [modified_at] <= @provDateTo)');
   }
 }
 
@@ -916,35 +938,32 @@ export class SqlServerStorageProvider implements StorageProvider {
     throw new VocabularyVersionConflictError(repositoryId, expectedVersion, row.version);
   }
 
-  async getVocabularyChangeLog(
+  public async getVocabularyChangeLog(
     repositoryId: string,
     options?: PaginationOptions,
   ): Promise<PaginatedResult<VocabularyChangeRecord>> {
-    await this.assertRepository(repositoryId);
     const pool = this.getPool();
     const limit = options?.limit ?? 10;
     const offset = options?.offset ?? 0;
 
-    const countResult = await pool.request()
-      .input('id', sql.UniqueIdentifier, repositoryId)
-      .query<{ cnt: number }>(
-        `SELECT COUNT(*) AS cnt FROM ${this.t('dm_vocabulary_change_log')} WHERE [repository_id] = @id`,
-      );
-    const total = countResult.recordset[0]?.cnt ?? 0;
-
+    // One batch: the repository check, the count and the page.
     const result = await pool.request()
-      .input('id', sql.UniqueIdentifier, repositoryId)
+      .input('repoId', sql.UniqueIdentifier, repositoryId)
       .input('limit', sql.Int, limit)
       .input('offset', sql.Int, offset)
-      .query<Record<string, unknown>>(
-        `SELECT * FROM ${this.t('dm_vocabulary_change_log')}
-         WHERE [repository_id] = @id
+      .query<[RepositoryCheckRow, { cnt: number }, Record<string, unknown>]>(
+        `${this.repositoryCheckSql()}
+         SELECT COUNT(*) AS cnt FROM ${this.t('dm_vocabulary_change_log')} WHERE [repository_id] = @repoId;
+         SELECT * FROM ${this.t('dm_vocabulary_change_log')}
+         WHERE [repository_id] = @repoId
          ORDER BY [proposed_at] DESC
-         OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`,
+         OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;`,
       );
+    this.assertRepositoryChecked(result.recordsets[0], repositoryId, 'getVocabularyChangeLog');
+    const total = result.recordsets[1][0]?.cnt ?? 0;
 
     return {
-      items: result.recordset.map(changeRecordFromRow),
+      items: result.recordsets[2].map(changeRecordFromRow),
       total,
       hasMore: offset + limit < total,
       limit,
@@ -1012,64 +1031,35 @@ export class SqlServerStorageProvider implements StorageProvider {
     return entity;
   }
 
-  async getEntity(repositoryId: string, entityId: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
-    const pool = this.getPool();
+  public async getEntity(
+    repositoryId: string,
+    entityId: string,
+    options?: EntityReadOptions,
+  ): Promise<StoredEntity | null> {
     const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
-    const result = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityId', sql.NVarChar, entityId)
-      .query<Record<string, unknown>>(
-        `SELECT ${cols} FROM ${this.t('dm_entities')}
-         WHERE [repository_id] = @repoId AND [entity_id] = @entityId`,
-      );
-
-    const row = result.recordset[0];
-    if (!row) return null;
-    return entityFromRow(row);
+    const [entity] = await this.readEntitiesGuarded(repositoryId, 'getEntity', { entityId }, cols);
+    return entity ?? null;
   }
 
-  async getEntityBySlug(repositoryId: string, slug: string, options?: EntityReadOptions): Promise<StoredEntity | null> {
-    const pool = this.getPool();
+  public async getEntityBySlug(
+    repositoryId: string,
+    slug: string,
+    options?: EntityReadOptions,
+  ): Promise<StoredEntity | null> {
     const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
-    const result = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('slug', sql.NVarChar, slug)
-      .query<Record<string, unknown>>(
-        `SELECT ${cols} FROM ${this.t('dm_entities')}
-         WHERE [repository_id] = @repoId AND [slug] = @slug`,
-      );
-
-    const row = result.recordset[0];
-    if (!row) return null;
-    return entityFromRow(row);
+    const [entity] = await this.readEntitiesGuarded(repositoryId, 'getEntityBySlug', { slug }, cols);
+    return entity ?? null;
   }
 
-  async getEntities(
+  /** An empty `entityIds` list still checks the repository. */
+  public async getEntities(
     repositoryId: string,
     entityIds: string[],
     options?: EntityReadOptions,
   ): Promise<Map<string, StoredEntity>> {
-    const pool = this.getPool();
-    const result = new Map<string, StoredEntity>();
-    if (entityIds.length === 0) return result;
-
     const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
-    const tvp = this.createIdListTvp(entityIds);
-    const rows = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityIds', tvp)
-      .query<Record<string, unknown>>(
-        `SELECT ${cols} FROM ${this.t('dm_entities')}
-         WHERE [repository_id] = @repoId
-         AND [entity_id] IN (SELECT [id] FROM @entityIds)`,
-      );
-
-    for (const row of rows.recordset) {
-      const entity = entityFromRow(row);
-      result.set(entity.id, entity);
-    }
-
-    return result;
+    const entities = await this.readEntitiesGuarded(repositoryId, 'getEntities', { entityIds }, cols);
+    return new Map(entities.map((entity) => [entity.id, entity]));
   }
 
   public async updateEntity(
@@ -1079,14 +1069,11 @@ export class SqlServerStorageProvider implements StorageProvider {
   ): Promise<StoredEntity> {
     const pool = this.getPool();
 
-    // Get existing entity. A miss checks the repository first, so a deleted
-    // repository reports `RepositoryNotFoundError` rather than a missing
-    // entity; the check costs a round trip on the failure path only.
+    // Get existing entity. The read checks the repository in the same batch,
+    // so a deleted repository reports `RepositoryNotFoundError` rather than a
+    // missing entity.
     const existing = await this.getEntity(repositoryId, entityId);
-    if (!existing) {
-      await this.assertRepository(repositoryId);
-      throw new EntityNotFoundError(entityId);
-    }
+    if (!existing) throw new EntityNotFoundError(entityId);
 
     // For optional string fields, null clears, undefined preserves, string sets.
     const updated: StoredEntity = {
@@ -1215,53 +1202,40 @@ export class SqlServerStorageProvider implements StorageProvider {
     `);
   }
 
-  async deleteEntitiesByType(
+  /**
+   * One batch and one transaction (see `deleteByTypeGuarded`): the
+   * relationships with an endpoint of the type go first, by source and then
+   * by target, then the entities.
+   */
+  public async deleteEntitiesByType(
     repositoryId: string,
     entityType: string,
   ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
-    await this.assertRepository(repositoryId);
-    const pool = this.getPool();
-
-    // Delete relationships where entities of this type are the SOURCE
-    const srcResult = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityType', sql.NVarChar, entityType)
-      .query(`
-        DELETE r FROM ${this.t('dm_relationships')} r
-        INNER JOIN ${this.t('dm_entities')} e
-          ON r.[repository_id] = e.[repository_id]
-          AND r.[source_entity_id] = e.[entity_id]
-        WHERE e.[repository_id] = @repoId AND e.[entity_type] = @entityType
-      `);
-
-    // Delete relationships where entities of this type are the TARGET
-    const tgtResult = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityType', sql.NVarChar, entityType)
-      .query(`
-        DELETE r FROM ${this.t('dm_relationships')} r
-        INNER JOIN ${this.t('dm_entities')} e
-          ON r.[repository_id] = e.[repository_id]
-          AND r.[target_entity_id] = e.[entity_id]
-        WHERE e.[repository_id] = @repoId AND e.[entity_type] = @entityType
-      `);
-
-    const deletedRelationships = (srcResult.rowsAffected[0] ?? 0) + (tgtResult.rowsAffected[0] ?? 0);
-
-    // Delete the entities
-    const entResult = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityType', sql.NVarChar, entityType)
-      .query(
-        `DELETE FROM ${this.t('dm_entities')}
-         WHERE [repository_id] = @repoId AND [entity_type] = @entityType`,
-      );
-    const deletedEntities = entResult.rowsAffected[0] ?? 0;
-
-    return { deletedEntities, deletedRelationships };
+    const request = this.getPool().request().input('entityType', sql.NVarChar, entityType);
+    return this.deleteByTypeGuarded(repositoryId, 'deleteEntitiesByType', request, `
+      DELETE r FROM ${this.t('dm_relationships')} r
+      INNER JOIN ${this.t('dm_entities')} e
+        ON r.[repository_id] = e.[repository_id]
+        AND r.[source_entity_id] = e.[entity_id]
+      WHERE e.[repository_id] = @repoId AND e.[entity_type] = @entityType;
+      SET @deletedRelationships += @@ROWCOUNT;
+      DELETE r FROM ${this.t('dm_relationships')} r
+      INNER JOIN ${this.t('dm_entities')} e
+        ON r.[repository_id] = e.[repository_id]
+        AND r.[target_entity_id] = e.[entity_id]
+      WHERE e.[repository_id] = @repoId AND e.[entity_type] = @entityType;
+      SET @deletedRelationships += @@ROWCOUNT;
+      DELETE FROM ${this.t('dm_entities')}
+      WHERE [repository_id] = @repoId AND [entity_type] = @entityType;
+      SET @deletedEntities = @@ROWCOUNT;
+    `);
   }
 
-  async findEntities(
+  /**
+   * One batch: the repository check, the count and the page, sharing one
+   * set of parameters.
+   */
+  public async findEntities(
     repositoryId: string,
     query: StorageFindQuery,
     options?: EntityReadOptions,
@@ -1299,62 +1273,27 @@ export class SqlServerStorageProvider implements StorageProvider {
 
     // Provenance filter
     if (query.provenance) {
-      addProvenanceConditions(req, query.provenance, conditions, 'data');
+      addProvenanceConditions(req, query.provenance, conditions);
     }
 
     const where = conditions.join(' AND ');
-
-    // Build a separate request for the count (mssql doesn't allow reusing requests)
-
-    const countReq = pool.request().input('repoId', sql.UniqueIdentifier, repositoryId);
-    const countConditions = ['[repository_id] = @repoId'];
-
-    if (query.entityTypes && query.entityTypes.length > 0) {
-      const typePlaceholders = query.entityTypes.map((t, i) => {
-        countReq.input(`et${i}`, sql.NVarChar, t);
-        return `@et${i}`;
-      });
-      countConditions.push(`[entity_type] IN (${typePlaceholders.join(',')})`);
-    }
-    if (query.searchTerm) {
-      countReq.input('searchTerm', sql.NVarChar, `%${query.searchTerm}%`);
-      countConditions.push(`([label] LIKE @searchTerm OR [summary] LIKE @searchTerm)`);
-    }
-    if (query.properties) {
-      const entries = Object.entries(query.properties);
-      for (let i = 0; i < entries.length; i++) {
-        const [key, value] = entries[i]!;
-        countReq.input(`propKey${i}`, sql.NVarChar, `$.${key}`);
-        countReq.input(`propVal${i}`, sql.NVarChar, String(value));
-        countConditions.push(`JSON_VALUE([properties], @propKey${i}) = @propVal${i}`);
-      }
-    }
-
-    // Provenance filter (count query)
-    if (query.provenance) {
-      addProvenanceConditions(countReq, query.provenance, countConditions, 'count');
-    }
-
-    const countWhere = countConditions.join(' AND ');
-    const totalResult = await countReq.query<{ cnt: number }>(
-      `SELECT COUNT(*) AS cnt FROM ${this.t('dm_entities')} WHERE ${countWhere}`,
-    );
-    const total = totalResult.recordset[0]?.cnt ?? 0;
-
-    // Fetch page
     req.input('limit', sql.Int, query.limit);
     req.input('offset', sql.Int, query.offset);
 
     const cols = options?.loadEmbeddings ? ENTITY_COLS_FULL : ENTITY_COLS_LIGHT;
-    const result = await req.query<Record<string, unknown>>(
-      `SELECT ${cols} FROM ${this.t('dm_entities')}
+    const result = await req.query<[RepositoryCheckRow, { cnt: number }, Record<string, unknown>]>(
+      `${this.repositoryCheckSql()}
+       SELECT COUNT(*) AS cnt FROM ${this.t('dm_entities')} WHERE ${where};
+       SELECT ${cols} FROM ${this.t('dm_entities')}
        WHERE ${where}
        ORDER BY [entity_id]
-       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`,
+       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;`,
     );
+    this.assertRepositoryChecked(result.recordsets[0], repositoryId, 'findEntities');
+    const total = result.recordsets[1][0]?.cnt ?? 0;
 
     return {
-      items: result.recordset.map(entityFromRow),
+      items: result.recordsets[2].map(entityFromRow),
       total,
       hasMore: query.offset + query.limit < total,
       limit: query.limit,
@@ -1484,7 +1423,7 @@ export class SqlServerStorageProvider implements StorageProvider {
     );
   }
 
-  async getRelationship(
+  public async getRelationship(
     repositoryId: string,
     relationshipId: string,
   ): Promise<StoredRelationship | null> {
@@ -1492,17 +1431,23 @@ export class SqlServerStorageProvider implements StorageProvider {
     const result = await pool.request()
       .input('repoId', sql.UniqueIdentifier, repositoryId)
       .input('relId', sql.NVarChar, relationshipId)
-      .query<Record<string, unknown>>(
-        `SELECT * FROM ${this.t('dm_relationships')}
-         WHERE [repository_id] = @repoId AND [relationship_id] = @relId`,
+      .query<[RepositoryCheckRow, Record<string, unknown>]>(
+        `${this.repositoryCheckSql()}
+         SELECT * FROM ${this.t('dm_relationships')}
+         WHERE [repository_id] = @repoId AND [relationship_id] = @relId;`,
       );
+    this.assertRepositoryChecked(result.recordsets[0], repositoryId, 'getRelationship');
 
-    const row = result.recordset[0];
+    const row = result.recordsets[1][0];
     if (!row) return null;
     return relationshipFromRow(row);
   }
 
-  async getEntityRelationships(
+  /**
+   * One batch: the repository check, the count and the page. Property
+   * filters apply to the fetched page afterwards.
+   */
+  public async getEntityRelationships(
     repositoryId: string,
     entityId: string,
     options?: RelationshipQueryOptions,
@@ -1528,32 +1473,24 @@ export class SqlServerStorageProvider implements StorageProvider {
     // instead of forcing an OR-based scan across source/target columns.
     const unionBranches = this.buildRelationshipUnion(tbl, direction, rtFilter);
 
-    const addParams = (req: sql.Request): sql.Request => {
-      req.input('repoId', sql.UniqueIdentifier, repositoryId);
-      req.input('entityId', sql.NVarChar, entityId);
-      for (const p of rtInputs) req.input(p.name, sql.NVarChar, p.value);
-      return req;
-    };
+    const req = pool.request()
+      .input('repoId', sql.UniqueIdentifier, repositoryId)
+      .input('entityId', sql.NVarChar, entityId)
+      .input('limit', sql.Int, limit)
+      .input('offset', sql.Int, offset);
+    for (const p of rtInputs) req.input(p.name, sql.NVarChar, p.value);
 
-    // Count
-    const countReq = addParams(pool.request());
-    const totalResult = await countReq.query<{ cnt: number }>(
-      `SELECT COUNT(*) AS cnt FROM (${unionBranches}) AS _u`,
-    );
-    const total = totalResult.recordset[0]?.cnt ?? 0;
-
-    // Fetch page
-    const fetchReq = addParams(pool.request());
-    fetchReq.input('limit', sql.Int, limit);
-    fetchReq.input('offset', sql.Int, offset);
-
-    const result = await fetchReq.query<Record<string, unknown>>(
-      `SELECT * FROM (${unionBranches}) AS _u
+    const result = await req.query<[RepositoryCheckRow, { cnt: number }, Record<string, unknown>]>(
+      `${this.repositoryCheckSql()}
+       SELECT COUNT(*) AS cnt FROM (${unionBranches}) AS _u;
+       SELECT * FROM (${unionBranches}) AS _u
        ORDER BY [relationship_id]
-       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`,
+       OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;`,
     );
+    this.assertRepositoryChecked(result.recordsets[0], repositoryId, 'getEntityRelationships');
+    const total = result.recordsets[1][0]?.cnt ?? 0;
 
-    let items = result.recordset.map(relationshipFromRow);
+    let items = result.recordsets[2].map(relationshipFromRow);
 
     // Apply property filters in-memory
     if (options?.propertyFilters && options.propertyFilters.length > 0) {
@@ -1646,33 +1583,38 @@ export class SqlServerStorageProvider implements StorageProvider {
     `);
   }
 
-  async deleteRelationshipsByType(
+  /** One batch and one transaction (see `deleteByTypeGuarded`). */
+  public async deleteRelationshipsByType(
     repositoryId: string,
     relationshipType: string,
   ): Promise<{ deletedRelationships: number }> {
-    await this.assertRepository(repositoryId);
-    const pool = this.getPool();
-
-    const result = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('relType', sql.NVarChar, relationshipType)
-      .query(
-        `DELETE FROM ${this.t('dm_relationships')}
-         WHERE [repository_id] = @repoId AND [relationship_type] = @relType`,
-      );
-
-    return { deletedRelationships: result.rowsAffected[0] ?? 0 };
+    const request = this.getPool().request().input('relType', sql.NVarChar, relationshipType);
+    const { deletedRelationships } = await this.deleteByTypeGuarded(
+      repositoryId,
+      'deleteRelationshipsByType',
+      request,
+      `DELETE FROM ${this.t('dm_relationships')}
+       WHERE [repository_id] = @repoId AND [relationship_type] = @relType;
+       SET @deletedRelationships = @@ROWCOUNT;`,
+    );
+    return { deletedRelationships };
   }
 
   // ─── Graph Traversal ────────────────────────────────────────────
 
-  async exploreNeighborhood(
+  public async exploreNeighborhood(
     repositoryId: string,
     entityId: string,
     options: StorageExploreOptions,
   ): Promise<StorageNeighborhood> {
-    // Verify the center entity exists (light — no embedding needed)
-    const center = await this.getEntityLight(repositoryId, entityId);
+    // The center entity must exist (light — no embedding needed); the same
+    // batch checks the repository first.
+    const [center] = await this.readEntitiesGuarded(
+      repositoryId,
+      'exploreNeighborhood',
+      { entityId },
+      ENTITY_COLS_LIGHT,
+    );
     if (!center) {
       throw new EntityNotFoundError(entityId);
     }
@@ -1760,19 +1702,23 @@ export class SqlServerStorageProvider implements StorageProvider {
     return { centerId: entityId, layers };
   }
 
-  async findPaths(
+  public async findPaths(
     repositoryId: string,
     sourceId: string,
     targetId: string,
     options: StoragePathOptions,
   ): Promise<StoragePathResult> {
-    // Verify both entities exist (light — no embedding needed)
-    const [source, target] = await Promise.all([
-      this.getEntityLight(repositoryId, sourceId),
-      this.getEntityLight(repositoryId, targetId),
-    ]);
-    if (!source) throw new EntityNotFoundError(sourceId);
-    if (!target) throw new EntityNotFoundError(targetId);
+    // Both entities must exist (light — no embedding needed); the same
+    // batch checks the repository first.
+    const endpoints = await this.readEntitiesGuarded(
+      repositoryId,
+      'findPaths',
+      { entityIds: [sourceId, targetId] },
+      ENTITY_COLS_LIGHT,
+    );
+    const found = new Set(endpoints.map((entity) => entity.id));
+    if (!found.has(sourceId)) throw new EntityNotFoundError(sourceId);
+    if (!found.has(targetId)) throw new EntityNotFoundError(targetId);
 
     if (sourceId === targetId) {
       return { paths: [{ entityIds: [sourceId], relationshipIds: [] }], totalPaths: 1 };
@@ -1857,12 +1803,18 @@ export class SqlServerStorageProvider implements StorageProvider {
 
   // ─── Timeline ───────────────────────────────────────────────────
 
-  async getTimeline(
+  public async getTimeline(
     repositoryId: string,
     entityId: string,
     options: StorageTimelineOptions,
   ): Promise<StorageTimelineResult> {
-    const entity = await this.getEntityLight(repositoryId, entityId);
+    // The same batch checks the repository before reading the entity.
+    const [entity] = await this.readEntitiesGuarded(
+      repositoryId,
+      'getTimeline',
+      { entityId },
+      ENTITY_COLS_LIGHT,
+    );
     if (!entity) {
       throw new EntityNotFoundError(entityId);
     }
@@ -1942,18 +1894,20 @@ export class SqlServerStorageProvider implements StorageProvider {
 
   // ─── Bulk Operations ────────────────────────────────────────────
 
-  async *exportAll(repositoryId: string): AsyncIterable<ExportChunk> {
-    await this.assertRepository(repositoryId);
+  public async *exportAll(repositoryId: string): AsyncIterable<ExportChunk> {
     const pool = this.getPool();
     const batchSize = 100;
 
-    // Export entities
+    // Export entities. The first count shares its batch with the repository
+    // check, so a missing repository throws before anything is yielded.
     const entityCount = await pool.request()
       .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .query<{ cnt: number }>(
-        `SELECT COUNT(*) AS cnt FROM ${this.t('dm_entities')} WHERE [repository_id] = @repoId`,
+      .query<[RepositoryCheckRow, { cnt: number }]>(
+        `${this.repositoryCheckSql()}
+         SELECT COUNT(*) AS cnt FROM ${this.t('dm_entities')} WHERE [repository_id] = @repoId;`,
       );
-    const totalEntities = entityCount.recordset[0]?.cnt ?? 0;
+    this.assertRepositoryChecked(entityCount.recordsets[0], repositoryId, 'exportAll');
+    const totalEntities = entityCount.recordsets[1][0]?.cnt ?? 0;
 
     if (totalEntities === 0) {
       yield { type: 'entities', data: [], sequence: 0, isLast: true };
@@ -2017,7 +1971,6 @@ export class SqlServerStorageProvider implements StorageProvider {
     data: ImportChunk[],
     _options?: BulkImportOptions,
   ): Promise<BulkImportResult> {
-    await this.assertRepository(repositoryId);
     const pool = this.getPool();
     let entitiesImported = 0;
     let relationshipsImported = 0;
@@ -2029,6 +1982,51 @@ export class SqlServerStorageProvider implements StorageProvider {
     let current: ImportRow | undefined;
     const transaction = pool.transaction();
     await transaction.begin();
+
+    // The repository row is the transaction's first read and is held
+    // (`HOLDLOCK`) to the end, in the same lock order as `deleteRepository`,
+    // so a concurrent delete waits for the import instead of failing it
+    // part-way. With no repository row nothing is written: the empty
+    // transaction commits and the call throws `RepositoryNotFoundError`.
+    // A failed check or commit rolls back; a typed error raised here passes
+    // through unchanged and only a driver error is wrapped.
+    let repositoryExists: boolean;
+    try {
+      const check = await transaction.request()
+        .input('repoId', sql.UniqueIdentifier, repositoryId)
+        .query<RepositoryCheckRow>(
+          `SELECT COUNT(*) AS repository_exists
+           FROM ${this.t('dm_repositories')} WITH (HOLDLOCK, ROWLOCK)
+           WHERE [repository_id] = @repoId`,
+        );
+      const checkRow = check.recordset[0];
+      if (checkRow === undefined) {
+        throw new ProviderError('SQL Server importBulk returned no repository check row.');
+      }
+      repositoryExists = checkRow.repository_exists === 1;
+      if (!repositoryExists) {
+        await transaction.commit();
+      }
+    } catch (err) {
+      let rollbackNote = '';
+      try {
+        await transaction.rollback();
+      } catch (rollbackErr) {
+        // Reported inside the error below; it must not replace the failure
+        // that caused the rollback.
+        rollbackNote = ` (the rollback also failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)})`;
+      }
+      if (err instanceof DeepMemoryError) throw err;
+      throw new ProviderError(
+        `SQL Server importBulk could not check the repository: ${err instanceof Error ? err.message : String(err)}${rollbackNote}`,
+        'Nothing from this import was written; re-running it is safe.',
+        { cause: err },
+      );
+    }
+    if (!repositoryExists) {
+      throw new RepositoryNotFoundError(repositoryId);
+    }
+
     try {
       for (const chunk of data) {
         if (chunk.entities) {
@@ -2163,20 +2161,38 @@ export class SqlServerStorageProvider implements StorageProvider {
     return tvp;
   }
 
-  /** Returns a StoredEntity without the embedding column (lighter I/O). */
-  private async getEntityLight(repositoryId: string, entityId: string): Promise<StoredEntity | null> {
-    const pool = this.getPool();
-    const result = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityId', sql.NVarChar, entityId)
-      .query<Record<string, unknown>>(
-        `SELECT ${ENTITY_COLS_LIGHT} FROM ${this.t('dm_entities')}
-         WHERE [repository_id] = @repoId AND [entity_id] = @entityId`,
-      );
+  /**
+   * Read entities by id, by ids or by slug in one batch that checks the
+   * repository first (see `repositoryCheckSql`), so a missing repository
+   * throws `RepositoryNotFoundError` rather than answering "no such entity".
+   * A single id binds a scalar parameter; a list goes through the id-list TVP.
+   */
+  private async readEntitiesGuarded(
+    repositoryId: string,
+    operation: GuardedEntityReadOperation,
+    match: { entityId: string } | { entityIds: string[] } | { slug: string },
+    cols: string,
+  ): Promise<StoredEntity[]> {
+    const req = this.getPool().request().input('repoId', sql.UniqueIdentifier, repositoryId);
+    let predicate: string;
+    if ('entityId' in match) {
+      req.input('entityId', sql.NVarChar, match.entityId);
+      predicate = '[entity_id] = @entityId';
+    } else if ('entityIds' in match) {
+      req.input('entityIds', this.createIdListTvp(match.entityIds));
+      predicate = '[entity_id] IN (SELECT [id] FROM @entityIds)';
+    } else {
+      req.input('slug', sql.NVarChar, match.slug);
+      predicate = '[slug] = @slug';
+    }
 
-    const row = result.recordset[0];
-    if (!row) return null;
-    return entityFromRow(row);
+    const result = await req.query<[RepositoryCheckRow, Record<string, unknown>]>(
+      `${this.repositoryCheckSql()}
+       SELECT ${cols} FROM ${this.t('dm_entities')}
+       WHERE [repository_id] = @repoId AND ${predicate};`,
+    );
+    this.assertRepositoryChecked(result.recordsets[0], repositoryId, operation);
+    return result.recordsets[1].map(entityFromRow);
   }
 
   /** Returns multiple entities without embedding columns, using TVP for batch lookup. */
@@ -2302,12 +2318,12 @@ export class SqlServerStorageProvider implements StorageProvider {
     deletes: string,
   ): Promise<{ deleted: string[]; notFound: string[] }> {
     const pool = this.getPool();
-    let result: IResult<[{ repository_exists: number }, { id: string }]>;
+    let result: IResult<[RepositoryCheckRow, { id: string }]>;
     try {
       result = await pool.request()
         .input('repoId', sql.UniqueIdentifier, repositoryId)
         .input('ids', this.createIdListTvp(ids))
-        .query<[{ repository_exists: number }, { id: string }]>(`
+        .query<[RepositoryCheckRow, { id: string }]>(`
           SET XACT_ABORT ON;
           DECLARE @repositories INT = 0;
           DECLARE @deleted TABLE ([id] NVARCHAR(300) NOT NULL);
@@ -2331,12 +2347,98 @@ export class SqlServerStorageProvider implements StorageProvider {
       );
     }
 
-    if (result.recordsets[0]?.[0]?.repository_exists !== 1) {
-      throw new RepositoryNotFoundError(repositoryId);
-    }
+    this.assertRepositoryChecked(result.recordsets[0], repositoryId, operation);
     const deleted = (result.recordsets[1] ?? []).map((row) => row.id);
     const deletedSet = new Set(deleted);
     return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
+  }
+
+  /**
+   * Head of a batch that must answer `RepositoryNotFoundError` for a missing
+   * repository. Its result set always comes first and always has one row.
+   * With no repository row the batch ends there (`RETURN`): it skips the
+   * reads and returns exactly that one result set, so callers can index
+   * `recordsets` by position and act on the check before touching the rest.
+   * (A repository row is the only marker on SQL Server: foreign keys and the
+   * single-transaction `deleteRepository` mean data never outlives it.)
+   */
+  private repositoryCheckSql(): string {
+    return `IF NOT EXISTS (SELECT 1 FROM ${this.t('dm_repositories')} WHERE [repository_id] = @repoId)
+       BEGIN
+         SELECT 0 AS repository_exists;
+         RETURN;
+       END;
+       SELECT 1 AS repository_exists;`;
+  }
+
+  /**
+   * Act on the result set of `repositoryCheckSql`. A missing row means the
+   * batch did not run as written, which is a provider failure, not a missing
+   * repository.
+   */
+  private assertRepositoryChecked(
+    rows: IRecordSet<RepositoryCheckRow> | undefined,
+    repositoryId: string,
+    operation: RepositoryCheckedOperation,
+  ): void {
+    const row = rows?.[0];
+    if (row === undefined) {
+      throw new ProviderError(`SQL Server ${operation} returned no repository check row.`);
+    }
+    if (row.repository_exists !== 1) throw new RepositoryNotFoundError(repositoryId);
+  }
+
+  /**
+   * Delete by type in one batch and one transaction that takes the
+   * repository row first, with `HOLDLOCK` to the end of the transaction, in
+   * the same order as `deleteRepository` and `deleteByIdsGuarded`. With no
+   * repository row nothing is deleted and the call throws
+   * `RepositoryNotFoundError`. `deletes` adds what it removes to
+   * `@deletedEntities` / `@deletedRelationships`; with `XACT_ABORT` on, an
+   * error anywhere rolls all of it back.
+   */
+  private async deleteByTypeGuarded(
+    repositoryId: string,
+    operation: 'deleteEntitiesByType' | 'deleteRelationshipsByType',
+    request: sql.Request,
+    deletes: string,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+    let result: IResult<{ repository_exists: number; deleted_entities: number; deleted_relationships: number }>;
+    try {
+      result = await request
+        .input('repoId', sql.UniqueIdentifier, repositoryId)
+        .query<{ repository_exists: number; deleted_entities: number; deleted_relationships: number }>(`
+          SET XACT_ABORT ON;
+          DECLARE @repositories INT = 0;
+          DECLARE @deletedEntities INT = 0;
+          DECLARE @deletedRelationships INT = 0;
+          BEGIN TRANSACTION;
+          SELECT @repositories = 1
+            FROM ${this.t('dm_repositories')} WITH (HOLDLOCK, ROWLOCK)
+            WHERE [repository_id] = @repoId;
+          IF @repositories = 1
+          BEGIN
+            ${deletes}
+          END
+          COMMIT TRANSACTION;
+          SELECT @repositories AS repository_exists,
+                 @deletedEntities AS deleted_entities,
+                 @deletedRelationships AS deleted_relationships;
+        `);
+    } catch (err) {
+      throw new ProviderError(
+        `SQL Server ${operation} failed: ${err instanceof Error ? err.message : String(err)}`,
+        'The delete is all-or-nothing; re-running it is safe.',
+        { cause: err },
+      );
+    }
+
+    const row = result.recordset[0];
+    if (row === undefined) {
+      throw new ProviderError(`SQL Server ${operation} returned no result row.`);
+    }
+    if (row.repository_exists !== 1) throw new RepositoryNotFoundError(repositoryId);
+    return { deletedEntities: row.deleted_entities, deletedRelationships: row.deleted_relationships };
   }
 
   private async assertRepository(repositoryId: string): Promise<void> {

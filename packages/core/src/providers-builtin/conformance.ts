@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { StorageProvider } from '../providers/StorageProvider.js';
+import type { GraphTraversalProvider } from '../providers/GraphTraversalProvider.js';
 import type { StoredEntity } from '../types/entities.js';
 import type { StoredRelationship } from '../types/relationships.js';
 import type { Provenance } from '../types/provenance.js';
@@ -35,6 +36,13 @@ function typedError(
   fields: Record<string, string> = {},
 ): Record<string, string> {
   return { name, code, ...fields };
+}
+
+/** Whether the provider under test also serves native traversal. */
+function isGraphTraversalProvider(
+  provider: StorageProvider,
+): provider is StorageProvider & GraphTraversalProvider {
+  return 'traverse' in provider && typeof provider.traverse === 'function';
 }
 
 function makeProvenance(): Provenance {
@@ -93,10 +101,7 @@ export function runStorageProviderConformanceTests(
 
   let provider: StorageProvider;
 
-  async function setup(): Promise<void> {
-    provider = await factory();
-    if (provider.initialize) await provider.initialize();
-
+  async function createConformanceRepository(): Promise<void> {
     await provider.createRepository({
       repositoryId: repoId,
       label: 'Conformance Test',
@@ -104,6 +109,12 @@ export function runStorageProviderConformanceTests(
       createdAt: new Date().toISOString(),
       createdBy: 'conformance-test',
     });
+  }
+
+  async function setup(): Promise<void> {
+    provider = await factory();
+    if (provider.initialize) await provider.initialize();
+    await createConformanceRepository();
   }
 
   describe('StorageProvider Conformance Tests', () => {
@@ -511,6 +522,35 @@ export function runStorageProviderConformanceTests(
         );
         expect(await provider.getRepository(repoId)).toBeNull();
       });
+
+      it('deleteEntitiesByType removes that type and its edges, and leaves the rest of the repository', async () => {
+        await provider.createEntity(repoId, makeEntity('d1', 'doomed-type'));
+        await provider.createEntity(repoId, makeEntity('d2', 'doomed-type'));
+        await provider.createEntity(repoId, makeEntity('k1'));
+        await provider.createEntity(repoId, makeEntity('k2'));
+        await provider.createRelationship(repoId, makeRelationship('rd1', 'connects', 'd1', 'k1'));
+        await provider.createRelationship(repoId, makeRelationship('rk', 'connects', 'k1', 'k2'));
+        await provider.createRelationship(repoId, makeRelationship('rd2', 'connects', 'k2', 'd2'));
+
+        const result = await provider.deleteEntitiesByType(repoId, 'doomed-type');
+        expect(result.deletedEntities).toBe(2);
+        // A provider that cannot count the cascaded edges cheaply reports undefined.
+        if (result.deletedRelationships !== undefined) expect(result.deletedRelationships).toBe(2);
+
+        expect(await provider.getEntity(repoId, 'd1')).toBeNull();
+        expect(await provider.getEntity(repoId, 'd2')).toBeNull();
+        expect(await provider.getRelationship(repoId, 'rd1')).toBeNull();
+        expect(await provider.getRelationship(repoId, 'rd2')).toBeNull();
+        expect((await provider.getRelationship(repoId, 'rk'))?.id).toBe('rk');
+        const k1Edges = await provider.getEntityRelationships(repoId, 'k1');
+        expect(k1Edges.items.map((r) => r.id)).toEqual(['rk']);
+
+        // The repository and its other entities are still there.
+        expect(await provider.getRepository(repoId)).not.toBeNull();
+        const survivors = await provider.getEntities(repoId, ['k1', 'k2', 'd1']);
+        expect([...survivors.keys()].sort()).toEqual(['k1', 'k2']);
+        expect((await provider.getEntityBySlug(repoId, 'test-type:k2'))?.id).toBe('k2');
+      });
     });
 
     // ─── Relationships ──────────────────────────────────────
@@ -534,6 +574,21 @@ export function runStorageProviderConformanceTests(
 
       it('returns null for non-existent relationship', async () => {
         expect(await provider.getRelationship(repoId, 'nonexistent')).toBeNull();
+      });
+
+      it('creates a self-loop and lists it once', async () => {
+        await provider.createRelationship(repoId, makeRelationship('loop', 'connects', 'a', 'a'));
+
+        const retrieved = await provider.getRelationship(repoId, 'loop');
+        expect(retrieved).not.toBeNull();
+        expect(retrieved!.sourceEntityId).toBe('a');
+        expect(retrieved!.targetEntityId).toBe('a');
+
+        for (const direction of ['both', 'out', 'in'] as const) {
+          const listed = await provider.getEntityRelationships(repoId, 'a', { direction });
+          expect(listed.items.map((r) => r.id), direction).toEqual(['loop']);
+          if (listed.total !== undefined) expect(listed.total, direction).toBe(1);
+        }
       });
 
       it('gets entity relationships', async () => {
@@ -1108,6 +1163,18 @@ export function runStorageProviderConformanceTests(
         await provider.deleteRepository(repoId);
       }
 
+      /**
+       * Recreate the deleted repository and assert that a rejected import
+       * left nothing behind: no entity and not the imported relationship.
+       */
+      async function expectNothingImported(relationshipId: string): Promise<void> {
+        expect(await provider.getRepository(repoId)).toBeNull();
+        await createConformanceRepository();
+        const entities = await provider.findEntities(repoId, { limit: 10, offset: 0 });
+        expect(entities.total).toBe(0);
+        expect(await provider.getRelationship(repoId, relationshipId)).toBeNull();
+      }
+
       it('getVocabulary', async () => {
         await populateAndDelete();
         await expect(provider.getVocabulary(repoId)).rejects.toMatchObject(repositoryNotFound);
@@ -1168,6 +1235,192 @@ export function runStorageProviderConformanceTests(
         await populateAndDelete();
         await expect(
           provider.updateEntity(repoId, 'e1', { properties: { key: 'changed' }, provenance: makeProvenance() }),
+        ).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getEntity, for a former entity and for an id that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.getEntity(repoId, 'e1')).rejects.toMatchObject(repositoryNotFound);
+        await expect(provider.getEntity(repoId, 'missing')).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getEntityBySlug, for a former slug and for a slug that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.getEntityBySlug(repoId, makeEntity('e1').slug)).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+        await expect(provider.getEntityBySlug(repoId, 'test-type:missing')).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getEntities, for former and never-existing ids', async () => {
+        await populateAndDelete();
+        await expect(provider.getEntities(repoId, ['e1', 'e2', 'missing'])).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getEntities with no ids', async () => {
+        await populateAndDelete();
+        await expect(provider.getEntities(repoId, [])).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('findEntities with no filter', async () => {
+        await populateAndDelete();
+        await expect(provider.findEntities(repoId, { limit: 10, offset: 0 })).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('findEntities with an entity type filter', async () => {
+        await populateAndDelete();
+        await expect(
+          provider.findEntities(repoId, { entityTypes: ['test-type'], limit: 10, offset: 0 }),
+        ).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('findEntities with a search term', async () => {
+        await populateAndDelete();
+        await expect(
+          provider.findEntities(repoId, { searchTerm: 'e1', limit: 10, offset: 0 }),
+        ).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getRelationship, for a former relationship and for an id that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.getRelationship(repoId, 'r1')).rejects.toMatchObject(repositoryNotFound);
+        await expect(provider.getRelationship(repoId, 'missing')).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getEntityRelationships, for a former entity and for an id that never existed', async () => {
+        await populateAndDelete();
+        await expect(
+          provider.getEntityRelationships(repoId, 'e1', { direction: 'both', limit: 10, offset: 0 }),
+        ).rejects.toMatchObject(repositoryNotFound);
+        await expect(
+          provider.getEntityRelationships(repoId, 'missing', { direction: 'both', limit: 10, offset: 0 }),
+        ).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteEntitiesByType, for a former type and for a type that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteEntitiesByType(repoId, 'test-type')).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+        await expect(provider.deleteEntitiesByType(repoId, 'missing-type')).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteRelationshipsByType, for a former type and for a type that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteRelationshipsByType(repoId, 'connects')).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+        await expect(provider.deleteRelationshipsByType(repoId, 'missing_type')).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getVocabularyChangeLog', async () => {
+        await populateAndDelete();
+        await expect(provider.getVocabularyChangeLog(repoId)).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getTimeline, for a former entity and for an id that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.getTimeline(repoId, 'e1', { limit: 10, offset: 0 })).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+        await expect(provider.getTimeline(repoId, 'missing', { limit: 10, offset: 0 })).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('exportAll, on the first iteration', async () => {
+        await populateAndDelete();
+        const drain = async (): Promise<number> => {
+          let chunks = 0;
+          for await (const _chunk of provider.exportAll(repoId)) {
+            chunks++;
+          }
+          return chunks;
+        };
+        await expect(drain()).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('importBulk in upsert mode, writing nothing', async () => {
+        await populateAndDelete();
+        await expect(
+          provider.importBulk(repoId, [
+            { entities: [makeEntity('e1'), makeEntity('e3')] },
+            { relationships: [makeRelationship('r2', 'connects', 'e1', 'e3')] },
+          ]),
+        ).rejects.toMatchObject(repositoryNotFound);
+        await expectNothingImported('r2');
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('importBulk in insert mode (skipExistenceCheck), writing nothing', async () => {
+        await populateAndDelete();
+        await expect(
+          provider.importBulk(
+            repoId,
+            [
+              { entities: [makeEntity('e3'), makeEntity('e4')] },
+              { relationships: [makeRelationship('r2', 'connects', 'e3', 'e4')] },
+            ],
+            { skipExistenceCheck: true },
+          ),
+        ).rejects.toMatchObject(repositoryNotFound);
+        await expectNothingImported('r2');
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('importBulk with no chunks', async () => {
+        await populateAndDelete();
+        await expect(provider.importBulk(repoId, [])).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('exploreNeighborhood, for a former entity and for an id that never existed', async () => {
+        await populateAndDelete();
+        const options = { depth: 1, direction: 'both' as const, limitPerType: 10, offsetPerType: 0 };
+        await expect(provider.exploreNeighborhood(repoId, 'e1', options)).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+        await expect(provider.exploreNeighborhood(repoId, 'missing', options)).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('findPaths, between former entities and between ids that never existed', async () => {
+        await populateAndDelete();
+        const options = { maxDepth: 2, limit: 10, offset: 0 };
+        await expect(provider.findPaths(repoId, 'e1', 'e2', options)).rejects.toMatchObject(repositoryNotFound);
+        await expect(provider.findPaths(repoId, 'missing', 'missing-too', options)).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('traverse, for a provider that implements GraphTraversalProvider', async (ctx) => {
+        // Providers without native traversal are served by the engine's
+        // fallback over the StorageProvider calls covered above.
+        const traversal = isGraphTraversalProvider(provider) ? provider : null;
+        if (traversal === null) return ctx.skip('provider does not implement GraphTraversalProvider');
+        await populateAndDelete();
+        await expect(
+          traversal.traverse(repoId, {
+            start: { entityId: 'e1' },
+            steps: [{ direction: 'out', relationshipTypes: ['connects'] }],
+            returnMode: 'terminal',
+            limit: 10,
+          }),
+        ).rejects.toMatchObject(repositoryNotFound);
+        await expect(
+          traversal.traverse(repoId, {
+            start: { entityType: 'test-type' },
+            returnMode: 'terminal',
+            limit: 10,
+          }),
         ).rejects.toMatchObject(repositoryNotFound);
       }, MULTI_STEP_TEST_TIMEOUT_MS);
 

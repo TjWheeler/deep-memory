@@ -5,9 +5,9 @@
 
 import type { Neo4jConnection } from '../Neo4jConnection.js';
 import type { MemoryVocabulary, RepositoryStats } from '@utaba/deep-memory/types';
-import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
+import { settledValue } from '../errors.js';
 import { bigintToSafeNumber } from '../mapping.js';
-import { REPOSITORY_MARKER_EXISTS_QUERY } from './repositoryDrain.js';
+import { assertRepositoryMarker } from './repositoryDrain.js';
 
 /**
  * Entities-by-type breakdown. One row per distinct `entityType`. Every entity
@@ -44,7 +44,7 @@ RETURN type(r) AS type, count(r) AS count
  * Aggregate repository statistics: entity / relationship totals, per-type
  * breakdowns, vocabulary version.
  *
- * Three server round-trips fire in parallel (`Promise.all`) — the JS driver
+ * Three server round-trips fire in parallel (`Promise.allSettled`) — the JS driver
  * multiplexes Bolt connections so the queries run concurrently rather than
  * serially: the two counts and a seek of the repository marker. The marker
  * check makes a deleted repository throw `RepositoryNotFoundError` instead of
@@ -69,14 +69,16 @@ export async function getRepositoryStats(
   repositoryId: string,
   vocabulary: MemoryVocabulary,
 ): Promise<RepositoryStats> {
-  const [entityResult, relationshipResult, markerResult] = await Promise.all([
+  const [entitySettled, relationshipSettled, markerSettled] = await Promise.allSettled([
     conn.executeQuery(ENTITY_STATS_QUERY, {}, { repositoryId, routing: 'READ' }),
     conn.executeQuery(RELATIONSHIP_STATS_QUERY, {}, { repositoryId, routing: 'READ' }),
-    conn.executeQuery(REPOSITORY_MARKER_EXISTS_QUERY, {}, { repositoryId, routing: 'READ' }),
+    assertRepositoryMarker(conn, repositoryId, 'getRepositoryStats', 'READ'),
   ]);
-  const markerRecord = markerResult.records[0];
-  if (markerRecord === undefined) throw new ProviderError('Neo4j repository marker read returned no row.');
-  if (markerRecord.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  // The marker first, so a missing repository is reported ahead of a failed count.
+  const context = { repositoryId, operation: 'getRepositoryStats' };
+  settledValue(markerSettled, context);
+  const entityResult = settledValue(entitySettled, context);
+  const relationshipResult = settledValue(relationshipSettled, context);
 
   const entityTypeBreakdown: Record<string, number> = {};
   let entityCount = 0;

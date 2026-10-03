@@ -1,11 +1,12 @@
 // Portability — tests for export, import, and vocabulary migration
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DeepMemory } from '../core/DeepMemory.js';
 import {
   DuplicateRelationshipError,
   InvalidInputError,
   OperationAbortedError,
+  RepositoryNotFoundError,
 } from '../core/errors.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
 import type { MemoryRepository } from '../core/MemoryRepository.js';
@@ -436,12 +437,43 @@ describe('Portability', () => {
       expect(result.statistics.relationshipsSkipped).toBeGreaterThan(0);
     });
 
-    it('fails for non-existent target repo', async () => {
-      const result = await memory.importRepository(archive, {
-        target: { mode: 'merge', repositoryId: '10000000-0000-4000-a000-00000000ffff' },
+    it('rejects with RepositoryNotFoundError and writes nothing when the target repo is missing', async () => {
+      const storage = new InMemoryStorageProvider();
+      const isolated = new DeepMemory({
+        storage,
+        provenance: { actorId: 'test-agent', actorType: 'agent' },
+      });
+      const missingId = '10000000-0000-4000-a000-00000000ffff';
+      const writes = [
+        vi.spyOn(storage, 'createRepository'),
+        vi.spyOn(storage, 'saveVocabulary'),
+        vi.spyOn(storage, 'importBulk'),
+      ];
+
+      const rejection = isolated.importRepository(archive, {
+        target: { mode: 'merge', repositoryId: missingId },
+        vocabularyConflict: 'extend',
       });
 
-      expect(result.success).toBe(false);
+      await expect(rejection).rejects.toBeInstanceOf(RepositoryNotFoundError);
+      await expect(rejection).rejects.toMatchObject({ repositoryId: missingId });
+      for (const write of writes) {
+        expect(write).not.toHaveBeenCalled();
+      }
+      expect(await storage.getRepository(missingId)).toBeNull();
+    });
+
+    it('streaming merge into a missing target repo rejects with RepositoryNotFoundError', async () => {
+      async function* chunks(): AsyncGenerator<ImportChunk> {
+        yield { entities: archive.entities };
+        yield { relationships: archive.relationships };
+      }
+
+      await expect(memory.importRepositoryStream(
+        { manifest: archive.manifest, vocabulary: archive.vocabulary },
+        chunks(),
+        { target: { mode: 'merge', repositoryId: '10000000-0000-4000-a000-00000000fffe' } },
+      )).rejects.toBeInstanceOf(RepositoryNotFoundError);
     });
   });
 
@@ -633,9 +665,9 @@ describe('Portability', () => {
       memory.on('import:failed', () => { events.push('import:failed'); });
 
       const archive = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
-      await memory.importRepository(archive, {
+      await expect(memory.importRepository(archive, {
         target: { mode: 'merge', repositoryId: '10000000-0000-4000-a000-00000000ffff' },
-      });
+      })).rejects.toBeInstanceOf(RepositoryNotFoundError);
 
       expect(events).toEqual(['import:failed']);
     });

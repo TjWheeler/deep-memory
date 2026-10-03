@@ -17,6 +17,9 @@ export interface GraphTraversalProvider {
    * Execute a structured traversal described by a TraversalSpec.
    * The provider owns compilation to its native dialect — the core
    * never hands down a pre-compiled query string.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing, ahead of
+   *   any outcome for the start entity and rather than an empty result.
    */
   traverse(
     repositoryId: string,

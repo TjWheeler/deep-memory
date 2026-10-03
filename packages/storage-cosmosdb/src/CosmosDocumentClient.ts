@@ -10,6 +10,7 @@
 // @azure/cosmos SDK dependency — keeps the provider's runtime footprint small
 // and matches what `ensureSchema()` already does for container provisioning.
 
+import { ProviderError } from '@utaba/deep-memory';
 import { cosmosAuthToken } from './cosmos-rest-auth.js';
 import { usageScope } from './usage.js';
 
@@ -150,12 +151,20 @@ export class CosmosDocumentClient {
           continue;
         }
         const text = await response.text();
-        throw new Error(`CosmosDB Document query ${response.status}: ${text}`);
+        throw new ProviderError(
+          `CosmosDB Document query ${response.status}: ${text}`,
+          'The container stayed throttled or unavailable through every retry; retry later or raise its throughput.',
+          { cause: { status: response.status, body: text } },
+        );
       }
 
       if (!response.ok) {
         const text = await response.text();
-        throw new Error(`CosmosDB Document query ${response.status}: ${text}`);
+        throw new ProviderError(
+          `CosmosDB Document query ${response.status}: ${text}`,
+          undefined,
+          { cause: { status: response.status, body: text } },
+        );
       }
 
       const json = (await response.json()) as { Documents?: unknown[]; _count?: number };
@@ -177,7 +186,7 @@ export class CosmosDocumentClient {
       };
     }
     // Unreachable — the loop either returns or throws on the final attempt.
-    throw new Error('CosmosDocumentClient.query: retry loop exhausted without resolution');
+    throw new ProviderError('CosmosDB Document query: retry loop exhausted without resolution');
   }
 
   /**

@@ -3,7 +3,16 @@
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import type { StorageTimelineOptions } from '@utaba/deep-memory/types';
 import type { StorageTimelineResult, StorageTimelineEvent } from '@utaba/deep-memory/types';
+import { repoVertexId } from './ids.js';
+import { markerCheckedRead, rowsPastMarker } from './marker.js';
 
+/**
+ * Creation, modification and relationship events for one entity. The first
+ * read fetches the repository marker with the entity in its first, indexed
+ * step, so a deleted repository is refused before any event is read.
+ *
+ * @throws RepositoryNotFoundError when the marker is absent.
+ */
 export async function getTimeline(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -14,12 +23,13 @@ export async function getTimeline(
 
   // Entity creation event
   const entityResult = await conn.submit(
-    "g.V().has('repositoryId', rid).hasId(eid).has('entityType').valueMap('createdAt', 'modifiedAt')",
-    { rid: repositoryId, eid: entityId },
+    markerCheckedRead('hasId(within(mid, eid))', "valueMap('createdAt', 'modifiedAt')"),
+    { rid: repositoryId, mid: repoVertexId(repositoryId), eid: entityId },
   );
+  const entityRows = rowsPastMarker(entityResult.items, repositoryId);
 
-  if (entityResult.items.length > 0) {
-    const props = entityResult.items[0] as Record<string, unknown>;
+  if (entityRows.length > 0) {
+    const props = entityRows[0] as Record<string, unknown>;
     const createdAt = unwrapValue(props['createdAt']);
     const modifiedAt = unwrapValue(props['modifiedAt']);
 

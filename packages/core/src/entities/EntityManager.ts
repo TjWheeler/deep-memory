@@ -24,7 +24,6 @@ import {
   OperationCancelledError,
   OperationAbortedError,
   EmbeddingProviderRequiredError,
-  RepositoryNotFoundError,
   isSlugConflict,
 } from '../core/errors.js';
 import { getEntityTypeDef } from '../vocabulary/VocabularyValidator.js';
@@ -182,14 +181,11 @@ export class EntityManager {
 
   /** Update an existing entity */
   public async update(entityId: string, updates: UpdateEntityInput): Promise<Entity> {
-    // Get existing entity to determine its type for validation. A miss checks
-    // the repository first, as storage's own update does: a deleted
-    // repository answers RepositoryNotFoundError, not a missing entity.
+    // Get existing entity to determine its type for validation. Storage
+    // answers a deleted repository with RepositoryNotFoundError before any
+    // miss, so a null here is a missing entity.
     const existing = await this.storage.getEntity(this.repositoryId, entityId);
     if (!existing) {
-      if ((await this.storage.getRepository(this.repositoryId)) === null) {
-        throw new RepositoryNotFoundError(this.repositoryId);
-      }
       throw new EntityNotFoundError(entityId);
     }
 
@@ -357,15 +353,12 @@ export class EntityManager {
 
   /**
    * Delete an entity. Throws `RepositoryNotFoundError` when the repository is
-   * gone, otherwise `EntityNotFoundError` when the entity does not exist. A
-   * miss checks the repository first, as `update` does.
+   * gone (raised by storage's entity read), otherwise `EntityNotFoundError`
+   * when the entity does not exist.
    */
   public async delete(entityId: string): Promise<void> {
     const existing = await this.storage.getEntity(this.repositoryId, entityId);
     if (!existing) {
-      if ((await this.storage.getRepository(this.repositoryId)) === null) {
-        throw new RepositoryNotFoundError(this.repositoryId);
-      }
       throw new EntityNotFoundError(entityId);
     }
 

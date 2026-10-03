@@ -1,6 +1,7 @@
 // Relationship CRUD Gremlin queries
 
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
+import type { CosmosDocumentClient } from '../CosmosDocumentClient.js';
 import type { StoredRelationship, RelationshipQueryOptions } from '@utaba/deep-memory/types';
 import type { PaginatedResult } from '@utaba/deep-memory/types';
 import {
@@ -12,6 +13,7 @@ import {
 import {
   DuplicateRelationshipError,
   EntityNotFoundError,
+  ProviderError,
   RelationshipNotFoundError,
   RepositoryNotFoundError,
   matchesPropertyFilters,
@@ -19,43 +21,46 @@ import {
 } from '@utaba/deep-memory';
 import { repoVertexId } from './ids.js';
 import { submitCreate } from './create.js';
-import { deleteRelationshipsByIds } from './deleteByIds.js';
+import { bucketIds, deleteRelationshipsByIds } from './deleteByIds.js';
+import { alongsideMarkerRead, assertRepositoryMarker, markerCheckedRead, rowsPastMarker } from './marker.js';
 
 // Sentinels the create query returns in place of the new edge; the caller
 // translates them — single round-trip either way. Mirrors entity.ts:
-//   - DUPLICATE_SENTINEL: an edge with the requested id already exists.
 //   - NO_REPOSITORY_SENTINEL: the repository's `_repository` marker vertex is
 //     absent, so nothing was written.
 //   - NO_SOURCE_SENTINEL: the marker exists but the source entity does not,
 //     so nothing was written.
 //   - NO_TARGET_SENTINEL: the marker and the source exist but the target
-//     entity does not, so `addE` had nothing to attach to and nothing was
-//     written.
+//     entity does not, so nothing was written.
 // Each missing endpoint throws `EntityNotFoundError` naming it, the source
-// ahead of the target when both are missing.
-const DUPLICATE_SENTINEL = '__duplicate';
+// ahead of the target when both are missing — unless the relationship id is
+// already taken (see `createRelationship`).
 const NO_REPOSITORY_SENTINEL = '__no_repository';
 const NO_SOURCE_SENTINEL = '__no_source';
 const NO_TARGET_SENTINEL = '__no_target';
 
 // Prefix shared by every relationship-create query:
 //
-//   1. Duplicate check on the edge id. The edge lookup cannot be started from
-//      a vertex traverser (there is no mid-traversal `E()`), so it stays the
-//      outermost step. That puts the id check ahead of the repository check,
-//      where the other storage providers check repository → id → source →
-//      target. The two orders give different errors only when a reused id
-//      meets a repository that is being deleted: here
-//      `DuplicateRelationshipError`, elsewhere `RepositoryNotFoundError`.
-//   2. Gate on the repository marker, inside the create branch.
-//      `deleteRepository` drops the `_repository` vertex before its chunked
-//      drain, so a create that runs after that point finds no marker and
-//      writes nothing. Checking the marker in the same traversal as the
-//      `addE`, rather than in a separate round-trip, leaves no gap between
-//      the check and the write for the drop to land in.
-//   3. Create: from the marker traverser, a mid-traversal `V()` finds the
-//      source entity and `addE` attaches the edge to the target entity, with
-//      the schema-managed edge property ladder.
+//   1. One indexed lookup fetches the repository marker, the source and the
+//      target by id (`hasId(within(repoVid, srcId, tgtId))`, partition-scoped)
+//      and folds them into one list. Every later step works on that list, so
+//      the statement has no mid-traversal `V()`, whose cost grows with the
+//      partition's size.
+//   2. Gate on the marker: `deleteRepository` drops the `_repository` vertex
+//      before its chunked drain, so a create that runs after that point finds
+//      no marker and writes nothing. Checking the marker in the same request
+//      as the `addE` leaves no gap between the check and the write for the
+//      drop to land in. `hasNot('entityType')` keeps an entity typed
+//      `_repository` from passing for the marker.
+//   3. Create: the target is labelled `t`, then `addE` runs from the source
+//      to it, with the schema-managed edge property ladder. A missing source
+//      or target leaves the create branch empty.
+//
+// The relationship id needs no check here: all of a repository's vertices and
+// edges share its partition, and Cosmos refuses a second document with the
+// same id in a partition (an edge, an entity or a system vertex) with a 409,
+// which `submitCreate` maps to `DuplicateRelationshipError`. The 409 is also
+// what a create racing another with the same id gets.
 //
 // Per-call user-property scalars append after the ladder (between the prefix
 // and `RELATIONSHIP_CREATE_CLOSE`). When the caller has no native-storable
@@ -67,33 +72,50 @@ const NO_TARGET_SENTINEL = '__no_target';
 // still land after the drain has passed it; re-running `deleteRepository`
 // removes such a straggler.
 const RELATIONSHIP_CREATE_PREFIX =
-  `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
-  `unfold().constant('${DUPLICATE_SENTINEL}'),` +
-  `g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(` +
-  `unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType')` +
-  `.addE(edgeLabel)` +
-  `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+  `g.V().has('repositoryId', rid).hasId(within(repoVid, srcId, tgtId)).fold().as('vs')` +
+  `.coalesce(__.unfold().hasLabel('_repository').hasNot('entityType').coalesce(` +
+  `__.select('vs').unfold().hasId(tgtId).has('entityType').as('t')` +
+  `.select('vs').unfold().hasId(srcId).has('entityType')` +
+  `.addE(edgeLabel).to('t')` +
   `.property('id', relId).property('repositoryId', rid)${buildRelationshipPropertyLadder()}`;
 
-// Closes the create branch, then supplies the gate's fallbacks, tried in
-// order once the create branch has written nothing:
-//   - from the marker (`unfold()` still emits it), the source exists, so the
-//     target is what was missing;
-//   - the marker exists, so the source is what was missing;
-//   - the marker itself is absent (nothing to unfold).
-// The source lookup is partition-scoped like every other lookup here, and
-// runs only on this failure path.
+// Closes the create branch, then supplies the fallbacks, tried in order once
+// the create branch has written nothing:
+//   - past the marker, the source is in the list, so the target was missing;
+//   - past the marker, so the source was missing;
+//   - the marker itself is absent.
 const RELATIONSHIP_CREATE_CLOSE =
-  `,unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').constant('${NO_TARGET_SENTINEL}')` +
-  `,unfold().constant('${NO_SOURCE_SENTINEL}'),constant('${NO_REPOSITORY_SENTINEL}')))`;
+  `,__.select('vs').unfold().hasId(srcId).has('entityType').constant('${NO_TARGET_SENTINEL}')` +
+  `,__.constant('${NO_SOURCE_SENTINEL}')),__.constant('${NO_REPOSITORY_SENTINEL}'))`;
 
 // Canonical empty-user-properties form. Exported so the unit test can pin the
 // invariant that every create without native-storable user properties emits
 // this one string.
 export const RELATIONSHIP_CREATE_QUERY = `${RELATIONSHIP_CREATE_PREFIX}${RELATIONSHIP_CREATE_CLOSE}`;
 
+// Whether any document in the repository's partition — an edge, an entity,
+// the marker or a vocabulary vertex — already has the id: the same rule the
+// store applies when it refuses the create's `addE` with a 409. Read through
+// the Document endpoint, pinned to the partition, only after the create found
+// an endpoint missing.
+export const RELATIONSHIP_ID_TAKEN_SQL = 'SELECT VALUE COUNT(1) FROM c WHERE c.id = @relId';
+
+/**
+ * Create a relationship in one request on the success path. The outcomes
+ * follow the precedence repository → id → source → target:
+ *   - no marker → `RepositoryNotFoundError`;
+ *   - the id taken by any document in the repository's partition (an edge,
+ *     an entity, the marker, a vocabulary vertex) →
+ *     `DuplicateRelationshipError` (a 409 from the store when both endpoints
+ *     exist; otherwise the id read below, which applies the same rule);
+ *   - a missing source, then a missing target → `EntityNotFoundError`.
+ * When an endpoint is missing, a partition-pinned id read decides between the
+ * duplicate and the missing endpoint. It runs whether core minted the id or
+ * the caller supplied it: it costs a round trip only on that failure path.
+ */
 export async function createRelationship(
   conn: CosmosDbConnection,
+  docClient: CosmosDocumentClient,
   repositoryId: string,
   relationship: StoredRelationship,
 ): Promise<StoredRelationship> {
@@ -134,22 +156,39 @@ export async function createRelationship(
     (cause) => new DuplicateRelationshipError(relationship.id, { cause }),
   );
 
-  if (result.items[0] === NO_REPOSITORY_SENTINEL) {
+  // Every branch of the statement emits a row (the new edge or a sentinel),
+  // so no row is a malformed response.
+  const outcome = result.items[0];
+  if (outcome === undefined) throw new ProviderError('Cosmos relationship create returned no row.');
+  if (outcome === NO_REPOSITORY_SENTINEL) {
     throw new RepositoryNotFoundError(repositoryId);
   }
-  if (result.items[0] === DUPLICATE_SENTINEL) {
-    throw new DuplicateRelationshipError(relationship.id);
-  }
-  if (result.items[0] === NO_SOURCE_SENTINEL) {
-    throw new EntityNotFoundError(relationship.sourceEntityId);
-  }
-  if (result.items[0] === NO_TARGET_SENTINEL) {
-    throw new EntityNotFoundError(relationship.targetEntityId);
+  if (outcome === NO_SOURCE_SENTINEL || outcome === NO_TARGET_SENTINEL) {
+    const taken = await docClient.query<number>(
+      RELATIONSHIP_ID_TAKEN_SQL,
+      [{ name: '@relId', value: relationship.id }],
+      { partitionKey: repositoryId },
+    );
+    // `COUNT(1)` always emits a row, so no row is a malformed response.
+    const count = taken.documents[0];
+    if (count === undefined) throw new ProviderError('Cosmos relationship id read returned no row.');
+    const matches = Number(count);
+    if (!Number.isFinite(matches)) throw new ProviderError('Cosmos relationship id read returned a count that is not a number.');
+    if (matches > 0) throw new DuplicateRelationshipError(relationship.id);
+    throw new EntityNotFoundError(
+      outcome === NO_SOURCE_SENTINEL ? relationship.sourceEntityId : relationship.targetEntityId,
+    );
   }
 
   return relationship;
 }
 
+/**
+ * Read one relationship by id. An edge lookup cannot fetch the repository
+ * marker in its first step, so a marker point read runs alongside it.
+ *
+ * @throws RepositoryNotFoundError when the marker is absent.
+ */
 export async function getRelationship(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -158,11 +197,13 @@ export async function getRelationship(
   const projection = buildEdgeProjectChain();
   // Edge-id lookup: g.E().hasId(relId) is engine-routed by doc id; the
   // `has('repositoryId', rid)` predicate after it still doesn't push partition
-  // routing down (issue #2 in plans/performance-issues.md). When the source
-  // vertex id is known, callers should partition-route via the vertex instead.
-  const result = await conn.submit(
-    `g.E().hasId(relId).has('repositoryId', rid).${projection}`,
-    { relId: relationshipId, rid: repositoryId },
+  // routing down. When the source vertex id is known, callers should
+  // partition-route via the vertex instead.
+  const result = await alongsideMarkerRead(conn, repositoryId, () =>
+    conn.submit(`g.E().hasId(relId).has('repositoryId', rid).${projection}`, {
+      relId: relationshipId,
+      rid: repositoryId,
+    }),
   );
   if (result.items.length === 0) return null;
   return relationshipFromGremlin(result.items[0] as Record<string, unknown>);
@@ -185,21 +226,6 @@ export async function getEntityRelationships(
     eid: entityId,
   };
 
-  // Build edge traversal based on direction
-  let edgeTraversal: string;
-  switch (direction) {
-    case 'out':
-      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').outE()";
-      break;
-    case 'in':
-      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').inE()";
-      break;
-    case 'both':
-    default:
-      edgeTraversal = "g.V().has('repositoryId', rid).hasId(eid).has('entityType').bothE()";
-      break;
-  }
-
   // Filter by relationship types
   let typeFilter = '';
   if (options?.relationshipTypes && options.relationshipTypes.length > 0) {
@@ -212,38 +238,60 @@ export async function getEntityRelationships(
     typeFilter = `.hasLabel(${typeParams.join(', ')})`;
   }
 
-  // For bidirectional support in outbound/inbound:
-  // When direction is 'out', include inbound edges that are bidirectional
-  // When direction is 'in', include outbound edges that are bidirectional
-  // This requires a union approach.
-  let unionQuery: string | null = null;
-  if (direction === 'out') {
-    // outE + inE where bidirectional=true
-    unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(outE()${typeFilter}, inE()${typeFilter}.has('bidirectional', true))`;
-  } else if (direction === 'in') {
-    unionQuery = `g.V().has('repositoryId', rid).hasId(eid).has('entityType').union(inE()${typeFilter}, outE()${typeFilter}.has('bidirectional', true))`;
+  // Edge steps from the entity. For bidirectional support in outbound /
+  // inbound: direction 'out' also takes inbound edges that are
+  // bidirectional, and 'in' takes outbound ones.
+  let edgeSteps: string;
+  switch (direction) {
+    case 'out':
+      edgeSteps = `union(__.outE()${typeFilter}, __.inE()${typeFilter}.has('bidirectional', true))`;
+      break;
+    case 'in':
+      edgeSteps = `union(__.inE()${typeFilter}, __.outE()${typeFilter}.has('bidirectional', true))`;
+      break;
+    case 'both':
+    default:
+      edgeSteps = `bothE()${typeFilter}`;
+      break;
   }
 
-  const baseQuery = unionQuery ?? `${edgeTraversal}${typeFilter}`;
   const projection = buildEdgeProjectChain();
 
   // Count and data round-trips are independent — run them in parallel to halve
-  // wall-clock latency. When `propertyFilters` is set the filter runs
-  // client-side after the fetch, so a server-side count would overstate the
-  // matched total — match the findEntities pattern and surface
+  // wall-clock latency. The data read fetches the repository marker with the
+  // entity in its first, indexed step, so a deleted repository is refused
+  // ahead of the page and the count: both are settled, and the data read's
+  // outcome (its failure, or a missing marker) is raised before a failed
+  // count. When `propertyFilters` is set the
+  // filter runs client-side after the fetch, so a server-side count would
+  // overstate the matched total — match the findEntities pattern and surface
   // `total: undefined` in that case.
-  const dataBindings = { ...baseBindings, rangeStart: offset, rangeEnd: offset + limit };
-  const [countResult, dataResult] = await Promise.all([
+  const dataBindings = {
+    ...baseBindings,
+    mid: repoVertexId(repositoryId),
+    rangeStart: offset,
+    rangeEnd: offset + limit,
+  };
+  const [countSettled, dataSettled] = await Promise.allSettled([
     hasPropertyFilters
       ? Promise.resolve(null)
-      : conn.submit(`${baseQuery}.dedup().count()`, baseBindings),
+      : conn.submit(
+          `g.V().has('repositoryId', rid).hasId(eid).has('entityType').${edgeSteps}.dedup().count()`,
+          baseBindings,
+        ),
     conn.submit(
-      `${baseQuery}.dedup().range(rangeStart, rangeEnd).${projection}`,
+      markerCheckedRead(
+        'hasId(within(mid, eid))',
+        `${edgeSteps}.dedup().range(rangeStart, rangeEnd).${projection}`,
+      ),
       dataBindings,
     ),
   ]);
 
-  const rawItems = dataResult.items as Record<string, unknown>[];
+  if (dataSettled.status === 'rejected') throw dataSettled.reason;
+  const rawItems = rowsPastMarker(dataSettled.value.items, repositoryId) as Record<string, unknown>[];
+  if (countSettled.status === 'rejected') throw countSettled.reason;
+  const countResult = countSettled.value;
   let items = rawItems.map(relationshipFromGremlin);
 
   if (hasPropertyFilters) {
@@ -279,21 +327,28 @@ export async function deleteRelationship(
 
 
 /**
- * Single round-trip type-delete via the aggregate-side-effect pattern: the
- * bucket records the edge ids that were actually dropped, giving an exact
+ * Type-delete via the aggregate-side-effect pattern: the bucket records the
+ * edge ids that were actually dropped, giving an exact
  * `deletedRelationships` count without a separate count query.
+ *
+ * An edge traversal cannot fetch the repository marker in its first step, so
+ * a marker point read runs first. Cosmos Gremlin has no transaction across
+ * requests: a `deleteRepository` that drops the marker between the two
+ * requests lets the drop go ahead on edges its drain would have removed, and
+ * the call reports them instead of `RepositoryNotFoundError`.
+ *
+ * @throws RepositoryNotFoundError when the marker is absent; nothing is dropped.
  */
 export async function deleteRelationshipsByType(
   conn: CosmosDbConnection,
   repositoryId: string,
   relationshipType: string,
 ): Promise<{ deletedRelationships: number }> {
+  await assertRepositoryMarker(conn, repositoryId);
   const result = await conn.submit(
     "g.E().has('repositoryId', rid).hasLabel(rtype)" +
       ".aggregate('found').by('id').drop().cap('found')",
     { rid: repositoryId, rtype: relationshipType },
   );
-  const bucket = result.items[0];
-  const deletedRelationships = Array.isArray(bucket) ? bucket.length : 0;
-  return { deletedRelationships };
+  return { deletedRelationships: bucketIds(result.items, 'relationship type delete').length };
 }

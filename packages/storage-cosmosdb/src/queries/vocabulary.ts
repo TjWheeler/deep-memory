@@ -392,7 +392,9 @@ export async function getVocabularyChangeLog(
 
   // Count and data round-trips are independent — run them in parallel. No
   // property filters here, so the count is exact and `total` is always a number.
-  const [countResult, dataResult] = await Promise.all([
+  // Both settle before either failure is raised, the page's first, so the
+  // error does not depend on which round trip failed sooner.
+  const [countSettled, dataSettled] = await Promise.allSettled([
     conn.submit(
       "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').count()",
       { rid: repositoryId },
@@ -402,9 +404,11 @@ export async function getVocabularyChangeLog(
       { rid: repositoryId, rangeStart: offset, rangeEnd: offset + limit },
     ),
   ]);
+  if (dataSettled.status === 'rejected') throw dataSettled.reason;
+  if (countSettled.status === 'rejected') throw countSettled.reason;
 
-  const total = Number(countResult.items[0] ?? 0);
-  const items = (dataResult.items as Record<string, unknown>[]).map(changeRecordFromGremlin);
+  const total = Number(countSettled.value.items[0] ?? 0);
+  const items = (dataSettled.value.items as Record<string, unknown>[]).map(changeRecordFromGremlin);
 
   return {
     items,

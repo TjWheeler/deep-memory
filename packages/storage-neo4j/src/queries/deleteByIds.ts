@@ -27,14 +27,18 @@
 
 import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
-import { REPOSITORY_MARKER_EXISTS_QUERY } from './repositoryDrain.js';
+import { assertRepositoryMarker } from './repositoryDrain.js';
+
+/** The public delete calls served by `deleteByIds`. */
+export type DeleteByIdsOperation = 'deleteEntity' | 'deleteEntities' | 'deleteRelationship' | 'deleteRelationships';
 
 /**
  * Run a repository-scoped delete statement and split `ids` into the ids this
  * call deleted and the ids it did not find. `cypher` must bind the ids as
  * `$ids` and return exactly one row: `repositoryExists` (whether the
  * `_Repository` marker exists; nothing is deleted when it does not) and
- * `deleted` (the list of ids it removed).
+ * `deleted` (the list of ids it removed). `operation` names the public call
+ * on a mapped driver error.
  *
  * Empty input deletes nothing but still checks the repository, with one
  * read of the marker (a seek of its unique constraint index), so an empty
@@ -48,12 +52,10 @@ export async function deleteByIds(
   repositoryId: string,
   cypher: string,
   ids: string[],
+  operation: DeleteByIdsOperation,
 ): Promise<{ deleted: string[]; notFound: string[] }> {
   if (ids.length === 0) {
-    const marker = await conn.executeQuery(REPOSITORY_MARKER_EXISTS_QUERY, {}, { repositoryId, routing: 'READ' });
-    const markerRecord = marker.records[0];
-    if (markerRecord === undefined) throw new ProviderError('Neo4j repository marker read returned no row.');
-    if (markerRecord.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+    await assertRepositoryMarker(conn, repositoryId, operation, 'READ');
     return { deleted: [], notFound: [] };
   }
   const deletedByEarlierAttempts = new Set<string>();

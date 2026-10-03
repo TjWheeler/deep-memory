@@ -17,7 +17,7 @@
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
 import { repoVertexId } from './ids.js';
-import { assertRepositoryMarker } from './repository.js';
+import { assertRepositoryMarker } from './marker.js';
 
 const CHUNK_SIZE = 100;
 
@@ -87,8 +87,16 @@ export function buildEdgeDeleteQuery(names: string): string {
   return `g.E().has('repositoryId', rid).hasId(within(${names})).aggregate('found').by('id').drop().cap('found')`;
 }
 
-function bucketIds(bucket: unknown): string[] {
-  return Array.isArray(bucket) ? bucket.filter((id): id is string => typeof id === 'string') : [];
+/**
+ * The ids in a drop's `cap('found')` bucket. `cap` always emits the bucket
+ * as a list, so no row, or a row that is not a list, is a malformed response
+ * rather than an answer. `what` names the request in the error.
+ */
+export function bucketIds(items: ReadonlyArray<unknown>, what: string): string[] {
+  if (items.length === 0) throw new ProviderError(`Cosmos ${what} returned no row.`);
+  const bucket = items[0];
+  if (!Array.isArray(bucket)) throw new ProviderError(`Cosmos ${what} returned a row that is not an id list.`);
+  return bucket.filter((id): id is string => typeof id === 'string');
 }
 
 function split(ids: string[], deleted: string[]): { deleted: string[]; notFound: string[] } {
@@ -120,10 +128,7 @@ export async function deleteEntitiesByIds(
       mid: markerId,
       ...chunk.bindings,
     });
-    // `cap('found')` always emits the bucket, so no row at all is a
-    // malformed response, not a missing repository.
-    if (result.items.length === 0) throw new ProviderError('Cosmos guarded entity delete returned no row.');
-    const found = bucketIds(result.items[0]);
+    const found = bucketIds(result.items, 'guarded entity delete');
     if (!found.includes(markerId)) throw new RepositoryNotFoundError(repositoryId);
     deleted.push(...found.filter((id) => id !== markerId));
   }
@@ -155,7 +160,7 @@ export async function deleteRelationshipsByIds(
   for (const chunk of idChunks(ids)) {
     await assertRepositoryMarker(conn, repositoryId);
     const result = await conn.submit(buildEdgeDeleteQuery(chunk.names), { rid: repositoryId, ...chunk.bindings });
-    deleted.push(...bucketIds(result.items[0]));
+    deleted.push(...bucketIds(result.items, 'relationship delete'));
   }
   return split(ids, deleted);
 }

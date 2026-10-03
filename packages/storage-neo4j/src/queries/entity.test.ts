@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DeepMemoryError,
   DuplicateEntityError,
   InvalidInputError,
   ProviderError,
@@ -12,6 +13,7 @@ import {
   buildFindEntitiesWhere,
   buildFulltextFindQuery,
   createEntity,
+  findEntities,
   escapeLuceneQuery,
   resolveSearchScoring,
   updateEntity,
@@ -19,12 +21,12 @@ import {
 } from './entity.js';
 
 describe('buildFindEntitiesWhere', () => {
-  it('returns an empty WHERE fragment when only the repository predicate is requested with no filters', () => {
+  it('returns only the repository predicates when no filters are requested', () => {
     const result = buildFindEntitiesWhere(
       { limit: 10, offset: 0 },
       { alias: 'n', includeRepositoryPredicate: true },
     );
-    expect(result.cypherWhere).toBe('WHERE n.repositoryId = $rid');
+    expect(result.cypherWhere).toBe('WHERE n.repositoryId = $rid AND n.id IS NOT NULL');
     expect(result.params).toEqual({});
   });
 
@@ -43,7 +45,7 @@ describe('buildFindEntitiesWhere', () => {
       { alias: 'n', includeRepositoryPredicate: true },
     );
     expect(result.cypherWhere).toBe(
-      'WHERE n.repositoryId = $rid AND n.entityType IN $entityTypes',
+      'WHERE n.repositoryId = $rid AND n.id IS NOT NULL AND n.entityType IN $entityTypes',
     );
     expect(result.params).toEqual({ entityTypes: ['Person', 'Place'] });
   });
@@ -54,7 +56,7 @@ describe('buildFindEntitiesWhere', () => {
       { alias: 'n', includeRepositoryPredicate: true },
     );
     expect(result.cypherWhere).toBe(
-      'WHERE n.repositoryId = $rid AND n.city = $prop0 AND n.age = $prop1',
+      'WHERE n.repositoryId = $rid AND n.id IS NOT NULL AND n.city = $prop0 AND n.age = $prop1',
     );
     expect(result.params['prop0']).toBe('Berlin');
     expect(result.params['prop1']).toBe(30);
@@ -475,5 +477,51 @@ describe('search scoring modes', () => {
     expect(() => buildFulltextFindQuery(untyped as Neo4jSearchScoring, 'WHERE node.repositoryId = $rid', 'node')).toThrow(
       InvalidInputError,
     );
+  });
+});
+
+/** A driver error the mapping does not recognise. */
+const DRIVER_FAILURE = Object.assign(new Error('database unavailable'), { code: 'Neo.DatabaseError.General.UnknownError' });
+
+/** A connection whose statements answer one row each through `answer`, or reject with what it throws. */
+function answeringConnection(answer: (cypher: string) => Record<string, unknown> | undefined): Neo4jConnection {
+  return {
+    executeQuery: async (cypher: string) => {
+      const row = answer(cypher);
+      return { records: row === undefined ? [] : [{ get: (key: string) => row[key] }] };
+    },
+  } as unknown as Neo4jConnection;
+}
+
+describe('findEntities on a failing page', () => {
+  /** The count statement, which also reads the repository marker. */
+  const isCount = (cypher: string): boolean => cypher.includes('AS repositoryExists');
+  const cases: Array<[string, string | undefined]> = [
+    ['without a search term', undefined],
+    ['with a search term', 'alpha'],
+  ];
+
+  it.each(cases)('reports a missing repository ahead of a failed page %s', async (_name, searchTerm) => {
+    const conn = answeringConnection((cypher) => {
+      if (isCount(cypher)) return { repositoryExists: false, total: 0n };
+      throw DRIVER_FAILURE;
+    });
+
+    await expect(
+      findEntities(conn, 'repo-find', { limit: 10, offset: 0, ...(searchTerm ? { searchTerm } : {}) }, undefined, 'relevance'),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+  });
+
+  it('raises a failed page as a typed error once the marker is found', async () => {
+    const conn = answeringConnection((cypher) => {
+      if (isCount(cypher)) return { repositoryExists: true, total: 1n };
+      throw DRIVER_FAILURE;
+    });
+
+    const thrown: unknown = await findEntities(conn, 'repo-find', { limit: 10, offset: 0 }, undefined, 'relevance').catch(
+      (err: unknown) => err,
+    );
+    expect(thrown).toBeInstanceOf(DeepMemoryError);
+    expect((thrown as Error).cause).toBe(DRIVER_FAILURE);
   });
 });

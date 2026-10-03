@@ -19,6 +19,7 @@ import {
 import {
   DuplicateEntityError,
   EntityNotFoundError,
+  ProviderError,
   RepositoryNotFoundError,
   SlugConflictError,
   buildVertexProjectChain,
@@ -26,7 +27,13 @@ import {
 } from '@utaba/deep-memory';
 import { repoVertexId } from './ids.js';
 import { submitCreate } from './create.js';
-import { assertRepositoryMarker } from './repository.js';
+import {
+  alongsideCheck,
+  assertRepositoryMarker,
+  assertRepositoryMarkerDocument,
+  markerCheckedRead,
+  rowsPastMarker,
+} from './marker.js';
 import { deleteEntitiesByIds } from './deleteByIds.js';
 
 // Sentinels the create query returns in place of the new vertex; the caller
@@ -144,6 +151,12 @@ export async function createEntity(
   return entity;
 }
 
+/**
+ * Read one entity by id, fetching the repository marker in the same request.
+ *
+ * @throws RepositoryNotFoundError when the marker is absent, whether or not
+ *   the entity is still there.
+ */
 export async function getEntity(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -151,14 +164,23 @@ export async function getEntity(
   options?: EntityReadOptions,
 ): Promise<StoredEntity | null> {
   const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
-  const result = await conn.submit(
-    `g.V().has('repositoryId', rid).hasId(eid).has('entityType').${projection}`,
-    { rid: repositoryId, eid: entityId },
-  );
-  if (result.items.length === 0) return null;
-  return entityFromGremlin(result.items[0] as Record<string, unknown>);
+  const result = await conn.submit(markerCheckedRead('hasId(within(mid, eid))', projection), {
+    rid: repositoryId,
+    mid: repoVertexId(repositoryId),
+    eid: entityId,
+  });
+  const rows = rowsPastMarker(result.items, repositoryId);
+  if (rows.length === 0) return null;
+  return entityFromGremlin(rows[0] as Record<string, unknown>);
 }
 
+/**
+ * Read one entity by slug. The marker and the slug lookup share the first,
+ * index-backed step (`or(hasId(mid), has(slug))`), so the marker costs no
+ * extra request.
+ *
+ * @throws RepositoryNotFoundError when the marker is absent.
+ */
 export async function getEntityBySlug(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -167,23 +189,33 @@ export async function getEntityBySlug(
 ): Promise<StoredEntity | null> {
   const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
   const result = await conn.submit(
-    `g.V().has('repositoryId', rid).has('slug', slugVal).has('entityType').${projection}`,
-    { rid: repositoryId, slugVal: slug },
+    markerCheckedRead("or(__.hasId(mid), __.has('slug', slugVal))", projection),
+    { rid: repositoryId, mid: repoVertexId(repositoryId), slugVal: slug },
   );
-  if (result.items.length === 0) return null;
-  return entityFromGremlin(result.items[0] as Record<string, unknown>);
+  const rows = rowsPastMarker(result.items, repositoryId);
+  if (rows.length === 0) return null;
+  return entityFromGremlin(rows[0] as Record<string, unknown>);
 }
 
+/**
+ * Read entities by id, fetching the repository marker in the same request.
+ * An empty list reads only the marker.
+ *
+ * @throws RepositoryNotFoundError when the marker is absent.
+ */
 export async function getEntities(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityIds: string[],
   options?: EntityReadOptions,
 ): Promise<Map<string, StoredEntity>> {
-  if (entityIds.length === 0) return new Map();
+  if (entityIds.length === 0) {
+    await assertRepositoryMarker(conn, repositoryId);
+    return new Map();
+  }
 
   // Build within() clause with individual params
-  const bindings: Record<string, unknown> = { rid: repositoryId };
+  const bindings: Record<string, unknown> = { rid: repositoryId, mid: repoVertexId(repositoryId) };
   const idParams: string[] = [];
   entityIds.forEach((id, i) => {
     const paramName = `eid${i}`;
@@ -191,15 +223,14 @@ export async function getEntities(
     idParams.push(paramName);
   });
 
-  const withinClause = `within(${idParams.join(', ')})`;
   const projection = buildVertexProjectChain({ withEmbedding: options?.loadEmbeddings });
   const result = await conn.submit(
-    `g.V().has('repositoryId', rid).hasId(${withinClause}).has('entityType').${projection}`,
+    markerCheckedRead(`hasId(within(mid, ${idParams.join(', ')}))`, projection),
     bindings,
   );
 
   const map = new Map<string, StoredEntity>();
-  for (const item of result.items) {
+  for (const item of rowsPastMarker(result.items, repositoryId)) {
     const entity = entityFromGremlin(item as Record<string, unknown>);
     map.set(entity.id, entity);
   }
@@ -420,31 +451,53 @@ export async function deleteEntity(
   if (notFound.length > 0) throw new EntityNotFoundError(entityId);
 }
 
+/** The marker-guarded by-type entity drop; see `deleteEntitiesByType`. */
+export const DELETE_ENTITIES_BY_TYPE_QUERY =
+  "g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('entityType', etype))" +
+  ".fold().as('vs').unfold().hasLabel('_repository').hasNot('entityType').aggregate('found').by('id')" +
+  ".select('vs').unfold().has('entityType', etype).aggregate('found').by('id').drop()" +
+  ".cap('found')";
+
 /**
- * Single round-trip type-delete via the aggregate-side-effect pattern: the
- * bucket records the vertex ids that the drop touched, giving an exact entity
- * count. The cascaded edge count is intentionally skipped — computing it
- * required a `bothE().dedup().count()` that walked every incident edge across
- * every partition the type touches, and the value is currently discarded by
- * the only caller (VocabularyEngine.cascadeDeleteData).
+ * Drop every entity of a type, with its edges, only while the repository
+ * marker exists, and report the ids dropped, in one partition-scoped request:
  *
+ *   g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('entityType', etype))  // marker and the type, one indexed lookup
+ *     .fold().as('vs').unfold()
+ *     .hasLabel('_repository').hasNot('entityType').aggregate('found').by('id')  // continues only past the marker
+ *     .select('vs').unfold().has('entityType', etype)
+ *     .aggregate('found').by('id').drop()
+ *     .cap('found')
+ *
+ * `cap` emits the bucket even when no traverser reaches it, so a bucket
+ * without the marker id means the repository is missing and nothing was
+ * dropped. Fetching the marker in the first step costs the same as the
+ * unguarded drop at any repository size; a mid-traversal `V()` would not.
+ *
+ * The cascaded edge count is intentionally skipped — computing it required a
+ * `bothE().dedup().count()` that walked every incident edge, and the value is
+ * currently discarded by the only caller (VocabularyEngine.cascadeDeleteData).
  * Returns `deletedRelationships: undefined` to signal the field is genuinely
  * unknown for this provider. SQL Server and in-memory providers continue to
  * return the exact number (rowsAffected / iteration).
+ *
+ * @throws RepositoryNotFoundError when the marker is absent; nothing is dropped.
  */
 export async function deleteEntitiesByType(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityType: string,
 ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
-  const result = await conn.submit(
-    "g.V().has('repositoryId', rid).has('entityType', etype)" +
-      ".aggregate('found').by('id').drop().cap('found')",
-    { rid: repositoryId, etype: entityType },
-  );
+  const markerId = repoVertexId(repositoryId);
+  const result = await conn.submit(DELETE_ENTITIES_BY_TYPE_QUERY, { rid: repositoryId, mid: markerId, etype: entityType });
+  // `cap('found')` always emits the bucket as a list, so no row, or a row
+  // that is not a list, is a malformed response, not a missing repository.
+  if (result.items.length === 0) throw new ProviderError('Cosmos guarded type delete returned no row.');
   const bucket = result.items[0];
-  const deletedEntities = Array.isArray(bucket) ? bucket.length : 0;
-  return { deletedEntities, deletedRelationships: undefined };
+  if (!Array.isArray(bucket)) throw new ProviderError('Cosmos guarded type delete returned a row that is not an id list.');
+  const found = bucket.filter((id): id is string => typeof id === 'string');
+  if (!found.includes(markerId)) throw new RepositoryNotFoundError(repositoryId);
+  return { deletedEntities: found.filter((id) => id !== markerId).length, deletedRelationships: undefined };
 }
 
 /**
@@ -607,14 +660,28 @@ export async function findEntities(
   // precise and runs alongside.
   const skipCount = propertyFilterMode === 'approximate';
 
-  const [dataResult, countResult] = await Promise.all([
-    docClient.query<Record<string, unknown>>(dataSql, dataParams, {
-      partitionKey: repositoryId,
-    }),
-    skipCount
-      ? Promise.resolve(null)
-      : docClient.query<number>(countSql, params, { partitionKey: repositoryId }),
-  ]);
+  // The marker read runs alongside the page and the count, so a deleted
+  // repository is refused rather than answered with an empty page (or with
+  // what a delete has not drained yet), at no added latency. A missing marker
+  // wins over a failed page or count read. The page and the count are both
+  // settled before either failure is raised, so neither is left running
+  // outside the call's usage scope.
+  const [dataResult, countResult] = await alongsideCheck(
+    () => assertRepositoryMarkerDocument(docClient, repositoryId),
+    async () => {
+      const [data, count] = await Promise.allSettled([
+        docClient.query<Record<string, unknown>>(dataSql, dataParams, {
+          partitionKey: repositoryId,
+        }),
+        skipCount
+          ? Promise.resolve(null)
+          : docClient.query<number>(countSql, params, { partitionKey: repositoryId }),
+      ]);
+      if (data.status === 'rejected') throw data.reason;
+      if (count.status === 'rejected') throw count.reason;
+      return [data.value, count.value] as const;
+    },
+  );
 
   let items = dataResult.documents.map(entityFromDocument);
 

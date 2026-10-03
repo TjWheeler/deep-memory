@@ -87,7 +87,7 @@ describe('deleteByIds under a driver re-run', () => {
   it('reports the ids a committed first attempt deleted as deleted, not notFound', async () => {
     const { conn, stored } = storeConnection(['a', 'b', 'keep'], 'committed-ack-lost');
 
-    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['a', 'b', 'missing']);
+    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['a', 'b', 'missing'], 'deleteEntities');
 
     expect(result.deleted.sort()).toEqual(['a', 'b']);
     expect(result.notFound).toEqual(['missing']);
@@ -97,7 +97,7 @@ describe('deleteByIds under a driver re-run', () => {
   it('answers the same when the first attempt rolled back', async () => {
     const { conn, stored } = storeConnection(['a', 'b', 'keep'], 'rolled-back');
 
-    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['a', 'b', 'missing']);
+    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['a', 'b', 'missing'], 'deleteEntities');
 
     expect(result.deleted.sort()).toEqual(['a', 'b']);
     expect(result.notFound).toEqual(['missing']);
@@ -107,7 +107,7 @@ describe('deleteByIds under a driver re-run', () => {
   it('reports an id no attempt found as notFound even after a re-run', async () => {
     const { conn } = storeConnection(['keep'], 'committed-ack-lost');
 
-    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['missing-1', 'missing-2']);
+    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['missing-1', 'missing-2'], 'deleteEntities');
 
     expect(result).toEqual({ deleted: [], notFound: ['missing-1', 'missing-2'] });
   });
@@ -115,7 +115,7 @@ describe('deleteByIds under a driver re-run', () => {
   it('answers a single acknowledged attempt from its own result', async () => {
     const { conn, stored } = storeConnection(['a', 'keep'], 'acknowledged');
 
-    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['a', 'missing']);
+    const result = await deleteByIds(conn, RID, DELETE_QUERY, ['a', 'missing'], 'deleteEntities');
 
     expect(result).toEqual({ deleted: ['a'], notFound: ['missing'] });
     expect(stored()).toEqual(['keep']);
@@ -124,7 +124,7 @@ describe('deleteByIds under a driver re-run', () => {
   it('reads only the repository marker for empty input', async () => {
     const { conn, transactions, markerReads } = storeConnection(['a'], 'acknowledged');
 
-    await expect(deleteByIds(conn, RID, DELETE_QUERY, [])).resolves.toEqual({ deleted: [], notFound: [] });
+    await expect(deleteByIds(conn, RID, DELETE_QUERY, [], 'deleteEntities')).resolves.toEqual({ deleted: [], notFound: [] });
     expect(transactions()).toBe(0);
     expect(markerReads).toEqual([REPOSITORY_MARKER_EXISTS_QUERY]);
   });
@@ -132,7 +132,7 @@ describe('deleteByIds under a driver re-run', () => {
   it('throws RepositoryNotFoundError for empty input when the repository marker is absent', async () => {
     const { conn, transactions } = storeConnection(['a'], 'acknowledged', () => false);
 
-    await expect(deleteByIds(conn, RID, DELETE_QUERY, [])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(deleteByIds(conn, RID, DELETE_QUERY, [], 'deleteEntities')).rejects.toBeInstanceOf(RepositoryNotFoundError);
     expect(transactions()).toBe(0);
   });
 
@@ -142,13 +142,13 @@ describe('deleteByIds under a driver re-run', () => {
         txFn({ run: async () => ({ records: [] }) } as unknown as ScopedTransaction, 1),
     } as unknown as Neo4jConnection;
 
-    await expect(deleteByIds(conn, RID, DELETE_QUERY, ['a'])).rejects.toBeInstanceOf(ProviderError);
+    await expect(deleteByIds(conn, RID, DELETE_QUERY, ['a'], 'deleteEntities')).rejects.toBeInstanceOf(ProviderError);
   });
 
   it('throws RepositoryNotFoundError and deletes nothing when the repository marker is absent', async () => {
     const { conn, stored } = storeConnection(['a', 'b'], 'acknowledged', () => false);
 
-    await expect(deleteByIds(conn, RID, DELETE_QUERY, ['a', 'missing'])).rejects.toBeInstanceOf(
+    await expect(deleteByIds(conn, RID, DELETE_QUERY, ['a', 'missing'], 'deleteEntities')).rejects.toBeInstanceOf(
       RepositoryNotFoundError,
     );
     expect(stored()).toEqual(['a', 'b']);
@@ -161,7 +161,7 @@ describe('deleteByIds under a driver re-run', () => {
       return statements === 1;
     });
 
-    await expect(deleteByIds(conn, RID, DELETE_QUERY, ['a'])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(deleteByIds(conn, RID, DELETE_QUERY, ['a'], 'deleteEntities')).rejects.toBeInstanceOf(RepositoryNotFoundError);
     expect(stored()).toEqual(['keep']);
   });
 });

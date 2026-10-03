@@ -34,6 +34,7 @@ import {
   VocabularyVersionConflictError,
 } from '@utaba/deep-memory';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
+import { settledValue } from '../errors.js';
 import { bigintToSafeNumber, changeRecordFromRecord } from '../mapping.js';
 
 /** Page size for the backfill's keyset scan over `_Vocabulary` nodes. */
@@ -297,7 +298,25 @@ async function repairVocabularyVersion(
 }
 
 /**
- * Page the vocabulary change-log for a repository, newest first.
+ * Change-log count, together with whether the repository marker exists. The
+ * marker is a seek of its unique constraint index; the count runs only when
+ * it exists and aggregates, so the statement always returns one row.
+ * `_VocabularyChangeLog` has no index on `repositoryId`, so the count is a
+ * label scan over the change-log nodes.
+ */
+export const VOCABULARY_CHANGE_LOG_COUNT_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+CALL (repo) {
+  MATCH (e:_VocabularyChangeLog {repositoryId: $rid})
+  WHERE repo IS NOT NULL
+  RETURN count(e) AS total
+}
+RETURN repo IS NOT NULL AS repositoryExists, total`;
+
+/**
+ * Page the vocabulary change-log for a repository, newest first. Throws
+ * `RepositoryNotFoundError` when the repository marker is absent; the marker
+ * rides on the count statement (`VOCABULARY_CHANGE_LOG_COUNT_QUERY`), which
+ * always runs and always returns one row.
  *
  * Data and count round-trips are independent — fire them in parallel. There
  * are no property filters beyond the repository scope, so the count is always
@@ -319,7 +338,7 @@ export async function getVocabularyChangeLog(
   const limit = options?.limit ?? 10;
   const offset = options?.offset ?? 0;
 
-  const [dataResult, countResult] = await Promise.all([
+  const [dataSettled, countSettled] = await Promise.allSettled([
     conn.executeQuery(
       `MATCH (e:_VocabularyChangeLog {repositoryId: $rid})
        RETURN e
@@ -328,16 +347,17 @@ export async function getVocabularyChangeLog(
       { offset: BigInt(offset), limit: BigInt(limit) },
       { repositoryId, routing: 'READ' },
     ),
-    conn.executeQuery(
-      'MATCH (e:_VocabularyChangeLog {repositoryId: $rid}) RETURN count(e) AS total',
-      {},
-      { repositoryId, routing: 'READ' },
-    ),
+    conn.executeQuery(VOCABULARY_CHANGE_LOG_COUNT_QUERY, {}, { repositoryId, routing: 'READ' }),
   ]);
 
-  const items = dataResult.records.map((record) => changeRecordFromRecord(record, 'e'));
-  const totalRaw = countResult.records[0]?.get('total');
-  const total = totalRaw === undefined ? 0 : bigintToSafeNumber(totalRaw);
+  // The count carries the marker check, so a missing repository is reported
+  // ahead of a failed page.
+  const context = { repositoryId, operation: 'getVocabularyChangeLog' };
+  const countRecord = settledValue(countSettled, context).records[0];
+  if (countRecord === undefined) throw new ProviderError('Neo4j vocabulary change-log count returned no row.');
+  if (countRecord.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  const items = settledValue(dataSettled, context).records.map((record) => changeRecordFromRecord(record, 'e'));
+  const total = bigintToSafeNumber(countRecord.get('total') ?? 0);
 
   return {
     items,

@@ -197,9 +197,6 @@ describe('EntityManager slug-conflict retry', () => {
     it('reports a deleted repository ahead of a missing entity', async () => {
       const [entity] = await repo.createEntities([{ entityType: 'person', label: 'Alex' }]);
       await storage.deleteRepository(repo.repositoryId);
-      // Database-backed stores answer an entity read on a deleted repository
-      // with no row rather than an error.
-      storage.getEntity = async () => null;
 
       await expect(repo.updateEntity(entity!.id, { label: 'Sam' })).rejects.toMatchObject({
         code: 'REPOSITORY_NOT_FOUND',
@@ -245,9 +242,6 @@ describe('EntityManager slug-conflict retry', () => {
     it('reports a deleted repository ahead of a missing entity', async () => {
       const [entity] = await repo.createEntities([{ entityType: 'person', label: 'Alex' }]);
       await storage.deleteRepository(REPO_ID);
-      // Database-backed stores answer an entity read on a deleted repository
-      // with no row rather than an error.
-      storage.getEntity = async () => null;
 
       await expect(entityManager().delete(entity!.id)).rejects.toMatchObject({ code: 'REPOSITORY_NOT_FOUND' });
     });

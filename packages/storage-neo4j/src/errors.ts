@@ -148,6 +148,17 @@ export function mapDriverError(error: unknown, context: DriverErrorContext = {})
 }
 
 /**
+ * The value of a settled statement, or its failure raised through
+ * `mapDriverError`. Parallel statements settle together so the caller can
+ * read the one carrying the repository marker check first: a missing
+ * repository is then reported ahead of a failure of a sibling statement.
+ */
+export function settledValue<T>(result: PromiseSettledResult<T>, context: DriverErrorContext = {}): T {
+  if (result.status === 'rejected') mapDriverError(result.reason, context);
+  return result.value;
+}
+
+/**
  * The typed error `mapDriverError` throws for `error`, returned instead of
  * thrown — for recording a failure (e.g. one bulk-import row) and carrying on.
  */

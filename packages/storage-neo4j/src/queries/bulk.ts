@@ -103,6 +103,7 @@ import {
   toTypedError,
   type DriverErrorContext,
 } from '../errors.js';
+import { assertRepositoryMarker } from './repositoryDrain.js';
 import { LOCK_REPOSITORY_MARKER } from './repositoryLock.js';
 
 /** What `Neo4jConnection.executeQuery` resolves to. */
@@ -195,11 +196,17 @@ LIMIT $batchSize
  *
  * The projection includes the embedding because a faithful round-trip is
  * the export-side contract; every other entity read defaults to embedding-off.
+ *
+ * Throws `RepositoryNotFoundError` on the first iteration when the
+ * repository marker is absent, before any page is read. The export is a
+ * stream of cursor pages, each its own statement, so no single statement
+ * covers it; one seek of the marker ahead of the first page is the check.
  */
 export async function* exportAll(
   conn: Neo4jConnection,
   repositoryId: string,
 ): AsyncIterable<ExportChunk> {
+  await assertRepositoryMarker(conn, repositoryId, 'exportAll', 'READ');
   let sequence = 0;
 
   let cursor: string | undefined;
@@ -612,7 +619,8 @@ RETURN row.id AS id, outcome
  *   still there.
  * - A missing repository marker — the repository does not exist, or was
  *   deleted while the import ran — stops the import with
- *   `RepositoryNotFoundError`.
+ *   `RepositoryNotFoundError`, including when every row is refused before
+ *   any write.
  *
  * `result.errors` lists entity rows before relationship rows. Among the
  * relationships, the repeats an insert refuses come first, then each
@@ -644,7 +652,7 @@ export async function importBulk(
   }
 
   const errors: BulkImportItemError[] = [];
-  const run: ImportRun = { stopped: false };
+  const run: ImportRun = { stopped: false, statementIssued: false };
   const stopOnFailure = <T, R>(fn: (item: T) => Promise<R>) => async (item: T): Promise<R> => {
     try {
       return await fn(item);
@@ -698,6 +706,14 @@ export async function importBulk(
     errors.push(...res.errors);
   }
 
+  // Every write statement checks the marker itself. An import whose rows were
+  // all refused before any round-trip (or that has no rows) ran none of them,
+  // so it reads the marker on its own: a missing repository answers
+  // `RepositoryNotFoundError` rather than row errors or an empty result.
+  if (!run.statementIssued) {
+    await assertRepositoryMarker(conn, repositoryId, 'importBulk', 'READ');
+  }
+
   return { entitiesImported, relationshipsImported, errors };
 }
 
@@ -711,13 +727,21 @@ interface RelationshipChunk {
   rows: StoredRelationship[];
 }
 
-/**
- * Shared by every chunk of one import. Set once any chunk rejects, so a
- * sibling chunk's per-row fallback stops at its next row instead of writing
- * on against a failing store.
- */
+/** Shared by every chunk of one import. */
 interface ImportRun {
+  /**
+   * Set once any chunk rejects, so a sibling chunk's per-row fallback stops
+   * at its next row instead of writing on against a failing store.
+   */
   stopped: boolean;
+  /**
+   * Set once any chunk sends its write statement, each of which checks the
+   * repository marker. Left unset, the import reads the marker on its own.
+   * It is set before the round trip: an issued statement that throws either
+   * rejects the import, or proves the marker matched through
+   * `LOCK_REPOSITORY_MARKER`'s `MATCH`, so the separate read is never needed.
+   */
+  statementIssued: boolean;
 }
 
 /**
@@ -727,21 +751,11 @@ interface ImportRun {
  * the chunk touched being deleted while it waited (each re-run reads the
  * committed state and reports the missing endpoint or marker as an outcome).
  */
-function rethrowUnlessChunkCanFallBack(error: unknown): void {
+function rethrowUnlessChunkCanFallBack(error: unknown, repositoryId: string): void {
   if (!isRowShapedFailure(error) && !isMemoryLimitFailure(error) && !isDeletedEntityFailure(error)) {
-    mapDriverError(error, { operation: 'importBulk' });
+    mapDriverError(error, { repositoryId, operation: 'importBulk' });
   }
 }
-
-/**
- * Reads whether the repository marker exists, after a single-row write was
- * refused on a node a concurrent transaction deleted. The refusal does not
- * name the node, and a deleted marker must stop the import rather than be
- * recorded against the row.
- */
-const REPOSITORY_MARKER_EXISTS_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
-RETURN repo IS NOT NULL AS repositoryExists
-`;
 
 /**
  * The row error for a single-row write refused because a node it touched was
@@ -755,17 +769,9 @@ async function deletedNodeRowError(
   item: string,
   detail: string,
 ): Promise<BulkImportItemError> {
-  let check: QueryResult;
-  try {
-    check = await conn.executeQuery(REPOSITORY_MARKER_EXISTS_QUERY, {}, { repositoryId });
-  } catch (err) {
-    mapDriverError(err, { operation: 'importBulk' });
-  }
-  const exists: unknown = check.records[0]?.get('repositoryExists');
-  if (typeof exists !== 'boolean') {
-    throw new ProviderError('Neo4j import repository check returned no row.');
-  }
-  if (!exists) throw new RepositoryNotFoundError(repositoryId);
+  // The refusal does not name the deleted node, and a deleted marker must
+  // stop the import rather than be recorded against the row.
+  await assertRepositoryMarker(conn, repositoryId, 'importBulk');
   return { item, error: `${detail} was deleted by a concurrent transaction`, code: 'ENTITY_NOT_FOUND' };
 }
 
@@ -775,9 +781,9 @@ async function deletedNodeRowError(
  * per-transaction memory limit. An exhausted server-wide memory pool is a
  * state of the store, so it stops the import.
  */
-function rethrowUnlessRowFailure(error: unknown): void {
+function rethrowUnlessRowFailure(error: unknown, repositoryId: string): void {
   if (!isRowShapedFailure(error) && !isTransactionMemoryLimit(error)) {
-    mapDriverError(error, { operation: 'importBulk' });
+    mapDriverError(error, { repositoryId, operation: 'importBulk' });
   }
 }
 
@@ -825,6 +831,8 @@ async function importEntityChunk(
   const writeAttempt = skipCheck ? randomUUID() : undefined;
 
   let result: QueryResult;
+  // Safe before the round trip: a throw either rejects the import or proves the marker matched.
+  run.statementIssued = true;
   try {
     result = await conn.executeQuery(
       query,
@@ -832,7 +840,7 @@ async function importEntityChunk(
       { repositoryId },
     );
   } catch (err) {
-    rethrowUnlessChunkCanFallBack(err);
+    rethrowUnlessChunkCanFallBack(err, repositoryId);
     // The driver re-runs a chunk whose commit acknowledgement was lost, and
     // the re-run trips the id or slug constraint on the rows its own first
     // run committed. Every row's id holding an entity with this chunk's
@@ -872,7 +880,7 @@ async function countEntitiesCarrying(
       { repositoryId },
     );
   } catch (err) {
-    mapDriverError(err, { operation: 'importBulk' });
+    mapDriverError(err, { repositoryId, operation: 'importBulk' });
   }
   const carrying = result.records[0]?.get('carrying');
   if (carrying === undefined || carrying === null) {
@@ -952,7 +960,7 @@ async function fallbackPerEntity(
         );
         continue;
       }
-      rethrowUnlessRowFailure(rowErr);
+      rethrowUnlessRowFailure(rowErr, repositoryId);
       const refusal = toTypedError(rowErr, {
         kind: 'entity',
         entityId: entity.id,
@@ -1026,7 +1034,7 @@ async function readEntityWriteAttempts(
   try {
     result = await conn.executeQuery(ENTITY_WRITE_ATTEMPTS_QUERY, { ids: [...new Set(entityIds)] }, { repositoryId });
   } catch (err) {
-    mapDriverError(err, { operation: 'importBulk' });
+    mapDriverError(err, { repositoryId, operation: 'importBulk' });
   }
   const stored = new Map<string, string>();
   for (const record of result.records) {
@@ -1085,10 +1093,12 @@ async function importRelationshipChunk(
   for (const wave of waves) {
     if (run.stopped) break;
     let result: QueryResult;
+    // Safe before the round trip: a throw either rejects the import or proves the marker matched.
+    run.statementIssued = true;
     try {
       result = await conn.executeQuery(query, relationshipChunkParams(wave, writeAttempt), { repositoryId });
     } catch (err) {
-      rethrowUnlessChunkCanFallBack(err);
+      rethrowUnlessChunkCanFallBack(err, repositoryId);
       const fallback = await fallbackPerRelationship(conn, repositoryId, wave, query, writeAttempt, run);
       imported += fallback.imported;
       errors.push(...fallback.errors);
@@ -1132,7 +1142,7 @@ async function fallbackPerRelationship(
         );
         continue;
       }
-      rethrowUnlessRowFailure(rowErr);
+      rethrowUnlessRowFailure(rowErr, repositoryId);
       errors.push(
         rowError(`relationship:${rel.id}`, rowErr, {
           kind: 'relationship',

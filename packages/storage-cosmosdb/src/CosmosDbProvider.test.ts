@@ -29,8 +29,8 @@ import {
   SlugConflictError,
   VocabularyVersionConflictError,
 } from '@utaba/deep-memory';
-import { ENTITY_CREATE_QUERY, UPDATE_ENTITY_START } from './queries/entity.js';
-import { RELATIONSHIP_CREATE_QUERY } from './queries/relationship.js';
+import { DELETE_ENTITIES_BY_TYPE_QUERY, ENTITY_CREATE_QUERY, UPDATE_ENTITY_START } from './queries/entity.js';
+import { RELATIONSHIP_CREATE_QUERY, RELATIONSHIP_ID_TAKEN_SQL } from './queries/relationship.js';
 import {
   DELETE_ENTITY_BATCH_QUERY,
   DELETE_INDEX_ENTRY_QUERY,
@@ -38,8 +38,14 @@ import {
   EDGE_BATCH_DROP_QUERY,
   ENTITY_BATCH_COUNT_QUERY,
   ENTITY_BATCH_DROP_QUERY,
-  REPOSITORY_MARKER_COUNT_QUERY,
 } from './queries/repository.js';
+import {
+  MARKER_BRANCH,
+  REPOSITORY_MARKER_COUNT_QUERY,
+  alongsideCheck,
+  REPOSITORY_MARKER_SQL,
+  REPOSITORY_PRESENT,
+} from './queries/marker.js';
 import {
   VOCABULARY_BACKFILL_SCAN_SQL,
   VOCABULARY_BACKFILL_WRITE_QUERY,
@@ -49,6 +55,7 @@ import {
   backfillVocabularyVersions,
 } from './queries/vocabulary.js';
 import type { CosmosDocumentClient, CosmosQueryParameter, CosmosQueryResult } from './CosmosDocumentClient.js';
+import { usageScope } from './usage.js';
 
 const TEST_REPO = '40000000-0000-4000-a000-000000000099';
 
@@ -56,6 +63,14 @@ const TEST_REPO = '40000000-0000-4000-a000-000000000099';
 // repository's `_repository` marker vertex.
 const ENTITY_CREATE_START =
   "g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(";
+
+// The union that opens the rows of a read fetching the marker with them.
+const MARKER_UNION = `.union(${MARKER_BRANCH}, __.has('entityType').`;
+
+// Every relationship-create query opens with one partition-scoped lookup of
+// the marker and both endpoints.
+const RELATIONSHIP_CREATE_START =
+  "g.V().has('repositoryId', rid).hasId(within(repoVid, srcId, tgtId)).fold().as('vs').coalesce(";
 
 interface SubmitCall {
   query: string;
@@ -107,6 +122,10 @@ function makeProvider(): { provider: CosmosDbProvider; stub: SubmitStub } {
       if (query === REPOSITORY_MARKER_COUNT_QUERY) {
         // The repository exists.
         return { items: [1] };
+      }
+      if (query.includes(MARKER_UNION)) {
+        // A read that fetches the marker with its rows: the marker's row only.
+        return { items: [REPOSITORY_PRESENT] };
       }
       if (query.startsWith('g.V().has(\'repositoryId\', pRid)')) {
         // Traversal query — return an empty union/path result. The provider
@@ -409,7 +428,7 @@ describe('single-round-trip create / update', () => {
     const { provider, stub } = makeProvider();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) {
         return { items: [{ id: 'created-edge' }] };
       }
       return { items: [] };
@@ -426,20 +445,23 @@ describe('single-round-trip create / update', () => {
 
     expect(after - before).toBe(1);
     const created = stub.calls[stub.calls.length - 1]!;
-    expect(created.query).toContain('fold().coalesce(');
+    expect(created.query.startsWith(RELATIONSHIP_CREATE_START)).toBe(true);
     expect(created.query).toContain('addE(edgeLabel)');
     expect(created.query).not.toContain('.count()');
+    // Only the first step looks vertices up: no mid-traversal V(), whose
+    // cost grows with the partition.
+    expect(created.query.split('V()')).toHaveLength(2);
+    expect(created.query).not.toContain('g.E()');
   });
 
-  it('createRelationship issues exactly one storage call on duplicate and throws DuplicateRelationshipError', async () => {
-    const { provider, stub } = makeProvider();
+  it('createRelationship reads the id in the partition after a missing endpoint, so a reused id wins as DuplicateRelationshipError', async () => {
+    const { provider, stub, doc } = makeProviderWithDocStub();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
-        return { items: ['__duplicate'] };
-      }
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) return { items: ['__no_source'] };
       return { items: [] };
     };
+    doc.respond = (sql) => (sql === RELATIONSHIP_ID_TAKEN_SQL ? [1] : []);
 
     const rel = makeRelationship(
       '40000000-0000-4000-a000-000000006004',
@@ -451,6 +473,40 @@ describe('single-round-trip create / update', () => {
     const after = stub.calls.length;
 
     expect(after - before).toBe(1);
+    // Any document id in the partition counts, as it does for the store's 409.
+    expect(doc.calls).toEqual([
+      { sql: RELATIONSHIP_ID_TAKEN_SQL, parameters: [{ name: '@relId', value: rel.id }], partitionKey: TEST_REPO },
+    ]);
+  });
+
+  it('createRelationship treats a missing create row as a malformed response', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      return { items: [] };
+    };
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006005',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0002',
+    );
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('createRelationship treats a missing id-read count row as a malformed response', async () => {
+    const { provider, stub, doc } = makeProviderWithDocStub();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) return { items: ['__no_target'] };
+      return { items: [] };
+    };
+    doc.respond = () => [];
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006006',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0002',
+    );
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(ProviderError);
   });
 
   it('createEntity is gated on the repository marker in the same query', async () => {
@@ -499,11 +555,15 @@ describe('single-round-trip create / update', () => {
     );
 
     const call = getCreateCall();
+    // Past the marker (an entity typed `_repository` does not pass), the
+    // target is labelled and the edge is added from the source to it, both
+    // taken from the folded list.
     expect(call.query).toContain(
-      "unfold().constant('__duplicate'),g.V().has('repositoryId', rid).hasId(repoVid).hasLabel('_repository').fold().coalesce(" +
-        "unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)",
+      "coalesce(__.unfold().hasLabel('_repository').hasNot('entityType').coalesce(" +
+        "__.select('vs').unfold().hasId(tgtId).has('entityType').as('t')" +
+        ".select('vs').unfold().hasId(srcId).has('entityType').addE(edgeLabel).to('t')",
     );
-    expect(call.query.endsWith(",unfold().constant('__no_source'),constant('__no_repository')))")).toBe(true);
+    expect(call.query.endsWith(",__.constant('__no_source')),__.constant('__no_repository'))")).toBe(true);
     expect(call.params!['repoVid']).toBe(`repo:${TEST_REPO}`);
   });
 
@@ -511,7 +571,7 @@ describe('single-round-trip create / update', () => {
     const { provider, stub } = makeProvider();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) {
         return { items: ['__no_repository'] };
       }
       return { items: [] };
@@ -533,16 +593,17 @@ describe('single-round-trip create / update', () => {
     ['__no_source', 'source', '40000000-0000-4000-a000-deadbeef0001'],
     ['__no_target', 'target', '40000000-0000-4000-a000-deadbeef0009'],
   ])(
-    'createRelationship maps %s to EntityNotFoundError naming the %s, in one call',
+    'createRelationship maps %s to EntityNotFoundError naming the %s once the id read finds the id free',
     async (sentinel, _endpoint, missingId) => {
-      const { provider, stub } = makeProvider();
+      const { provider, stub, doc } = makeProviderWithDocStub();
       stub.submit = async (query, params) => {
         stub.calls.push({ query, params });
-        if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+        if (query.startsWith(RELATIONSHIP_CREATE_START)) {
           return { items: [sentinel] };
         }
         return { items: [] };
       };
+      doc.respond = (sql) => (sql === RELATIONSHIP_ID_TAKEN_SQL ? [0] : []);
 
       const rel = makeRelationship(
         '40000000-0000-4000-a000-000000006014',
@@ -554,10 +615,49 @@ describe('single-round-trip create / update', () => {
       await expect(create).rejects.toBeInstanceOf(EntityNotFoundError);
       await expect(create).rejects.toMatchObject({ code: 'ENTITY_NOT_FOUND', id: missingId });
       expect(stub.calls.length - before).toBe(1);
+      expect(doc.calls.map((c) => c.sql)).toEqual([RELATIONSHIP_ID_TAKEN_SQL]);
     },
   );
 
-  it('createRelationship tells a missing target from a missing source with a partition-scoped lookup of the source', async () => {
+  it('createRelationship treats a relationship id count that is not a number as a provider failure', async () => {
+    const { provider, stub, doc } = makeProviderWithDocStub();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) return { items: ['__no_source'] };
+      return { items: [] };
+    };
+    doc.respond = (sql) => (sql === RELATIONSHIP_ID_TAKEN_SQL ? ['not a count'] : []);
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006017',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0009',
+    );
+
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('createRelationship keeps the same statement and precedence when core minted the id', async () => {
+    const { provider, stub, doc } = makeProviderWithDocStub();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) return { items: ['__no_target'] };
+      return { items: [] };
+    };
+    doc.respond = (sql) => (sql === RELATIONSHIP_ID_TAKEN_SQL ? [1] : []);
+    const rel = makeRelationship(
+      '40000000-0000-4000-a000-000000006016',
+      '40000000-0000-4000-a000-deadbeef0001',
+      '40000000-0000-4000-a000-deadbeef0009',
+    );
+
+    await expect(provider.createRelationship(TEST_REPO, rel, { idMinted: true })).rejects.toBeInstanceOf(
+      DuplicateRelationshipError,
+    );
+    expect(stub.calls.map((c) => c.query)).toEqual([RELATIONSHIP_CREATE_QUERY]);
+    expect(doc.calls.map((c) => c.sql)).toEqual([RELATIONSHIP_ID_TAKEN_SQL]);
+  });
+
+  it('createRelationship tells a missing target from a missing source from the folded endpoints', async () => {
     const { provider, getCreateCall } = captureRelationshipCreateQuery();
     await provider.createRelationship(
       TEST_REPO,
@@ -573,8 +673,8 @@ describe('single-round-trip create / update', () => {
     // marker exists (so the source is missing), no marker.
     expect(
       query.endsWith(
-        ",unfold().V().has('repositoryId', rid).hasId(srcId).has('entityType').constant('__no_target')" +
-          ",unfold().constant('__no_source'),constant('__no_repository')))",
+        ",__.select('vs').unfold().hasId(srcId).has('entityType').constant('__no_target')" +
+          ",__.constant('__no_source')),__.constant('__no_repository'))",
       ),
     ).toBe(true);
   });
@@ -875,7 +975,7 @@ describe('create maps a store-side 409 to the duplicate error', () => {
     const driverError = cosmosResponseError(409);
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith("g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(")) throw driverError;
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) throw driverError;
       return { items: [] };
     };
     const rel = makeRelationship(
@@ -1435,7 +1535,7 @@ function captureRelationshipCreateQuery(): {
   const { provider, stub } = makeProvider();
   stub.submit = async (query, params) => {
     stub.calls.push({ query, params });
-    if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
+    if (query.startsWith(RELATIONSHIP_CREATE_START)) {
       return { items: [{ id: 'created-edge' }] };
     }
     return { items: [] };
@@ -1445,7 +1545,7 @@ function captureRelationshipCreateQuery(): {
     stub,
     getCreateCall: () => {
       const call = stub.calls.find((c) =>
-        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+        c.query.startsWith(RELATIONSHIP_CREATE_START),
       );
       if (!call) throw new Error('no create call captured');
       return call;
@@ -1554,7 +1654,7 @@ describe('createRelationship user-property scalars', () => {
     const createCalls = stub.calls
       .slice(before, after)
       .filter((c) =>
-        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+        c.query.startsWith(RELATIONSHIP_CREATE_START),
       );
     expect(createCalls).toHaveLength(0);
   });
@@ -1572,7 +1672,7 @@ describe('createRelationship user-property scalars', () => {
     const createCalls = stub.calls
       .slice(before, after)
       .filter((c) =>
-        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+        c.query.startsWith(RELATIONSHIP_CREATE_START),
       );
     expect(createCalls).toHaveLength(0);
   });
@@ -1592,20 +1692,21 @@ describe('createRelationship user-property scalars', () => {
     const createCalls = stub.calls
       .slice(before, after)
       .filter((c) =>
-        c.query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce('),
+        c.query.startsWith(RELATIONSHIP_CREATE_START),
       );
     expect(createCalls).toHaveLength(0);
   });
 
-  it('duplicate-detection sentinel path still fires when scalars are present', async () => {
-    const { provider, stub } = makeProvider();
+  it('duplicate detection still fires when scalars are present', async () => {
+    const { provider, stub, doc } = makeProviderWithDocStub();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.startsWith('g.E().has(\'repositoryId\', rid).hasId(relId).fold().coalesce(')) {
-        return { items: ['__duplicate'] };
+      if (query.startsWith(RELATIONSHIP_CREATE_START)) {
+        return { items: ['__no_target'] };
       }
       return { items: [] };
     };
+    doc.respond = (sql) => (sql === RELATIONSHIP_ID_TAKEN_SQL ? [1] : []);
 
     const rel: StoredRelationship = {
       ...makeRelationship('40000000-0000-4000-a000-00000000a008', SRC, TGT),
@@ -1615,7 +1716,7 @@ describe('createRelationship user-property scalars', () => {
     await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(
       DuplicateRelationshipError,
     );
-    const lastCall = stub.calls[stub.calls.length - 1]!;
+    const lastCall = stub.calls.find((c) => c.query.startsWith(RELATIONSHIP_CREATE_START))!;
     // Suffix is present in the duplicate-path query too — the addE branch
     // carries the scalars whether or not it fires at runtime.
     expect(lastCall.query).toContain(".property('weight', p_user_0)");
@@ -1841,8 +1942,8 @@ describe('single-round-trip delete paths', () => {
     const { provider, stub } = makeProvider();
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
-      if (query.includes("aggregate('found')") && query.includes("has('entityType', etype)")) {
-        return { items: [[ENTITY_A, ENTITY_B]] };
+      if (query === DELETE_ENTITIES_BY_TYPE_QUERY) {
+        return { items: [[`repo:${TEST_REPO}`, ENTITY_A, ENTITY_B]] };
       }
       return { items: [] };
     };
@@ -1858,10 +1959,46 @@ describe('single-round-trip delete paths', () => {
     const issued = stub.calls[stub.calls.length - 1]!;
     expect(issued.query).not.toContain('.count()');
     expect(issued.query).not.toContain('bothE()');
-    expect(issued.query).toContain("aggregate('found').by('id')");
+    expect(issued.params).toEqual({ rid: TEST_REPO, mid: `repo:${TEST_REPO}`, etype: 'Person' });
+    // The marker and the type come from the first, indexed step; the drop
+    // runs only past the marker, and there is no mid-traversal V().
+    expect(issued.query.startsWith("g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('entityType', etype))")).toBe(true);
+    expect(issued.query).toContain(".hasLabel('_repository').hasNot('entityType').aggregate('found').by('id')");
+    expect(issued.query.split('V()')).toHaveLength(2);
   });
 
-  it('deleteRelationshipsByType issues one storage call and returns the bucket count', async () => {
+  it('deleteEntitiesByType throws RepositoryNotFoundError when the bucket lacks the marker id', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      // Without the marker no traverser reaches the drop; `cap` still emits the bucket.
+      if (query === DELETE_ENTITIES_BY_TYPE_QUERY) return { items: [[]] };
+      return { items: [] };
+    };
+    await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  it('deleteEntitiesByType treats a missing row as a malformed response', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      return { items: [] };
+    };
+    await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('deleteEntitiesByType treats a row that is not an id list as a malformed response', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === DELETE_ENTITIES_BY_TYPE_QUERY) return { items: [3] };
+      return { items: [] };
+    };
+    await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('deleteRelationshipsByType reads the marker, then drops in one call, and returns the bucket count', async () => {
     const { provider, stub } = makeProvider();
     const REL_X = '40000000-0000-4000-a000-000000007020';
     const REL_Y = '40000000-0000-4000-a000-000000007021';
@@ -1869,6 +2006,7 @@ describe('single-round-trip delete paths', () => {
 
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [1] };
       if (query.includes("aggregate('found')") && query.startsWith('g.E().')) {
         return { items: [[REL_X, REL_Y, REL_Z]] };
       }
@@ -1879,12 +2017,53 @@ describe('single-round-trip delete paths', () => {
     const result = await provider.deleteRelationshipsByType(TEST_REPO, 'KNOWS');
     const after = stub.calls.length;
 
-    expect(after - before).toBe(1);
+    expect(after - before).toBe(2);
+    expect(stub.calls[before]!.query).toBe(REPOSITORY_MARKER_COUNT_QUERY);
     expect(result.deletedRelationships).toBe(3);
 
     const issued = stub.calls[stub.calls.length - 1]!;
     expect(issued.query).not.toContain('.count()');
     expect(issued.query).toContain("aggregate('found').by('id')");
+  });
+
+  it('deleteRelationshipsByType drops nothing when the marker is gone', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [0] };
+      return { items: [[]] };
+    };
+    await expect(provider.deleteRelationshipsByType(TEST_REPO, 'KNOWS')).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    expect(stub.calls.map((c) => c.query)).toEqual([REPOSITORY_MARKER_COUNT_QUERY]);
+  });
+
+  it.each([
+    ['no row', []],
+    ['a row that is not a list', [{ found: [] }]],
+  ])('deleteRelationshipsByType and deleteRelationships treat a drop answering %s as a provider failure', async (_shape, items) => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [1] };
+      return { items };
+    };
+    await expect(provider.deleteRelationshipsByType(TEST_REPO, 'KNOWS')).rejects.toBeInstanceOf(ProviderError);
+    await expect(provider.deleteRelationships(TEST_REPO, ['40000000-0000-4000-a000-000000007023'])).rejects.toBeInstanceOf(
+      ProviderError,
+    );
+  });
+
+  it('a marker count that is not a number is a provider failure, not an answer', async () => {
+    const { provider, stub } = makeProvider();
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: ['not a count'] };
+      return { items: [[]] };
+    };
+    await expect(provider.deleteRelationshipsByType(TEST_REPO, 'KNOWS')).rejects.toBeInstanceOf(ProviderError);
+    expect(stub.calls.map((c) => c.query)).toEqual([REPOSITORY_MARKER_COUNT_QUERY]);
   });
 
   // ─── upsertEntity / upsertRelationship partition-key constraint ────
@@ -2640,6 +2819,10 @@ interface DocClientStub {
     options: { partitionKey?: string },
   ): Promise<CosmosQueryResult<T>>;
   calls: DocQueryCall[];
+  /** Marker reads (`REPOSITORY_MARKER_SQL`), kept apart from `calls`. */
+  markerCalls: DocQueryCall[];
+  /** Whether the marker read finds the repository marker. */
+  markerExists: boolean;
   /** Override per test to shape returned documents/count by SQL inspection. */
   respond: (sql: string) => unknown[];
 }
@@ -2647,12 +2830,23 @@ interface DocClientStub {
 function makeDocClientStub(): DocClientStub {
   const stub: DocClientStub = {
     calls: [],
+    markerCalls: [],
+    markerExists: true,
     respond: () => [],
     async query<T>(
       sql: string,
       parameters: CosmosQueryParameter[],
       options: { partitionKey?: string },
     ): Promise<CosmosQueryResult<T>> {
+      if (sql === REPOSITORY_MARKER_SQL) {
+        stub.markerCalls.push({ sql, parameters, partitionKey: options.partitionKey });
+        return {
+          documents: (stub.markerExists ? [{ id: parameters[0]?.value }] : []) as T[],
+          requestCharge: 0,
+          queryMetrics: null,
+          continuationToken: null,
+        };
+      }
       stub.calls.push({ sql, parameters, partitionKey: options.partitionKey });
       return {
         documents: stub.respond(sql) as T[],
@@ -2665,14 +2859,55 @@ function makeDocClientStub(): DocClientStub {
   return stub;
 }
 
-function makeProviderWithDocStub(): { provider: CosmosDbProvider; doc: DocClientStub } {
-  const { provider } = makeProvider();
+function makeProviderWithDocStub(): { provider: CosmosDbProvider; stub: SubmitStub; doc: DocClientStub } {
+  const { provider, stub } = makeProvider();
   const doc = makeDocClientStub();
   (provider as unknown as { docClient: DocClientStub }).docClient = doc;
-  return { provider, doc };
+  return { provider, stub, doc };
 }
 
 describe('findEntities SQL shape', () => {
+  it('reads the repository marker alongside the page, pinned to the partition', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
+
+    await provider.findEntities(TEST_REPO, { limit: 10, offset: 0 });
+
+    expect(doc.markerCalls).toEqual([
+      {
+        sql: REPOSITORY_MARKER_SQL,
+        parameters: [{ name: '@mid', value: `repo:${TEST_REPO}` }],
+        partitionKey: TEST_REPO,
+      },
+    ]);
+    expect(REPOSITORY_MARKER_SQL).toContain('NOT IS_DEFINED(c.entityType)');
+  });
+
+  it('throws RepositoryNotFoundError when the marker is gone, even when the page read fails', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.markerExists = false;
+    doc.respond = (sql) => {
+      if (sql.includes('COUNT(1)')) return [1];
+      throw new ProviderError('page read failed');
+    };
+
+    await expect(provider.findEntities(TEST_REPO, { limit: 10, offset: 0 })).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    // The page and the count both ran to completion alongside the marker read.
+    expect(doc.calls).toHaveLength(2);
+  });
+
+  it('throws RepositoryNotFoundError when the marker is gone, even with matching rows', async () => {
+    const { provider, doc } = makeProviderWithDocStub();
+    doc.markerExists = false;
+    doc.respond = (sql) => (sql.includes('COUNT(1)') ? [1] : [{ id: 'e1' }]);
+
+    await expect(provider.findEntities(TEST_REPO, { limit: 10, offset: 0 })).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+  });
+
   it('binds the partition predicate and pins the partition key on every query', async () => {
     const { provider, doc } = makeProviderWithDocStub();
     doc.respond = (sql) => (sql.includes('COUNT(1)') ? [0] : []);
@@ -4010,6 +4245,11 @@ describe('calls on a repository whose marker is gone', () => {
         made.stub.calls.push({ query, params });
         return { items: [ENTITY_B] };
       }
+      if (query.includes(MARKER_UNION)) {
+        // A surviving row comes back, but not the marker's.
+        made.stub.calls.push({ query, params });
+        return { items: [{ id: ENTITY_A }] };
+      }
       if (query.includes(".values('properties').limit(1)")) {
         made.stub.calls.push({ query, params });
         return { items: ['{}'] };
@@ -4158,5 +4398,244 @@ describe('calls on a repository whose marker is gone', () => {
     await expect(provider.deleteEntities(TEST_REPO, [ENTITY_A])).rejects.toBeInstanceOf(ProviderError);
     await expect(provider.deleteEntities(TEST_REPO, [])).rejects.toBeInstanceOf(ProviderError);
     await expect(provider.deleteRelationships(TEST_REPO, [ENTITY_A])).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('reads that fetch the marker with their rows throw when only surviving rows come back', async () => {
+    const { provider, stub } = markerlessProvider();
+    const page = { limit: 10, offset: 0 };
+
+    await expect(provider.getEntity(TEST_REPO, ENTITY_A)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.getEntityBySlug(TEST_REPO, 'person:a')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.getEntities(TEST_REPO, [ENTITY_A, ENTITY_B])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(
+      provider.getEntityRelationships(TEST_REPO, ENTITY_A, { direction: 'out', ...page }),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.getTimeline(TEST_REPO, ENTITY_A, page)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+
+    // Each fetched the marker by id in its first step, partition-scoped.
+    const reads = stub.calls.filter((c) => c.query.includes(MARKER_UNION));
+    expect(reads).toHaveLength(5);
+    for (const read of reads) {
+      expect(read.query.split('V()')).toHaveLength(2);
+      expect(read.query.startsWith("g.V().has('repositoryId', rid).")).toBe(true);
+      expect(read.params).toMatchObject({ rid: TEST_REPO, mid: `repo:${TEST_REPO}` });
+    }
+    expect(reads[1]!.query.startsWith("g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('slug', slugVal))")).toBe(true);
+    // getTimeline stops before reading the relationship events.
+    expect(stub.calls.some((c) => c.query.includes('bothE().valueMap('))).toBe(false);
+  });
+
+  it('calls that cannot fetch the marker in their first step read it with a point read', async () => {
+    const { provider, stub } = markerlessProvider();
+    stub.calls.length = 0;
+    await expect(provider.getEntities(TEST_REPO, [])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.map((c) => c.query)).toEqual([REPOSITORY_MARKER_COUNT_QUERY]);
+
+    // The point read runs alongside the read, and wins over its row.
+    stub.calls.length = 0;
+    await expect(provider.getRelationship(TEST_REPO, ENTITY_A)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.map((c) => c.query)).toContain(REPOSITORY_MARKER_COUNT_QUERY);
+    expect(stub.calls).toHaveLength(2);
+
+    stub.calls.length = 0;
+    await expect(provider.getVocabularyChangeLog(TEST_REPO)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.map((c) => c.query)).toContain(REPOSITORY_MARKER_COUNT_QUERY);
+  });
+
+  it('exportAll throws on the first iteration before reading a page', async () => {
+    const { provider, stub } = markerlessProvider();
+    const iterator = provider.exportAll(TEST_REPO)[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.map((c) => c.query)).toEqual([REPOSITORY_MARKER_COUNT_QUERY]);
+  });
+
+  it.each([
+    ['traverse', (p: CosmosDbProvider) => p.traverse(TEST_REPO, SIMPLE_TRAVERSAL)],
+    [
+      'exploreNeighborhood',
+      (p: CosmosDbProvider) =>
+        p.exploreNeighborhood(TEST_REPO, ENTITY_A, { depth: 1, direction: 'both', limitPerType: 10, offsetPerType: 0 }),
+    ],
+    ['findPaths', (p: CosmosDbProvider) => p.findPaths(TEST_REPO, ENTITY_A, ENTITY_B, { maxDepth: 2, limit: 10, offset: 0 })],
+  ])('%s with a warm vocabulary cache reads the marker alongside and throws without it', async (_name, call) => {
+    const { provider, stub } = makeProvider();
+    await provider.getVocabulary(TEST_REPO, { fresh: true }); // fills the cache
+    await call(provider);
+    // Warm cache: one marker point read, no further vocabulary read.
+    expect(stub.calls.filter((c) => c.query === REPOSITORY_MARKER_COUNT_QUERY)).toHaveLength(1);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) {
+        stub.calls.push({ query, params });
+        return { items: [0] };
+      }
+      if (query === VOCABULARY_READ_QUERY) {
+        stub.calls.push({ query, params });
+        return { items: [{ id: params?.['vid'], json: JSON.stringify(makeVocabulary('1.0.0')) }] };
+      }
+      return defaultSubmit(query, params);
+    };
+    await expect(call(provider)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    // The refusal dropped the cache entry: the next call reads the vocabulary.
+    await expect(call(provider)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('a traversal with a cold cache relies on the vocabulary read, which checks the marker', async () => {
+    const { provider, stub } = makeProvider();
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+    expect(stub.calls.some((c) => c.query === REPOSITORY_MARKER_COUNT_QUERY)).toBe(false);
+  });
+
+  it('a read that finds the marker gone drops the vocabulary cache entry', async () => {
+    const { provider, stub } = makeProvider();
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL); // fills the cache
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query.includes(MARKER_UNION)) {
+        stub.calls.push({ query, params });
+        return { items: [] };
+      }
+      return defaultSubmit(query, params);
+    };
+
+    await expect(provider.getEntity(TEST_REPO, ENTITY_A)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('exportAll drops the vocabulary cache entry when its first iteration finds the marker gone', async () => {
+    const { provider, stub } = makeProvider();
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL); // fills the cache
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) {
+        stub.calls.push({ query, params });
+        return { items: [0] };
+      }
+      return defaultSubmit(query, params);
+    };
+
+    const iterator = provider.exportAll(TEST_REPO)[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toBeInstanceOf(RepositoryNotFoundError);
+
+    stub.submit = defaultSubmit;
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('getEntityRelationships raises the missing marker ahead of a failed count', async () => {
+    const { provider, stub } = markerlessProvider();
+    const withMarkerless = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query.endsWith('.dedup().count()')) {
+        stub.calls.push({ query, params });
+        throw new ProviderError('count failed');
+      }
+      return withMarkerless(query, params);
+    };
+
+    await expect(
+      provider.getEntityRelationships(TEST_REPO, ENTITY_A, { direction: 'both', limit: 10, offset: 0 }),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.some((c) => c.query.endsWith('.dedup().count()'))).toBe(true);
+  });
+
+  it('exportAll reports the usage of a stream that fails on its first iteration', async () => {
+    const sink = vi.fn();
+    const provider = new CosmosDbProvider({
+      endpoint: 'ws://unit-test/',
+      key: 'C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==',
+      database: 'd',
+      container: 'c',
+      reportUsage: sink,
+    });
+    const conn = {
+      submit: async (query: string): Promise<GremlinResult> => {
+        const acc = usageScope.getStore();
+        if (acc) {
+          acc.ru += 2;
+          acc.calls += 1;
+        }
+        return { items: query === REPOSITORY_MARKER_COUNT_QUERY ? [0] : [] };
+      },
+    };
+    (provider as unknown as { conn: typeof conn }).conn = conn;
+
+    const iterator = provider.exportAll(TEST_REPO)[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect(sink.mock.calls[0]![0]).toMatchObject({ operation: 'exportAll', value: 2, repositoryId: TEST_REPO });
+  });
+
+  it('reports one usage record carrying both charges when the marker read fails ahead of a slower read', async () => {
+    const sink = vi.fn();
+    const provider = new CosmosDbProvider({
+      endpoint: 'ws://unit-test/',
+      key: 'C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==',
+      database: 'd',
+      container: 'c',
+      reportUsage: sink,
+    });
+    const charge = (ru: number): void => {
+      const acc = usageScope.getStore();
+      if (acc) {
+        acc.ru += ru;
+        acc.calls += 1;
+      }
+    };
+    const conn = {
+      submit: async (query: string): Promise<GremlinResult> => {
+        if (query === REPOSITORY_MARKER_COUNT_QUERY) {
+          charge(2);
+          throw new ProviderError('marker read failed');
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        charge(5);
+        return { items: [] };
+      },
+    };
+    (provider as unknown as { conn: typeof conn }).conn = conn;
+
+    await expect(provider.getRelationship(TEST_REPO, '40000000-0000-4000-a000-000000007024')).rejects.toBeInstanceOf(
+      ProviderError,
+    );
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect(sink.mock.calls[0]![0]).toMatchObject({ operation: 'getRelationship', value: 7, repositoryId: TEST_REPO });
+  });
+});
+
+describe('alongsideCheck', () => {
+  it('a failed check wins over a failed read', async () => {
+    await expect(
+      alongsideCheck(
+        () => Promise.reject(new RepositoryNotFoundError(TEST_REPO)),
+        () => Promise.reject(new ProviderError('read failed')),
+      ),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+  });
+
+  it('a synchronous throw from the read still waits for the check, which wins', async () => {
+    let checkSettled = false;
+    const check = async (): Promise<void> => {
+      await Promise.resolve();
+      checkSettled = true;
+      throw new RepositoryNotFoundError(TEST_REPO);
+    };
+    const read = (): Promise<number> => {
+      throw new ProviderError('thrown before returning a promise');
+    };
+    await expect(alongsideCheck(check, read)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(checkSettled).toBe(true);
+  });
+
+  it('returns the read when the check passes, and raises a failed read otherwise', async () => {
+    await expect(alongsideCheck(() => Promise.resolve(), () => Promise.resolve(7))).resolves.toBe(7);
+    await expect(
+      alongsideCheck(() => Promise.resolve(), () => Promise.reject(new ProviderError('read failed'))),
+    ).rejects.toBeInstanceOf(ProviderError);
   });
 });

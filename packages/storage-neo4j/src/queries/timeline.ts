@@ -26,6 +26,7 @@ import type {
   StorageTimelineOptions,
   StorageTimelineResult,
 } from '@utaba/deep-memory/types';
+import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
 
 const ENTITY_CREATED = 'entity:created';
 const ENTITY_UPDATED = 'entity:updated';
@@ -41,23 +42,33 @@ const RELATIONSHIP_CREATED = 'relationship:created';
  *
  * `collect(DISTINCT r)` dedupes the rare self-loop case where the same edge
  * matches the undirected pattern as both source and target.
+ *
+ * The statement opens with the repository marker (a seek of its unique
+ * constraint index) and matches the centre entity only when the marker
+ * exists. Every match is optional and the edges aggregate, so the statement
+ * returns exactly one row: a deleted repository reports `repositoryExists`
+ * false, and a missing centre entity reports null timestamps and no edges.
  */
-const TIMELINE_QUERY = `
-MATCH (n:_Entity {repositoryId: $rid, id: $id})
+export const TIMELINE_QUERY = `
+OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+OPTIONAL MATCH (n:_Entity {repositoryId: $rid, id: $id}) WHERE repo IS NOT NULL
 OPTIONAL MATCH (n)-[r {repositoryId: $rid}]-()
-WITH n, collect(DISTINCT r) AS rels
+WITH repo, n, collect(DISTINCT r) AS rels
 RETURN
+  repo IS NOT NULL AS repositoryExists,
   n.createdAt AS createdAt,
   n.modifiedAt AS modifiedAt,
   [x IN rels WHERE x IS NOT NULL | {id: x.id, createdAt: x.createdAt}] AS rels
 `;
 
 /**
- * Build the timeline event stream for an entity. Returns an empty result when
- * the centre entity does not exist (matching the Cosmos contract — the
- * InMemory provider throws `EntityNotFoundError`, but the storage-level
- * contract leaves the error to higher layers; `MemoryRepository.getTimeline`
- * re-fetches the centre via `getEntity` afterwards regardless).
+ * Build the timeline event stream for an entity. Throws
+ * `RepositoryNotFoundError` when the repository marker is absent. Returns
+ * an empty result when the centre entity does not exist (matching the Cosmos
+ * contract — the InMemory provider throws `EntityNotFoundError`, but the
+ * storage-level contract leaves the error to higher layers;
+ * `MemoryRepository.getTimeline` re-fetches the centre via `getEntity`
+ * afterwards regardless).
  *
  * Filter ordering matches the InMemory precedent — `timeRange` first, then
  * `eventTypes`, then descending-timestamp sort, then page. `provenance` is
@@ -79,9 +90,8 @@ export async function getTimeline(
     { repositoryId, routing: 'READ' },
   );
   const record = result.records[0];
-  if (record === undefined) {
-    return { events: [], total: 0 };
-  }
+  if (record === undefined) throw new ProviderError('Neo4j timeline read returned no row.');
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
 
   const createdAt = record.get('createdAt');
   const modifiedAt = record.get('modifiedAt');

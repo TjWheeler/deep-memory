@@ -66,7 +66,7 @@ import {
 } from '../mapping.js';
 import { LOCK_REPOSITORY_MARKER_OPTIONAL } from './repositoryLock.js';
 import { deleteByIds } from './deleteByIds.js';
-import { isDeletedEntityFailure, mapDriverError } from '../errors.js';
+import { isDeletedEntityFailure, mapDriverError, settledValue } from '../errors.js';
 
 type QueryResult = Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
 
@@ -435,16 +435,23 @@ async function throwForMissingPrecondition(
 
 /**
  * Look up a relationship by id, anchored on the repository's entities (see
- * the cost invariant above). The `(repositoryId, id)` predicate on the edge
- * is the application-level dedup key.
+ * the cost invariant above), together with whether the repository marker
+ * exists. The marker is a seek of its unique constraint index; the edge
+ * match runs only when it exists, so a relationship a delete in progress has
+ * left behind reads as a deleted repository, not as a hit. Both matches are
+ * optional, so the statement always returns one row. The `(repositoryId, id)`
+ * predicate on the edge is the application-level dedup key.
  */
 export const RELATIONSHIP_GET_QUERY =
-  'MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid, id: $relId}]->() ' +
-  `WHERE e.id IS NOT NULL RETURN ${RELATIONSHIP_PROJECTION}`;
+  'OPTIONAL MATCH (repo:_Repository {repositoryId: $rid}) ' +
+  'OPTIONAL MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid, id: $relId}]->() ' +
+  'WHERE repo IS NOT NULL AND e.id IS NOT NULL ' +
+  `RETURN repo IS NOT NULL AS repositoryExists, r IS NOT NULL AS relationshipFound, ${RELATIONSHIP_PROJECTION}`;
 
 /**
- * Look up a relationship by id (`RELATIONSHIP_GET_QUERY`). Returns `null` on
- * miss — contract is `null`-on-miss, not throw.
+ * Look up a relationship by id (`RELATIONSHIP_GET_QUERY`). Returns `null`
+ * when no relationship has the id; throws `RepositoryNotFoundError` when the
+ * repository marker is absent.
  */
 export async function getRelationship(
   conn: Neo4jConnection,
@@ -461,7 +468,9 @@ export async function getRelationship(
     { repositoryId, routing: 'READ' },
   );
   const record = result.records[0];
-  if (record === undefined) return null;
+  if (record === undefined) throw new ProviderError('Neo4j relationship read returned no row.');
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  if (record.get('relationshipFound') !== true) return null;
   return relationshipFromRecord(record);
 }
 
@@ -482,6 +491,12 @@ export async function getRelationship(
  *
  * Data and count round-trips run in parallel under one Bolt connection;
  * the driver multiplexes so wall-clock latency approximates one round-trip.
+ *
+ * The data statement also reads the repository marker (see
+ * `buildEntityRelationshipQueries`), so a deleted repository throws
+ * `RepositoryNotFoundError` rather than reporting an empty page, even while
+ * a delete still in progress has left edges behind. The marker rides on the
+ * data statement because the count is skipped when property filters apply.
  */
 export async function getEntityRelationships(
   conn: Neo4jConnection,
@@ -510,14 +525,24 @@ export async function getEntityRelationships(
 
   const { dataCypher, countCypher } = buildEntityRelationshipQueries(direction, typeFilter);
 
-  const [dataResult, countResult] = await Promise.all([
+  const [dataSettled, countSettled] = await Promise.allSettled([
     conn.executeQuery(dataCypher, params, { repositoryId, routing: 'READ' }),
     hasPropertyFilters
       ? Promise.resolve(null)
       : conn.executeQuery(countCypher, params, { repositoryId, routing: 'READ' }),
   ]);
 
-  let items = dataResult.records.map((record) => relationshipFromRecord(record));
+  // The page carries the marker check, so a missing repository is reported
+  // ahead of a failed count.
+  const context = { repositoryId, operation: 'getEntityRelationships' };
+  const dataResult = settledValue(dataSettled, context);
+  const firstRow = dataResult.records[0];
+  if (firstRow === undefined) throw new ProviderError('Neo4j relationship read returned no row.');
+  if (firstRow.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  const countResult = settledValue(countSettled, context);
+  const rows = dataResult.records.filter((record) => record.get('relationshipFound') === true);
+
+  let items = rows.map((record) => relationshipFromRecord(record));
   if (hasPropertyFilters) {
     items = items.filter((rel) => matchesPropertyFilters(rel.properties, propertyFilters));
   }
@@ -530,7 +555,7 @@ export async function getEntityRelationships(
       : 0;
   }
   const hasMore =
-    total !== undefined ? offset + dataResult.records.length < total : dataResult.records.length === limit;
+    total !== undefined ? offset + rows.length < total : rows.length === limit;
 
   return { items, total, hasMore, limit, offset };
 }
@@ -571,7 +596,7 @@ export async function deleteRelationships(
   repositoryId: string,
   ids: string[],
 ): Promise<{ deleted: string[]; notFound: string[] }> {
-  return deleteByIds(conn, repositoryId, RELATIONSHIP_DELETE_MANY_QUERY, ids);
+  return deleteByIds(conn, repositoryId, RELATIONSHIP_DELETE_MANY_QUERY, ids, 'deleteRelationships');
 }
 
 /**
@@ -587,15 +612,52 @@ export async function deleteRelationship(
   repositoryId: string,
   relationshipId: string,
 ): Promise<void> {
-  const { notFound } = await deleteByIds(conn, repositoryId, RELATIONSHIP_DELETE_MANY_QUERY, [relationshipId]);
+  const { notFound } = await deleteByIds(
+    conn,
+    repositoryId,
+    RELATIONSHIP_DELETE_MANY_QUERY,
+    [relationshipId],
+    'deleteRelationship',
+  );
   if (notFound.length > 0) throw new RelationshipNotFoundError(relationshipId);
 }
 
 /**
- * Drop every relationship of a type in the repository, returning an exact
- * count in a single round-trip. The type slot is interpolated after
- * `assertSafeRelationshipType` (Cypher 25 cannot parameterise it); the
- * `repositoryId` predicate on the edge property map bounds the match.
+ * Drop every relationship of a type in the repository, only while the
+ * repository marker exists, and count what was dropped. The marker is a seek
+ * of its unique constraint index; the edges are reached from the
+ * repository's entities, sought through the `(repositoryId, id)` unique
+ * index (`WHERE e.id IS NOT NULL`) and expanded one entity at a time in a
+ * subquery. Matching the typed edge pattern directly lets the planner scan
+ * every relationship of the type in the database instead. Directional
+ * pattern — edges are stored directionally, so `->` reaches each
+ * relationship exactly once, from its source. The subquery aggregates, so the
+ * statement returns exactly one row (`repositoryExists`, `deleted`); with no
+ * marker it deletes nothing.
+ *
+ * The type slot is interpolated (Cypher 25 cannot parameterise it); callers
+ * pass it through `assertSafeRelationshipType` first.
+ */
+export function buildDeleteRelationshipsByTypeQuery(relType: string): string {
+  return `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+CALL (repo) {
+  MATCH (e:_Entity {repositoryId: $rid})
+  WHERE repo IS NOT NULL AND e.id IS NOT NULL
+  CALL (e) {
+    MATCH (e)-[r:${relType} {repositoryId: $rid}]->()
+    DELETE r
+    RETURN count(*) AS edges
+  }
+  RETURN sum(edges) AS deleted
+}
+RETURN repo IS NOT NULL AS repositoryExists, deleted`;
+}
+
+/**
+ * Drop every relationship of a type in the repository
+ * (`buildDeleteRelationshipsByTypeQuery`), returning an exact count in a
+ * single round-trip. Throws `RepositoryNotFoundError` when the repository
+ * marker is absent, and nothing is deleted.
  */
 export async function deleteRelationshipsByType(
   conn: Neo4jConnection,
@@ -603,15 +665,11 @@ export async function deleteRelationshipsByType(
   relationshipType: string,
 ): Promise<{ deletedRelationships: number }> {
   const relType = assertSafeRelationshipType(relationshipType);
-  // Directional pattern — edges are stored directionally, so `->` matches
-  // each relationship exactly once. `-[r]-` would double-count by visiting
-  // each edge from both endpoint perspectives.
-  const result = await conn.executeQuery(
-    `MATCH ()-[r:${relType} {repositoryId: $rid}]->() WITH r, r.id AS id DELETE r RETURN id`,
-    {},
-    { repositoryId },
-  );
-  return { deletedRelationships: result.records.length };
+  const result = await conn.executeQuery(buildDeleteRelationshipsByTypeQuery(relType), {}, { repositoryId });
+  const record = result.records[0];
+  if (record === undefined) throw new ProviderError('Neo4j delete by relationship type returned no row.');
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  return { deletedRelationships: bigintToSafeNumber(record.get('deleted') ?? 0) };
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────
@@ -635,22 +693,45 @@ function buildTypeFilter(
 }
 
 /**
+ * Wrap a page read of an entity's relationships so the statement also
+ * reports whether the repository marker exists. The marker is a seek of its
+ * unique constraint index. `page` returns the relationship projection plus
+ * `relationshipFound`, ordered and sliced; it runs only when the marker
+ * exists, inside `OPTIONAL CALL`, so the statement returns one row even when
+ * the marker is absent or the page is empty (with `relationshipFound` null).
+ * The outer sort repeats the page's order over at most `$limit` rows, so the
+ * page order does not depend on how the subquery's rows are streamed.
+ */
+function withRepositoryMarker(page: string): string {
+  return (
+    'OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})\n' +
+    'OPTIONAL CALL (repo) {\n' +
+    '  WITH repo WHERE repo IS NOT NULL\n' +
+    `  ${page}\n` +
+    '}\n' +
+    `RETURN repo IS NOT NULL AS repositoryExists, relationshipFound, ${reprojectFromCallScope()} ORDER BY id`
+  );
+}
+
+/**
  * Assemble the data + count Cypher for a given direction. `'both'` collapses
  * to a single MATCH; the directional cases UNION ALL the natural-direction
  * edges with the inverse-direction bidirectional edges so the bidir read-time
  * hint is exposed from both endpoints without writers duplicating the edge.
+ * The data statement carries the repository marker (`withRepositoryMarker`).
  *
  * Count queries wrap the same UNION ALL in a `CALL ( ) { ... }` subquery so
  * `count(*)` aggregates over the unioned row set.
  */
-function buildEntityRelationshipQueries(
+export function buildEntityRelationshipQueries(
   direction: 'out' | 'in' | 'both',
   typeFilter: string,
 ): { dataCypher: string; countCypher: string } {
   if (direction === 'both') {
-    const dataCypher =
+    const dataCypher = withRepositoryMarker(
       `MATCH (e:_Entity {repositoryId: $rid, id: $eid})-[r {repositoryId: $rid}]-()${typeFilter} ` +
-      `RETURN ${RELATIONSHIP_PROJECTION} ORDER BY id SKIP $offset LIMIT $limit`;
+        `RETURN ${RELATIONSHIP_PROJECTION}, true AS relationshipFound ORDER BY id SKIP $offset LIMIT $limit`,
+    );
     const countCypher =
       `MATCH (e:_Entity {repositoryId: $rid, id: $eid})-[r {repositoryId: $rid}]-()${typeFilter} ` +
       `RETURN count(r) AS total`;
@@ -669,13 +750,14 @@ function buildEntityRelationshipQueries(
       ? '()-[r {repositoryId: $rid, bidirectional: true}]->(e:_Entity {repositoryId: $rid, id: $eid})'
       : '(e:_Entity {repositoryId: $rid, id: $eid})-[r {repositoryId: $rid, bidirectional: true}]->()';
 
-  const dataCypher =
+  const dataCypher = withRepositoryMarker(
     `CALL () {\n` +
-    `  MATCH ${naturalPattern}${typeFilter} RETURN ${RELATIONSHIP_PROJECTION}\n` +
-    `  UNION ALL\n` +
-    `  MATCH ${bidirPattern}${typeFilter} RETURN ${RELATIONSHIP_PROJECTION}\n` +
-    `}\n` +
-    `RETURN ${reprojectFromCallScope()} ORDER BY id SKIP $offset LIMIT $limit`;
+      `  MATCH ${naturalPattern}${typeFilter} RETURN ${RELATIONSHIP_PROJECTION}\n` +
+      `  UNION ALL\n` +
+      `  MATCH ${bidirPattern}${typeFilter} RETURN ${RELATIONSHIP_PROJECTION}\n` +
+      `}\n` +
+      `RETURN ${reprojectFromCallScope()}, true AS relationshipFound ORDER BY id SKIP $offset LIMIT $limit`,
+  );
 
   const countCypher =
     `CALL () {\n` +

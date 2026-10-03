@@ -25,6 +25,7 @@ import {
 import { repoVertexId, vocabVertexId } from './ids.js';
 import { submitCreate } from './create.js';
 import { getVocabulary } from './vocabulary.js';
+import { assertRepositoryMarker } from './marker.js';
 
 const REPO_LABEL = '_repository';
 
@@ -408,27 +409,6 @@ export const ENTITY_BATCH_DROP_QUERY =
 // Sizing read for deleteRepository's entity batch, whose drop sits behind the
 // re-create guard (DELETE_ENTITY_BATCH_QUERY). Bounded by `batchSize`.
 export const ENTITY_BATCH_COUNT_QUERY = "g.V().has('repositoryId', rid).has('entityType').limit(batchSize).count()";
-// Whether the repository marker exists: a partition-scoped point read of the
-// marker vertex, read before deleteAllContents drains anything.
-// `hasNot('entityType')` keeps an entity vertex out of the count: entity
-// types are vertex labels, so an entity can carry the `_repository` label,
-// and only entity vertices carry `entityType`.
-export const REPOSITORY_MARKER_COUNT_QUERY =
-  "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').hasNot('entityType').count()";
-
-/** Throw `RepositoryNotFoundError` unless the marker exists (a partition-scoped point read). */
-export async function assertRepositoryMarker(conn: CosmosDbConnection, repositoryId: string): Promise<void> {
-  const marker = await conn.submit(REPOSITORY_MARKER_COUNT_QUERY, {
-    rid: repositoryId,
-    vid: repoVertexId(repositoryId),
-  });
-  // `count()` always emits a row, so no row is a malformed response, not a
-  // missing repository.
-  const count = marker.items[0];
-  if (count === undefined) throw new ProviderError('Cosmos repository marker read returned no row.');
-  if (Number(count) === 0) throw new RepositoryNotFoundError(repositoryId);
-}
-
 // Sentinel cleanup, skipped once a re-create has landed. The marker check runs
 // in the repository's partition; the write targets the sentinel in the
 // `_index` partition (a cross-partition mutation in one submit, as in
@@ -643,13 +623,7 @@ export async function deleteAllContents(
 ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
   // A partition-scoped point read of the marker: a repository that does not
   // exist is refused rather than reported as empty.
-  const marker = await conn.submit(REPOSITORY_MARKER_COUNT_QUERY, {
-    rid: repositoryId,
-    vid: repoVertexId(repositoryId),
-  });
-  if (Number(marker.items[0] ?? 0) === 0) {
-    throw new RepositoryNotFoundError(repositoryId);
-  }
+  await assertRepositoryMarker(conn, repositoryId);
 
   let relationshipsDeleted = 0;
   let entitiesDeleted = 0;

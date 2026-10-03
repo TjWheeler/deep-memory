@@ -13,6 +13,11 @@
 // `:_Entity {repositoryId: $rid}` qualifier. The chokepoint's `$rid` assertion
 // then passes structurally. The compiler does not itself emit repositoryId
 // because the compiler is provider-agnostic — the rewrite lives here.
+//
+// The scoped query then runs inside a wrapper that also reads the repository
+// marker (`guardWithRepositoryMarker`), so a deleted repository answers
+// `RepositoryNotFoundError` from the same statement rather than an empty
+// result, whatever vocabulary the caller compiled against.
 
 import type {
   MemoryVocabulary,
@@ -27,6 +32,7 @@ import {
   DeepMemoryError,
   ProviderError,
   QueryTimeoutError,
+  RepositoryNotFoundError,
   TraversalTimeoutError,
   TraversalValidationError,
 } from '@utaba/deep-memory';
@@ -151,8 +157,8 @@ export class Neo4jTraversalExecutor {
     const startTime = Date.now();
     assertNoInternalPropertyKeys(spec);
     const compiled = this.compiler.compile(spec, vocabulary);
-    const scopedQuery = this.scopeQuery(compiled.query);
-    const finalQuery = this.config.profileTraversals ? `PROFILE ${scopedQuery}` : scopedQuery;
+    const guardedQuery = guardWithRepositoryMarker(this.scopeQuery(compiled.query));
+    const finalQuery = this.config.profileTraversals ? `PROFILE ${guardedQuery}` : guardedQuery;
     // The compiler emits `SKIP / LIMIT $pN` with JS-number bindings; Cypher's
     // pagination clauses require a Cypher INTEGER, and with `useBigInt: true`
     // a plain number arrives as FLOAT (`Neo.ClientError.Statement.ArgumentError:
@@ -203,6 +209,8 @@ export class Neo4jTraversalExecutor {
       raw.profile = summariseProfile(summary.profile);
     }
 
+    const records = traversalRows(result.records, repositoryId);
+
     // Projection rows have a different shape (scalar columns, no Node objects)
     // so they bypass the entity/relationship parsers entirely. The compiler
     // only emits the projection RETURN when returnMode is terminal/default,
@@ -211,13 +219,13 @@ export class Neo4jTraversalExecutor {
       spec.projection !== undefined && spec.returnMode !== 'path' && spec.returnMode !== 'all';
 
     if (emitsProjection) {
-      this.parseProjectionRows(result.records, raw, spec.projection!.properties, spec.projection!.mode ?? 'values');
+      this.parseProjectionRows(records, raw, spec.projection!.properties, spec.projection!.mode ?? 'values');
     } else if (spec.returnMode === 'terminal') {
-      this.parseTerminalRows(result.records, raw);
+      this.parseTerminalRows(records, raw);
     } else if (spec.returnMode === 'all') {
-      this.parseAllRows(result.records, raw);
+      this.parseAllRows(records, raw);
     } else {
-      this.parsePathRows(result.records, raw);
+      this.parsePathRows(records, raw);
     }
 
     return raw;
@@ -398,6 +406,80 @@ export class Neo4jTraversalExecutor {
       });
     }
   }
+}
+
+/**
+ * Column reporting whether the repository marker exists. Backquoted with a
+ * hyphen so it can never collide with a compiler alias or a projected
+ * property name, which are plain identifiers.
+ */
+const REPOSITORY_EXISTS_COLUMN = 'dm-repository-exists';
+
+/** Column set to true on every row the traversal itself produced. */
+const TRAVERSAL_ROW_COLUMN = 'dm-traversal-row';
+
+/**
+ * The tail every compiled traversal ends with: one `RETURN` line, an
+ * optional `SKIP $pN` line and a `LIMIT $pN` line, closing the statement.
+ * Group 1 is the `SKIP` / `LIMIT` slice. Anything else after the `RETURN`
+ * line (an `ORDER BY`, a `LIMIT` placed before it, a trailing clause) is a
+ * compiler emission the marker guard was not written for.
+ */
+const COMPILED_TRAVERSAL_TAIL = /\nRETURN [^\n]+((?:\nSKIP \$\w+)?\nLIMIT \$\w+)$/;
+
+/**
+ * Wrap a scoped compiled traversal so the one statement also reports whether
+ * the repository marker exists:
+ *
+ *   OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+ *   WITH repo IS NOT NULL AS `dm-repository-exists`
+ *   OPTIONAL CALL (`dm-repository-exists`) {
+ *     WITH `dm-repository-exists` WHERE `dm-repository-exists`
+ *     <compiled MATCH … RETURN …, true AS `dm-traversal-row` SKIP … LIMIT …>
+ *   }
+ *   RETURN *
+ *
+ * The marker is a seek of its unique constraint index and the traversal runs
+ * only when it exists. `OPTIONAL CALL` keeps one row when the marker is
+ * absent or the traversal matches nothing, so the two cases stay apart; the
+ * row column tells a traversal row from that placeholder, which matters for
+ * projections whose values can all be null. Only the boolean reaches the
+ * outer scope, so `RETURN *` carries no marker node into the row parsers.
+ * The compiled `SKIP` / `LIMIT` apply inside the subquery to the single
+ * marker row's traversal, exactly as they did at the top level.
+ */
+export function guardWithRepositoryMarker(scopedQuery: string): string {
+  const slice = COMPILED_TRAVERSAL_TAIL.exec(scopedQuery)?.[1];
+  if (slice === undefined) {
+    throw new ProviderError(
+      'Neo4jTraversalExecutor: compiled query did not end with the expected RETURN / SKIP / LIMIT clauses; cannot add the repository check.',
+      'This indicates a CypherCompiler emission change that the provider has not been updated for.',
+    );
+  }
+  const sliceAt = scopedQuery.length - slice.length;
+  const exists = `\`${REPOSITORY_EXISTS_COLUMN}\``;
+  const traversal = `${scopedQuery.slice(0, sliceAt)}, true AS \`${TRAVERSAL_ROW_COLUMN}\`${scopedQuery.slice(sliceAt)}`;
+  return (
+    'OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})\n' +
+    `WITH repo IS NOT NULL AS ${exists}\n` +
+    `OPTIONAL CALL (${exists}) {\n` +
+    `WITH ${exists} WHERE ${exists}\n` +
+    `${traversal}\n` +
+    '}\n' +
+    'RETURN *'
+  );
+}
+
+/**
+ * The traversal's own rows from a guarded statement. Throws
+ * `RepositoryNotFoundError` when the marker is absent; a statement that
+ * returned no row at all is a provider fault.
+ */
+function traversalRows<R extends { get(key: string): unknown }>(records: ReadonlyArray<R>, repositoryId: string): R[] {
+  const first = records[0];
+  if (first === undefined) throw new ProviderError('Neo4j traversal returned no row.');
+  if (first.get(REPOSITORY_EXISTS_COLUMN) !== true) throw new RepositoryNotFoundError(repositoryId);
+  return records.filter((record) => record.get(TRAVERSAL_ROW_COLUMN) === true);
 }
 
 function isNode(value: unknown): value is NodeLike {

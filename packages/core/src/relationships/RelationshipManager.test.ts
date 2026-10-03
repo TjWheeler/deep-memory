@@ -56,9 +56,6 @@ describe('RelationshipManager.create on a missing endpoint', () => {
 
   it('reports a deleted repository ahead of a missing source', async () => {
     await storage.deleteRepository(REPO_ID);
-    // Database-backed stores answer an entity read on a deleted repository
-    // with no row rather than an error.
-    storage.getEntity = async () => null;
 
     await expect(
       relationshipManager().create([{ relationshipType: 'KNOWS', sourceEntityId: sourceId, targetEntityId: targetId }]),
@@ -66,10 +63,14 @@ describe('RelationshipManager.create on a missing endpoint', () => {
   });
 
   it('reports a deleted repository ahead of a missing target', async () => {
+    // The repository is deleted between the source read and the target read:
+    // the source read is served from before the delete, the target read
+    // reaches the store.
     const source = await storage.getEntity(REPO_ID, sourceId);
+    const readEntity = storage.getEntity.bind(storage);
     await storage.deleteRepository(REPO_ID);
-    storage.getEntity = async (_repositoryId: string, entityId: string): Promise<StoredEntity | null> =>
-      entityId === sourceId ? source : null;
+    storage.getEntity = async (repositoryId: string, entityId: string): Promise<StoredEntity | null> =>
+      entityId === sourceId ? source : readEntity(repositoryId, entityId);
 
     await expect(
       relationshipManager().create([{ relationshipType: 'KNOWS', sourceEntityId: sourceId, targetEntityId: targetId }]),

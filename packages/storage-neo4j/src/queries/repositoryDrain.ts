@@ -19,6 +19,13 @@
 // `Neo4jConnection.executeImplicitInTransactions`, which the driver does not
 // retry. `$batchSize` and `$edgeCap` must be bound as BigInts so each `LIMIT`
 // sees a Cypher INTEGER, not a FLOAT.
+//
+// The repository marker seek lives here too, because the drains' callers are
+// among the calls that must refuse a missing repository before they act.
+
+import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
+import { mapDriverError } from '../errors.js';
+import type { ExecuteQueryOptions, Neo4jConnection } from '../Neo4jConnection.js';
 
 /**
  * One batch of the repository's relationships, walked as a keyset cursor
@@ -90,12 +97,52 @@ export const ENTITY_DRAIN_QUERY = `CALL () {
 } IN TRANSACTIONS OF $batchSize ROWS`;
 
 /**
- * Whether the repository marker exists, read before `deleteAllContents`
- * drains anything and alongside the `getRepositoryStats` counts, so a missing
- * repository is refused rather than reported as empty. `{repositoryId: $rid}`
- * on `_Repository` is a seek of the
- * `dm_repository_unique` constraint index; the statement always returns one
- * row.
+ * Whether the repository marker exists, for a call that must refuse a
+ * missing repository but has no statement of its own to carry the check
+ * (see `assertRepositoryMarker`). `{repositoryId: $rid}` on `_Repository` is
+ * a seek of the `dm_repository_unique` constraint index; the statement
+ * always returns one row.
  */
 export const REPOSITORY_MARKER_EXISTS_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
 RETURN repo IS NOT NULL AS repositoryExists`;
+
+/** The public calls that check the repository marker through `assertRepositoryMarker`. */
+export type RepositoryMarkerOperation =
+  | 'deleteEntity'
+  | 'deleteEntities'
+  | 'deleteRelationship'
+  | 'deleteRelationships'
+  | 'deleteAllContents'
+  | 'exploreNeighborhood'
+  | 'findPaths'
+  | 'exportAll'
+  | 'importBulk'
+  | 'getRepositoryStats';
+
+/**
+ * Throw `RepositoryNotFoundError` unless the repository marker exists
+ * (`REPOSITORY_MARKER_EXISTS_QUERY`). `routing` defaults to the connection's
+ * write routing; pass `'READ'` for a read-only call. A driver failure is
+ * mapped to a typed error carrying `repositoryId` and `operation`; a missing
+ * result row is a `ProviderError`.
+ */
+export async function assertRepositoryMarker(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  operation: RepositoryMarkerOperation,
+  routing?: ExecuteQueryOptions['routing'],
+): Promise<void> {
+  let marker: Awaited<ReturnType<Neo4jConnection['executeQuery']>>;
+  try {
+    marker = await conn.executeQuery(
+      REPOSITORY_MARKER_EXISTS_QUERY,
+      {},
+      routing !== undefined ? { repositoryId, routing } : { repositoryId },
+    );
+  } catch (err) {
+    mapDriverError(err, { repositoryId, operation });
+  }
+  const record = marker.records[0];
+  if (record === undefined) throw new ProviderError('Neo4j repository marker read returned no row.');
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+}

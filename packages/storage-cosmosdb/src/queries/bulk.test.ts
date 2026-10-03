@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderError } from '@utaba/deep-memory';
+import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
 import type { StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
 import type { CosmosDbConnection, GremlinResult } from '../CosmosDbConnection.js';
 import { importBulk, isRowShapedSubmitFailure } from './bulk.js';
+import { REPOSITORY_MARKER_COUNT_QUERY } from './marker.js';
 
 const RID = '40000000-0000-4000-a000-00000000b001';
 
@@ -43,17 +44,28 @@ function cosmosError(status: number, message: string): Error & { statusAttribute
   });
 }
 
-/** Connection fake: `respond` returns the error a submit should fail with, if any. */
+/**
+ * Connection fake: `respond` returns the error a submit should fail with, if
+ * any. The repository marker read answers `markerCount` and is counted in
+ * `markerReads`, not in `submitted`.
+ */
 function fakeConnection(
   respond: (bindings: Record<string, unknown>) => Error | undefined,
   items: (bindings: Record<string, unknown>) => unknown[] = () => [{}],
+  markerCount = 1,
 ): {
   conn: CosmosDbConnection;
   submitted: string[];
+  markerReads: () => number;
 } {
   const submitted: string[] = [];
+  let markerReads = 0;
   const fake = {
-    async submit(_query: string, bindings: Record<string, unknown> = {}): Promise<GremlinResult> {
+    async submit(query: string, bindings: Record<string, unknown> = {}): Promise<GremlinResult> {
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) {
+        markerReads++;
+        return { items: [markerCount] };
+      }
       const id = String(bindings['vid'] ?? bindings['relId']);
       submitted.push(id);
       const failure = respond(bindings);
@@ -61,7 +73,7 @@ function fakeConnection(
       return { items: items(bindings) };
     },
   };
-  return { conn: fake as unknown as CosmosDbConnection, submitted };
+  return { conn: fake as unknown as CosmosDbConnection, submitted, markerReads: () => markerReads };
 }
 
 describe('importBulk failure handling', () => {
@@ -164,6 +176,34 @@ describe('importBulk failure handling', () => {
       name: 'ProviderError',
       cause: lost,
     });
+  });
+});
+
+describe('importBulk on a missing repository', () => {
+  it.each([
+    ['upsert', false],
+    ['insert', true],
+  ])('refuses in %s mode before writing any row', async (_mode, skipExistenceCheck) => {
+    const { conn, submitted } = fakeConnection(() => undefined, () => [{}], 0);
+
+    await expect(
+      importBulk(conn, RID, [{ entities: [entity('e1')], relationships: [relationship('r1')] }], { skipExistenceCheck }),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(submitted).toEqual([]);
+  });
+
+  it('refuses an empty import', async () => {
+    const { conn, markerReads } = fakeConnection(() => undefined, () => [{}], 0);
+
+    await expect(importBulk(conn, RID, [])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(markerReads()).toBe(1);
+  });
+
+  it('reads the marker once per chunk', async () => {
+    const { conn, markerReads } = fakeConnection(() => undefined);
+
+    await importBulk(conn, RID, [{ entities: [entity('e1')] }, { relationships: [relationship('r1')] }, {}]);
+    expect(markerReads()).toBe(3);
   });
 });
 

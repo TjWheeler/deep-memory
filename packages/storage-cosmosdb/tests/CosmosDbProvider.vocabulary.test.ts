@@ -51,6 +51,8 @@ const RID = {
   recreate: '40000000-0000-4000-a000-0000000000ca',
   markerless: '40000000-0000-4000-a000-0000000000cb',
   collision: '40000000-0000-4000-a000-0000000000cc',
+  survivors: '40000000-0000-4000-a000-0000000000cd',
+  typeDelete: '40000000-0000-4000-a000-0000000000ce',
 } as const;
 
 const skipIfNoEndpoint = !ENDPOINT || !KEY;
@@ -169,8 +171,8 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
     return result.items;
   }
 
-  beforeAll(async () => {
-    provider = new CosmosDbProvider({
+  async function newProvider(): Promise<CosmosDbProvider> {
+    const created = new CosmosDbProvider({
       endpoint: ENDPOINT!,
       key: KEY!,
       database: DATABASE,
@@ -181,7 +183,19 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
         usage.push(record);
       },
     });
-    await provider.initialize();
+    await created.initialize();
+    return created;
+  }
+
+  async function dropMarker(rid: string): Promise<void> {
+    await raw.submit(
+      "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').hasNot('entityType').drop()",
+      { rid, vid: `repo:${rid}` },
+    );
+  }
+
+  beforeAll(async () => {
+    provider = await newProvider();
     await provider.ensureSchema();
     raw = new CosmosDbConnection({
       endpoint: ENDPOINT!,
@@ -447,13 +461,18 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
       provider.updateEntity(RID.markerless, 'ml-a', { slug: 'Thing:ml-b', provenance }),
     ).rejects.toBeInstanceOf(RepositoryNotFoundError);
 
-    // Nothing was written or dropped.
-    const a = await provider.getEntity(RID.markerless, 'ml-a');
-    expect(a?.label).toBe('ml-a');
-    expect(a?.properties).toEqual({ colour: 'blue' });
-    expect(a?.slug).toBe(makeEntity('ml-a').slug);
-    expect(await provider.getEntity(RID.markerless, 'ml-b')).not.toBeNull();
-    expect(await provider.getRelationship(RID.markerless, 'ml-r')).not.toBeNull();
+    // Nothing was written or dropped. The reads go round the provider, which
+    // refuses them too.
+    const a = await raw.submit(
+      "g.V().has('repositoryId', rid).hasId(eid).project('label', 'properties', 'slug')" +
+        ".by(values('entityLabel')).by(values('properties')).by(values('slug'))",
+      { rid: RID.markerless, eid: 'ml-a' },
+    );
+    expect(a.items).toEqual([
+      { label: 'ml-a', properties: JSON.stringify({ colour: 'blue' }), slug: makeEntity('ml-a').slug },
+    ]);
+    expect(await count("g.V().has('repositoryId', rid).has('entityType').count()", RID.markerless)).toBe(2);
+    expect(await count("g.E().has('repositoryId', rid).count()", RID.markerless)).toBe(1);
 
     await expect(provider.deleteRepository(RID.markerless)).resolves.toEqual({
       deletedEntities: 2,
@@ -503,15 +522,159 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
       RepositoryNotFoundError,
     );
     await expect(provider.getVocabulary(RID.collision, { fresh: true })).rejects.toBeInstanceOf(RepositoryNotFoundError);
-    const survivor = await provider.getEntity(RID.collision, 'col-x');
-    expect(survivor?.label).toBe('Renamed');
-    expect(survivor?.entityType).toBe('_repository');
+    await expect(provider.getEntity(RID.collision, 'col-x')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    const survivor = await raw.submit(
+      "g.V().has('repositoryId', rid).hasId(eid).project('label', 'entityType').by(values('entityLabel')).by(values('entityType'))",
+      { rid: RID.collision, eid: 'col-x' },
+    );
+    expect(survivor.items).toEqual([{ label: 'Renamed', entityType: '_repository' }]);
 
     await expect(provider.deleteRepository(RID.collision)).resolves.toEqual({
       deletedEntities: 2,
       deletedRelationships: 0,
     });
   }, 60_000);
+
+  it('deleting the entities typed _repository leaves the repository marker in place', async () => {
+    const rid = RID.typeDelete;
+    await freshRepository(rid);
+    await provider.createEntity(rid, { ...makeEntity('td-x'), entityType: '_repository', slug: '_repository:td-x' });
+    await provider.createEntity(rid, makeEntity('td-y'));
+    const markerCount = async (): Promise<number> => {
+      const result = await raw.submit(
+        "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').hasNot('entityType').count()",
+        { rid, vid: `repo:${rid}` },
+      );
+      return Number(result.items[0] ?? 0);
+    };
+
+    await expect(provider.deleteEntitiesByType(rid, '_repository')).resolves.toMatchObject({ deletedEntities: 1 });
+    expect(await markerCount()).toBe(1);
+    expect(await provider.getEntity(rid, 'td-x')).toBeNull();
+    expect((await provider.getEntity(rid, 'td-y'))?.id).toBe('td-y');
+    expect(await provider.getRepository(rid)).not.toBeNull();
+
+    // With no entity of the type left, the marker still stays.
+    await expect(provider.deleteEntitiesByType(rid, '_repository')).resolves.toMatchObject({ deletedEntities: 0 });
+    expect(await markerCount()).toBe(1);
+
+    await expect(provider.deleteRepository(rid)).resolves.toEqual({ deletedEntities: 1, deletedRelationships: 0 });
+  }, 60_000);
+
+  // A repository whose marker is gone but whose data survives (a delete
+  // that stopped after dropping the marker) must be refused by every read,
+  // not only by the ones that would have found nothing: each call below is
+  // first shown to find the surviving data.
+  it('with the marker gone, calls that would find surviving data throw RepositoryNotFoundError and change nothing', async () => {
+    const rid = RID.survivors;
+    await freshRepository(rid, makeVocabulary('2.0.0'));
+    for (const id of ['sv-a', 'sv-b', 'sv-c']) await provider.createEntity(rid, makeEntity(id));
+    await provider.createRelationship(rid, makeRelationship('sv-r1', 'sv-a', 'sv-b'));
+    await provider.createRelationship(rid, makeRelationship('sv-r2', 'sv-b', 'sv-c'));
+    // A vocabulary change-log row, so the change-log read has something to
+    // find. The provider does not write the log itself, so it is seeded here.
+    await raw.submit(
+      "g.addV('_vocabularyChangeLog').property('id', cid).property('repositoryId', rid)" +
+        ".property('changeId', cid).property('changeType', 'entity_type_added').property('typeName', 'Thing')" +
+        ".property('newVersion', '2.0.1').property('proposedBy', 'vocabulary-test')" +
+        ".property('proposedAt', '2026-05-27T02:00:00Z').property('reason', 'seeded')",
+      { rid, cid: 'sv-change-1' },
+    );
+
+    const spec = {
+      start: { entityId: 'sv-a' },
+      steps: [{ direction: 'out' as const }],
+      returnMode: 'terminal' as const,
+      limit: 10,
+    };
+    const exploreOptions = { depth: 1, direction: 'both' as const, limitPerType: 10, offsetPerType: 0 };
+    const pathOptions = { maxDepth: 2, limit: 10, offset: 0 };
+    const drain = async (): Promise<number> => {
+      let rows = 0;
+      for await (const chunk of provider.exportAll(rid)) rows += chunk.data.length;
+      return rows;
+    };
+    const reads: Array<[string, () => Promise<unknown>, unknown]> = [
+      ['getEntity', async () => (await provider.getEntity(rid, 'sv-a'))?.id, 'sv-a'],
+      ['getEntityBySlug', async () => (await provider.getEntityBySlug(rid, 'Thing:sv-b'))?.id, 'sv-b'],
+      ['getEntities', async () => (await provider.getEntities(rid, ['sv-a', 'sv-c'])).size, 2],
+      ['findEntities', async () => (await provider.findEntities(rid, { limit: 10, offset: 0 })).items.length, 3],
+      [
+        'findEntities by type and term',
+        async () =>
+          (await provider.findEntities(rid, { entityTypes: ['Thing'], searchTerm: 'sv-c', limit: 10, offset: 0 }))
+            .items.length,
+        1,
+      ],
+      ['getRelationship', async () => (await provider.getRelationship(rid, 'sv-r1'))?.id, 'sv-r1'],
+      ['getVocabularyChangeLog', async () => (await provider.getVocabularyChangeLog(rid)).total, 1],
+      [
+        'getEntityRelationships',
+        async () => (await provider.getEntityRelationships(rid, 'sv-b', { direction: 'both', limit: 10, offset: 0 })).total,
+        2,
+      ],
+      ['getTimeline', async () => (await provider.getTimeline(rid, 'sv-b', { limit: 10, offset: 0 })).total > 0, true],
+      ['exploreNeighborhood', async () => (await provider.exploreNeighborhood(rid, 'sv-b', exploreOptions)).layers.length, 1],
+      ['findPaths', async () => (await provider.findPaths(rid, 'sv-a', 'sv-c', pathOptions)).totalPaths, 1],
+      ['exportAll', drain, 5],
+    ];
+    for (const [, read, expected] of reads) {
+      await expect(read()).resolves.toEqual(expected);
+    }
+
+    // Fill the vocabulary cache of this provider and of one provider per
+    // traversal entry point, so each meets the dropped marker with a warm
+    // cache.
+    const warm = { traverse: await newProvider(), explore: await newProvider(), paths: await newProvider() };
+    try {
+      expect((await provider.traverse(rid, spec)).entities.map((e) => e.id)).toEqual(['sv-b']);
+      for (const p of Object.values(warm)) await p.traverse(rid, spec);
+
+      await dropMarker(rid);
+
+      await expect(provider.traverse(rid, spec)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+      await expect(warm.traverse.traverse(rid, spec)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+      await expect(warm.explore.exploreNeighborhood(rid, 'sv-b', exploreOptions)).rejects.toBeInstanceOf(
+        RepositoryNotFoundError,
+      );
+      await expect(warm.paths.findPaths(rid, 'sv-a', 'sv-c', pathOptions)).rejects.toBeInstanceOf(
+        RepositoryNotFoundError,
+      );
+    } finally {
+      for (const p of Object.values(warm)) await p.dispose();
+    }
+    // The cold-cache path: the refusal above dropped this provider's entry.
+    await expect(provider.traverse(rid, { start: { entityType: 'Thing' }, returnMode: 'terminal', limit: 10 })).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    for (const [name, read] of reads) {
+      await expect(read(), name).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    }
+
+    const entityCount = (): Promise<number> => count("g.V().has('repositoryId', rid).has('entityType').count()", rid);
+    const edgeCount = (): Promise<number> => count("g.E().has('repositoryId', rid).count()", rid);
+    await expect(provider.deleteEntitiesByType(rid, 'Thing')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(await entityCount()).toBe(3);
+    await expect(provider.deleteRelationshipsByType(rid, 'LINKS')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(await edgeCount()).toBe(2);
+
+    // Imports write nothing, in either mode.
+    const chunks = [
+      { entities: [{ ...makeEntity('sv-a'), label: 'changed' }, makeEntity('sv-new')] },
+      { relationships: [makeRelationship('sv-r3', 'sv-c', 'sv-a')] },
+    ];
+    await expect(provider.importBulk(rid, chunks)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.importBulk(rid, chunks, { skipExistenceCheck: true })).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    expect(await entityCount()).toBe(3);
+    expect(await edgeCount()).toBe(2);
+    expect(await count("g.V().has('repositoryId', rid).hasId('sv-new').count()", rid)).toBe(0);
+    const unchanged = await raw.submit("g.V().has('repositoryId', rid).hasId('sv-a').values('entityLabel')", { rid });
+    expect(unchanged.items).toEqual(['sv-a']);
+
+    await expect(provider.deleteRepository(rid)).resolves.toEqual({ deletedEntities: 3, deletedRelationships: 2 });
+  }, 120_000);
 
   it('the delete drain and sentinel cleanup stand down while a marker exists', async () => {
     await freshRepository(RID.recreate);

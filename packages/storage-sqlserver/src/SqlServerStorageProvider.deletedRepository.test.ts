@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type sql from 'mssql';
-import type { StoredEntityUpdate } from '@utaba/deep-memory/types';
+import type { ImportChunk, StoredEntityUpdate } from '@utaba/deep-memory/types';
 import { SqlServerStorageProvider } from './SqlServerStorageProvider.js';
 
 const RID = '50000000-0000-4000-a000-000000000002';
@@ -14,9 +14,18 @@ interface FakeResult {
 /** What the fake answers for one statement; anything else answers no rows. */
 type Answer = (text: string) => Partial<FakeResult> | undefined;
 
-/** A provider over a fake pool that answers each statement through `answer`. */
-function providerWith(answer: Answer): { provider: SqlServerStorageProvider; statements: string[] } {
+/**
+ * A provider over a fake pool that answers each statement through `answer`.
+ * Statements run inside a transaction share the same answers; the
+ * transaction's lifecycle calls are recorded in `transactionCalls`.
+ */
+function providerWith(answer: Answer): {
+  provider: SqlServerStorageProvider;
+  statements: string[];
+  transactionCalls: string[];
+} {
   const statements: string[] = [];
+  const transactionCalls: string[] = [];
   interface FakeRequest {
     input(): FakeRequest;
     query(text: string): Promise<FakeResult>;
@@ -32,11 +41,24 @@ function providerWith(answer: Answer): { provider: SqlServerStorageProvider; sta
       return { recordset, recordsets: result.recordsets ?? [recordset], rowsAffected: result.rowsAffected ?? [0] };
     },
   };
-  const provider = new SqlServerStorageProvider({ connection: { server: 'unused', database: 'unused' } });
-  (provider as unknown as { pool: Pick<sql.ConnectionPool, 'request'> }).pool = {
+  const transaction = {
+    async begin(): Promise<void> {
+      transactionCalls.push('begin');
+    },
     request: () => request as unknown as sql.Request,
+    async commit(): Promise<void> {
+      transactionCalls.push('commit');
+    },
+    async rollback(): Promise<void> {
+      transactionCalls.push('rollback');
+    },
   };
-  return { provider, statements };
+  const provider = new SqlServerStorageProvider({ connection: { server: 'unused', database: 'unused' } });
+  (provider as unknown as { pool: Pick<sql.ConnectionPool, 'request' | 'transaction'> }).pool = {
+    request: () => request as unknown as sql.Request,
+    transaction: () => transaction as unknown as sql.Transaction,
+  };
+  return { provider, statements, transactionCalls };
 }
 
 /** Answers for the guarded delete batch: whether the repository row exists, and the ids removed. */
@@ -45,6 +67,22 @@ function guardedDelete(repositoryExists: boolean, deletedIds: string[]): Answer 
     text.includes('DECLARE @deleted TABLE')
       ? { recordsets: [[{ repository_exists: repositoryExists ? 1 : 0 }], deletedIds.map((id) => ({ id }))] }
       : undefined;
+}
+
+/**
+ * Answers a read batch headed by the repository check: the check row, and
+ * then (for an existing repository) `resultSets` as the following result
+ * sets, in order.
+ */
+function guardedRead(
+  text: string,
+  repositoryExists: boolean,
+  ...resultSets: unknown[][]
+): Partial<FakeResult> | undefined {
+  if (!text.includes('IF NOT EXISTS')) return undefined;
+  return repositoryExists
+    ? { recordsets: [[{ repository_exists: 1 }], ...resultSets] }
+    : { recordsets: [[{ repository_exists: 0 }]] };
 }
 
 /** Answers the repository read with a row when `exists`; every delete matches no row. */
@@ -136,6 +174,13 @@ describe('SqlServerStorageProvider on a deleted repository', () => {
     }
   });
 
+  it('deleteEntities and deleteRelationships treat a batch with no repository check row as a provider failure', async () => {
+    const { provider } = providerWith(() => ({ recordsets: [[]] }));
+
+    await expect(provider.deleteEntities(RID, ['e1'])).rejects.toMatchObject({ name: 'ProviderError' });
+    await expect(provider.deleteRelationships(RID, ['r1'])).rejects.toMatchObject({ name: 'ProviderError' });
+  });
+
   it('a failed delete batch is a ProviderError carrying the driver error', async () => {
     const failure = Object.assign(new Error('deadlocked'), { name: 'RequestError', number: 1205 });
     const { provider } = providerWith((text) => {
@@ -164,7 +209,7 @@ describe('SqlServerStorageProvider on a deleted repository', () => {
   });
 
   it('updateEntity reports a missing repository ahead of a missing entity', async () => {
-    const { provider } = providerWith(() => undefined);
+    const { provider } = providerWith((text) => guardedRead(text, false, []));
 
     await expect(provider.updateEntity(RID, 'e1', labelUpdate())).rejects.toMatchObject({
       name: 'RepositoryNotFoundError',
@@ -179,7 +224,7 @@ describe('SqlServerStorageProvider on a deleted repository', () => {
     for (const [repositoryExists, name] of cases) {
       const { provider } = providerWith((text) => {
         if (text.includes('UPDATE')) return { rowsAffected: [0] };
-        if (text.includes('dm_entities')) return { recordset: [ENTITY_ROW] };
+        if (text.includes('IF NOT EXISTS')) return guardedRead(text, repositoryExists, [ENTITY_ROW]);
         if (text.includes('dm_repositories') && repositoryExists) {
           return { recordset: [{ repository_id: RID, label: 'r', governance_config: '{"mode":"open"}' }] };
         }
@@ -188,5 +233,129 @@ describe('SqlServerStorageProvider on a deleted repository', () => {
 
       await expect(provider.updateEntity(RID, 'e1', labelUpdate())).rejects.toMatchObject({ name });
     }
+  });
+
+  const guardedReads: Array<[string, (provider: SqlServerStorageProvider) => Promise<unknown>]> = [
+    ['getEntity', (p) => p.getEntity(RID, 'e1')],
+    ['getEntityBySlug', (p) => p.getEntityBySlug(RID, 'test-type:e1')],
+    ['getEntities', (p) => p.getEntities(RID, ['e1'])],
+    ['getEntities with no ids', (p) => p.getEntities(RID, [])],
+    ['findEntities', (p) => p.findEntities(RID, { searchTerm: 'e', limit: 10, offset: 0 })],
+    ['getRelationship', (p) => p.getRelationship(RID, 'r1')],
+    ['getEntityRelationships', (p) => p.getEntityRelationships(RID, 'e1')],
+    ['getVocabularyChangeLog', (p) => p.getVocabularyChangeLog(RID)],
+    ['getTimeline', (p) => p.getTimeline(RID, 'e1', { limit: 10, offset: 0 })],
+    [
+      'exploreNeighborhood',
+      (p) => p.exploreNeighborhood(RID, 'e1', { depth: 1, direction: 'both', limitPerType: 10, offsetPerType: 0 }),
+    ],
+    ['findPaths', (p) => p.findPaths(RID, 'e1', 'e2', { maxDepth: 2, limit: 10, offset: 0 })],
+    [
+      'exportAll',
+      async (p) => {
+        for await (const chunk of p.exportAll(RID)) return chunk;
+        return undefined;
+      },
+    ],
+  ];
+
+  it.each(guardedReads)('%s checks the repository in the batch that reads', async (_name, call) => {
+    const { provider, statements } = providerWith((text) => guardedRead(text, false, []));
+
+    await expect(call(provider)).rejects.toMatchObject({ name: 'RepositoryNotFoundError' });
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toContain('dm_repositories');
+  });
+
+  it('reads the result sets after the repository check of an existing repository by position', async () => {
+    const { provider } = providerWith((text) =>
+      text.includes('COUNT(*) AS cnt')
+        ? guardedRead(text, true, [{ cnt: 3 }], [ENTITY_ROW])
+        : guardedRead(text, true, [ENTITY_ROW]),
+    );
+
+    await expect(provider.getEntity(RID, 'e1')).resolves.toMatchObject({ id: 'e1', entityType: 'test-type' });
+    await expect(provider.findEntities(RID, { limit: 1, offset: 0 })).resolves.toMatchObject({
+      items: [{ id: 'e1' }],
+      total: 3,
+      hasMore: true,
+      limit: 1,
+      offset: 0,
+    });
+  });
+
+  it.each(guardedReads)('%s treats a batch with no repository check row as a provider failure', async (_name, call) => {
+    const { provider } = providerWith(() => ({ recordsets: [[]] }));
+
+    await expect(call(provider)).rejects.toMatchObject({ name: 'ProviderError' });
+  });
+
+  const typeDeletes: Array<[string, (provider: SqlServerStorageProvider) => Promise<unknown>]> = [
+    ['deleteEntitiesByType', (p) => p.deleteEntitiesByType(RID, 'test-type')],
+    ['deleteRelationshipsByType', (p) => p.deleteRelationshipsByType(RID, 'connects')],
+  ];
+
+  it.each(typeDeletes)('%s checks the repository in its delete batch', async (_name, call) => {
+    const { provider, statements } = providerWith(() => ({
+      recordset: [{ repository_exists: 0, deleted_entities: 0, deleted_relationships: 0 }],
+    }));
+
+    await expect(call(provider)).rejects.toMatchObject({ name: 'RepositoryNotFoundError' });
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toContain('WITH (HOLDLOCK, ROWLOCK)');
+  });
+
+  it.each(typeDeletes)('%s treats a batch with no result row as a provider failure', async (_name, call) => {
+    const { provider } = providerWith(() => undefined);
+
+    await expect(call(provider)).rejects.toMatchObject({ name: 'ProviderError' });
+  });
+  const importChunks: ImportChunk[] = [
+    {
+      entities: [
+        {
+          id: 'e1',
+          entityType: 'test-type',
+          slug: 'test-type:e1',
+          label: 'e1',
+          properties: {},
+          provenance: labelUpdate().provenance,
+        },
+      ],
+    },
+  ];
+
+  it('importBulk rolls back and raises a ProviderError when the repository check fails, writing nothing', async () => {
+    const failure = Object.assign(new Error('connection reset'), { name: 'RequestError' });
+    const { provider, statements, transactionCalls } = providerWith((text) => {
+      if (text.includes('repository_exists')) throw failure;
+      return undefined;
+    });
+
+    const thrown: unknown = await provider.importBulk(RID, importChunks).catch((err: unknown) => err);
+    expect(thrown).toMatchObject({ name: 'ProviderError' });
+    expect((thrown as Error).cause).toBe(failure);
+    expect(transactionCalls).toEqual(['begin', 'rollback']);
+    expect(statements.some((text) => text.includes('MERGE'))).toBe(false);
+  });
+
+  it('importBulk passes its own missing-check-row ProviderError through unchanged', async () => {
+    const { provider, transactionCalls } = providerWith(() => ({ recordset: [] }));
+
+    const thrown: unknown = await provider.importBulk(RID, importChunks).catch((err: unknown) => err);
+    expect(thrown).toMatchObject({ name: 'ProviderError' });
+    expect((thrown as Error).message).toContain('returned no repository check row');
+    expect((thrown as Error).cause).toBeUndefined();
+    expect(transactionCalls).toEqual(['begin', 'rollback']);
+  });
+
+  it('importBulk commits the empty transaction and throws RepositoryNotFoundError without a repository row', async () => {
+    const { provider, statements, transactionCalls } = providerWith((text) =>
+      text.includes('repository_exists') ? { recordset: [{ repository_exists: 0 }] } : undefined,
+    );
+
+    await expect(provider.importBulk(RID, importChunks)).rejects.toMatchObject({ name: 'RepositoryNotFoundError' });
+    expect(transactionCalls).toEqual(['begin', 'commit']);
+    expect(statements.some((text) => text.includes('MERGE'))).toBe(false);
   });
 });

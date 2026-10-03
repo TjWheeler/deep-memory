@@ -42,15 +42,26 @@ import {
   relationshipUserPropertyParams,
 } from '../mapping.js';
 import { resolveController, runAdaptive } from './adaptive-import.js';
+import { assertRepositoryMarker } from './marker.js';
 
 const EXPORT_BATCH_SIZE = 100;
 
 // ─── Export ──────────────────────────────────────────────────────
 
+/**
+ * Stream every entity, then every relationship. The repository marker is
+ * read (a partition-scoped point read) before the first page, so a deleted
+ * repository is refused on the first iteration. A delete that starts while
+ * the export runs is not detected: later pages return what its drain has not
+ * removed yet.
+ *
+ * @throws RepositoryNotFoundError on the first iteration when the marker is absent.
+ */
 export async function* exportAll(
   conn: CosmosDbConnection,
   repositoryId: string,
 ): AsyncIterable<ExportChunk> {
+  await assertRepositoryMarker(conn, repositoryId);
   let sequence = 0;
 
   // Export entities using cursor-based pagination (ordered by id)
@@ -143,6 +154,16 @@ export async function* exportAll(
  *   row would hide the cause and keep loading a failing store, so the import
  *   stops dispatching rows and rejects with a ProviderError. Rows written
  *   before that point stay written.
+ *
+ * Deleted repositories: before each chunk (and once for an empty list) a
+ * partition-scoped point read checks the repository marker and throws
+ * `RepositoryNotFoundError` when it is gone, so a repository deleted before
+ * the call writes nothing. The row writes themselves are not gated on the
+ * marker, and Cosmos Gremlin has no transaction across requests: when a
+ * `deleteRepository` drops the marker while a chunk is being written, that
+ * chunk's remaining rows still land (the next chunk is refused), and rows
+ * written after the delete's drain has passed them stay behind until
+ * `deleteRepository` runs again.
  */
 export async function importBulk(
   conn: CosmosDbConnection,
@@ -164,7 +185,9 @@ export async function importBulk(
   // handle per import and threads it through automatically.
   const controller = resolveController(options?.adaptiveConcurrency, options?.adaptiveConcurrencyHandle);
 
+  if (data.length === 0) await assertRepositoryMarker(conn, repositoryId);
   for (const chunk of data) {
+    await assertRepositoryMarker(conn, repositoryId);
     if (chunk.entities && chunk.entities.length > 0) {
       const results = await runAdaptive(
         chunk.entities,

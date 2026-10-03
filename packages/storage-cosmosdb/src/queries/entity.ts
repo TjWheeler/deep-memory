@@ -26,6 +26,8 @@ import {
 } from '@utaba/deep-memory';
 import { repoVertexId } from './ids.js';
 import { submitCreate } from './create.js';
+import { assertRepositoryMarker } from './repository.js';
+import { deleteEntitiesByIds } from './deleteByIds.js';
 
 // Sentinels the create query returns in place of the new vertex; the caller
 // translates them into typed errors — single round-trip either way:
@@ -222,6 +224,23 @@ export async function getEntities(
 // the caller does not touch properties, the pre-read is skipped and the
 // shape is unchanged from the historical single-round-trip path.
 
+// The update's write fetches the repository marker and the entity in its
+// first, index-backed step (partition-scoped, both by id), then continues to
+// the entity only past the marker: with no marker the traversal writes
+// nothing and returns no row. `updateEntity` reads the marker
+// (`assertRepositoryMarker`) only on its failure paths, so the repository
+// outcome takes precedence over the entity and slug outcomes without costing
+// a successful update a round trip.
+//
+// The entity type is the vertex label and nothing reserves `_`-prefixed
+// types, so an entity typed `_repository` carries the marker's label too.
+// `hasNot('entityType')` (every entity vertex carries it, the marker never
+// does) keeps such an entity from standing in for a missing marker, or from
+// passing alongside the real one and running the write twice.
+export const UPDATE_ENTITY_START =
+  "g.V().has('repositoryId', rid).hasId(within(repoVid, eid)).fold().as('vs')" +
+  ".unfold().hasLabel('_repository').hasNot('entityType').select('vs').unfold().has('entityType')";
+
 async function readExistingEntityPropertiesBlob(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -279,6 +298,7 @@ export async function updateEntity(
           ".project('entityType','label').by(values('entityType')).by(coalesce(values('entityLabel'), constant('')))",
         { rid: repositoryId, eid: entityId },
       );
+      await assertRepositoryMarker(conn, repositoryId);
       const current = target.items[0];
       if (current === null || typeof current !== 'object') throw new EntityNotFoundError(entityId);
       // The driver hands a projection back as a Map or a plain object.
@@ -295,7 +315,9 @@ export async function updateEntity(
   if (updates.properties !== undefined) {
     const existing = await readExistingEntityPropertiesBlob(conn, repositoryId, entityId);
     if (!existing.found) {
-      // Short-circuit before the write: no entity to update.
+      // Short-circuit before the write: no entity to update, unless the
+      // repository itself is gone.
+      await assertRepositoryMarker(conn, repositoryId);
       throw new EntityNotFoundError(entityId);
     }
     const existingKeys = existingEntityScalarUserKeys(existing.blob);
@@ -303,7 +325,7 @@ export async function updateEntity(
     droppedUserKeys = existingKeys.filter((k) => !newKeySet.has(k));
   }
 
-  const bindings: Record<string, unknown> = { rid: repositoryId, eid: entityId };
+  const bindings: Record<string, unknown> = { rid: repositoryId, repoVid: repoVertexId(repositoryId), eid: entityId };
   const propParts: string[] = [];
   let idx = 0;
 
@@ -368,26 +390,34 @@ export async function updateEntity(
   // Embeddings stay off the wire — callers that need the embedding pass the
   // option through the public StorageProvider.getEntity call themselves.
   const projection = buildVertexProjectChain();
-  const query = `g.V().has('repositoryId', rid).hasId(eid).has('entityType')${propParts.join('')}.${projection}`;
+  const query = `${UPDATE_ENTITY_START}${propParts.join('')}.${projection}`;
   const result = await conn.submit(query, bindings);
 
   if (result.items.length === 0) {
+    // No row: the marker or the entity is missing, and nothing was written.
+    // The repository outcome takes precedence. A delete in progress has
+    // already dropped the marker, so an entity it has not drained yet is not
+    // written either.
+    await assertRepositoryMarker(conn, repositoryId);
     throw new EntityNotFoundError(entityId);
   }
 
   return entityFromGremlin(result.items[0] as Record<string, unknown>);
 }
 
+/**
+ * Delete one entity and its edges through the marker-guarded delete
+ * (`deleteEntitiesByIds`). A missing repository marker →
+ * `RepositoryNotFoundError`; an id with no entity in an existing repository
+ * → `EntityNotFoundError`.
+ */
 export async function deleteEntity(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityId: string,
 ): Promise<void> {
-  // Gremlin drop() on a vertex also drops connected edges
-  await conn.submit(
-    "g.V().has('repositoryId', rid).hasId(eid).has('entityType').drop()",
-    { rid: repositoryId, eid: entityId },
-  );
+  const { notFound } = await deleteEntitiesByIds(conn, repositoryId, [entityId]);
+  if (notFound.length > 0) throw new EntityNotFoundError(entityId);
 }
 
 /**

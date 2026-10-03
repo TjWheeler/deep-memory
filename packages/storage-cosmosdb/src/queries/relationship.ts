@@ -12,12 +12,14 @@ import {
 import {
   DuplicateRelationshipError,
   EntityNotFoundError,
+  RelationshipNotFoundError,
   RepositoryNotFoundError,
   matchesPropertyFilters,
   buildEdgeProjectChain,
 } from '@utaba/deep-memory';
 import { repoVertexId } from './ids.js';
 import { submitCreate } from './create.js';
+import { deleteRelationshipsByIds } from './deleteByIds.js';
 
 // Sentinels the create query returns in place of the new edge; the caller
 // translates them — single round-trip either way. Mirrors entity.ts:
@@ -260,15 +262,19 @@ export async function getEntityRelationships(
   };
 }
 
+/**
+ * Delete one relationship through the marker-checked delete
+ * (`deleteRelationshipsByIds`). A missing repository marker →
+ * `RepositoryNotFoundError`; an id with no relationship in an existing
+ * repository → `RelationshipNotFoundError`.
+ */
 export async function deleteRelationship(
   conn: CosmosDbConnection,
   repositoryId: string,
   relationshipId: string,
 ): Promise<void> {
-  await conn.submit(
-    "g.E().hasId(relId).has('repositoryId', rid).drop()",
-    { relId: relationshipId, rid: repositoryId },
-  );
+  const { notFound } = await deleteRelationshipsByIds(conn, repositoryId, [relationshipId]);
+  if (notFound.length > 0) throw new RelationshipNotFoundError(relationshipId);
 }
 
 

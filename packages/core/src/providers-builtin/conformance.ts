@@ -374,6 +374,20 @@ export function runStorageProviderConformanceTests(
         expect(await provider.getEntity(repoId, 'e1')).toBeNull();
       });
 
+      it('deleting an entity id that never existed throws EntityNotFoundError', async () => {
+        await expect(provider.deleteEntity(repoId, 'never-existed')).rejects.toMatchObject(
+          typedError('EntityNotFoundError', 'ENTITY_NOT_FOUND', { id: 'never-existed' }),
+        );
+      });
+
+      it('deleting the same entity twice throws EntityNotFoundError the second time', async () => {
+        await provider.createEntity(repoId, makeEntity('e1'));
+        await provider.deleteEntity(repoId, 'e1');
+        await expect(provider.deleteEntity(repoId, 'e1')).rejects.toMatchObject(
+          typedError('EntityNotFoundError', 'ENTITY_NOT_FOUND', { id: 'e1' }),
+        );
+      });
+
       it('finds entities by search term', async () => {
         await provider.createEntity(repoId, makeEntity('e1', 'test-type', 'Alpha'));
         await provider.createEntity(repoId, makeEntity('e2', 'test-type', 'Beta'));
@@ -547,6 +561,20 @@ export function runStorageProviderConformanceTests(
         await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
         await provider.deleteRelationship(repoId, 'r1');
         expect(await provider.getRelationship(repoId, 'r1')).toBeNull();
+      });
+
+      it('deleting a relationship id that never existed throws RelationshipNotFoundError', async () => {
+        await expect(provider.deleteRelationship(repoId, 'never-existed')).rejects.toMatchObject(
+          typedError('RelationshipNotFoundError', 'RELATIONSHIP_NOT_FOUND', { relationshipId: 'never-existed' }),
+        );
+      });
+
+      it('deleting the same relationship twice throws RelationshipNotFoundError the second time', async () => {
+        await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'a', 'b'));
+        await provider.deleteRelationship(repoId, 'r1');
+        await expect(provider.deleteRelationship(repoId, 'r1')).rejects.toMatchObject(
+          typedError('RelationshipNotFoundError', 'RELATIONSHIP_NOT_FOUND', { relationshipId: 'r1' }),
+        );
       });
 
       it('creating a relationship with an explicit id already in use throws DuplicateRelationshipError', async () => {
@@ -1036,6 +1064,128 @@ export function runStorageProviderConformanceTests(
         expect(stats.entityTypeBreakdown['beta']).toBe(1);
         expect(stats.relationshipTypeBreakdown['links']).toBe(1);
       });
+    });
+
+    // ─── Deleted repository ─────────────────────────────────
+
+    describe('after deleteRepository, each call throws RepositoryNotFoundError', () => {
+      const repositoryNotFound = typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND');
+
+      /**
+       * Give the repository a vocabulary, two entities and a relationship,
+       * then delete it. The fresh read that supplies the expected version
+       * fills a provider's vocabulary cache, and `saveVocabulary` drops that
+       * entry again, so no cache holds the vocabulary when the calls under
+       * test run.
+       */
+      async function populateAndDelete(): Promise<void> {
+        const now = new Date().toISOString();
+        const current = await provider.getVocabulary(repoId, { fresh: true });
+        await provider.saveVocabulary(
+          repoId,
+          {
+            ...current,
+            version: '1.0.0',
+            lastModified: now,
+            entityTypes: [
+              {
+                type: 'test-type',
+                description: 'Entity type of the deleted repository',
+                version: '1.0.0',
+                properties: [],
+                createdAt: now,
+                createdBy: 'conformance-test',
+                modifiedAt: now,
+                modifiedBy: 'conformance-test',
+              },
+            ],
+          },
+          current.version,
+        );
+        await provider.createEntity(repoId, makeEntity('e1'));
+        await provider.createEntity(repoId, makeEntity('e2'));
+        await provider.createRelationship(repoId, makeRelationship('r1', 'connects', 'e1', 'e2'));
+        await provider.deleteRepository(repoId);
+      }
+
+      it('getVocabulary', async () => {
+        await populateAndDelete();
+        await expect(provider.getVocabulary(repoId)).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getVocabulary with { fresh: true }', async () => {
+        await populateAndDelete();
+        await expect(provider.getVocabulary(repoId, { fresh: true })).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getRepositoryStats', async () => {
+        await populateAndDelete();
+        await expect(provider.getRepositoryStats(repoId)).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteEntities', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteEntities(repoId, ['e1', 'missing'])).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteRelationships', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteRelationships(repoId, ['r1', 'missing'])).rejects.toMatchObject(
+          repositoryNotFound,
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteEntities with no ids', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteEntities(repoId, [])).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteRelationships with no ids', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteRelationships(repoId, [])).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteEntity, for a former entity and for an id that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteEntity(repoId, 'e1')).rejects.toMatchObject(repositoryNotFound);
+        await expect(provider.deleteEntity(repoId, 'missing')).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteRelationship, for a former relationship and for an id that never existed', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteRelationship(repoId, 'r1')).rejects.toMatchObject(repositoryNotFound);
+        await expect(provider.deleteRelationship(repoId, 'missing')).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('updateEntity, ahead of EntityNotFoundError', async () => {
+        await populateAndDelete();
+        await expect(
+          provider.updateEntity(repoId, 'e1', { label: 'Renamed', provenance: makeProvenance() }),
+        ).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('updateEntity with properties', async () => {
+        await populateAndDelete();
+        await expect(
+          provider.updateEntity(repoId, 'e1', { properties: { key: 'changed' }, provenance: makeProvenance() }),
+        ).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('a second deleteRepository', async () => {
+        await populateAndDelete();
+        await expect(provider.deleteRepository(repoId)).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getVocabulary is not served from a cache filled before the delete', async () => {
+        // Fill any provider cache with a read, then delete through the same
+        // provider instance: the delete must drop the cached copy.
+        await provider.getVocabulary(repoId);
+        await provider.getRepositoryStats(repoId);
+        await provider.deleteRepository(repoId);
+
+        await expect(provider.getVocabulary(repoId)).rejects.toMatchObject(repositoryNotFound);
+        await expect(provider.getRepositoryStats(repoId)).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
     });
   });
 }

@@ -104,6 +104,18 @@ export interface RelationshipCreateOptions {
  * Works with "Stored" types (full internal representations including
  * provenance and embeddings). The core engine maps these to public types
  * based on the requested detail level.
+ *
+ * **Deleted repositories.** A repository counts as missing once its record
+ * (the marker a delete removes first) is gone, even while a delete that has
+ * not finished leaves entities, relationships or a vocabulary behind. The
+ * methods documented with `@throws RepositoryNotFoundError` throw it for a
+ * missing repository, and do so ahead of any outcome for a particular id
+ * (repository → id → source → target), so a caller can tell a deleted
+ * repository from an empty one or from a missing id. Such a call changes
+ * nothing, with one exception: CosmosDB runs a batch delete of more than
+ * 100 ids in chunks, and the chunks deleted before a later chunk finds the
+ * repository gone stay deleted (Cosmos Gremlin has no transaction across
+ * requests).
  */
 export interface StorageProvider {
   // ─── Lifecycle ─────────────────────────────────────────────────────
@@ -138,13 +150,32 @@ export interface StorageProvider {
    * delete can outlast a server timeout on a large repository and leave it
    * undeletable. `onProgress` reports the running counts as the delete
    * proceeds; providers that delete in one statement may not call it.
+   *
+   * A repository whose record is gone but whose data a delete did not finish
+   * removing is not missing here: the call finishes the delete and reports
+   * what it removed.
+   *
+   * @throws RepositoryNotFoundError when there was nothing at all to delete:
+   *   no record and no data. The repository is already gone, so a caller
+   *   retrying a delete can treat this as done (it is also the answer for an
+   *   id that never existed).
    */
   deleteRepository(
     repositoryId: string,
     onProgress?: DeleteProgressCallback,
   ): Promise<{ deletedEntities: number; deletedRelationships: number }>;
-  /** Delete all entities and relationships in a repository without deleting the repository itself */
+  /**
+   * Delete all entities and relationships in a repository without deleting the repository itself.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing.
+   */
   deleteAllContents(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }>;
+  /**
+   * Entity and relationship counts, per type, and the vocabulary version.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing, rather
+   *   than reporting zero counts.
+   */
   getRepositoryStats(repositoryId: string): Promise<RepositoryStats>;
 
   // ─── Vocabulary ────────────────────────────────────────────────────
@@ -152,6 +183,15 @@ export interface StorageProvider {
   /**
    * Read the repository's vocabulary. Pass `{ fresh: true }` to bypass any
    * provider-side cache; providers without a cache ignore `options`.
+   *
+   * A provider with a cache drops a repository's entry whenever one of its
+   * calls finds that repository missing, and when it deletes the repository
+   * itself. A cached read within the cache's lifetime is not checked against
+   * the store, so it may still return the vocabulary of a repository that
+   * another process deleted; `{ fresh: true }` always reflects the store.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing (on every
+   *   read that goes to the store), never an empty vocabulary in its place.
    */
   getVocabulary(repositoryId: string, options?: VocabularyReadOptions): Promise<MemoryVocabulary>;
   /**
@@ -212,6 +252,8 @@ export interface StorageProvider {
   /**
    * Apply `updates` to an existing entity.
    *
+   * @throws RepositoryNotFoundError when the repository is missing, ahead of
+   *   the entity check: an entity a delete has not yet removed is not updated.
    * @throws EntityNotFoundError when no entity has `entityId`.
    * @throws SlugConflictError when `updates.slug` is held by a different
    *   entity; the entity is left unchanged. Its own current slug is never a
@@ -222,8 +264,25 @@ export interface StorageProvider {
     entityId: string,
     updates: StoredEntityUpdate,
   ): Promise<StoredEntity>;
+  /**
+   * Delete one entity and its associated relationships.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing, ahead of
+   *   any outcome for the id: an entity a delete has not yet removed is not
+   *   deleted here.
+   * @throws EntityNotFoundError when the repository exists and no entity has
+   *   the id, including an id an earlier call already deleted.
+   */
   deleteEntity(repositoryId: string, entityId: string): Promise<void>;
-  /** Delete multiple entities and their associated relationships in a single batch operation */
+  /**
+   * Delete multiple entities and their associated relationships in a single
+   * batch operation. Ids with no entity are reported in `notFound`.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing, even for
+   *   an empty `ids` list; no id is reported as not found, and nothing is
+   *   deleted (on CosmosDB, with more than 100 ids, chunks deleted before the
+   *   repository went missing stay deleted).
+   */
   deleteEntities(
     repositoryId: string,
     ids: string[],
@@ -269,11 +328,29 @@ export interface StorageProvider {
     entityId: string,
     options?: RelationshipQueryOptions,
   ): Promise<PaginatedResult<StoredRelationship>>;
+  /**
+   * Delete one relationship.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing, ahead of
+   *   any outcome for the id: a relationship a delete has not yet removed is
+   *   not deleted here.
+   * @throws RelationshipNotFoundError when the repository exists and no
+   *   relationship has the id, including an id an earlier call already
+   *   deleted.
+   */
   deleteRelationship(
     repositoryId: string,
     relationshipId: string,
   ): Promise<void>;
-  /** Delete multiple relationships in a single batch operation */
+  /**
+   * Delete multiple relationships in a single batch operation. Ids with no
+   * relationship are reported in `notFound`.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing, even for
+   *   an empty `ids` list; no id is reported as not found, and nothing is
+   *   deleted (on CosmosDB, with more than 100 ids, chunks deleted before the
+   *   repository went missing stay deleted).
+   */
   deleteRelationships(
     repositoryId: string,
     ids: string[],

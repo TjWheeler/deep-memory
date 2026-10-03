@@ -852,6 +852,7 @@ export class Neo4jStorageProvider {
       mapDriverError(err, { repositoryId, operation });
     }
     if (marker.records[0]?.get('repositoryExists') !== true) {
+      this.invalidateVocabularyCache(repositoryId);
       throw new RepositoryNotFoundError(repositoryId);
     }
     return this.drainEntitiesAndRelationships(repositoryId, operation, onProgress);
@@ -945,13 +946,25 @@ export class Neo4jStorageProvider {
    * the version they pass to `saveVocabulary` must be the stored one, and a
    * cached copy can be up to the TTL behind another process's write. The
    * fresh result replaces the cache entry so later cached reads see it too.
+   *
+   * A read that goes to the database throws `RepositoryNotFoundError` when
+   * the repository marker is absent, and so does every other call here that
+   * finds the marker gone; each drops the repository's cache entry as it
+   * throws, and this provider's own `deleteRepository` drops it too. A cache
+   * hit is not checked against the database: within the TTL it can still
+   * return the vocabulary of a repository another process has deleted.
+   * Closing that window would cost a round trip on every cached read, which
+   * is what the cache exists to avoid; pass `{ fresh: true }` when the
+   * answer must reflect the stored state.
    */
   public async getVocabulary(
     repositoryId: string,
     options?: VocabularyReadOptions,
   ): Promise<MemoryVocabulary> {
     if (options?.fresh === true) {
-      const vocab = await vocabQueries.getVocabulary(this.connection, repositoryId);
+      const vocab = await this.forgetMissingRepository(repositoryId, () =>
+        vocabQueries.getVocabulary(this.connection, repositoryId),
+      );
       this.vocabularyCache.set(repositoryId, {
         vocab,
         expiresAt: Date.now() + VOCABULARY_CACHE_TTL_MS,
@@ -978,7 +991,9 @@ export class Neo4jStorageProvider {
     if (cached && cached.expiresAt > now) {
       return cached.vocab;
     }
-    const vocab = await vocabQueries.getVocabulary(this.connection, repositoryId);
+    const vocab = await this.forgetMissingRepository(repositoryId, () =>
+      vocabQueries.getVocabulary(this.connection, repositoryId),
+    );
     this.vocabularyCache.set(repositoryId, {
       vocab,
       expiresAt: now + VOCABULARY_CACHE_TTL_MS,
@@ -986,9 +1001,27 @@ export class Neo4jStorageProvider {
     return vocab;
   }
 
-  /** Drop the cache entry for a repository — call after every vocabulary write. */
+  /**
+   * Drop the cache entry for a repository — call after every vocabulary
+   * write, and whenever the repository turns out to be missing.
+   */
   private invalidateVocabularyCache(repositoryId: string): void {
     this.vocabularyCache.delete(repositoryId);
+  }
+
+  /**
+   * Run a repository-scoped call, dropping the repository's cached vocabulary
+   * when the call reports the repository missing: the repository was
+   * deleted, so a later cached read must go to the database (and throw)
+   * rather than serve its old vocabulary.
+   */
+  private async forgetMissingRepository<T>(repositoryId: string, call: () => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (err) {
+      if (err instanceof RepositoryNotFoundError) this.invalidateVocabularyCache(repositoryId);
+      throw err;
+    }
   }
 
   /**
@@ -1010,7 +1043,7 @@ export class Neo4jStorageProvider {
     try {
       await vocabQueries.saveVocabulary(this.connection, repositoryId, vocabulary, expectedVersion);
     } catch (err) {
-      if (err instanceof VocabularyVersionConflictError) {
+      if (err instanceof VocabularyVersionConflictError || err instanceof RepositoryNotFoundError) {
         this.invalidateVocabularyCache(repositoryId);
       }
       throw err;
@@ -1046,7 +1079,9 @@ export class Neo4jStorageProvider {
     repositoryId: string,
     entity: StoredEntity,
   ): Promise<StoredEntity> {
-    return entityQueries.createEntity(this.connection, repositoryId, entity);
+    return this.forgetMissingRepository(repositoryId, () =>
+      entityQueries.createEntity(this.connection, repositoryId, entity),
+    );
   }
 
   /** Read a single entity by id; `null` when not found. */
@@ -1082,36 +1117,45 @@ export class Neo4jStorageProvider {
   /**
    * Variable-shape projection-on-write update: one MATCH+SET+RETURN round
    * trip, at the cost of one statement shape per set of updated fields.
-   * Empty record array → `EntityNotFoundError`.
+   * A missing repository marker → `RepositoryNotFoundError` (ahead of the
+   * entity check); a missing entity → `EntityNotFoundError`.
    */
   public async updateEntity(
     repositoryId: string,
     entityId: string,
     updates: StoredEntityUpdate,
   ): Promise<StoredEntity> {
-    return entityQueries.updateEntity(this.connection, repositoryId, entityId, updates);
+    return this.forgetMissingRepository(repositoryId, () =>
+      entityQueries.updateEntity(this.connection, repositoryId, entityId, updates),
+    );
   }
 
   /**
    * Delete a single entity (and its incident relationships via `DETACH
-   * DELETE`). Throws `EntityNotFoundError` when the match returns zero rows.
+   * DELETE`). Throws `RepositoryNotFoundError` when the repository marker is
+   * absent, otherwise `EntityNotFoundError` when no entity has the id.
    */
   public async deleteEntity(
     repositoryId: string,
     entityId: string,
   ): Promise<void> {
-    return entityQueries.deleteEntity(this.connection, repositoryId, entityId);
+    return this.forgetMissingRepository(repositoryId, () =>
+      entityQueries.deleteEntity(this.connection, repositoryId, entityId),
+    );
   }
 
   /**
    * Bulk delete by ids — single round-trip. Returns the ids actually
-   * deleted; missing ids land in `notFound`.
+   * deleted; missing ids land in `notFound`. A missing repository marker →
+   * `RepositoryNotFoundError`, and nothing is deleted.
    */
   public async deleteEntities(
     repositoryId: string,
     ids: string[],
   ): Promise<{ deleted: string[]; notFound: string[] }> {
-    return entityQueries.deleteEntities(this.connection, repositoryId, ids);
+    return this.forgetMissingRepository(repositoryId, () =>
+      entityQueries.deleteEntities(this.connection, repositoryId, ids),
+    );
   }
 
   /**
@@ -1163,11 +1207,8 @@ export class Neo4jStorageProvider {
     relationship: StoredRelationship,
     options?: RelationshipCreateOptions,
   ): Promise<StoredRelationship> {
-    return relationshipQueries.createRelationship(
-      this.connection,
-      repositoryId,
-      relationship,
-      options?.idMinted === true,
+    return this.forgetMissingRepository(repositoryId, () =>
+      relationshipQueries.createRelationship(this.connection, repositoryId, relationship, options?.idMinted === true),
     );
   }
 
@@ -1201,23 +1242,32 @@ export class Neo4jStorageProvider {
     );
   }
 
-  /** Drop a single relationship by id. No-op when the id does not match. */
+  /**
+   * Drop a single relationship by id. A missing repository marker →
+   * `RepositoryNotFoundError`; otherwise `RelationshipNotFoundError` when no
+   * relationship has the id.
+   */
   public async deleteRelationship(
     repositoryId: string,
     relationshipId: string,
   ): Promise<void> {
-    return relationshipQueries.deleteRelationship(this.connection, repositoryId, relationshipId);
+    return this.forgetMissingRepository(repositoryId, () =>
+      relationshipQueries.deleteRelationship(this.connection, repositoryId, relationshipId),
+    );
   }
 
   /**
    * Bulk drop by ids — single round-trip. Returns the ids actually deleted;
-   * missing ids land in `notFound`.
+   * missing ids land in `notFound`. A missing repository marker →
+   * `RepositoryNotFoundError`, and nothing is deleted.
    */
   public async deleteRelationships(
     repositoryId: string,
     ids: string[],
   ): Promise<{ deleted: string[]; notFound: string[] }> {
-    return relationshipQueries.deleteRelationships(this.connection, repositoryId, ids);
+    return this.forgetMissingRepository(repositoryId, () =>
+      relationshipQueries.deleteRelationships(this.connection, repositoryId, ids),
+    );
   }
 
   /**
@@ -1263,7 +1313,9 @@ export class Neo4jStorageProvider {
    * provider owns Cypher compilation; the spec stays language-agnostic.
    * `track('traverse')` opens the per-operation usage scope so every
    * `executeQuery` round-trip the executor performs aggregates into a single
-   * `OperationUsage` record.
+   * `OperationUsage` record. On a deleted repository it throws
+   * `RepositoryNotFoundError` when the vocabulary cache is cold; within the
+   * cache TTL it may answer as it does for a missing start entity.
    */
   public async traverse(
     repositoryId: string,
@@ -1732,7 +1784,9 @@ export class Neo4jStorageProvider {
     data: ImportChunk[],
     options?: BulkImportOptions,
   ): Promise<BulkImportResult> {
-    return bulkQueries.importBulk(this.connection, repositoryId, data, options);
+    return this.forgetMissingRepository(repositoryId, () =>
+      bulkQueries.importBulk(this.connection, repositoryId, data, options),
+    );
   }
 
   /**
@@ -1819,7 +1873,9 @@ export class Neo4jStorageProvider {
    */
   public async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
     const vocabulary = await this.getVocabularyCached(repositoryId);
-    return repositoryQueries.getRepositoryStats(this.connection, repositoryId, vocabulary);
+    return this.forgetMissingRepository(repositoryId, () =>
+      repositoryQueries.getRepositoryStats(this.connection, repositoryId, vocabulary),
+    );
   }
 
   // ─── Native Query ──────────────────────────────────────────────────

@@ -323,6 +323,40 @@ g.V().has('repositoryId', rid).hasId(srcId).has('entityType').outE().hasId(relId
 
 When only the relationship id is known, the `g.E().hasId(relId).has('repositoryId', rid)` form is still correct but inherently fans out. See [Performance issue #2](../plans/performance-issues.md).
 
+### Mid-traversal `V()` after `aggregate(...).fold()` costs RU in proportion to the partition
+
+Only the first `g.V().has('repositoryId', rid).hasId(...)` step is documented as index-backed. Measured on the emulator 2026-10-03 against a 10-entity repository and a 5,000-entity / 400-edge repository (RU from each submit's request charge and from the provider's usage records):
+
+| Shape | 10 entities | 5,000 entities |
+|---|---|---|
+| Entity delete, unguarded: `g.V()…hasId(within(i0, i1)).has('entityType').aggregate('found').by('id').drop().cap('found')` | 56.35 | 56.35 |
+| Entity delete, marker checked by a mid-traversal `V()`: `<targets>.aggregate('found').by('id').fold().as('targets').V()…hasId(mid).hasLabel('_repository').aggregate('found').by('id').select('targets').unfold().drop().cap('found')` | 47.06 | **226.89** |
+| Entity delete, marker fetched with the targets (chosen): `g.V().has('repositoryId', rid).hasId(within(mid, i0, i1)).or(hasLabel('_repository'), has('entityType')).aggregate('found').by('id').fold().as('vs').unfold().hasLabel('_repository').select('vs').unfold().has('entityType').drop().cap('found')` | 43.58 | 43.58 |
+| Edge delete, unguarded: `g.E().has('repositoryId', rid).hasId(within(i0, i1)).aggregate('found').by('id').drop().cap('found')` | 18.83 | 18.83 |
+| Edge delete, marker checked by a mid-traversal `V()` (same suffix as above) | 22.18 | **202.01** |
+| Edge delete (chosen): marker point read `g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').count()` (3.39), then the unguarded drop | 22.2 | 22.2 |
+| Entity update, unguarded: `g.V()…hasId(eid).has('entityType').property(…).project(…)` | 15.47 | 15.47 |
+| Entity update, marker then a mid-traversal `V()` directly after a vertex step: `g.V()…hasId(repoVid).hasLabel('_repository').V()…hasId(eid).has('entityType').property(…)` | 18.70 | 18.70 |
+| Entity update (chosen): `g.V().has('repositoryId', rid).hasId(within(repoVid, eid)).fold().as('vs').unfold().hasLabel('_repository').select('vs').unfold().has('entityType').property(…).project(…)` | 15.41 | 15.41 |
+
+The mid-traversal `V()` that follows `aggregate(...).fold()` grew roughly 4–9× with the partition, while the same lookup directly after a single-vertex step stayed flat. Prefer fetching every vertex a statement needs in the first step: `hasId(within(marker, ...ids))`, then split by label after a `fold()`. Through the provider the chosen shapes cost the same at both sizes: `updateEntity` 18.84 (label) / 23.70 (properties), `deleteEntities` of two ids 30.58, `deleteEntity` 30.48, `deleteRelationships` of two ids 22.23, `deleteRelationship` 22.12, `deleteEntities([])` 3.39. Used by `updateEntity` in [packages/storage-cosmosdb/src/queries/entity.ts](../packages/storage-cosmosdb/src/queries/entity.ts) and by [packages/storage-cosmosdb/src/queries/deleteByIds.ts](../packages/storage-cosmosdb/src/queries/deleteByIds.ts).
+
+Behaviour of the chosen entity delete, validated on the emulator 2026-10-03: with the marker present the bucket holds the marker's id plus the ids dropped, and only entities are dropped; with the marker absent the bucket holds the matched entity ids without the marker's, and nothing is dropped (the marker filter passes no traverser, and `cap('found')` still emits the bucket). The update shape returns no row and writes nothing when either the marker or the entity is missing; the provider-level projection chain reads properties correctly from the vertex re-emitted by `select('vs').unfold()`.
+
+**The marker filter must exclude entities: `hasLabel('_repository').hasNot('entityType')`** (2026-10-03, emulator). The entity type is the vertex label and nothing reserves `_`-prefixed types, so an entity typed `_repository` carries the marker's label. With a bare `.unfold().hasLabel('_repository')` filter after `fold()`, "nothing is dropped" above held only when no target was such an entity:
+
+| Shape, target is an entity typed `_repository` | Marker present | Marker absent |
+|---|---|---|
+| Entity delete, bare `hasLabel('_repository')` | dropped (two traversers pass, so the drop runs twice; idempotent) | **dropped**, and the provider then reports `RepositoryNotFoundError` |
+| Entity update, bare `hasLabel('_repository')` | written and projected **twice** (two rows) | **written**, one row: the update succeeds |
+| Either shape with `.hasNot('entityType')` | one traverser passes: dropped / written once | nothing dropped or written |
+
+Every entity vertex carries `entityType` and the system vertices never do, so the same guard sits on every marker or vocabulary filter the provider uses to detect a repository: the guarded entity delete, the update's `UPDATE_ENTITY_START`, the marker point read (`REPOSITORY_MARKER_COUNT_QUERY`) and the vocabulary read (`hasLabel('_repository', '_vocabulary').hasNot('entityType')`), as `VOCABULARY_BACKFILL_WRITE_QUERY` already did. The id-keyed reads cannot pick up a differently-id'd entity anyway; the guard there keeps them correct regardless of how an entity's id was chosen. Re-measured at 10 and 5,000 entities, flat at both sizes: the update and the entity delete cost the same with the guard as without (15.41 RU raw update; 30.58 RU raw delete of one edgeless entity, 56.29 of one with two edges; through the provider `updateEntity` 18.84 / 23.70, `deleteEntities` of two ids 30.58, `deleteEntity` 30.48); the marker point read went from 3.39 to 3.59 RU and the vocabulary read from 3.47 to 3.67, so `deleteEntities([])` is 3.59 and `deleteRelationships` of two ids 22.43.
+
+**Bucket entry lost ahead of an empty mid-traversal `V()`** (2026-10-03, emulator): `g.V()…hasId('e1').aggregate('found').by('id').V()…hasId(mid).hasLabel('_repository').aggregate('found').by('id').cap('found')` returns `[[]]` when the marker is absent — the `e1` entry aggregated *before* the `V()` that matches nothing does not reach `cap` (with the marker present it returns both ids). Inserting `fold().as('t')` between the first `aggregate` and the `V()` keeps it: `[["e1"]]`. The chosen shapes above have no mid-traversal `V()`, so they do not depend on this.
+
+**Not yet re-measured:** the guarded `createRelationship` shape (`<marker>.fold().coalesce(unfold().V()…hasId(srcId)…addE(…)…)`) measured 25.44 RU on the small repository and 205.24 RU on the 5,000-entity one through the provider (2026-10-03), consistent with the same mid-traversal `V()` cost; `createEntity` stayed flat (30.35 / 30.73).
+
 ### `valueMap(true)` ships every property
 
 For an entity with a 1536-float `embedding` (the default for `text-embedding-3-large` at 1024 dimensions or `text-embedding-3-small` at 1536), the JSON-stringified embedding is ~30 KB per vertex. `valueMap(true)` ships it on every traversal, even though `projectEntity` strips it client-side at every detail level.

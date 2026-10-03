@@ -1,6 +1,7 @@
 // SqlServerStorageProvider — SQL Server implementation of StorageProvider
 
 import sql from 'mssql';
+import type { IResult } from 'mssql';
 import type {
   StorageProvider,
   EnsureSchemaResult,
@@ -764,8 +765,13 @@ export class SqlServerStorageProvider implements StorageProvider {
     };
   }
 
-  async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
-    await this.assertRepository(repositoryId);
+  /**
+   * Entity and relationship counts per type, plus the vocabulary version. The
+   * counts and the vocabulary read run in parallel; the vocabulary read
+   * checks the repository row, so a missing repository throws
+   * `RepositoryNotFoundError` rather than reporting zero counts.
+   */
+  public async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
     const pool = this.getPool();
 
     const [entityStats, relStats, vocab] = await Promise.all([
@@ -814,22 +820,27 @@ export class SqlServerStorageProvider implements StorageProvider {
   /**
    * Read the stored vocabulary. This provider keeps no vocabulary cache, so
    * every read already goes to the database and `fresh` needs no handling.
+   * One query reads the repository row and its vocabulary together: no
+   * repository row → `RepositoryNotFoundError`.
    */
   public async getVocabulary(
     repositoryId: string,
     _options?: VocabularyReadOptions,
   ): Promise<MemoryVocabulary> {
-    await this.assertRepository(repositoryId);
     const pool = this.getPool();
 
     const result = await pool.request()
       .input('id', sql.UniqueIdentifier, repositoryId)
-      .query<{ vocabulary: string }>(
-        `SELECT [vocabulary] FROM ${this.t('dm_vocabularies')} WHERE [repository_id] = @id`,
+      .query<{ vocabulary: string | null }>(
+        `SELECT v.[vocabulary]
+         FROM ${this.t('dm_repositories')} r
+         LEFT JOIN ${this.t('dm_vocabularies')} v ON v.[repository_id] = r.[repository_id]
+         WHERE r.[repository_id] = @id`,
       );
 
     const row = result.recordset[0];
-    if (!row) {
+    if (!row) throw new RepositoryNotFoundError(repositoryId);
+    if (row.vocabulary === null) {
       // createRepository inserts the vocabulary row together with the
       // repository row, so an existing repository without one is corrupt
       // state. Returning a synthetic empty vocabulary would hand callers a
@@ -1068,9 +1079,12 @@ export class SqlServerStorageProvider implements StorageProvider {
   ): Promise<StoredEntity> {
     const pool = this.getPool();
 
-    // Get existing entity
+    // Get existing entity. A miss checks the repository first, so a deleted
+    // repository reports `RepositoryNotFoundError` rather than a missing
+    // entity; the check costs a round trip on the failure path only.
     const existing = await this.getEntity(repositoryId, entityId);
     if (!existing) {
+      await this.assertRepository(repositoryId);
       throw new EntityNotFoundError(entityId);
     }
 
@@ -1105,7 +1119,7 @@ export class SqlServerStorageProvider implements StorageProvider {
       .input('modifiedInConversation', sql.NVarChar, updates.provenance.modifiedInConversation ?? null)
       .input('modifiedFromMessage', sql.NVarChar, updates.provenance.modifiedFromMessage ?? null);
 
-    await req.query(`
+    const update = await req.query(`
       UPDATE ${this.t('dm_entities')} SET
         [entity_type] = @entityType,
         [slug] = @slug,
@@ -1129,10 +1143,24 @@ export class SqlServerStorageProvider implements StorageProvider {
       label: updated.label,
     }));
 
+    // The entity (or its whole repository) was deleted between the read and
+    // the write: nothing was updated.
+    if ((update.rowsAffected[0] ?? 0) === 0) {
+      await this.assertRepository(repositoryId);
+      throw new EntityNotFoundError(entityId);
+    }
+
     return updated;
   }
 
-  async deleteEntity(repositoryId: string, entityId: string): Promise<void> {
+  /**
+   * Delete one entity and its relationships. A miss checks the repository,
+   * so a deleted repository reports `RepositoryNotFoundError` rather than a
+   * missing entity; the check costs a round trip on the failure path only.
+   * `deleteRepository` removes a repository's rows in one transaction, so
+   * an entity row never outlives its repository row.
+   */
+  public async deleteEntity(repositoryId: string, entityId: string): Promise<void> {
     const pool = this.getPool();
 
     // Delete relationships first (FK constraints would block otherwise)
@@ -1156,45 +1184,35 @@ export class SqlServerStorageProvider implements StorageProvider {
       );
 
     if (result.rowsAffected[0] === 0) {
+      await this.assertRepository(repositoryId);
       throw new EntityNotFoundError(entityId);
     }
   }
 
-  async deleteEntities(
+  /**
+   * Delete entities by id in one guarded batch (`deleteByIdsGuarded`). An
+   * empty list deletes nothing but still checks the repository.
+   */
+  public async deleteEntities(
     repositoryId: string,
     ids: string[],
   ): Promise<{ deleted: string[]; notFound: string[] }> {
-    if (ids.length === 0) return { deleted: [], notFound: [] };
+    if (ids.length === 0) {
+      await this.assertRepository(repositoryId);
+      return { deleted: [], notFound: [] };
+    }
 
-    const pool = this.getPool();
-
-    // Cascade: delete relationships where any of these entities is source or target
-    const tvp1 = this.createIdListTvp(ids);
-    const cascadeReq = pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityIds', tvp1);
-    await cascadeReq.query(`
+    // Relationships where any of these entities is source or target go
+    // first (foreign keys); OUTPUT tells which entity rows actually existed.
+    return this.deleteByIdsGuarded(repositoryId, ids, 'deleteEntities', `
       DELETE FROM ${this.t('dm_relationships')}
-        WHERE [repository_id] = @repoId AND [source_entity_id] IN (SELECT [id] FROM @entityIds);
+        WHERE [repository_id] = @repoId AND [source_entity_id] IN (SELECT [id] FROM @ids);
       DELETE FROM ${this.t('dm_relationships')}
-        WHERE [repository_id] = @repoId AND [target_entity_id] IN (SELECT [id] FROM @entityIds);
+        WHERE [repository_id] = @repoId AND [target_entity_id] IN (SELECT [id] FROM @ids);
+      DELETE FROM ${this.t('dm_entities')}
+        OUTPUT DELETED.[entity_id] INTO @deleted
+        WHERE [repository_id] = @repoId AND [entity_id] IN (SELECT [id] FROM @ids);
     `);
-
-    // Delete entities — OUTPUT DELETED tells us which rows actually existed
-    const tvp2 = this.createIdListTvp(ids);
-    const result = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('entityIds', tvp2)
-      .query<{ entity_id: string }>(
-        `DELETE FROM ${this.t('dm_entities')}
-         OUTPUT DELETED.[entity_id]
-         WHERE [repository_id] = @repoId
-           AND [entity_id] IN (SELECT [id] FROM @entityIds)`,
-      );
-
-    const deleted = result.recordset.map((row) => row.entity_id);
-    const deletedSet = new Set(deleted);
-    return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
   }
 
   async deleteEntitiesByType(
@@ -1587,7 +1605,12 @@ export class SqlServerStorageProvider implements StorageProvider {
     }
   }
 
-  async deleteRelationship(repositoryId: string, relationshipId: string): Promise<void> {
+  /**
+   * Delete one relationship. A miss checks the repository, so a deleted
+   * repository reports `RepositoryNotFoundError` rather than a missing
+   * relationship; the check costs a round trip on the failure path only.
+   */
+  public async deleteRelationship(repositoryId: string, relationshipId: string): Promise<void> {
     const pool = this.getPool();
     const result = await pool.request()
       .input('repoId', sql.UniqueIdentifier, repositoryId)
@@ -1598,31 +1621,29 @@ export class SqlServerStorageProvider implements StorageProvider {
       );
 
     if (result.rowsAffected[0] === 0) {
+      await this.assertRepository(repositoryId);
       throw new RelationshipNotFoundError(relationshipId);
     }
   }
 
-  async deleteRelationships(
+  /**
+   * Delete relationships by id in one guarded batch (`deleteByIdsGuarded`).
+   * An empty list deletes nothing but still checks the repository.
+   */
+  public async deleteRelationships(
     repositoryId: string,
     ids: string[],
   ): Promise<{ deleted: string[]; notFound: string[] }> {
-    if (ids.length === 0) return { deleted: [], notFound: [] };
+    if (ids.length === 0) {
+      await this.assertRepository(repositoryId);
+      return { deleted: [], notFound: [] };
+    }
 
-    const pool = this.getPool();
-    const tvp = this.createIdListTvp(ids);
-    const result = await pool.request()
-      .input('repoId', sql.UniqueIdentifier, repositoryId)
-      .input('relIds', tvp)
-      .query<{ relationship_id: string }>(
-        `DELETE FROM ${this.t('dm_relationships')}
-         OUTPUT DELETED.[relationship_id]
-         WHERE [repository_id] = @repoId
-           AND [relationship_id] IN (SELECT [id] FROM @relIds)`,
-      );
-
-    const deleted = result.recordset.map((row) => row.relationship_id);
-    const deletedSet = new Set(deleted);
-    return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
+    return this.deleteByIdsGuarded(repositoryId, ids, 'deleteRelationships', `
+      DELETE FROM ${this.t('dm_relationships')}
+        OUTPUT DELETED.[relationship_id] INTO @deleted
+        WHERE [repository_id] = @repoId AND [relationship_id] IN (SELECT [id] FROM @ids);
+    `);
   }
 
   async deleteRelationshipsByType(
@@ -2257,6 +2278,65 @@ export class SqlServerStorageProvider implements StorageProvider {
     }
 
     return result;
+  }
+
+  /**
+   * Run a delete-by-ids batch in one round trip, only while the repository
+   * row exists. `deletes` reads the ids from the `@ids` table parameter,
+   * scopes every statement by `@repoId`, and records the ids it removed with
+   * `OUTPUT ... INTO @deleted`.
+   *
+   * The batch reads the repository row under a shared lock held to the end
+   * of its transaction, so `deleteRepository` (which locks that row first)
+   * cannot remove the repository between the check and the deletes. Both
+   * take the repository row before any other row, so the two cannot
+   * deadlock on each other. With no repository row nothing is deleted and
+   * the call throws `RepositoryNotFoundError`, ahead of any per-id outcome.
+   * With `XACT_ABORT` on, an error anywhere in the batch rolls all of it
+   * back.
+   */
+  private async deleteByIdsGuarded(
+    repositoryId: string,
+    ids: string[],
+    operation: 'deleteEntities' | 'deleteRelationships',
+    deletes: string,
+  ): Promise<{ deleted: string[]; notFound: string[] }> {
+    const pool = this.getPool();
+    let result: IResult<[{ repository_exists: number }, { id: string }]>;
+    try {
+      result = await pool.request()
+        .input('repoId', sql.UniqueIdentifier, repositoryId)
+        .input('ids', this.createIdListTvp(ids))
+        .query<[{ repository_exists: number }, { id: string }]>(`
+          SET XACT_ABORT ON;
+          DECLARE @repositories INT = 0;
+          DECLARE @deleted TABLE ([id] NVARCHAR(300) NOT NULL);
+          BEGIN TRANSACTION;
+          SELECT @repositories = 1
+            FROM ${this.t('dm_repositories')} WITH (HOLDLOCK, ROWLOCK)
+            WHERE [repository_id] = @repoId;
+          IF @repositories = 1
+          BEGIN
+            ${deletes}
+          END
+          COMMIT TRANSACTION;
+          SELECT @repositories AS repository_exists;
+          SELECT [id] FROM @deleted;
+        `);
+    } catch (err) {
+      throw new ProviderError(
+        `SQL Server ${operation} failed: ${err instanceof Error ? err.message : String(err)}`,
+        'The batch is all-or-nothing; re-running is safe, and ids already removed report as not found.',
+        { cause: err },
+      );
+    }
+
+    if (result.recordsets[0]?.[0]?.repository_exists !== 1) {
+      throw new RepositoryNotFoundError(repositoryId);
+    }
+    const deleted = (result.recordsets[1] ?? []).map((row) => row.id);
+    const deletedSet = new Set(deleted);
+    return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
   }
 
   private async assertRepository(repositoryId: string): Promise<void> {

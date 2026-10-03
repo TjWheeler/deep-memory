@@ -45,6 +45,7 @@ import {
   GremlinCompiler,
   ProviderError,
   InvalidInputError,
+  RepositoryNotFoundError,
   VocabularyVersionConflictError,
   isValidUuid,
   projectEntity,
@@ -63,6 +64,7 @@ import * as entityQueries from './queries/entity.js';
 import * as relQueries from './queries/relationship.js';
 import * as timelineQueries from './queries/timeline.js';
 import * as bulkQueries from './queries/bulk.js';
+import * as deleteQueries from './queries/deleteByIds.js';
 
 /** Configuration for CosmosDbProvider. */
 export interface CosmosDbProviderConfig {
@@ -515,17 +517,19 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     });
   }
 
-  async deleteAllContents(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+  public async deleteAllContents(repositoryId: string, onProgress?: DeleteProgressCallback): Promise<{ deletedEntities: number; deletedRelationships: number }> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteAllContents', repositoryId, () =>
-      repoQueries.deleteAllContents(this.conn, repositoryId, onProgress),
+      this.forgetMissingRepository(repositoryId, () =>
+        repoQueries.deleteAllContents(this.conn, repositoryId, onProgress),
+      ),
     );
   }
 
-  async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
+  public async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getRepositoryStats', repositoryId, () =>
-      repoQueries.getRepositoryStats(this.conn, repositoryId),
+      this.forgetMissingRepository(repositoryId, () => repoQueries.getRepositoryStats(this.conn, repositoryId)),
     );
   }
 
@@ -538,6 +542,15 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    * cache entry with the result, because a caller that asks for a fresh read
    * is about to act on the stored version and traversal compilation should
    * see it too.
+   *
+   * Throws `RepositoryNotFoundError` when the repository marker is absent,
+   * as does every other call here that finds the marker gone; each drops the
+   * repository's traversal cache entry as it throws, and this provider's own
+   * `deleteRepository` drops it too. A traversal served from the cache within
+   * the TTL is not checked against the database, so it can still compile
+   * against the vocabulary of a repository another process has deleted (and
+   * then match nothing). Closing that window would cost a round trip on every
+   * cached read, which is what the cache exists to avoid.
    */
   public async getVocabulary(
     repositoryId: string,
@@ -545,7 +558,9 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   ): Promise<MemoryVocabulary> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getVocabulary', repositoryId, async () => {
-      const vocab = await vocabQueries.getVocabulary(this.conn, repositoryId);
+      const vocab = await this.forgetMissingRepository(repositoryId, () =>
+        vocabQueries.getVocabulary(this.conn, repositoryId),
+      );
       if (options?.fresh === true) {
         this.vocabularyCache.set(repositoryId, {
           vocab,
@@ -571,7 +586,9 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     if (cached && cached.expiresAt > now) {
       return cached.vocab;
     }
-    const vocab = await vocabQueries.getVocabulary(this.conn, repositoryId);
+    const vocab = await this.forgetMissingRepository(repositoryId, () =>
+      vocabQueries.getVocabulary(this.conn, repositoryId),
+    );
     this.vocabularyCache.set(repositoryId, {
       vocab,
       expiresAt: now + VOCABULARY_CACHE_TTL_MS,
@@ -579,9 +596,27 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return vocab;
   }
 
-  /** Drop the cache entry for a repository — call after any vocabulary write. */
+  /**
+   * Drop the cache entry for a repository — call after any vocabulary write,
+   * and whenever the repository turns out to be missing.
+   */
   private invalidateVocabularyCache(repositoryId: string): void {
     this.vocabularyCache.delete(repositoryId);
+  }
+
+  /**
+   * Run a repository-scoped call, dropping the repository's cached vocabulary
+   * when the call reports the repository missing: the repository was
+   * deleted, so a later traversal must read the vocabulary again (and throw)
+   * rather than compile against its old vocabulary.
+   */
+  private async forgetMissingRepository<T>(repositoryId: string, call: () => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (err) {
+      if (err instanceof RepositoryNotFoundError) this.invalidateVocabularyCache(repositoryId);
+      throw err;
+    }
   }
 
   /**
@@ -605,7 +640,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
       try {
         await vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary, expectedVersion);
       } catch (err) {
-        if (err instanceof VocabularyVersionConflictError) {
+        if (err instanceof VocabularyVersionConflictError || err instanceof RepositoryNotFoundError) {
           this.invalidateVocabularyCache(repositoryId);
         }
         throw err;
@@ -623,10 +658,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
 
   // ─── Entities ──────────────────────────────────────────────────────
 
-  async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
+  public async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('createEntity', repositoryId, () =>
-      entityQueries.createEntity(this.conn, repositoryId, entity),
+      this.forgetMissingRepository(repositoryId, () => entityQueries.createEntity(this.conn, repositoryId, entity)),
     );
   }
 
@@ -651,67 +686,39 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async updateEntity(repositoryId: string, entityId: string, updates: StoredEntityUpdate): Promise<StoredEntity> {
+  public async updateEntity(repositoryId: string, entityId: string, updates: StoredEntityUpdate): Promise<StoredEntity> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('updateEntity', repositoryId, () =>
-      entityQueries.updateEntity(this.conn, repositoryId, entityId, updates),
+      this.forgetMissingRepository(repositoryId, () =>
+        entityQueries.updateEntity(this.conn, repositoryId, entityId, updates),
+      ),
     );
-  }
-
-  async deleteEntity(repositoryId: string, entityId: string): Promise<void> {
-    this.assertValidRepositoryId(repositoryId);
-    return this.track('deleteEntity', repositoryId, () =>
-      entityQueries.deleteEntity(this.conn, repositoryId, entityId),
-    );
-  }
-
-  async deleteEntities(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
-    if (ids.length === 0) return { deleted: [], notFound: [] };
-    this.assertValidRepositoryId(repositoryId);
-    return this.track('deleteEntities', repositoryId, () => this.deleteEntitiesImpl(repositoryId, ids));
   }
 
   /**
-   * Single round-trip bulk-delete via the aggregate-side-effect pattern:
-   * collapses the per-chunk existence-check + drop into one Gremlin call.
-   *
-   *   g.V()...hasId(within(...)).has('entityType')
-   *     .aggregate('found').by('id')   // collects the ids that match
-   *     .drop()                         // drops the vertices (and cascaded edges)
-   *     .cap('found')                   // emits the bucket as the single result
-   *
-   * The bucket is always emitted as a single list item — empty when nothing
-   * matched.
-   * `notFound` is derived client-side as the set difference.
+   * Delete one entity and its edges, only while the repository marker exists
+   * (`RepositoryNotFoundError` otherwise). An id with no entity →
+   * `EntityNotFoundError`.
    */
-  private async deleteEntitiesImpl(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
-    const deleted: string[] = [];
-    const CHUNK = 100;
+  public async deleteEntity(repositoryId: string, entityId: string): Promise<void> {
+    this.assertValidRepositoryId(repositoryId);
+    return this.track('deleteEntity', repositoryId, () =>
+      this.forgetMissingRepository(repositoryId, () => entityQueries.deleteEntity(this.conn, repositoryId, entityId)),
+    );
+  }
 
-    for (let i = 0; i < ids.length; i += CHUNK) {
-      const chunk = ids.slice(i, i + CHUNK);
-
-      const bindings: Record<string, unknown> = { rid: repositoryId };
-      const idParams: string[] = [];
-      for (let j = 0; j < chunk.length; j++) {
-        const p = `id${j}`;
-        bindings[p] = chunk[j];
-        idParams.push(p);
-      }
-      const withinExpr = `within(${idParams.join(', ')})`;
-      const result = await this.conn.submit(
-        `g.V().has('repositoryId', rid).hasId(${withinExpr}).has('entityType')` +
-          `.aggregate('found').by('id').drop().cap('found')`,
-        bindings,
-      );
-      const bucket = result.items[0];
-      if (Array.isArray(bucket)) {
-        deleted.push(...(bucket as string[]));
-      }
-    }
-
-    const deletedSet = new Set(deleted);
-    return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
+  /**
+   * Delete entities (and their edges) by id, one round trip per chunk of 100
+   * ids (`deleteQueries.deleteEntitiesByIds`): each request fetches the
+   * repository marker together with the entities and drops them only when the
+   * marker exists. `notFound` is derived client-side as the set difference.
+   * A missing marker → `RepositoryNotFoundError`, even for an empty list.
+   */
+  public async deleteEntities(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
+    this.assertValidRepositoryId(repositoryId);
+    return this.track('deleteEntities', repositoryId, () =>
+      this.forgetMissingRepository(repositoryId, () => deleteQueries.deleteEntitiesByIds(this.conn, repositoryId, ids)),
+    );
   }
 
   async deleteEntitiesByType(repositoryId: string, entityType: string): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
@@ -742,7 +749,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   ): Promise<StoredRelationship> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('createRelationship', repositoryId, () =>
-      relQueries.createRelationship(this.conn, repositoryId, relationship),
+      this.forgetMissingRepository(repositoryId, () => relQueries.createRelationship(this.conn, repositoryId, relationship)),
     );
   }
 
@@ -760,61 +767,33 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     );
   }
 
-  async deleteRelationship(repositoryId: string, relationshipId: string): Promise<void> {
+  /**
+   * Delete one relationship, only while the repository marker exists
+   * (`RepositoryNotFoundError` otherwise). An id with no relationship →
+   * `RelationshipNotFoundError`.
+   */
+  public async deleteRelationship(repositoryId: string, relationshipId: string): Promise<void> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteRelationship', repositoryId, () =>
-      relQueries.deleteRelationship(this.conn, repositoryId, relationshipId),
+      this.forgetMissingRepository(repositoryId, () =>
+        relQueries.deleteRelationship(this.conn, repositoryId, relationshipId),
+      ),
     );
   }
 
-  async deleteRelationships(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
-    if (ids.length === 0) return { deleted: [], notFound: [] };
-    this.assertValidRepositoryId(repositoryId);
-    return this.track('deleteRelationships', repositoryId, () => this.deleteRelationshipsImpl(repositoryId, ids));
-  }
-
   /**
-   * Single round-trip bulk relationship delete via the aggregate-side-effect
-   * pattern: collapses the per-chunk existence-check + drop into one Gremlin
-   * call. Gremlin drop on edges is routed by the engine and the bucket gives
-   * back the exact ids that were actually dropped, so `notFound` can be
-   * derived client-side.
-   *
-   * Source-id partition routing is not exposed on this method (the public
-   * surface accepts only edge ids), so the lookup may fan out across
-   * partitions — see [docs/cosmosdb-gremlin-compatibility.md §`g.E().has`
-   * doesn't always push partition down]. Callers that already hold a
-   * StoredRelationship and want partition-scoped routing should add a
-   * dedicated method when the need is concrete.
+   * Delete relationships by id, one marker point read and one drop per chunk
+   * of 100 ids (`deleteQueries.deleteRelationshipsByIds`). The bucket gives
+   * back the exact ids dropped, so `notFound` is derived client-side. A
+   * missing marker → `RepositoryNotFoundError`, even for an empty list.
    */
-  private async deleteRelationshipsImpl(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
-    const deleted: string[] = [];
-    const CHUNK = 100;
-
-    for (let i = 0; i < ids.length; i += CHUNK) {
-      const chunk = ids.slice(i, i + CHUNK);
-
-      const bindings: Record<string, unknown> = { rid: repositoryId };
-      const idParams: string[] = [];
-      for (let j = 0; j < chunk.length; j++) {
-        const p = `id${j}`;
-        bindings[p] = chunk[j];
-        idParams.push(p);
-      }
-      const withinExpr = `within(${idParams.join(', ')})`;
-      const result = await this.conn.submit(
-        `g.E().has('repositoryId', rid).hasId(${withinExpr})` +
-          `.aggregate('found').by('id').drop().cap('found')`,
-        bindings,
-      );
-      const bucket = result.items[0];
-      if (Array.isArray(bucket)) {
-        deleted.push(...(bucket as string[]));
-      }
-    }
-
-    const deletedSet = new Set(deleted);
-    return { deleted, notFound: ids.filter((id) => !deletedSet.has(id)) };
+  public async deleteRelationships(repositoryId: string, ids: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
+    this.assertValidRepositoryId(repositoryId);
+    return this.track('deleteRelationships', repositoryId, () =>
+      this.forgetMissingRepository(repositoryId, () =>
+        deleteQueries.deleteRelationshipsByIds(this.conn, repositoryId, ids),
+      ),
+    );
   }
 
   async deleteRelationshipsByType(repositoryId: string, relationshipType: string): Promise<{ deletedRelationships: number }> {
@@ -1112,10 +1091,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     return this.trackIterable('exportAll', repositoryId, bulkQueries.exportAll(this.conn, repositoryId));
   }
 
-  async importBulk(repositoryId: string, data: ImportChunk[], options?: BulkImportOptions): Promise<BulkImportResult> {
+  public async importBulk(repositoryId: string, data: ImportChunk[], options?: BulkImportOptions): Promise<BulkImportResult> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('importBulk', repositoryId, () =>
-      bulkQueries.importBulk(this.conn, repositoryId, data, options),
+      this.forgetMissingRepository(repositoryId, () => bulkQueries.importBulk(this.conn, repositoryId, data, options)),
     );
   }
 
@@ -1185,7 +1164,13 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     };
   }
 
-  async traverse(
+  /**
+   * Execute a `TraversalSpec` against this repository's subgraph. On a
+   * deleted repository it throws `RepositoryNotFoundError` when the
+   * vocabulary cache is cold; within the cache TTL it may answer as it does
+   * for a missing start entity.
+   */
+  public async traverse(
     repositoryId: string,
     spec: TraversalSpec,
   ): Promise<TraversalResult> {

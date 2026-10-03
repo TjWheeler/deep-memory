@@ -3,6 +3,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { DeepMemory } from '../core/DeepMemory.js';
 import type { MemoryRepository } from '../core/MemoryRepository.js';
+import { VocabularyEngine } from '../core/VocabularyEngine.js';
+import { ProvenanceTracker } from '../core/ProvenanceTracker.js';
+import { EventBus } from '../core/EventBus.js';
+import { EntityManager } from './EntityManager.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
 import { DuplicateEntityError, ProviderError, SlugConflictError } from '../core/errors.js';
 import type { StoredEntity, StoredEntityUpdate } from '../types/entities.js';
@@ -190,6 +194,24 @@ describe('EntityManager slug-conflict retry', () => {
       expect((await repo.getEntity(entity!.id))!.slug).toBe('person:alex');
     });
 
+    it('reports a deleted repository ahead of a missing entity', async () => {
+      const [entity] = await repo.createEntities([{ entityType: 'person', label: 'Alex' }]);
+      await storage.deleteRepository(repo.repositoryId);
+      // Database-backed stores answer an entity read on a deleted repository
+      // with no row rather than an error.
+      storage.getEntity = async () => null;
+
+      await expect(repo.updateEntity(entity!.id, { label: 'Sam' })).rejects.toMatchObject({
+        code: 'REPOSITORY_NOT_FOUND',
+      });
+    });
+
+    it('reports a missing entity when the repository exists', async () => {
+      await expect(repo.updateEntity('missing-entity', { label: 'Sam' })).rejects.toMatchObject({
+        code: 'ENTITY_NOT_FOUND',
+      });
+    });
+
     it('does not retry an error that is not a slug conflict', async () => {
       const [entity] = await repo.createEntities([{ entityType: 'person', label: 'Alex' }]);
       storage.attemptedSlugs.length = 0;
@@ -205,6 +227,33 @@ describe('EntityManager slug-conflict retry', () => {
       const updated = await repo.updateEntity(entity!.id, { label: 'ALEX' });
 
       expect(updated.slug).toBe('person:alex');
+    });
+  });
+
+  describe('delete', () => {
+    function entityManager(): EntityManager {
+      const provenance = { actorId: 'test-agent', actorType: 'agent' as const };
+      return new EntityManager(
+        REPO_ID,
+        new VocabularyEngine({ repositoryId: REPO_ID, storageProvider: storage, governanceConfig: { mode: 'open' } }),
+        new ProvenanceTracker(provenance),
+        new EventBus(provenance, REPO_ID),
+        storage,
+      );
+    }
+
+    it('reports a deleted repository ahead of a missing entity', async () => {
+      const [entity] = await repo.createEntities([{ entityType: 'person', label: 'Alex' }]);
+      await storage.deleteRepository(REPO_ID);
+      // Database-backed stores answer an entity read on a deleted repository
+      // with no row rather than an error.
+      storage.getEntity = async () => null;
+
+      await expect(entityManager().delete(entity!.id)).rejects.toMatchObject({ code: 'REPOSITORY_NOT_FOUND' });
+    });
+
+    it('reports a missing entity when the repository exists', async () => {
+      await expect(entityManager().delete('missing-entity')).rejects.toMatchObject({ code: 'ENTITY_NOT_FOUND' });
     });
   });
 });

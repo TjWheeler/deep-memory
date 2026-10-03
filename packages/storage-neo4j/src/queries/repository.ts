@@ -5,7 +5,9 @@
 
 import type { Neo4jConnection } from '../Neo4jConnection.js';
 import type { MemoryVocabulary, RepositoryStats } from '@utaba/deep-memory/types';
+import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
 import { bigintToSafeNumber } from '../mapping.js';
+import { REPOSITORY_MARKER_EXISTS_QUERY } from './repositoryDrain.js';
 
 /**
  * Entities-by-type breakdown. One row per distinct `entityType`. Every entity
@@ -42,12 +44,14 @@ RETURN type(r) AS type, count(r) AS count
  * Aggregate repository statistics: entity / relationship totals, per-type
  * breakdowns, vocabulary version.
  *
- * Two server round-trips fire in parallel (`Promise.all`) — the JS driver
+ * Three server round-trips fire in parallel (`Promise.all`) — the JS driver
  * multiplexes Bolt connections so the queries run concurrently rather than
- * serially. The vocabulary version comes from the caller-supplied
- * `MemoryVocabulary` value, which the provider sources from its 60 s
- * vocabulary cache; on a warm cache the stats path costs exactly two round-
- * trips total.
+ * serially: the two counts and a seek of the repository marker. The marker
+ * check makes a deleted repository throw `RepositoryNotFoundError` instead of
+ * reporting zero counts, even when the caller's vocabulary came from a cache
+ * filled before another process deleted it. The vocabulary version comes
+ * from the caller-supplied `MemoryVocabulary` value, which the provider
+ * sources from its 60 s vocabulary cache.
  *
  * `count(n)` and `count(r)` come back as `BigInt` because the driver runs
  * with `useBigInt: true`. The mapping helper
@@ -65,10 +69,14 @@ export async function getRepositoryStats(
   repositoryId: string,
   vocabulary: MemoryVocabulary,
 ): Promise<RepositoryStats> {
-  const [entityResult, relationshipResult] = await Promise.all([
+  const [entityResult, relationshipResult, markerResult] = await Promise.all([
     conn.executeQuery(ENTITY_STATS_QUERY, {}, { repositoryId, routing: 'READ' }),
     conn.executeQuery(RELATIONSHIP_STATS_QUERY, {}, { repositoryId, routing: 'READ' }),
+    conn.executeQuery(REPOSITORY_MARKER_EXISTS_QUERY, {}, { repositoryId, routing: 'READ' }),
   ]);
+  const markerRecord = markerResult.records[0];
+  if (markerRecord === undefined) throw new ProviderError('Neo4j repository marker read returned no row.');
+  if (markerRecord.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
 
   const entityTypeBreakdown: Record<string, number> = {};
   let entityCount = 0;

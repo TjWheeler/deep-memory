@@ -330,6 +330,17 @@ export async function getEntities(
 }
 
 /**
+ * Match clause shared by `updateEntity`'s pre-read and write: the repository
+ * marker (a seek of its unique constraint index) and, only when the marker
+ * exists, the entity (a seek of the `(repositoryId, id)` index). Both are
+ * optional, so the statement returns one row in every case and `n` is null
+ * when either is missing.
+ */
+export const UPDATE_ENTITY_MATCH =
+  'OPTIONAL MATCH (repo:_Repository {repositoryId: $rid}) ' +
+  'OPTIONAL MATCH (n:_Entity {repositoryId: $rid, id: $id}) WHERE repo IS NOT NULL';
+
+/**
  * Variable-shape projection-on-write update. Builds a `SET n.<field> =
  * $param` clause per dirty field, then projects the post-SET state in the
  * same round-trip — `MATCH ... SET ... RETURN <projection>` ships the
@@ -351,8 +362,11 @@ export async function getEntities(
  * for `entity.properties` round-trip, so the divergence affects only
  * predicate-match shape, not read shape.
  *
- * Empty record array → `EntityNotFoundError`. A slug change that collides
- * with another entity's slug → `SlugConflictError`.
+ * Both statements match the repository marker alongside the entity
+ * (`UPDATE_ENTITY_MATCH`). A missing marker → `RepositoryNotFoundError`,
+ * checked first, so an entity left behind by a delete still in progress is
+ * not written. Otherwise a missing entity → `EntityNotFoundError`, and a slug
+ * change that collides with another entity's slug → `SlugConflictError`.
  */
 export async function updateEntity(
   conn: Neo4jConnection,
@@ -376,13 +390,15 @@ export async function updateEntity(
   let keysToRemove: string[] = [];
   if (userProperties !== null) {
     const readResult = await conn.executeQuery(
-      'MATCH (n:_Entity {repositoryId: $rid, id: $id}) RETURN properties(n) AS props',
+      `${UPDATE_ENTITY_MATCH} RETURN repo IS NOT NULL AS repositoryExists, properties(n) AS props`,
       { id: entityId },
       { repositoryId, routing: 'READ' },
     );
     const readRecord = readResult.records[0];
-    if (readRecord === undefined) throw new EntityNotFoundError(entityId);
-    const props = readRecord.get('props');
+    if (readRecord === undefined) throw new ProviderError('Neo4j entity property read returned no row.');
+    if (readRecord.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+    const props: unknown = readRecord.get('props');
+    if (props === null) throw new EntityNotFoundError(entityId);
     const existingProps =
       typeof props === 'object' && props !== null && !Array.isArray(props)
         ? (props as Record<string, unknown>)
@@ -447,12 +463,14 @@ export async function updateEntity(
     removeClause = ` REMOVE ${safeKeys.join(', ')}`;
   }
 
+  // With no marker, or no entity, `n` is null and every SET / REMOVE on it is
+  // a no-op; the flags in the returned row say which outcome applies.
   const cypher =
-    `MATCH (n:_Entity {repositoryId: $rid, id: $id}) ` +
+    `${UPDATE_ENTITY_MATCH} ` +
     `SET ${setParts.join(', ')}` +
     `${userPropsClause}` +
     `${removeClause} ` +
-    `RETURN ${ENTITY_PROJECTION_LIGHT}`;
+    `RETURN repo IS NOT NULL AS repositoryExists, n IS NOT NULL AS entityFound, ${ENTITY_PROJECTION_LIGHT}`;
 
   // A slug change can violate `dm_entity_slug_unique`. No `kind` is passed:
   // a violation the mapping cannot identify becomes a ProviderError (with the
@@ -470,13 +488,28 @@ export async function updateEntity(
     });
   }
   const record = result.records[0];
-  if (record === undefined) throw new EntityNotFoundError(entityId);
+  if (record === undefined) throw new ProviderError('Neo4j entity update returned no row.');
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+  if (record.get('entityFound') !== true) throw new EntityNotFoundError(entityId);
   return entityFromRecord(record);
 }
 
-const ENTITY_DELETE_MANY_QUERY =
-  'MATCH (n:_Entity {repositoryId: $rid}) WHERE n.id IN $ids ' +
-  'WITH n, n.id AS id DETACH DELETE n RETURN id AS deleted';
+/**
+ * Delete entities by id, only while the repository marker exists. The marker
+ * is a seek of its unique constraint index and each id a seek of the
+ * `(repositoryId, id)` index. The subquery aggregates, so the statement
+ * returns exactly one row (`repositoryExists`, `deleted`) whether or not
+ * anything matched; with no marker the subquery deletes nothing.
+ */
+export const ENTITY_DELETE_MANY_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+CALL (repo) {
+  MATCH (n:_Entity {repositoryId: $rid})
+  WHERE repo IS NOT NULL AND n.id IN $ids
+  WITH n, n.id AS id
+  DETACH DELETE n
+  RETURN collect(id) AS deleted
+}
+RETURN repo IS NOT NULL AS repositoryExists, deleted`;
 
 /**
  * Delete a single entity and its incident relationships (`DETACH DELETE`).
@@ -484,7 +517,9 @@ const ENTITY_DELETE_MANY_QUERY =
  * Runs the bulk delete statement for one id through `deleteByIds`, so a
  * re-run by the driver after a commit whose acknowledgement was lost still
  * answers success: the entity the first attempt deleted counts as deleted
- * rather than as missing. An id no attempt found → `EntityNotFoundError`.
+ * rather than as missing. A missing repository marker →
+ * `RepositoryNotFoundError`; otherwise an id no attempt found →
+ * `EntityNotFoundError`.
  */
 export async function deleteEntity(
   conn: Neo4jConnection,
@@ -497,11 +532,13 @@ export async function deleteEntity(
 
 /**
  * Bulk delete by ids — single statement. Returns the ids actually deleted
- * (drawn from the `DETACH DELETE` operator's RETURN slice); the `notFound`
- * set is the set difference against the input ids. `deleteByIds` keeps the
- * answer right when the driver re-runs a delete whose commit succeeded.
+ * (collected from the `DETACH DELETE` rows); the `notFound` set is the set
+ * difference against the input ids. `deleteByIds` keeps the answer right
+ * when the driver re-runs a delete whose commit succeeded, and throws
+ * `RepositoryNotFoundError` when the repository marker is absent.
  *
- * Empty input → empty result, no round-trip.
+ * Empty input deletes nothing but still reads the marker, so a deleted
+ * repository is reported for an empty list too.
  */
 export async function deleteEntities(
   conn: Neo4jConnection,

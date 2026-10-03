@@ -27,6 +27,7 @@ import {
 import { CosmosDbProvider } from '../src/CosmosDbProvider.js';
 import { CosmosDbConnection } from '../src/CosmosDbConnection.js';
 import { VOCABULARY_BACKFILL_WRITE_QUERY } from '../src/queries/vocabulary.js';
+import { UPDATE_ENTITY_START } from '../src/queries/entity.js';
 import { DELETE_INDEX_ENTRY_QUERY, DELETE_VERTEX_BATCH_QUERY } from '../src/queries/repository.js';
 
 const ENDPOINT = process.env['COSMOSDB_GREMLIN_ENDPOINT'];
@@ -48,6 +49,8 @@ const RID = {
   large: '40000000-0000-4000-a000-0000000000c8',
   interrupted: '40000000-0000-4000-a000-0000000000c9',
   recreate: '40000000-0000-4000-a000-0000000000ca',
+  markerless: '40000000-0000-4000-a000-0000000000cb',
+  collision: '40000000-0000-4000-a000-0000000000cc',
 } as const;
 
 const skipIfNoEndpoint = !ENDPOINT || !KEY;
@@ -404,6 +407,110 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
     });
     expect(await count("g.V().has('repositoryId', rid).hasLabel('_vocabulary').count()", RID.interrupted)).toBe(1);
     expect(await count("g.V().has('repositoryId', rid).has('entityType').count()", RID.interrupted)).toBe(0);
+  }, 60_000);
+
+  it('a repository whose marker is gone refuses writes and reads, and deleteRepository still finishes it', async () => {
+    await freshRepository(RID.markerless, makeVocabulary('2.0.0'));
+    await provider.createEntity(RID.markerless, makeEntity('ml-a'));
+    await provider.createEntity(RID.markerless, makeEntity('ml-b'));
+    await provider.createRelationship(RID.markerless, makeRelationship('ml-r', 'ml-a', 'ml-b'));
+    // Simulate a delete that stopped right after dropping the marker.
+    await raw.submit(
+      "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').drop()",
+      { rid: RID.markerless, vid: `repo:${RID.markerless}` },
+    );
+    const provenance = makeEntity('ml-a').provenance;
+
+    await expect(provider.getVocabulary(RID.markerless)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.getVocabulary(RID.markerless, { fresh: true })).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    await expect(provider.getRepositoryStats(RID.markerless)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.deleteEntities(RID.markerless, ['ml-a', 'missing'])).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    await expect(provider.deleteRelationships(RID.markerless, ['ml-r'])).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    await expect(provider.deleteEntity(RID.markerless, 'ml-b')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.deleteRelationship(RID.markerless, 'ml-r')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.deleteEntities(RID.markerless, [])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.deleteRelationships(RID.markerless, [])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.updateEntity(RID.markerless, 'ml-a', { label: 'Renamed', provenance })).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    await expect(
+      provider.updateEntity(RID.markerless, 'ml-a', { properties: { colour: 'red' }, provenance }),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    // Ahead of the slug clash with ml-b.
+    await expect(
+      provider.updateEntity(RID.markerless, 'ml-a', { slug: 'Thing:ml-b', provenance }),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+
+    // Nothing was written or dropped.
+    const a = await provider.getEntity(RID.markerless, 'ml-a');
+    expect(a?.label).toBe('ml-a');
+    expect(a?.properties).toEqual({ colour: 'blue' });
+    expect(a?.slug).toBe(makeEntity('ml-a').slug);
+    expect(await provider.getEntity(RID.markerless, 'ml-b')).not.toBeNull();
+    expect(await provider.getRelationship(RID.markerless, 'ml-r')).not.toBeNull();
+
+    await expect(provider.deleteRepository(RID.markerless)).resolves.toEqual({
+      deletedEntities: 2,
+      deletedRelationships: 1,
+    });
+    await expect(provider.deleteRepository(RID.markerless)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+  }, 60_000);
+
+  // The entity type is the vertex label, so an entity typed `_repository`
+  // carries the marker's label. The marker guards tell the two apart by
+  // `entityType`, which only entity vertices carry. Written at the provider
+  // level, below any vocabulary validation.
+  it('an entity typed _repository is never taken for the repository marker', async () => {
+    await freshRepository(RID.collision);
+    const impostor = (id: string): StoredEntity => ({ ...makeEntity(id), entityType: '_repository', slug: `_repository:${id}` });
+    await provider.createEntity(RID.collision, impostor('col-x'));
+    await provider.createEntity(RID.collision, impostor('col-z'));
+    await provider.createEntity(RID.collision, makeEntity('col-y'));
+    const provenance = makeEntity('col-x').provenance;
+
+    // Marker present: the write runs once and the drop reports the id once.
+    await expect(provider.updateEntity(RID.collision, 'col-x', { label: 'Renamed', provenance })).resolves.toMatchObject({
+      id: 'col-x',
+      label: 'Renamed',
+    });
+    const rows = await raw.submit(`${UPDATE_ENTITY_START}.property('entityLabel', p0).id()`, {
+      rid: RID.collision,
+      repoVid: `repo:${RID.collision}`,
+      eid: 'col-x',
+      p0: 'Renamed',
+    });
+    expect(rows.items).toEqual(['col-x']);
+    await expect(provider.deleteEntities(RID.collision, ['col-z'])).resolves.toEqual({
+      deleted: ['col-z'],
+      notFound: [],
+    });
+    expect(await provider.getEntity(RID.collision, 'col-z')).toBeNull();
+
+    // Marker absent: the impostor does not stand in for it.
+    await raw.submit(
+      "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').hasNot('entityType').drop()",
+      { rid: RID.collision, vid: `repo:${RID.collision}` },
+    );
+    await expect(provider.deleteEntities(RID.collision, ['col-x'])).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.deleteEntity(RID.collision, 'col-x')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.updateEntity(RID.collision, 'col-x', { label: 'Overwritten', provenance })).rejects.toBeInstanceOf(
+      RepositoryNotFoundError,
+    );
+    await expect(provider.getVocabulary(RID.collision, { fresh: true })).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    const survivor = await provider.getEntity(RID.collision, 'col-x');
+    expect(survivor?.label).toBe('Renamed');
+    expect(survivor?.entityType).toBe('_repository');
+
+    await expect(provider.deleteRepository(RID.collision)).resolves.toEqual({
+      deletedEntities: 2,
+      deletedRelationships: 0,
+    });
   }, 60_000);
 
   it('the delete drain and sentinel cleanup stand down while a marker exists', async () => {

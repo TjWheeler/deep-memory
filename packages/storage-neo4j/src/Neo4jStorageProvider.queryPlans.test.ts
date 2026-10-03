@@ -11,8 +11,9 @@
 // call pay for every repository in the store. The write-token read-backs that
 // answer a re-run of a committed create are held to the same rule, and a
 // create with an engine-minted id must not expand the repository's edges at
-// all. EXPLAIN plans the statements without running them, so this checks the
-// operators the server would use.
+// all. Statements that refuse a deleted repository check its marker through
+// the marker's unique constraint index. EXPLAIN plans the statements without
+// running them, so this checks the operators the server would use.
 //
 // Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD to run. Skipped otherwise so
 // CI builds without a live Neo4j stay green.
@@ -23,7 +24,6 @@ import {
   buildCreateMintedRelationshipQuery,
   buildCreateRelationshipQuery,
   RELATIONSHIP_DELETE_MANY_QUERY,
-  RELATIONSHIP_DELETE_QUERY,
   RELATIONSHIP_GET_QUERY,
   RELATIONSHIP_WRITE_ATTEMPT_QUERY,
 } from './queries/relationship.js';
@@ -33,6 +33,8 @@ import {
   REPOSITORY_MARKER_EXISTS_QUERY,
 } from './queries/repositoryDrain.js';
 import { ENTITY_STATS_QUERY, RELATIONSHIP_STATS_QUERY } from './queries/repository.js';
+import { ENTITY_DELETE_MANY_QUERY, UPDATE_ENTITY_MATCH } from './queries/entity.js';
+import { VOCABULARY_READ_QUERY } from './queries/vocabulary.js';
 import {
   buildInsertRelationshipsQuery,
   buildUpsertRelationshipsQuery,
@@ -192,12 +194,38 @@ if (NEO4J_URI) {
       expectIndexAnchoredPlan(await explain(RELATIONSHIP_GET_QUERY, { relId: ROW.id }));
     });
 
-    it('deleteRelationship seeks the entity index for its anchor', async () => {
-      expectIndexAnchoredPlan(await explain(RELATIONSHIP_DELETE_QUERY, { relId: ROW.id }));
+    it('deleteRelationship and deleteRelationships seek the entity index for their anchor', async () => {
+      expectIndexAnchoredPlan(await explain(RELATIONSHIP_DELETE_MANY_QUERY, { ids: [ROW.id, 'plan-r2'] }));
     });
 
-    it('deleteRelationships seeks the entity index for its anchor', async () => {
-      expectIndexAnchoredPlan(await explain(RELATIONSHIP_DELETE_MANY_QUERY, { ids: [ROW.id, 'plan-r2'] }));
+    /** A seek of the repository marker's unique constraint index. */
+    function expectMarkerSeek(ops: string[]): void {
+      expect(ops.some((op) => op.startsWith('NodeUniqueIndexSeek') && op.includes(':_Repository(repositoryId)'))).toBe(true);
+    }
+
+    it('deleteRelationships checks the repository marker through its constraint index', async () => {
+      expectMarkerSeek(await explain(RELATIONSHIP_DELETE_MANY_QUERY, { ids: [ROW.id, 'plan-r2'] }));
+    });
+
+    it('deleteEntities seeks the marker and each entity by id', async () => {
+      const ops = await explain(ENTITY_DELETE_MANY_QUERY, { ids: ['plan-a', 'plan-b'] });
+      expectEntityIdSeek(ops);
+      expectMarkerSeek(ops);
+    });
+
+    it('updateEntity seeks the marker and the entity by id', async () => {
+      const ops = await explain(
+        `${UPDATE_ENTITY_MATCH} SET n.label = $label RETURN repo IS NOT NULL AS repositoryExists, n.id AS id`,
+        { id: 'plan-a', label: 'plan' },
+      );
+      expectEntityIdSeek(ops);
+      expectMarkerSeek(ops);
+    });
+
+    it('getVocabulary checks the repository marker through its constraint index', async () => {
+      const ops = await explain(VOCABULARY_READ_QUERY, {});
+      for (const scan of ['AllNodesScan', 'AllRelationshipsScan']) expect(ops.map(operatorName)).not.toContain(scan);
+      expectMarkerSeek(ops);
     });
 
     /** The plan of a batched drain; `IN TRANSACTIONS` plans only on an auto-commit session. */

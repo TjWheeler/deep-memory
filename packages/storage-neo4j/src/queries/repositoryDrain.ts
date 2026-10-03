@@ -91,8 +91,9 @@ export const ENTITY_DRAIN_QUERY = `CALL () {
 
 /**
  * Whether the repository marker exists, read before `deleteAllContents`
- * drains anything so a missing repository is refused rather than reported
- * as empty. `{repositoryId: $rid}` on `_Repository` is a seek of the
+ * drains anything and alongside the `getRepositoryStats` counts, so a missing
+ * repository is refused rather than reported as empty. `{repositoryId: $rid}`
+ * on `_Repository` is a seek of the
  * `dm_repository_unique` constraint index; the statement always returns one
  * row.
  */

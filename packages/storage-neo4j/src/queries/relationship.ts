@@ -52,6 +52,7 @@ import {
   DuplicateRelationshipError,
   EntityNotFoundError,
   ProviderError,
+  RelationshipNotFoundError,
   RepositoryNotFoundError,
   matchesPropertyFilters,
 } from '@utaba/deep-memory';
@@ -535,52 +536,35 @@ export async function getEntityRelationships(
 }
 
 /**
- * Delete one relationship by id, anchored on the repository's entities (see
- * the cost invariant above). Directional pattern: edges are stored
- * directionally so `->` matches each relationship once. `-[r]-` would
- * enumerate both endpoint perspectives and re-issue DELETE against an
- * already-removed edge, which is wasted work even though the operation
- * remains idempotent.
- */
-export const RELATIONSHIP_DELETE_QUERY =
-  'MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid, id: $relId}]->() ' +
-  'WHERE e.id IS NOT NULL DELETE r';
-
-/**
- * Drop a single relationship by id (`RELATIONSHIP_DELETE_QUERY`). No-op on
- * miss — mirrors the Cosmos contract (the public surface returns `void`, not
- * a deleted-row count).
- */
-export async function deleteRelationship(
-  conn: Neo4jConnection,
-  repositoryId: string,
-  relationshipId: string,
-): Promise<void> {
-  await conn.executeQuery(
-    RELATIONSHIP_DELETE_QUERY,
-    { relId: relationshipId },
-    { repositoryId },
-  );
-}
-
-/**
  * Delete relationships by id, anchored on the repository's entities (see the
  * cost invariant above). Directional pattern — edges are stored
  * directionally, so `->` matches each relationship exactly once. `-[r]-`
  * would double-yield each edge (once per endpoint perspective), producing
  * duplicate ids in the returned `deleted` set.
+ *
+ * The delete runs only while the repository marker exists (a seek of its
+ * unique constraint index). The subquery aggregates, so the statement returns
+ * exactly one row (`repositoryExists`, `deleted`) whether or not anything
+ * matched; with no marker the subquery deletes nothing.
  */
-export const RELATIONSHIP_DELETE_MANY_QUERY =
-  'MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid}]->() ' +
-  'WHERE e.id IS NOT NULL AND r.id IN $ids ' +
-  'WITH r, r.id AS id DELETE r RETURN id AS deleted';
+export const RELATIONSHIP_DELETE_MANY_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+CALL (repo) {
+  MATCH (e:_Entity {repositoryId: $rid})-[r {repositoryId: $rid}]->()
+  WHERE repo IS NOT NULL AND e.id IS NOT NULL AND r.id IN $ids
+  WITH r, r.id AS id
+  DELETE r
+  RETURN collect(id) AS deleted
+}
+RETURN repo IS NOT NULL AS repositoryExists, deleted`;
 
 /**
  * Bulk delete by ids — single statement. Returns the ids actually deleted
- * (drawn from the `DELETE` operator's RETURN slice); the `notFound` set is
- * the set difference against the input ids. `deleteByIds` keeps the answer
- * right when the driver re-runs a delete whose commit succeeded. Empty input
- * short-circuits without a round-trip.
+ * (collected from the `DELETE` rows); the `notFound` set is the set
+ * difference against the input ids. `deleteByIds` keeps the answer right
+ * when the driver re-runs a delete whose commit succeeded, and throws
+ * `RepositoryNotFoundError` when the repository marker is absent. Empty
+ * input deletes nothing but still reads the marker, so a deleted repository
+ * is reported for an empty list too.
  */
 export async function deleteRelationships(
   conn: Neo4jConnection,
@@ -588,6 +572,23 @@ export async function deleteRelationships(
   ids: string[],
 ): Promise<{ deleted: string[]; notFound: string[] }> {
   return deleteByIds(conn, repositoryId, RELATIONSHIP_DELETE_MANY_QUERY, ids);
+}
+
+/**
+ * Drop a single relationship by id. Runs the bulk delete statement for one id
+ * through `deleteByIds`, so it checks the repository marker in the same
+ * statement and is answered correctly when the driver re-runs it: an id an
+ * earlier, committed attempt deleted counts as deleted. A missing repository
+ * marker → `RepositoryNotFoundError`; an id no attempt found in an existing
+ * repository → `RelationshipNotFoundError`.
+ */
+export async function deleteRelationship(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  relationshipId: string,
+): Promise<void> {
+  const { notFound } = await deleteByIds(conn, repositoryId, RELATIONSHIP_DELETE_MANY_QUERY, [relationshipId]);
+  if (notFound.length > 0) throw new RelationshipNotFoundError(relationshipId);
 }
 
 /**

@@ -72,10 +72,25 @@ function parseStoredVocabulary(raw: unknown): MemoryVocabulary {
 }
 
 /**
- * Read the vocabulary for a repository. Returns an empty vocabulary when no
- * `_Vocabulary` node exists — mirrors the Cosmos provider's forgiving-read
- * contract so callers can compose `getVocabulary` into traversal compilation
- * without a separate existence check.
+ * Vocabulary read, together with whether the repository marker exists. The
+ * marker lookup is a seek of its unique constraint index; `_Vocabulary` has
+ * no index on `repositoryId`, so the vocabulary lookup is a label scan over
+ * the vocabulary nodes (one per repository). Both matches are optional, so
+ * the statement always returns one row. The marker decides existence, not
+ * the vocabulary node: a delete removes the marker first and the vocabulary
+ * last, so a vocabulary node without a marker belongs to a deleted
+ * repository.
+ */
+export const VOCABULARY_READ_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
+OPTIONAL MATCH (v:_Vocabulary {repositoryId: $rid})
+RETURN repo IS NOT NULL AS repositoryExists, v.vocabulary AS json`;
+
+/**
+ * Read the vocabulary for a repository. Throws `RepositoryNotFoundError` when
+ * the repository marker is absent, so a deleted repository is never mistaken
+ * for one that has no types yet. A repository whose vocabulary node is
+ * missing reads as the empty vocabulary (`createRepository` always seeds the
+ * node, so this only covers data written outside this provider).
  *
  * Only the JSON `vocabulary` property is projected — the per-node `repositoryId`
  * and label are not needed by callers.
@@ -84,13 +99,10 @@ export async function getVocabulary(
   conn: Neo4jConnection,
   repositoryId: string,
 ): Promise<MemoryVocabulary> {
-  const result = await conn.executeQuery(
-    'MATCH (v:_Vocabulary {repositoryId: $rid}) RETURN v.vocabulary AS json',
-    {},
-    { repositoryId, routing: 'READ' },
-  );
+  const result = await conn.executeQuery(VOCABULARY_READ_QUERY, {}, { repositoryId, routing: 'READ' });
   const record = result.records[0];
-  if (record === undefined) return emptyVocabulary();
+  if (record === undefined) throw new ProviderError('Neo4j vocabulary read returned no row.');
+  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
   return parseStoredVocabulary(record.get('json'));
 }
 

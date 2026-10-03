@@ -24,6 +24,7 @@ import {
 } from '@utaba/deep-memory';
 import { repoVertexId, vocabVertexId } from './ids.js';
 import { submitCreate } from './create.js';
+import { getVocabulary } from './vocabulary.js';
 
 const REPO_LABEL = '_repository';
 
@@ -409,8 +410,24 @@ export const ENTITY_BATCH_DROP_QUERY =
 export const ENTITY_BATCH_COUNT_QUERY = "g.V().has('repositoryId', rid).has('entityType').limit(batchSize).count()";
 // Whether the repository marker exists: a partition-scoped point read of the
 // marker vertex, read before deleteAllContents drains anything.
+// `hasNot('entityType')` keeps an entity vertex out of the count: entity
+// types are vertex labels, so an entity can carry the `_repository` label,
+// and only entity vertices carry `entityType`.
 export const REPOSITORY_MARKER_COUNT_QUERY =
-  "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').count()";
+  "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_repository').hasNot('entityType').count()";
+
+/** Throw `RepositoryNotFoundError` unless the marker exists (a partition-scoped point read). */
+export async function assertRepositoryMarker(conn: CosmosDbConnection, repositoryId: string): Promise<void> {
+  const marker = await conn.submit(REPOSITORY_MARKER_COUNT_QUERY, {
+    rid: repositoryId,
+    vid: repoVertexId(repositoryId),
+  });
+  // `count()` always emits a row, so no row is a malformed response, not a
+  // missing repository.
+  const count = marker.items[0];
+  if (count === undefined) throw new ProviderError('Cosmos repository marker read returned no row.');
+  if (Number(count) === 0) throw new RepositoryNotFoundError(repositoryId);
+}
 
 // Sentinel cleanup, skipped once a re-create has landed. The marker check runs
 // in the repository's partition; the write targets the sentinel in the
@@ -658,22 +675,17 @@ export async function deleteAllContents(
   return { deletedEntities: entitiesDeleted, deletedRelationships: relationshipsDeleted };
 }
 
+/**
+ * Entity and relationship counts per type, plus the vocabulary version. The
+ * vocabulary read also checks the repository marker, so a deleted repository
+ * throws `RepositoryNotFoundError` before any count runs instead of reporting
+ * zero counts.
+ */
 export async function getRepositoryStats(
   conn: CosmosDbConnection,
   repositoryId: string,
 ): Promise<RepositoryStats> {
-  // Get vocabulary version
-  const vocabResult = await conn.submit(
-    "g.V().has('repositoryId', rid).hasLabel('_vocabulary').values('vocabulary')",
-    { rid: repositoryId },
-  );
-  let vocabVersion = '0.0.0';
-  if (vocabResult.items.length > 0) {
-    try {
-      const vocab = JSON.parse(vocabResult.items[0] as string);
-      vocabVersion = vocab.version ?? '0.0.0';
-    } catch { /* default */ }
-  }
+  const vocabVersion = (await getVocabulary(conn, repositoryId)).version;
 
   // Count entities by type (exclude system vertices)
   const entityResult = await conn.submit(

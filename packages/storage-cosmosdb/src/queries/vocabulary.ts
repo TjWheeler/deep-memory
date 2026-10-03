@@ -27,7 +27,7 @@ import {
   VocabularyVersionConflictError,
 } from '@utaba/deep-memory';
 import { changeRecordFromGremlin, pluckDocValue } from '../mapping.js';
-import { vocabVertexId } from './ids.js';
+import { repoVertexId, vocabVertexId } from './ids.js';
 
 /**
  * Whether a failed write lost a race rather than failed outright. The Cosmos
@@ -69,9 +69,10 @@ function parseStoredObject(raw: unknown): MemoryVocabulary | null {
 }
 
 /**
- * Decode a stored JSON blob for reading. Anything that is not a JSON object
- * decodes to the empty vocabulary — the forgiving read `getVocabulary` has
- * always offered.
+ * Decode a stored JSON blob for reading. A blob that is not a JSON object
+ * (missing, empty, unparseable, or a JSON scalar / array / `null`) decodes to
+ * the empty vocabulary. This covers only the blob's decoding: a missing
+ * repository is reported by `getVocabulary` before any blob is decoded.
  */
 function parseStoredVocabulary(raw: unknown): MemoryVocabulary {
   return parseStoredObject(raw) ?? EMPTY_VOCABULARY();
@@ -94,24 +95,51 @@ function stringField(row: Record<string, unknown>, key: string): string {
   return typeof value === 'string' ? value : '';
 }
 
+// Vocabulary read together with the repository marker: one partition-scoped
+// fetch of the two system vertices by their fixed ids, each projected to its
+// id and the vocabulary blob (empty for the marker). Only the JSON-stringified
+// `vocabulary` property is read; `valueMap(true)` would ship every property.
+//
+// `has('repositoryId', rid)` scopes the lookup to a single partition before
+// `hasId(...)`; `hasId` is post-routing in Cosmos Gremlin and fans out across
+// all partitions without the partition predicate.
+//
+// `hasNot('entityType')` keeps entity vertices out: entity types are vertex
+// labels, so an entity can carry the `_repository` or `_vocabulary` label,
+// and only entity vertices carry `entityType`.
+export const VOCABULARY_READ_QUERY =
+  "g.V().has('repositoryId', rid).hasId(within(mid, vid)).hasLabel('_repository', '_vocabulary').hasNot('entityType')" +
+  ".project('id', 'json').by(id).by(coalesce(values('vocabulary'), constant('')))";
+
+/**
+ * Read the vocabulary for a repository. Throws `RepositoryNotFoundError` when
+ * the `_repository` marker is absent, so a deleted repository is never
+ * mistaken for one with no types yet: a delete drops the marker first and the
+ * vocabulary vertex last, so a vocabulary without a marker belongs to a
+ * repository being deleted. A repository whose vocabulary vertex is missing
+ * reads as the empty vocabulary (`createRepository` always seeds it, so this
+ * only covers data written outside this provider).
+ */
 export async function getVocabulary(
   conn: CosmosDbConnection,
   repositoryId: string,
 ): Promise<MemoryVocabulary> {
-  // We only ever read the JSON-stringified `vocabulary` property; the full
-  // valueMap(true) shipped every property on the vocab vertex (label,
-  // repositoryId, etc.) for no reason. `.values('vocabulary').limit(1)`
-  // returns just the JSON string — smaller wire payload, single column read.
-  //
-  // `has('repositoryId', rid)` scopes the lookup to a single partition before
-  // `hasId(vid)`; `hasId` is post-routing in Cosmos Gremlin and fans out
-  // across all partitions without the partition predicate.
-  const result = await conn.submit(
-    "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_vocabulary').values('vocabulary').limit(1)",
-    { vid: vocabVertexId(repositoryId), rid: repositoryId },
-  );
-  if (result.items.length === 0) return EMPTY_VOCABULARY();
-  return parseStoredVocabulary(result.items[0]);
+  const markerId = repoVertexId(repositoryId);
+  const vocabularyId = vocabVertexId(repositoryId);
+  const result = await conn.submit(VOCABULARY_READ_QUERY, { rid: repositoryId, mid: markerId, vid: vocabularyId });
+  let repositoryExists = false;
+  let json: unknown = '';
+  for (const item of result.items) {
+    if (item === null || typeof item !== 'object') continue;
+    // The driver hands a projection back as a Map or a plain object.
+    const field = (key: string): unknown =>
+      item instanceof Map ? item.get(key) : (item as Record<string, unknown>)[key];
+    const id = field('id');
+    if (id === markerId) repositoryExists = true;
+    else if (id === vocabularyId) json = field('json');
+  }
+  if (!repositoryExists) throw new RepositoryNotFoundError(repositoryId);
+  return parseStoredVocabulary(json);
 }
 
 // Compare-and-set write. Partition predicate first (hasId alone fans out

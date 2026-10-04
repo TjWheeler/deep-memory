@@ -1,5 +1,12 @@
 # @utaba/deep-memory-indexer
 
+## 0.20.2
+
+### Patch Changes
+
+- Updated dependencies [a5b9af5]
+  - @utaba/deep-memory@0.24.0
+
 ## 0.20.1
 
 ### Patch Changes

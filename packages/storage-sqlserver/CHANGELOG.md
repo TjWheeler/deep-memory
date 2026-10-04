@@ -1,5 +1,12 @@
 # @utaba/deep-memory-storage-sqlserver
 
+## 0.24.0
+
+### Patch Changes
+
+- Updated dependencies [a5b9af5]
+  - @utaba/deep-memory@0.24.0
+
 ## 0.23.0
 
 ### Patch Changes

@@ -1,5 +1,16 @@
 # @utaba/deep-memory-indexer-mcp-server
 
+## 0.20.2
+
+### Patch Changes
+
+- Updated dependencies [a5b9af5]
+  - @utaba/deep-memory@0.24.0
+  - @utaba/deep-memory-indexer@0.20.2
+  - @utaba/deep-memory-indexer-llm-anthropic@0.19.5
+  - @utaba/deep-memory-storage-cosmosdb@0.24.0
+  - @utaba/deep-memory-storage-sqlserver@0.24.0
+
 ## 0.20.1
 
 ### Patch Changes

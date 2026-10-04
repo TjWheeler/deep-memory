@@ -14,7 +14,11 @@
 // Statements that refuse a deleted repository — writes, entity and
 // relationship reads, page counts, type deletes and compiled traversals —
 // check its marker through the marker's unique constraint index, and the
-// entity reads they guard keep to the entity indexes. EXPLAIN plans the
+// entity reads they guard keep to the entity indexes. The vocabulary write
+// and the change-log reads and drain reach the change log through its
+// `(repositoryId, changeId)` constraint index, and the vocabulary read,
+// write and outcome read reach the vocabulary node through its
+// `repositoryId` index. EXPLAIN plans the
 // statements without running them, so this checks the operators the server
 // would use.
 //
@@ -33,6 +37,7 @@ import {
   RELATIONSHIP_WRITE_ATTEMPT_QUERY,
 } from './queries/relationship.js';
 import {
+  CHANGE_LOG_DRAIN_QUERY,
   ENTITY_DRAIN_QUERY,
   RELATIONSHIP_DRAIN_QUERY,
   REPOSITORY_MARKER_EXISTS_QUERY,
@@ -50,7 +55,14 @@ import {
   UPDATE_ENTITY_MATCH,
 } from './queries/entity.js';
 import { TIMELINE_QUERY } from './queries/timeline.js';
-import { VOCABULARY_CHANGE_LOG_COUNT_QUERY, VOCABULARY_READ_QUERY } from './queries/vocabulary.js';
+import {
+  VOCABULARY_CHANGE_LOG_COUNT_QUERY,
+  VOCABULARY_CHANGE_LOG_PAGE_QUERY,
+  VOCABULARY_READ_QUERY,
+  VOCABULARY_SAVE_OUTCOME_QUERY,
+  VOCABULARY_SAVE_QUERY,
+} from './queries/vocabulary.js';
+import { getSchemaCypher } from './schema.js';
 import { Neo4jTraversalExecutor } from './Neo4jTraversalExecutor.js';
 import type { MemoryVocabulary, TraversalSpec } from '@utaba/deep-memory/types';
 import {
@@ -147,13 +159,17 @@ if (NEO4J_URI) {
   describe('repository-scoped relationship statements — query plans (live)', () => {
     let conn: Neo4jConnection;
 
-    beforeAll(() => {
+    beforeAll(async () => {
       conn = new Neo4jConnection({
         uri: NEO4J_URI,
         username: NEO4J_USER,
         password: NEO4J_PASSWORD,
         database: NEO4J_DATABASE,
       });
+      // The plans depend on the schema's indexes; every statement is idempotent.
+      for (const statement of getSchemaCypher()) await conn.executeSystemDdl(statement);
+      // A new index is planned only once it is online.
+      await conn.executeSystemDdl('CALL db.awaitIndexes(60)');
     });
 
     afterAll(async () => {
@@ -249,25 +265,35 @@ if (NEO4J_URI) {
       expectMarkerSeek(ops);
     });
 
-    it('getVocabulary checks the repository marker through its constraint index', async () => {
+    /** A seek of the vocabulary's `repositoryId` index, and no scan of any label (`_Vocabulary` included). */
+    function expectVocabularySeek(ops: string[]): void {
+      expectNoWholeStoreScan(ops);
+      expect(ops.some((op) => op.startsWith('NodeIndexSeek') && op.includes(':_Vocabulary(repositoryId)'))).toBe(true);
+    }
+
+    it('getVocabulary seeks the repository marker and the vocabulary through their indexes', async () => {
       const ops = await explain(VOCABULARY_READ_QUERY, {});
-      for (const scan of ['AllNodesScan', 'AllRelationshipsScan']) expect(ops.map(operatorName)).not.toContain(scan);
+      expectVocabularySeek(ops);
       expectMarkerSeek(ops);
     });
 
     /** The plan of a batched drain; `IN TRANSACTIONS` plans only on an auto-commit session. */
-    async function drainPlan(cypher: string): Promise<PlanNode> {
+    async function drainPlan(cypher: string, params: Record<string, unknown> = {}): Promise<PlanNode> {
       const { summary } = await conn.executeImplicitInTransactions(
         `EXPLAIN ${cypher}`,
-        { batchSize: 500n, edgeCap: 10_000n, after: '' },
+        { batchSize: 500n, edgeCap: 10_000n, after: '', ...params },
         { repositoryId: 'plan-check' },
       );
       expect(summary.plan).not.toBe(false);
       return summary.plan as PlanNode;
     }
 
-    it('the relationship drain range-seeks the entity index after its cursor, in index order', async () => {
-      const plan = await drainPlan(RELATIONSHIP_DRAIN_QUERY);
+    /**
+     * A keyset batch over the repository's entities: a range seek of the
+     * `(repositoryId, id)` index after `$after`, read in index order and
+     * stopped at `$batchSize`, with no whole-store scan.
+     */
+    function expectCursorSeekInIndexOrder(plan: PlanNode): void {
       const names = operators(plan).map(operatorName);
       for (const scan of WHOLE_STORE_SCANS) expect(names).not.toContain(scan);
       // Each batch reads only the entries past the cursor: a range seek of
@@ -291,10 +317,28 @@ if (NEO4J_URI) {
       expect(nodeDetails(seekPath[limitAt]!)).toContain('$batchSize');
       const between = seekPath.slice(limitAt + 1, -1).map((node) => operatorName(node.operatorType));
       for (const blocking of BLOCKING_OPERATORS) expect(between).not.toContain(blocking);
+    }
+
+    it('the relationship drain range-seeks the entity index after its cursor, in index order', async () => {
+      expectCursorSeekInIndexOrder(await drainPlan(RELATIONSHIP_DRAIN_QUERY));
     });
 
     it('the entity drain seeks the entity index rather than scanning the label', async () => {
       expectIndexAnchoredPlan(operators(await drainPlan(ENTITY_DRAIN_QUERY)));
+    });
+
+    /** A seek of the change log's `(repositoryId, changeId)` constraint index, and no scan of the label. */
+    function expectChangeLogSeek(ops: string[]): void {
+      expect(
+        ops.some((op) => op.startsWith('NodeUniqueIndexSeek') && op.includes(':_VocabularyChangeLog(repositoryId, changeId)')),
+      ).toBe(true);
+      expect(ops.some((op) => op.startsWith('NodeByLabelScan') && op.includes(':_VocabularyChangeLog'))).toBe(false);
+    }
+
+    it('the change-log drain seeks the change-log constraint index rather than scanning the label', async () => {
+      const ops = operators(await drainPlan(CHANGE_LOG_DRAIN_QUERY));
+      expectChangeLogSeek(ops);
+      expect(ops.find((op) => op.startsWith('NodeUniqueIndexSeek'))).toContain('IS NOT NULL');
     });
 
     it('getRepositoryStats counts entities through the entity index', async () => {
@@ -436,25 +480,55 @@ if (NEO4J_URI) {
       });
     }
 
-    it('deleteEntitiesByType seeks the marker and the entity type index', async () => {
-      const ops = await explain(ENTITY_DELETE_BY_TYPE_QUERY, { entityType: 'thing' });
+    it('a deleteEntitiesByType batch seeks the marker and the entity type index, and expands the edges from the batch', async () => {
+      const ops = operators(await drainPlan(ENTITY_DELETE_BY_TYPE_QUERY, { entityType: 'thing' }));
       expectNoWholeStoreScan(ops);
       expectMarkerSeek(ops);
       expect(ops.some((op) => op.startsWith('NodeIndexSeek') && op.includes(':_Entity(repositoryId, entityType)'))).toBe(true);
+      expect(ops.map(operatorName)).toContain('Expand');
     });
 
-    it('deleteRelationshipsByType seeks the marker and reaches the edges from the entity index anchor', async () => {
-      const ops = await explain(buildDeleteRelationshipsByTypeQuery('KNOWS'), {});
-      expectIndexAnchoredPlan(ops);
-      expectMarkerSeek(ops);
+    it('a deleteRelationshipsByType batch seeks the marker and range-seeks the entity index after its cursor', async () => {
+      const plan = await drainPlan(buildDeleteRelationshipsByTypeQuery('KNOWS'));
+      expectCursorSeekInIndexOrder(plan);
+      expectMarkerSeek(operators(plan));
     });
 
-    it('getVocabularyChangeLog counts after a seek of the repository marker', async () => {
-      const ops = await explain(VOCABULARY_CHANGE_LOG_COUNT_QUERY, {});
+    /** No scan of every node in the database, and none of the repository's entities. */
+    function expectNoNodeScan(ops: string[]): void {
       const names = ops.map(operatorName);
       for (const scan of ['AllNodesScan', 'AllRelationshipsScan']) expect(names).not.toContain(scan);
-      // `_VocabularyChangeLog` has no repository index; no `_Entity` is scanned.
       expect(ops.some((op) => op.startsWith('NodeByLabelScan') && op.includes(':_Entity'))).toBe(false);
+    }
+
+    it('getVocabularyChangeLog counts through the change-log index after a seek of the repository marker', async () => {
+      const ops = await explain(VOCABULARY_CHANGE_LOG_COUNT_QUERY, {});
+      expectNoNodeScan(ops);
+      expectMarkerSeek(ops);
+      expectChangeLogSeek(ops);
+    });
+
+    it('getVocabularyChangeLog pages through the change-log index', async () => {
+      const ops = await explain(VOCABULARY_CHANGE_LOG_PAGE_QUERY, { offset: 0n, limit: 10n });
+      expectNoNodeScan(ops);
+      expectChangeLogSeek(ops);
+    });
+
+    it('saveVocabulary locks the marker, seeks the vocabulary and merges its change record, each through its index', async () => {
+      const ops = await explain(VOCABULARY_SAVE_QUERY, {
+        expectedVersion: '1.0.0',
+        json: '{}',
+        newVersion: '1.1.0',
+        change: { changeId: 'plan-change', changeType: 'entity_type_added', typeName: 'thing' },
+      });
+      expectVocabularySeek(ops);
+      expectMarkerSeek(ops);
+      expectChangeLogSeek(ops);
+    });
+
+    it('the saveVocabulary outcome read seeks the repository marker and the vocabulary through their indexes', async () => {
+      const ops = await explain(VOCABULARY_SAVE_OUTCOME_QUERY, {});
+      expectVocabularySeek(ops);
       expectMarkerSeek(ops);
     });
 
@@ -501,7 +575,7 @@ if (NEO4J_URI) {
           start: { entityId: 'plan-a' },
           steps: [{ direction: 'out' }],
           returnMode: 'terminal',
-          projection: { properties: ['entityType'], mode: 'count' },
+          projection: { properties: ['colour'], mode: 'count' },
         },
       ],
     ];

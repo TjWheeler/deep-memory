@@ -19,14 +19,17 @@ import {
 import {
   processProposal,
 } from '../vocabulary/VocabularyGovernor.js';
+import { toScreamingSnakeCase } from '../vocabulary/similarity.js';
 import {
   validateEntity,
   validateEntityUpdate,
   validateRelationship,
   validatePropertySchema,
+  validateNewTypeName,
   getEntityTypeDef,
   type ValidationResult,
 } from '../vocabulary/VocabularyValidator.js';
+import type { PropertyOwner } from '../validation/propertyNames.js';
 import type { PropertySchema } from '../types/vocabulary.js';
 import { VocabularyValidationError, type DeepMemoryErrorCode } from './errors.js';
 
@@ -42,6 +45,35 @@ const VOCABULARY_VERSION_CONFLICT: DeepMemoryErrorCode = 'VOCABULARY_VERSION_CON
  */
 function isVocabularyVersionConflict(err: unknown): boolean {
   return err instanceof Error && 'code' in err && err.code === VOCABULARY_VERSION_CONFLICT;
+}
+
+/** A type name with case and surrounding whitespace removed from the comparison */
+function foldTypeName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+/**
+ * True when `vocabulary` declares a type of the kind a delete proposal names
+ * that matches `typeName` ignoring case and surrounding whitespace, or, for a
+ * relationship type, whose SCREAMING_SNAKE_CASE form is `typeName`.
+ *
+ * `typeName` is the name governance resolved the proposal to and found
+ * undeclared. A store may compare type names more loosely than governance
+ * does, so deleting data by such a near miss could delete a declared type's
+ * data.
+ */
+function declaresNearMatch(
+  proposal: VocabularyProposal,
+  typeName: string,
+  vocabulary: MemoryVocabulary,
+): boolean {
+  const folded = foldTypeName(typeName);
+  if (proposal.proposalType === 'delete_entity_type') {
+    return vocabulary.entityTypes.some((et) => foldTypeName(et.type) === folded);
+  }
+  return vocabulary.relationshipTypes.some(
+    (rt) => foldTypeName(rt.type) === folded || toScreamingSnakeCase(rt.type) === typeName,
+  );
 }
 
 /**
@@ -63,6 +95,13 @@ export interface VocabularyEngineConfig {
   embeddingProvider?: EmbeddingProvider;
   /** Similarity threshold for deduplication (default 0.85) */
   deduplicationThreshold?: number;
+  /**
+   * Read the vocabulary with `{ fresh: true }`, bypassing the storage
+   * provider's vocabulary cache, so validation sees another process's
+   * vocabulary change as soon as it is stored. Off by default: reads go
+   * through the provider cache, which bounds that staleness by its lifetime.
+   */
+  freshVocabulary?: boolean;
 }
 
 export class VocabularyEngine {
@@ -70,14 +109,13 @@ export class VocabularyEngine {
   private readonly storage: StorageProvider;
   private readonly governanceConfig: GovernanceConfig;
   private readonly deduplicator: SemanticDeduplicator;
-
-  /** Cached vocabulary — invalidated on mutation */
-  private cachedVocabulary: MemoryVocabulary | null = null;
+  private readonly freshVocabulary: boolean;
 
   constructor(config: VocabularyEngineConfig) {
     this.repositoryId = config.repositoryId;
     this.storage = config.storageProvider;
     this.governanceConfig = config.governanceConfig;
+    this.freshVocabulary = config.freshVocabulary ?? false;
     this.deduplicator = new SemanticDeduplicator({
       similarityThreshold: config.deduplicationThreshold,
       embeddingProvider: config.embeddingProvider,
@@ -85,20 +123,26 @@ export class VocabularyEngine {
   }
 
   /** Get the governance configuration for this repository */
-  getGovernanceConfig(): GovernanceConfig {
+  public getGovernanceConfig(): GovernanceConfig {
     return this.governanceConfig;
   }
 
-  /** Get the current vocabulary from storage (cached) */
-  async getVocabulary(): Promise<MemoryVocabulary> {
-    if (!this.cachedVocabulary) {
-      this.cachedVocabulary = await this.storage.getVocabulary(this.repositoryId);
-    }
-    return this.cachedVocabulary;
+  /**
+   * Read the vocabulary from storage. Every call reads through the storage
+   * provider, so the engine holds no copy of its own that could outlive a
+   * change another process (or another handle) made: staleness is bounded by
+   * the provider's vocabulary cache, or removed with `freshVocabulary`. A
+   * repository deleted since the handle was opened surfaces as the
+   * provider's `RepositoryNotFoundError` on any read that goes to the store.
+   */
+  public async getVocabulary(): Promise<MemoryVocabulary> {
+    return this.freshVocabulary
+      ? this.storage.getVocabulary(this.repositoryId, { fresh: true })
+      : this.storage.getVocabulary(this.repositoryId);
   }
 
   /** Get the resolved vocabulary with governance info */
-  async getResolvedVocabulary(): Promise<ResolvedVocabulary> {
+  public async getResolvedVocabulary(): Promise<ResolvedVocabulary> {
     const vocabulary = await this.getVocabulary();
     return {
       vocabulary,
@@ -107,19 +151,20 @@ export class VocabularyEngine {
     };
   }
 
-  /** Invalidate the cached vocabulary (call after external mutations) */
-  invalidateCache(): void {
-    this.cachedVocabulary = null;
-  }
-
-  /** Validate an entity creation input against the vocabulary */
-  async validateEntity(input: CreateEntityInput): Promise<ValidationResult> {
-    const vocabulary = await this.getVocabulary();
-    return validateEntity(input, vocabulary);
+  /**
+   * Validate an entity creation input against the vocabulary. Pass
+   * `vocabulary` to validate against one already read (a batch validates all
+   * of its members against a single read); otherwise the vocabulary is read.
+   */
+  public async validateEntity(
+    input: CreateEntityInput,
+    vocabulary?: MemoryVocabulary,
+  ): Promise<ValidationResult> {
+    return validateEntity(input, vocabulary ?? (await this.getVocabulary()));
   }
 
   /** Validate an entity update input against the vocabulary */
-  async validateEntityUpdate(
+  public async validateEntityUpdate(
     input: UpdateEntityInput,
     entityType: string,
   ): Promise<ValidationResult> {
@@ -139,18 +184,27 @@ export class VocabularyEngine {
     return validateEntityUpdate(input, typeDef, vocabulary);
   }
 
-  /** Validate a relationship creation input against the vocabulary */
-  async validateRelationship(
+  /**
+   * Validate a relationship creation input against the vocabulary. Pass
+   * `vocabulary` to validate against one already read (a batch validates all
+   * of its members against a single read); otherwise the vocabulary is read.
+   */
+  public async validateRelationship(
     input: CreateRelationshipInput,
     sourceEntityType: string,
     targetEntityType: string,
+    vocabulary?: MemoryVocabulary,
   ): Promise<ValidationResult> {
-    const vocabulary = await this.getVocabulary();
-    return validateRelationship(input, vocabulary, sourceEntityType, targetEntityType);
+    return validateRelationship(
+      input,
+      vocabulary ?? (await this.getVocabulary()),
+      sourceEntityType,
+      targetEntityType,
+    );
   }
 
   /** Get an entity type definition from the vocabulary */
-  async getEntityTypeDef(entityType: string): Promise<EntityTypeDefinition | null> {
+  public async getEntityTypeDef(entityType: string): Promise<EntityTypeDefinition | null> {
     const vocabulary = await this.getVocabulary();
     return getEntityTypeDef(entityType, vocabulary);
   }
@@ -158,7 +212,10 @@ export class VocabularyEngine {
   /**
    * Propose a vocabulary change (add, edit, or delete).
    * Runs deduplication for add proposals, then governance rules.
-   * For delete proposals, cascades data deletion if approved.
+   * For delete proposals, cascades data deletion if approved. A delete
+   * proposal for a type the vocabulary no longer declares re-runs the data
+   * deletion, so resending a deletion whose data step failed completes it
+   * (see `resumeTypeDeletion`).
    *
    * The write is compare-and-set against the version that was read. When a
    * concurrent writer changed the vocabulary in between, the whole proposal is
@@ -166,7 +223,7 @@ export class VocabularyEngine {
    * `VOCABULARY_WRITE_ATTEMPTS` times. If every attempt conflicts, the
    * `VocabularyVersionConflictError` propagates to the caller.
    */
-  async proposeChange(
+  public async proposeChange(
     proposal: VocabularyProposal,
     proposedBy: string,
   ): Promise<VocabularyProposalResult> {
@@ -184,8 +241,7 @@ export class VocabularyEngine {
   /**
    * One read → evaluate → compare-and-set write cycle for a proposal.
    *
-   * Reads the stored vocabulary fresh (bypassing both this engine's cache and
-   * any provider cache) so the version passed to `saveVocabulary` is the one
+   * Reads the stored vocabulary fresh (bypassing any provider cache) so the version passed to `saveVocabulary` is the one
    * actually stored, not a copy another process may have superseded.
    */
   private async attemptProposal(
@@ -193,6 +249,13 @@ export class VocabularyEngine {
     proposedBy: string,
   ): Promise<VocabularyProposalResult> {
     const vocabulary = await this.storage.getVocabulary(this.repositoryId, { fresh: true });
+
+    // Refuse unusable names and invalid property schemas before deduplication,
+    // which may call the embedding provider.
+    const declarationErrors = this.validateProposalDeclarations(proposal);
+    if (declarationErrors) {
+      return declarationErrors;
+    }
 
     // Only run deduplication for add proposals
     const isAddProposal =
@@ -221,19 +284,17 @@ export class VocabularyEngine {
       }
     }
 
-    // Validate property schemas in the proposal (e.g. embeddable only allowed on string)
-    const propertySchemaErrors = this.validateProposalPropertySchemas(proposal);
-    if (propertySchemaErrors) {
-      return propertySchemaErrors;
-    }
-
     // Process through governance
-    const { result, updatedVocabulary } = processProposal(
+    const { result, updatedVocabulary, changeRecord, typeAbsent } = processProposal(
       vocabulary,
       proposal,
       this.governanceConfig,
       { duplicates, proposedBy },
     );
+
+    if (typeAbsent) {
+      return this.resumeTypeDeletion(proposal, result, vocabulary);
+    }
 
     // Persist if approved
     if (result.status === 'approved' && updatedVocabulary) {
@@ -249,8 +310,12 @@ export class VocabularyEngine {
           },
         ]);
       }
-      await this.storage.saveVocabulary(this.repositoryId, updatedVocabulary, vocabulary.version);
-      this.cachedVocabulary = updatedVocabulary;
+      await this.storage.saveVocabulary(
+        this.repositoryId,
+        updatedVocabulary,
+        vocabulary.version,
+        changeRecord,
+      );
 
       // Delete proposals cascade only after the vocabulary write has landed.
       // The vocabulary is the source of truth: data left behind under a type
@@ -262,7 +327,7 @@ export class VocabularyEngine {
         proposal.proposalType === 'delete_relationship_type';
 
       if (isDeleteProposal) {
-        await this.cascadeDeleteData(proposal);
+        await this.cascadeDeleteData(proposal, result.type);
       }
     }
 
@@ -270,7 +335,7 @@ export class VocabularyEngine {
   }
 
   /** @deprecated Use proposeChange instead */
-  async proposeExtension(
+  public async proposeExtension(
     proposal: VocabularyProposal,
     proposedBy: string,
   ): Promise<VocabularyProposalResult> {
@@ -278,45 +343,104 @@ export class VocabularyEngine {
   }
 
   /**
+   * Finish deleting a type the stored vocabulary no longer declares.
+   *
+   * A type deletion stores the vocabulary first and deletes the type's data
+   * afterwards, so when the data step fails (a server timeout, a lost
+   * connection) the type is gone from the vocabulary but its data remains.
+   * Resending the proposal lands here: the data step runs again, against the
+   * vocabulary as it is. When it removed something, the deletion is complete
+   * and the proposal answers `approved` with the vocabulary's version as read
+   * after the data step; the vocabulary is not written again, so this call
+   * does not move the version and makes no second change-log record (the
+   * record was stored with the vocabulary change itself). When nothing was
+   * left, the type never existed or its deletion already finished, and
+   * governance's "not found" rejection stands.
+   *
+   * The governance check is exact, but a store may match type names more
+   * loosely (SQL Server's default collation ignores case and trailing
+   * spaces). A requested name that differs from a still-declared type only
+   * by case or surrounding whitespace (or, for a relationship type, by its
+   * SCREAMING_SNAKE_CASE form) is answered "not found" without the data
+   * step, so a near-miss name can never delete the data of a type the
+   * vocabulary still declares.
+   *
+   * The data step runs against the vocabulary read for this attempt. A
+   * concurrent proposal that re-adds the type before the data step runs has
+   * its new data deleted with the old: the same window the normal path has
+   * between its vocabulary write and its data step.
+   */
+  private async resumeTypeDeletion(
+    proposal: VocabularyProposal,
+    notFound: VocabularyProposalResult,
+    vocabulary: MemoryVocabulary,
+  ): Promise<VocabularyProposalResult> {
+    if (declaresNearMatch(proposal, notFound.type, vocabulary)) {
+      return notFound;
+    }
+    const { deletedEntities, deletedRelationships } = await this.cascadeDeleteData(
+      proposal,
+      notFound.type,
+    );
+    // An entity type's deletion is measured by its entities: the edges it
+    // removes only go with them, and a provider may not count those edges.
+    const removed =
+      proposal.proposalType === 'delete_entity_type' ? deletedEntities : (deletedRelationships ?? 0);
+    if (removed === 0) {
+      return notFound;
+    }
+    const current = await this.storage.getVocabulary(this.repositoryId, { fresh: true });
+    return { status: 'approved', type: notFound.type, vocabularyVersion: current.version };
+  }
+
+  /**
    * Cascade-delete all data for a deleted vocabulary type.
+   *
+   * `typeName` is the name governance resolved the proposal to (a
+   * relationship type normalised to SCREAMING_SNAKE_CASE), which is the name
+   * the data is stored under, rather than the name as proposed.
    *
    * `deletedRelationships` may be `undefined` when the underlying provider
    * does not count cascaded edges (see StorageProvider.deleteEntitiesByType).
-   * The return value is currently discarded by the only caller; the type is
-   * preserved for symmetry with the storage contract.
    */
   private async cascadeDeleteData(
     proposal: VocabularyProposal,
+    typeName: string,
   ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
-    if (proposal.proposalType === 'delete_entity_type' && proposal.deleteEntityType) {
-      return this.storage.deleteEntitiesByType(
-        this.repositoryId,
-        proposal.deleteEntityType.type,
-      );
+    if (proposal.proposalType === 'delete_entity_type') {
+      return this.storage.deleteEntitiesByType(this.repositoryId, typeName);
     }
 
-    if (proposal.proposalType === 'delete_relationship_type' && proposal.deleteRelationshipType) {
-      const result = await this.storage.deleteRelationshipsByType(
-        this.repositoryId,
-        proposal.deleteRelationshipType.type,
-      );
+    if (proposal.proposalType === 'delete_relationship_type') {
+      const result = await this.storage.deleteRelationshipsByType(this.repositoryId, typeName);
       return { deletedEntities: 0, deletedRelationships: result.deletedRelationships };
     }
 
     return { deletedEntities: 0, deletedRelationships: 0 };
   }
 
-  /** Validate all property schemas in a proposal — returns a rejected result on the first invalid schema, or undefined if all pass */
-  private validateProposalPropertySchemas(proposal: VocabularyProposal): VocabularyProposalResult | undefined {
+  /**
+   * Validate the names and property schemas a proposal declares: a new
+   * type's name, and every declared property's name and flags. Returns a
+   * rejected result on the first failure, or undefined if all pass. These
+   * rules hold on every storage provider, so a vocabulary can never declare
+   * a name that some provider could not write.
+   */
+  private validateProposalDeclarations(proposal: VocabularyProposal): VocabularyProposalResult | undefined {
     const schemas: PropertySchema[] = [];
     let typeName = '';
+    let owner: PropertyOwner = 'entity';
+    let newTypeName: ValidationResult | undefined;
 
     if (proposal.proposalType === 'entity_type' && proposal.entityType) {
       schemas.push(...(proposal.entityType.properties ?? []));
       typeName = proposal.entityType.type;
+      newTypeName = validateNewTypeName(typeName, 'entity');
     } else if (proposal.proposalType === 'relationship_type' && proposal.relationshipType) {
       schemas.push(...(proposal.relationshipType.properties ?? []));
       typeName = proposal.relationshipType.type;
+      owner = 'relationship';
+      newTypeName = validateNewTypeName(typeName, 'relationship');
     } else if (proposal.proposalType === 'edit_entity_type' && proposal.editEntityType) {
       schemas.push(...(proposal.editEntityType.addProperties ?? []));
       schemas.push(...(proposal.editEntityType.updateProperties ?? []));
@@ -325,10 +449,14 @@ export class VocabularyEngine {
       schemas.push(...(proposal.editRelationshipType.addProperties ?? []));
       schemas.push(...(proposal.editRelationshipType.updateProperties ?? []));
       typeName = proposal.editRelationshipType.type;
+      owner = 'relationship';
     }
 
-    for (const schema of schemas) {
-      const result = validatePropertySchema(schema);
+    const results = [
+      ...(newTypeName ? [newTypeName] : []),
+      ...schemas.map((schema) => validatePropertySchema(schema, owner)),
+    ];
+    for (const result of results) {
       if (!result.valid) {
         return {
           status: 'rejected',

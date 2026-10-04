@@ -5,6 +5,7 @@ import {
   validateRelationship,
   validatePropertyValue,
   validatePropertySchema,
+  validateNewTypeName,
   getEntityTypeDef,
   getRelationshipTypeDef,
 } from './VocabularyValidator.js';
@@ -362,35 +363,72 @@ describe('getEntityTypeDef / getRelationshipTypeDef', () => {
 
 describe('validatePropertySchema', () => {
   it('passes a string property without embeddable', () => {
-    const result = validatePropertySchema({ name: 'title', type: 'string', required: false });
+    const result = validatePropertySchema({ name: 'title', type: 'string', required: false }, 'entity');
     expect(result.valid).toBe(true);
   });
 
   it('passes a string property with embeddable: true', () => {
-    const result = validatePropertySchema({ name: 'content', type: 'string', required: false, embeddable: true });
+    const result = validatePropertySchema({ name: 'content', type: 'string', required: false, embeddable: true }, 'entity');
     expect(result.valid).toBe(true);
   });
 
   it('rejects embeddable on a number property', () => {
-    const result = validatePropertySchema({ name: 'count', type: 'number', required: false, embeddable: true });
+    const result = validatePropertySchema({ name: 'count', type: 'number', required: false, embeddable: true }, 'entity');
     expect(result.valid).toBe(false);
     expect(result.errors[0]?.message).toMatch(/cannot be embeddable/);
     expect(result.errors[0]?.message).toMatch(/"count"/);
   });
 
   it('rejects embeddable on a boolean property', () => {
-    const result = validatePropertySchema({ name: 'active', type: 'boolean', required: false, embeddable: true });
+    const result = validatePropertySchema({ name: 'active', type: 'boolean', required: false, embeddable: true }, 'entity');
     expect(result.valid).toBe(false);
     expect(result.errors[0]?.message).toMatch(/cannot be embeddable/);
   });
 
   it('rejects embeddable on a date property', () => {
-    const result = validatePropertySchema({ name: 'startDate', type: 'date', required: false, embeddable: true });
+    const result = validatePropertySchema({ name: 'startDate', type: 'date', required: false, embeddable: true }, 'entity');
     expect(result.valid).toBe(false);
   });
 
   it('rejects embeddable on an enum property', () => {
-    const result = validatePropertySchema({ name: 'status', type: 'enum', required: false, enumValues: ['a', 'b'], embeddable: true });
+    const result = validatePropertySchema({ name: 'status', type: 'enum', required: false, enumValues: ['a', 'b'], embeddable: true }, 'entity');
     expect(result.valid).toBe(false);
+  });
+
+  it('rejects a non-identifier property name', () => {
+    const result = validatePropertySchema({ name: 'start-date', type: 'string', required: false }, 'entity');
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]?.field).toBe('properties.start-date');
+    expect(result.errors[0]?.message).toMatch(/not a valid identifier/);
+  });
+
+  it('rejects a reserved property name for the owner it is reserved on', () => {
+    expect(validatePropertySchema({ name: 'label', type: 'string', required: false }, 'entity').valid).toBe(false);
+    expect(validatePropertySchema({ name: 'label', type: 'string', required: false }, 'relationship').valid).toBe(false);
+    expect(validatePropertySchema({ name: 'slug', type: 'string', required: false }, 'entity').valid).toBe(false);
+    expect(validatePropertySchema({ name: 'slug', type: 'string', required: false }, 'relationship').valid).toBe(true);
+  });
+});
+
+describe('validateNewTypeName', () => {
+  it('accepts identifier-shaped type names', () => {
+    expect(validateNewTypeName('Person', 'entity').valid).toBe(true);
+    expect(validateNewTypeName('works on', 'relationship').valid).toBe(true);
+  });
+
+  it.each(['start-date', '2ND_DEGREE', 'Board Meeting', ''])('rejects entity type name %j', (name) => {
+    const result = validateNewTypeName(name, 'entity');
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]?.message).toMatch(/not a valid identifier/);
+  });
+
+  it('checks a relationship type in the form it is stored under', () => {
+    const result = validateNewTypeName('2nd degree', 'relationship');
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]?.message).toContain('2ND_DEGREE');
+  });
+
+  it('rejects a relationship type name with nothing left after normalisation', () => {
+    expect(validateNewTypeName('---', 'relationship').valid).toBe(false);
   });
 });

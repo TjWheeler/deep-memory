@@ -29,7 +29,7 @@ import type {
   StoredEntity,
   StoredRelationship,
 } from '@utaba/deep-memory/types';
-import { DeepMemoryError, ProviderError } from '@utaba/deep-memory';
+import { DeepMemoryError, DuplicateRelationshipError, ProviderError } from '@utaba/deep-memory';
 import type { DeepMemoryErrorCode } from '@utaba/deep-memory';
 import {
   buildEntityPropertyLadder,
@@ -139,6 +139,23 @@ export async function* exportAll(
  * Import entities, then relationships, one write per row through the
  * adaptive pool.
  *
+ * Relationship ids:
+ * - `skipExistenceCheck: true` (insert) writes each edge without looking for
+ *   its id. A repository's vertices and edges share its partition, where ids
+ *   are unique, so an id already stored — or repeated within the call — is
+ *   refused by the store with a 409 and recorded as
+ *   `RELATIONSHIP_ALREADY_EXISTS`.
+ * - `skipExistenceCheck: false` (upsert) updates an existing edge in place
+ *   when it has the row's id, type and endpoints. An id held by an edge of
+ *   another type or between other endpoints (or by a vertex) is refused with
+ *   `RELATIONSHIP_ALREADY_EXISTS` and nothing is written, so the stored
+ *   `relationshipType`, `sourceEntityId` and `targetEntityId` always agree
+ *   with the edge's label and endpoints. The endpoints are checked first: a
+ *   row with a missing endpoint reports `ENTITY_NOT_FOUND` even when its id
+ *   is in use. A row refused with a 409 is submitted once more, so an id
+ *   repeated within the call with the same type and endpoints updates the
+ *   edge its first occurrence wrote rather than being refused.
+ *
  * Error policy:
  * - A row that fails because of its own contents — a property the mapping
  *   refuses, a write the server rejects for that document (see
@@ -220,10 +237,12 @@ export async function importBulk(
           writeRow(conn, {
             item: `relationship:${rel.id}`,
             conflictCode: 'RELATIONSHIP_ALREADY_EXISTS',
+            conflictMessage: new DuplicateRelationshipError(rel.id).message,
             buildStatement: () =>
               skipCheck
                 ? insertRelationshipStatement(repositoryId, rel)
                 : upsertRelationshipStatement(repositoryId, rel),
+            resubmitOnConflict: !skipCheck,
             // Both statements start from the source vertex and attach to the
             // target vertex; when either is missing they match nothing, write
             // nothing and return no rows.
@@ -273,6 +292,19 @@ interface RowWrite {
   item: string;
   /** Code for a 409: the row's id is already taken. */
   conflictCode: DeepMemoryErrorCode;
+  /**
+   * Message for a 409, in place of the store's own wording, so the row error
+   * reads the same as the other providers report it.
+   */
+  conflictMessage?: string;
+  /**
+   * Submit the statement once more after a 409. An upsert's update branch
+   * only sees an edge that existed when its request ran, so a row whose id
+   * another row of the same import created a moment earlier takes the
+   * create branch and is refused; the second submit finds that edge and
+   * updates it when it is the same edge, and is refused again when it is not.
+   */
+  resubmitOnConflict?: boolean;
   buildStatement: () => GremlinStatement;
   /** The row's error when the statement succeeds but returns nothing. */
   onEmptyResult?: () => BulkImportItemError;
@@ -295,24 +327,25 @@ async function writeRow(conn: CosmosDbConnection, row: RowWrite): Promise<BulkIm
     return { item, error: err.message, code: err.code };
   }
 
-  let result: GremlinResult;
-  try {
-    result = await conn.submit(statement.query, statement.bindings);
-  } catch (err: unknown) {
-    if (err instanceof DeepMemoryError || isTransientError(err)) throw err;
-    const message = err instanceof Error ? err.message : String(err);
-    if (isRowShapedSubmitFailure(err)) {
-      return {
-        item,
-        error: message,
-        code: cosmosStatusCode(err) === 409 ? row.conflictCode : 'PROVIDER_ERROR',
-      };
+  let result: GremlinResult | undefined;
+  for (let attempt = 1; result === undefined; attempt++) {
+    try {
+      result = await conn.submit(statement.query, statement.bindings);
+    } catch (err: unknown) {
+      if (err instanceof DeepMemoryError || isTransientError(err)) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      if (isRowShapedSubmitFailure(err)) {
+        const conflict = cosmosStatusCode(err) === 409;
+        if (conflict && row.resubmitOnConflict === true && attempt === 1) continue;
+        if (conflict) return { item, error: row.conflictMessage ?? message, code: row.conflictCode };
+        return { item, error: message, code: 'PROVIDER_ERROR' };
+      }
+      throw new ProviderError(
+        `CosmosDB import stopped at ${item}: ${message}`,
+        'The store failed rather than this row; rows written before it remain. Check the CosmosDB account, database and container are reachable, then re-run the import (an upsert import is idempotent).',
+        { cause: err },
+      );
     }
-    throw new ProviderError(
-      `CosmosDB import stopped at ${item}: ${message}`,
-      'The store failed rather than this row; rows written before it remain. Check the CosmosDB account, database and container are reachable, then re-run the import (an upsert import is idempotent).',
-      { cause: err },
-    );
   }
   if (result.items.length === 0 && row.onEmptyResult !== undefined) return row.onEmptyResult();
   return undefined;
@@ -356,13 +389,25 @@ const UPSERT_ENTITY_CREATE_BRANCH =
 const UPSERT_ENTITY_QUERY =
   `${UPSERT_ENTITY_OPEN}${UPSERT_ENTITY_CREATE_BRANCH})`;
 
+// The relationship upsert fetches both endpoints in its first, index-backed
+// step, labels the target `t` and continues from the source. The update
+// branch matches only the edge the row describes: the row's id, leaving the
+// source with the row's label and arriving at the row's target. An id held
+// by anything else (an edge of another type or between other endpoints, or
+// a vertex) fails that branch, and the create branch's `addE` is refused by
+// the store with a 409, because a repository's vertices and edges share its
+// partition and the id is unique there. So the update never rewrites
+// `relationshipType`, `sourceEntityId` or `targetEntityId` to values that
+// contradict the edge's label and endpoints. A missing endpoint leaves no
+// traverser and the statement returns no rows.
 const UPSERT_RELATIONSHIP_OPEN =
-  `g.E().has('repositoryId', rid).hasId(relId).fold().coalesce(` +
-  `unfold()${RELATIONSHIP_LADDER_CHAIN}`;
+  `g.V().has('repositoryId', rid).hasId(within(srcId, tgtId)).has('entityType').fold().as('vs')` +
+  `.unfold().hasId(tgtId).as('t')` +
+  `.select('vs').unfold().hasId(srcId)` +
+  `.coalesce(__.outE(edgeLabel).hasId(relId).where(__.inV().hasId(tgtId))${RELATIONSHIP_LADDER_CHAIN}`;
 
 const UPSERT_RELATIONSHIP_CREATE_BRANCH =
-  `, g.V().has('repositoryId', rid).hasId(srcId).has('entityType').addE(edgeLabel)` +
-  `.to(g.V().has('repositoryId', rid).hasId(tgtId).has('entityType'))` +
+  `, __.addE(edgeLabel).to('t')` +
   `.property('id', relId).property('repositoryId', rid)${RELATIONSHIP_LADDER_CHAIN}`;
 
 const UPSERT_RELATIONSHIP_QUERY =
@@ -516,10 +561,12 @@ function upsertEntityStatement(
 
 /**
  * Build the statement that upserts a relationship using Gremlin's coalesce pattern — single query.
- * Replaces the old 2-query check-then-create/update approach.
  *
- * The E() lookup is scoped by repositoryId so an edge with the same id in a
- * different repo cannot be matched and silently overwritten.
+ * Every lookup is scoped by repositoryId, so an edge with the same id in a
+ * different repository cannot be matched and overwritten. An existing edge
+ * is updated only when it has the row's type and endpoints; an id in use by
+ * anything else is refused by the store with a 409 (see
+ * `UPSERT_RELATIONSHIP_OPEN`), recorded as `RELATIONSHIP_ALREADY_EXISTS`.
  *
  * User-property dual-write contract: same shape as `upsertEntity` above —
  * native-storable values in `relationship.properties` project to per-key

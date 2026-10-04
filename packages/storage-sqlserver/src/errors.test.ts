@@ -4,11 +4,13 @@ import {
   DuplicateRelationshipError,
   DuplicateRepositoryError,
   ImportError,
+  InvalidInputError,
   ProviderError,
   SlugConflictError,
 } from '@utaba/deep-memory';
 import {
   importFailure,
+  importRowRejected,
   isForeignKeyViolation,
   mapUniqueViolation,
   readUniqueViolation,
@@ -185,6 +187,21 @@ describe('importFailure', () => {
     expect((err.cause as SlugConflictError).cause).toBe(SLUG_INDEX_VIOLATION);
   });
 
+  it('wraps a refusal the import raised itself as ImportError with that refusal as cause', () => {
+    const refusal = new DuplicateRelationshipError('r1');
+    const err = importFailure(refusal, { item: 'relationship:r1', context: { kind: 'relationship', relationshipId: 'r1' } }, undefined);
+    expect(err).toBeInstanceOf(ImportError);
+    expect(err.message).toMatch(/^SQL Server import rolled back: relationship:r1 failed: Relationship "r1" already exists/);
+    expect(err.cause).toBe(refusal);
+  });
+
+  it('wraps a typed failure that is not a row refusal as ProviderError', () => {
+    const inner = new ProviderError('no row count');
+    const err = importFailure(inner, { item: 'relationship:r1', context: { kind: 'relationship', relationshipId: 'r1' } }, undefined);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect(err.cause).toBe(inner);
+  });
+
   it('wraps any other failure as ProviderError with the native error as cause', () => {
     const native = sqlError(547, 'FOREIGN KEY conflict');
     const err = importFailure(native, { item: 'relationship:r1', context: { kind: 'relationship', relationshipId: 'r1' } }, undefined);
@@ -205,5 +222,16 @@ describe('importFailure', () => {
     const err = importFailure(native, undefined, undefined);
     expect(err).toBeInstanceOf(ProviderError);
     expect(err.message).toContain('the commit failed');
+  });
+});
+
+describe('importRowRejected', () => {
+  it('names the row and keeps the InvalidInputError as cause', () => {
+    const refusal = new InvalidInputError('properties.start-date', 'Property name "start-date" is not a valid identifier');
+    const err = importRowRejected({ item: 'entity:e1', context: ENTITY }, refusal);
+    expect(err).toBeInstanceOf(ImportError);
+    expect(err.message).toMatch(/^SQL Server import refused: entity:e1 failed: Property name "start-date"/);
+    expect(err.suggestion).toContain('Nothing from this import was written');
+    expect(err.cause).toBe(refusal);
   });
 });

@@ -7,6 +7,10 @@
 // batches, and a hub entity with more outgoing edges than one inner
 // transaction holds makes one batch commit several inner transactions. The
 // counts the calls return and report as progress must still be exact.
+// `deleteEntitiesByType` and `deleteRelationshipsByType` delete in the same
+// batches, under the same per-statement edge cap, and their counts must be
+// exact too, self-loops included: the vocabulary engine decides whether a
+// resent type deletion removed anything from them.
 //
 // The entity drain's `DETACH DELETE` removes any edge the relationship drain
 // left behind, so exact final counts alone would not show a cursor that
@@ -207,6 +211,116 @@ if (NEO4J_URI) {
       const stats = await provider.getRepositoryStats(repositoryId);
       expect(stats.entityCount).toBe(0);
       expect(stats.relationshipCount).toBe(0);
+    }, 120_000);
+
+    /** Two `Place` entities, one `KNOWS` edge from a person to a place, and two `LIKES` edges between people. */
+    async function addOtherTypes(repositoryId: string): Promise<void> {
+      const places: StoredEntity[] = ['place-a', 'place-b'].map((id) => ({
+        ...makeEntity(id),
+        slug: `place:${id}`,
+        entityType: 'Place',
+      }));
+      await provider.importBulk(repositoryId, [{ entities: places }]);
+      await provider.importBulk(repositoryId, [
+        {
+          relationships: [
+            makeRelationship('person-to-place', entityId(0), 'place-a'),
+            { ...makeRelationship('likes-1', entityId(1), entityId(2)), relationshipType: 'LIKES' },
+            { ...makeRelationship('likes-2', entityId(ENTITIES - 1), entityId(3)), relationshipType: 'LIKES' },
+          ],
+        },
+      ]);
+    }
+
+    it('deleteEntitiesByType removes a type larger than one batch and counts it exactly', async () => {
+      const repositoryId = await populatedRepository();
+      await addOtherTypes(repositoryId);
+
+      // Every person-to-person edge, the edge to a place and both LIKES edges go with the people.
+      await expect(provider.deleteEntitiesByType(repositoryId, 'Person')).resolves.toEqual({
+        deletedEntities: ENTITIES,
+        deletedRelationships: EXPECTED.deletedRelationships + 3,
+      });
+
+      const stats = await provider.getRepositoryStats(repositoryId);
+      expect(stats.entityCount).toBe(2);
+      expect(stats.relationshipCount).toBe(0);
+      expect(stats.entityTypeBreakdown).toEqual({ Place: 2 });
+      await expect(provider.deleteEntitiesByType(repositoryId, 'Person')).resolves.toEqual({
+        deletedEntities: 0,
+        deletedRelationships: 0,
+      });
+    }, 120_000);
+
+    it('deleteEntitiesByType drains a hub of the deleted type by repeating its batch at the edge cap, and counts it exactly', async () => {
+      const repositoryId = await populatedRepository();
+      await addOtherTypes(repositoryId);
+
+      // The hub is a Person with more edges than the small cap: its batch
+      // deletes edges at the cap until they run out, then deletes the people.
+      await expect(smallCapProvider.deleteEntitiesByType(repositoryId, 'Person')).resolves.toEqual({
+        deletedEntities: ENTITIES,
+        deletedRelationships: EXPECTED.deletedRelationships + 3,
+      });
+
+      const stats = await provider.getRepositoryStats(repositoryId);
+      expect(stats.entityCount).toBe(2);
+      expect(stats.relationshipCount).toBe(0);
+      expect(stats.entityTypeBreakdown).toEqual({ Place: 2 });
+    }, 120_000);
+
+    it('the by-type deletes count a self-loop once', async () => {
+      const repositoryId = randomUUID();
+      repositoryIds.push(repositoryId);
+      await provider.createRepository({
+        repositoryId,
+        label: 'self-loop test',
+        governanceConfig: { mode: 'open' },
+        createdAt: new Date().toISOString(),
+        createdBy: 'drain-test',
+      });
+      const place = { ...makeEntity('loop-place'), slug: 'place:loop-place', entityType: 'Place' };
+      await provider.importBulk(repositoryId, [{ entities: [makeEntity('loop-a'), makeEntity('loop-b'), place] }]);
+      await provider.importBulk(repositoryId, [
+        {
+          relationships: [
+            makeRelationship('knows-self', 'loop-a', 'loop-a'),
+            makeRelationship('knows-other', 'loop-a', 'loop-b'),
+            { ...makeRelationship('likes-self', 'loop-b', 'loop-b'), relationshipType: 'LIKES' },
+            { ...makeRelationship('likes-place', 'loop-place', 'loop-place'), relationshipType: 'LIKES' },
+          ],
+        },
+      ]);
+
+      await expect(provider.deleteRelationshipsByType(repositoryId, 'KNOWS')).resolves.toEqual({
+        deletedRelationships: 2,
+      });
+      // The people take their one remaining self-loop with them; the place keeps its own.
+      await expect(provider.deleteEntitiesByType(repositoryId, 'Person')).resolves.toEqual({
+        deletedEntities: 2,
+        deletedRelationships: 1,
+      });
+
+      const stats = await provider.getRepositoryStats(repositoryId);
+      expect(stats.entityTypeBreakdown).toEqual({ Place: 1 });
+      expect(stats.relationshipTypeBreakdown).toEqual({ LIKES: 1 });
+    }, 60_000);
+
+    it('deleteRelationshipsByType removes a type across many cursor batches, repeating a hub batch, and counts it exactly', async () => {
+      const repositoryId = await populatedRepository();
+      await addOtherTypes(repositoryId);
+
+      // The small edge cap makes the hub's batch repeat; the person-to-place edge is a KNOWS edge too.
+      await expect(smallCapProvider.deleteRelationshipsByType(repositoryId, 'KNOWS')).resolves.toEqual({
+        deletedRelationships: EXPECTED.deletedRelationships + 1,
+      });
+
+      const stats = await provider.getRepositoryStats(repositoryId);
+      expect(stats.entityCount).toBe(ENTITIES + 2);
+      expect(stats.relationshipTypeBreakdown).toEqual({ LIKES: 2 });
+      await expect(provider.deleteRelationshipsByType(repositoryId, 'KNOWS')).resolves.toEqual({
+        deletedRelationships: 0,
+      });
     }, 120_000);
   });
 } else {

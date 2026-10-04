@@ -1,21 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderError } from '@utaba/deep-memory';
-import type { StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
+import { InvalidInputError, ProviderError, RESERVED_ENTITY_PROPERTY_KEYS } from '@utaba/deep-memory';
+import type { StoredEntity, StoredRelationship, VocabularyChangeRecord } from '@utaba/deep-memory/types';
 import {
   assertSafeRelationshipType,
   assertSafeUserPropertyKey,
   bigintToSafeNumber,
   buildRelationshipProjection,
+  changeRecordFromProperties,
+  changeRecordToProperties,
   entityFromProperties,
   entityFromRecord,
   entityToParams,
+  entityUpdatePropertyParams,
   entityUserPropertyParams,
   isNativeStorableValue,
   relationshipFromProperties,
   relationshipFromRecord,
   relationshipToParams,
   repositoryFromRecord,
-  RESERVED_ENTITY_PROPERTY_KEYS,
   STORED_ENTITY_FIELDS,
   STORED_RELATIONSHIP_FIELDS,
   WRITE_ATTEMPT_PROPERTY,
@@ -193,7 +195,7 @@ describe('entityFromProperties', () => {
     expect('embedding' in entity).toBe(false);
   });
 
-  it('prefers the JSON properties blob over per-scalar copies (O1 resolution)', () => {
+  it('prefers the JSON properties blob over per-scalar copies', () => {
     // The schema stores indexed scalars separately AND a JSON blob; the JSON
     // blob is the source of truth so user-supplied keys round-trip even if
     // the scalar copies drift.
@@ -394,17 +396,26 @@ describe('assertSafeUserPropertyKey', () => {
   });
 
   it('rejects keys that are not bare Cypher identifiers', () => {
-    expect(() => assertSafeUserPropertyKey('has-dash')).toThrowError(ProviderError);
-    expect(() => assertSafeUserPropertyKey('has space')).toThrowError(ProviderError);
-    expect(() => assertSafeUserPropertyKey('1leading-digit')).toThrowError(ProviderError);
-    expect(() => assertSafeUserPropertyKey('')).toThrowError(ProviderError);
-    expect(() => assertSafeUserPropertyKey('a.b')).toThrowError(ProviderError);
+    expect(() => assertSafeUserPropertyKey('has-dash')).toThrowError(InvalidInputError);
+    expect(() => assertSafeUserPropertyKey('has space')).toThrowError(InvalidInputError);
+    expect(() => assertSafeUserPropertyKey('1leading-digit')).toThrowError(InvalidInputError);
+    expect(() => assertSafeUserPropertyKey('')).toThrowError(InvalidInputError);
+    expect(() => assertSafeUserPropertyKey('a.b')).toThrowError(InvalidInputError);
   });
 
   it('rejects keys that collide with reserved schema field names', () => {
     for (const reserved of RESERVED_ENTITY_PROPERTY_KEYS) {
-      expect(() => assertSafeUserPropertyKey(reserved)).toThrowError(ProviderError);
+      expect(() => assertSafeUserPropertyKey(reserved)).toThrowError(InvalidInputError);
     }
+  });
+
+  it('names the refused key as the input field, with code INVALID_INPUT', () => {
+    expect(() => assertSafeUserPropertyKey('has-dash')).toThrowError(
+      expect.objectContaining({ code: 'INVALID_INPUT', field: 'properties.has-dash' }),
+    );
+    expect(() => assertSafeUserPropertyKey('label')).toThrowError(
+      expect.objectContaining({ code: 'INVALID_INPUT', field: 'properties.label' }),
+    );
   });
 });
 
@@ -466,14 +477,37 @@ describe('entityUserPropertyParams', () => {
     ).toEqual({ scalar: 'kept' });
   });
 
-  it('throws ProviderError on a reserved-key collision (no silent overwrite of a schema field)', () => {
-    expect(() => entityUserPropertyParams({ entityType: 'forced' })).toThrowError(ProviderError);
-    expect(() => entityUserPropertyParams({ slug: 'forced' })).toThrowError(ProviderError);
-    expect(() => entityUserPropertyParams({ createdBy: 'forced' })).toThrowError(ProviderError);
+  it('throws InvalidInputError on a reserved-key collision (no silent overwrite of a schema field)', () => {
+    expect(() => entityUserPropertyParams({ entityType: 'forced' })).toThrowError(InvalidInputError);
+    expect(() => entityUserPropertyParams({ slug: 'forced' })).toThrowError(InvalidInputError);
+    expect(() => entityUserPropertyParams({ createdBy: 'forced' })).toThrowError(InvalidInputError);
   });
 
-  it('throws ProviderError on a malformed key (defence in depth at the write seam)', () => {
-    expect(() => entityUserPropertyParams({ 'bad-key': 'x' })).toThrowError(ProviderError);
+  it('throws InvalidInputError on a malformed key (defence in depth at the write seam)', () => {
+    expect(() => entityUserPropertyParams({ 'bad-key': 'x' })).toThrowError(InvalidInputError);
+  });
+});
+
+describe('entityUpdatePropertyParams', () => {
+  it('leaves an unchanged stored key the rules refuse out of the native map instead of refusing it', () => {
+    const stored = { 'bad-key': { nested: [1] }, slug: 'user value', ok: 1 };
+
+    expect(entityUpdatePropertyParams({ 'bad-key': { nested: [1] }, slug: 'user value', ok: 2 }, stored)).toEqual({
+      ok: 2,
+    });
+  });
+
+  it('refuses a key the rules refuse when it is new or its value changes', () => {
+    expect(() => entityUpdatePropertyParams({ 'bad-key': 'x' }, {})).toThrowError(InvalidInputError);
+    expect(() => entityUpdatePropertyParams({ slug: 'changed' }, { slug: 'user value' })).toThrowError(
+      InvalidInputError,
+    );
+  });
+
+  it('projects valid keys as entityUserPropertyParams does', () => {
+    expect(entityUpdatePropertyParams({ city: 'Berlin', nested: { a: 1 } }, { city: 'Paris' })).toEqual({
+      city: 'Berlin',
+    });
   });
 });
 
@@ -521,12 +555,49 @@ describe('assertSafeRelationshipType', () => {
   });
 
   it('rejects values containing characters Cypher would interpret as syntax', () => {
-    expect(() => assertSafeRelationshipType('WORKS AT')).toThrowError(ProviderError);
-    expect(() => assertSafeRelationshipType('WORKS-AT')).toThrowError(ProviderError);
-    expect(() => assertSafeRelationshipType('1KNOWS')).toThrowError(ProviderError);
-    expect(() => assertSafeRelationshipType('KNOWS`')).toThrowError(ProviderError);
-    expect(() => assertSafeRelationshipType('a]->(b)')).toThrowError(ProviderError);
-    expect(() => assertSafeRelationshipType('')).toThrowError(ProviderError);
+    expect(() => assertSafeRelationshipType('WORKS AT')).toThrowError(InvalidInputError);
+    expect(() => assertSafeRelationshipType('WORKS-AT')).toThrowError(InvalidInputError);
+    expect(() => assertSafeRelationshipType('1KNOWS')).toThrowError(InvalidInputError);
+    expect(() => assertSafeRelationshipType('KNOWS`')).toThrowError(InvalidInputError);
+    expect(() => assertSafeRelationshipType('a]->(b)')).toThrowError(InvalidInputError);
+    expect(() => assertSafeRelationshipType('')).toThrowError(InvalidInputError);
+  });
+
+  it('names relationshipType as the input field', () => {
+    expect(() => assertSafeRelationshipType('WORKS-AT')).toThrowError(
+      expect.objectContaining({ code: 'INVALID_INPUT', field: 'relationshipType' }),
+    );
+  });
+});
+
+// ─── Relationship property keys ─────────────────────────────────────
+
+describe('relationshipToParams property keys', () => {
+  const rel = (properties: Record<string, unknown>): StoredRelationship => ({
+    ...relationshipFromProperties(FULL_REL_PROPS),
+    properties,
+  });
+
+  it('accepts identifier keys that are not reserved', () => {
+    expect(relationshipToParams(rel({ weight: 1 }))['properties']).toBe('{"weight":1}');
+  });
+
+  it('refuses a reserved or non-identifier key as an input error on that key', () => {
+    for (const key of ['label', 'sourceEntityId', 'has-dash']) {
+      expect(() => relationshipToParams(rel({ [key]: 'x' }))).toThrowError(
+        expect.objectContaining({ code: 'INVALID_INPUT', field: `properties.${key}` }),
+      );
+    }
+  });
+});
+
+// ─── Reserved names cover the node layout ───────────────────────────
+
+describe('core reserved property names', () => {
+  it('include every schema-managed field on an entity node', () => {
+    for (const field of [...STORED_ENTITY_FIELDS, 'repositoryId', 'embedding', WRITE_ATTEMPT_PROPERTY]) {
+      expect(RESERVED_ENTITY_PROPERTY_KEYS.has(field)).toBe(true);
+    }
   });
 });
 
@@ -536,8 +607,8 @@ describe('write token property', () => {
   it('is reserved, so it cannot be written or filtered as an entity property', () => {
     expect(WRITE_ATTEMPT_PROPERTY).toBe('_attempt');
     expect(RESERVED_ENTITY_PROPERTY_KEYS.has('_attempt')).toBe(true);
-    expect(() => assertSafeUserPropertyKey('_attempt')).toThrowError(ProviderError);
-    expect(() => entityUserPropertyParams({ _attempt: 'forged' })).toThrowError(ProviderError);
+    expect(() => assertSafeUserPropertyKey('_attempt')).toThrowError(InvalidInputError);
+    expect(() => entityUserPropertyParams({ _attempt: 'forged' })).toThrowError(InvalidInputError);
   });
 
   it('is never projected by the entity or relationship read projections', () => {
@@ -563,5 +634,38 @@ describe('write token property', () => {
     expect(JSON.stringify(entity)).not.toContain('token');
     expect(JSON.stringify(relationship)).not.toContain('token');
     expect(JSON.stringify(repository)).not.toContain('token');
+  });
+});
+
+describe('changeRecordToProperties', () => {
+  const FULL: VocabularyChangeRecord = {
+    changeId: 'c1',
+    changeType: 'entity_type_removed',
+    typeName: 'person',
+    previousVersion: '1.0.0',
+    newVersion: '2.0.0',
+    proposedBy: 'agent-a',
+    proposedAt: '2026-01-01T00:00:00.000Z',
+    approvedBy: 'agent-b',
+    approvedAt: '2026-01-01T00:00:01.000Z',
+    reason: 'no longer used',
+  };
+
+  it('stores every field, and reads back as the same record', () => {
+    expect(changeRecordFromProperties(changeRecordToProperties(FULL))).toEqual(FULL);
+  });
+
+  it('leaves an absent optional field absent rather than null', () => {
+    const { previousVersion: _p, approvedBy: _b, approvedAt: _a, ...minimal } = FULL;
+    const props = changeRecordToProperties(minimal);
+    expect(Object.keys(props).sort()).toEqual(
+      ['changeId', 'changeType', 'newVersion', 'proposedAt', 'proposedBy', 'reason', 'typeName'],
+    );
+    expect(changeRecordFromProperties(props)).toEqual(minimal);
+  });
+
+  it('copies only the record fields', () => {
+    const extra = { ...FULL, repositoryId: 'r1' } as VocabularyChangeRecord;
+    expect(changeRecordToProperties(extra)).not.toHaveProperty('repositoryId');
   });
 });

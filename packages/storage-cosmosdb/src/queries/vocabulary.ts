@@ -15,6 +15,11 @@
 //     filter and the property writes are one traversal, so two writers that
 //     read the same base version cannot both land — the second matches no
 //     vertex and writes nothing.
+//   - Each change record is a `_vocabularyChangeLog` vertex, id
+//     `vocablog:<changeId>`, in the repository's partition. Only
+//     `saveVocabulary` writes one, in the same traversal as the vocabulary
+//     write it describes. `deleteRepository` drains it with the other system
+//     vertices; `deleteAllContents` keeps it, with the vocabulary.
 
 import { cosmosStatusCode } from '../CosmosDbConnection.js';
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
@@ -26,8 +31,13 @@ import {
   RepositoryNotFoundError,
   VocabularyVersionConflictError,
 } from '@utaba/deep-memory';
-import { changeRecordFromGremlin, pluckDocValue } from '../mapping.js';
-import { repoVertexId, vocabVertexId } from './ids.js';
+import {
+  buildChangeRecordPropertyLadder,
+  changeRecordFromGremlin,
+  changeRecordToLadderBindings,
+  pluckDocValue,
+} from '../mapping.js';
+import { changeLogVertexId, repoVertexId, vocabVertexId } from './ids.js';
 
 /**
  * Whether a failed write lost a race rather than failed outright. The Cosmos
@@ -142,42 +152,102 @@ export async function getVocabulary(
   return parseStoredVocabulary(json);
 }
 
-// Compare-and-set write. Partition predicate first (hasId alone fans out
-// across partitions); the version filter sits before the property writes so
-// a stale `expectedVersion` matches nothing and writes nothing. `count()`
-// reports how many vertices were written: 1 on success, 0 otherwise.
-export const VOCABULARY_SAVE_QUERY =
-  "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_vocabulary').has('version', expectedVersion)" +
-  ".property('version', newVersion).property('vocabulary', vocabJson).count()";
+// Compare-and-set write, up to and including the vocabulary property writes.
+// The marker and the vocabulary vertex are fetched by id in the first,
+// partition-scoped step (hasId alone fans out across partitions) and folded;
+// the traversal continues only past the marker, so a repository whose marker
+// a delete has already dropped is not written. The version filter sits before
+// the property writes, so a stale `expectedVersion` matches nothing and writes
+// nothing. `hasNot('entityType')` keeps entity vertices from passing for
+// either system vertex (an entity's type is its label, so one can carry
+// either label).
+const VOCABULARY_CAS_WRITE =
+  "g.V().has('repositoryId', rid).hasId(within(mid, vid)).fold().as('vs')" +
+  ".unfold().hasLabel('_repository').hasNot('entityType')" +
+  ".select('vs').unfold().hasId(vid).hasLabel('_vocabulary').hasNot('entityType').has('version', expectedVersion)" +
+  ".property('version', newVersion).property('vocabulary', vocabJson)";
 
-// Follow-up read on a compare-and-set miss. It reads the `version` property
-// and the blob together: a vertex written by an earlier provider release has
-// no `version` property, and `values('version')` alone would return nothing
-// for it — indistinguishable from a missing vertex.
+// The change-record vertex the compare-and-set write adds, with its fixed
+// `vocablog:<changeId>` id (bound as `lid`) and its partition key. The id and
+// the partition key are written only when the vertex is added.
+const CHANGE_RECORD_ADD = "addV('_vocabularyChangeLog').property('id', lid).property('repositoryId', rid)";
+
+// The record's properties. The ladder's optional slots are `choose` steps,
+// and each one that writes is a document write of its own, so a request that
+// fails part-way can leave a record holding only some of its properties.
+const CHANGE_RECORD_LADDER = buildChangeRecordPropertyLadder();
+
+// The compare-and-set write without a change record. `count()` reports how
+// many vertices were written: 1 on success, 0 otherwise.
+export const VOCABULARY_SAVE_QUERY = `${VOCABULARY_CAS_WRITE}.count()`;
+
+// The compare-and-set write with its change record, in one traversal: the
+// record vertex is added only by the traverser that passed the marker and the
+// version filter and wrote the vocabulary, so a missing repository or a stale
+// version writes neither. The record is added after the vocabulary writes: a
+// write that loses a race for the vocabulary vertex fails (412) before the
+// record exists. `count()` is 1 when both landed, 0 when nothing was written.
+export const VOCABULARY_SAVE_WITH_CHANGE_QUERY = `${VOCABULARY_CAS_WRITE}.${CHANGE_RECORD_ADD}${CHANGE_RECORD_LADDER}.count()`;
+
+// Follow-up read on a compare-and-set miss: the marker and the vocabulary
+// vertex by id, each projected to its id, `version` property and blob. It reads
+// the `version` property and the blob together: a vertex written by an earlier
+// provider release has no `version` property, and `values('version')` alone
+// would return nothing for it — indistinguishable from a missing vertex.
 export const VOCABULARY_STATE_QUERY =
-  "g.V().has('repositoryId', rid).hasId(vid).hasLabel('_vocabulary')" +
-  ".project('version', 'json')" +
+  "g.V().has('repositoryId', rid).hasId(within(mid, vid)).hasLabel('_repository', '_vocabulary').hasNot('entityType')" +
+  ".project('id', 'version', 'json').by(id)" +
   ".by(coalesce(values('version'), constant('')))" +
   ".by(coalesce(values('vocabulary'), constant('')))";
 
+// Write the change record unless it is already stored, only while the marker
+// exists: the marker and the record are fetched by id in the first step, and
+// past the marker `coalesce` finds an existing record or adds one. Used when a
+// retried compare-and-set finds its own vocabulary already stored, so the
+// record lands exactly once whether or not the first attempt wrote it. The
+// property ladder sits after the `coalesce`, so it is written on a found
+// record too: an attempt that stopped part-way through the ladder leaves a
+// record missing properties, and this request completes it with the same
+// values. An entity holding the record's id does not pass for the record; the
+// add then fails (409) rather than reporting a record that was never written.
+// `count()` is 1 when the record is stored, 0 when the marker is gone.
+export const CHANGE_RECORD_ENSURE_QUERY =
+  "g.V().has('repositoryId', rid).hasId(within(mid, lid)).fold().as('vs')" +
+  ".unfold().hasLabel('_repository').hasNot('entityType')" +
+  ".select('vs').coalesce(" +
+  "__.unfold().hasId(lid).hasLabel('_vocabularyChangeLog').hasNot('entityType'), " +
+  `__.${CHANGE_RECORD_ADD})${CHANGE_RECORD_LADDER}.count()`;
+
 /**
- * Compare-and-set write of the vocabulary. The success path is one round-trip:
- * the version filter and the property writes are a single traversal, so the
- * check cannot be separated from the write by a concurrent writer.
+ * Compare-and-set write of the vocabulary, with its change record when one is
+ * given. The success path is one round-trip: the marker check, the version
+ * filter, the property writes and the record's vertex are a single traversal,
+ * so the check cannot be separated from the write by a concurrent writer, and
+ * a write that matches nothing adds no record.
+ *
+ * The traversal is not a transaction: its writes are separate document
+ * writes. A failure after the vocabulary write (other than a lost race, which
+ * fails before it) can leave the vocabulary changed without its record; the
+ * error propagates to the caller.
  *
  * Zero vertices written — or a 412 / 404 from a write that lost a race (see
- * `isLostWriteRace`) — means either the vocabulary vertex is gone (the
- * repository was deleted, or never existed), its version is stale, or the
- * connection retried a submit whose first attempt had already committed.
- * Only on that path does a follow-up read (version property and blob
- * together) decide the outcome:
+ * `isLostWriteRace`) — means either the marker or the vocabulary vertex is
+ * gone (the repository was deleted, is being deleted, or never existed), its
+ * version is stale, or the connection retried a submit whose first attempt
+ * had already committed. Only on that path does a follow-up read (the marker,
+ * and the vocabulary's version property and blob together) decide the
+ * outcome:
  *
- *   - no vertex → `RepositoryNotFoundError`
+ *   - no marker, or no vocabulary vertex → `RepositoryNotFoundError`
  *   - the vertex holds exactly the blob and version this call wrote →
  *     success. A transient-error retry re-ran the compare-and-set after the
  *     first attempt landed, so the retry saw its own write as a newer
  *     version; reporting a conflict would make the caller redo a change
- *     that is already stored.
+ *     that is already stored. The change record, if any, is then added
+ *     unless it is already stored, and its properties written either way
+ *     (`CHANGE_RECORD_ENSURE_QUERY`): the first attempt may have stopped
+ *     between the vocabulary write and the record, or part-way through the
+ *     record's properties.
  *   - `version` property missing, or different from the blob's own version →
  *     `ProviderError`. The vertex was written by an earlier provider release
  *     (which updated only the blob) and `ensureSchema` has not repaired it.
@@ -199,19 +269,30 @@ export async function saveVocabulary(
   repositoryId: string,
   vocabulary: MemoryVocabulary,
   expectedVersion: string,
+  changeRecord?: VocabularyChangeRecord,
 ): Promise<void> {
+  const mid = repoVertexId(repositoryId);
   const vid = vocabVertexId(repositoryId);
   const vocabJson = JSON.stringify(vocabulary);
+  const recordBindings =
+    changeRecord === undefined
+      ? undefined
+      : { lid: changeLogVertexId(changeRecord.changeId), ...changeRecordToLadderBindings(changeRecord) };
 
   let written = 0;
   try {
-    const write = await conn.submit(VOCABULARY_SAVE_QUERY, {
-      rid: repositoryId,
-      vid,
-      expectedVersion,
-      newVersion: vocabulary.version,
-      vocabJson,
-    });
+    const write = await conn.submit(
+      recordBindings === undefined ? VOCABULARY_SAVE_QUERY : VOCABULARY_SAVE_WITH_CHANGE_QUERY,
+      {
+        rid: repositoryId,
+        mid,
+        vid,
+        expectedVersion,
+        newVersion: vocabulary.version,
+        vocabJson,
+        ...recordBindings,
+      },
+    );
     written = Number(write.items[0] ?? 0);
   } catch (err: unknown) {
     // A concurrent writer replaced the vertex between this traversal's
@@ -222,15 +303,29 @@ export async function saveVocabulary(
   }
   if (written > 0) return;
 
-  const current = await conn.submit(VOCABULARY_STATE_QUERY, { rid: repositoryId, vid });
-  const row = current.items[0];
-  if (row == null || typeof row !== 'object') {
+  const current = await conn.submit(VOCABULARY_STATE_QUERY, { rid: repositoryId, mid, vid });
+  let repositoryExists = false;
+  let state: Record<string, unknown> | null = null;
+  for (const item of current.items) {
+    if (item === null || typeof item !== 'object') continue;
+    // The driver hands a projection back as a Map or a plain object.
+    const row: Record<string, unknown> =
+      item instanceof Map ? Object.fromEntries(item) : (item as Record<string, unknown>);
+    if (row['id'] === mid) repositoryExists = true;
+    else if (row['id'] === vid) state = row;
+  }
+  if (!repositoryExists || state === null) {
     throw new RepositoryNotFoundError(repositoryId);
   }
-  const state = row as Record<string, unknown>;
   const actualVersion = stringField(state, 'version');
   const storedJson = stringField(state, 'json');
-  if (actualVersion === vocabulary.version && storedJson === vocabJson) return;
+  if (actualVersion === vocabulary.version && storedJson === vocabJson) {
+    if (recordBindings !== undefined) {
+      const ensured = await conn.submit(CHANGE_RECORD_ENSURE_QUERY, { rid: repositoryId, mid, ...recordBindings });
+      if (Number(ensured.items[0] ?? 0) === 0) throw new RepositoryNotFoundError(repositoryId);
+    }
+    return;
+  }
 
   const blobVersion = storedBlobVersion(storedJson);
   if (actualVersion === '' || actualVersion !== blobVersion) {
@@ -382,6 +477,22 @@ export interface VocabularyBackfillResult {
   failures: VocabularyBackfillFailure[];
 }
 
+// The change-log reads. `hasNot('entityType')` keeps out entities: an entity
+// typed `_vocabularyChangeLog` carries the record label, and only entity
+// vertices carry `entityType`.
+export const CHANGE_LOG_COUNT_QUERY =
+  "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').hasNot('entityType').count()";
+// Newest first by `proposedAt`; records proposed in the same millisecond are
+// ordered by `changeId`, descending, so pages do not overlap or skip.
+export const CHANGE_LOG_PAGE_QUERY =
+  "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').hasNot('entityType')" +
+  ".order().by('proposedAt', decr).by('changeId', decr).range(rangeStart, rangeEnd).valueMap(true)";
+
+/**
+ * Page the repository's change records, newest first by `proposedAt`, then
+ * by `changeId` descending. The provider runs a marker point read alongside
+ * (the read starts from a label, not an id).
+ */
 export async function getVocabularyChangeLog(
   conn: CosmosDbConnection,
   repositoryId: string,
@@ -395,14 +506,8 @@ export async function getVocabularyChangeLog(
   // Both settle before either failure is raised, the page's first, so the
   // error does not depend on which round trip failed sooner.
   const [countSettled, dataSettled] = await Promise.allSettled([
-    conn.submit(
-      "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').count()",
-      { rid: repositoryId },
-    ),
-    conn.submit(
-      "g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').order().by('proposedAt', decr).range(rangeStart, rangeEnd).valueMap(true)",
-      { rid: repositoryId, rangeStart: offset, rangeEnd: offset + limit },
-    ),
+    conn.submit(CHANGE_LOG_COUNT_QUERY, { rid: repositoryId }),
+    conn.submit(CHANGE_LOG_PAGE_QUERY, { rid: repositoryId, rangeStart: offset, rangeEnd: offset + limit }),
   ]);
   if (dataSettled.status === 'rejected') throw dataSettled.reason;
   if (countSettled.status === 'rejected') throw countSettled.reason;

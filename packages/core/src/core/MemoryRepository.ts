@@ -63,6 +63,7 @@ import { RelationshipManager } from '../relationships/RelationshipManager.js';
 import { GraphTraversal } from '../relationships/GraphTraversal.js';
 import { SearchOrchestrator } from '../search/SearchOrchestrator.js';
 import { RepositoryValidator } from '../validation/RepositoryValidator.js';
+import { BatchPartialFailureError, toError } from './errors.js';
 
 export interface MemoryRepositoryConfig {
   repositoryId: string;
@@ -142,7 +143,13 @@ export class MemoryRepository {
 
   // ─── Vocabulary ────────────────────────────────────────────────────
 
-  async getVocabulary(): Promise<ResolvedVocabulary> {
+  /**
+   * The repository's vocabulary and governance settings, read through the
+   * storage provider on every call (fresh from the store when the handle was
+   * opened with `freshVocabulary`). Throws `RepositoryNotFoundError` once the
+   * repository has been deleted, on any read that goes to the store.
+   */
+  public async getVocabulary(): Promise<ResolvedVocabulary> {
     return this.vocabularyEngine.getResolvedVocabulary();
   }
 
@@ -156,7 +163,11 @@ export class MemoryRepository {
    * vocabulary that won, up to three attempts. If all attempts conflict, a
    * `VocabularyVersionConflictError` is thrown — re-read the vocabulary and
    * resubmit. For approved delete proposals, data of the removed type is
-   * deleted only after the vocabulary write succeeds.
+   * deleted only after the vocabulary write succeeds. If that data deletion
+   * fails, resend the same proposal: with the type already gone from the
+   * vocabulary it deletes the remaining data and answers `approved` with the
+   * current vocabulary version, or `rejected` (not found) when nothing of the
+   * type is left.
    */
   async proposeVocabularyChange(
     proposal: VocabularyProposal,
@@ -174,31 +185,51 @@ export class MemoryRepository {
 
   // ─── Entities ──────────────────────────────────────────────────────
 
-  async createEntities(inputs: CreateEntityInput[]): Promise<Entity[]> {
-    const entities = await this.entityManager.create(inputs);
-
-    // Index in search provider if available
-    if (this.search) {
-      for (const entity of entities) {
-        await this.search.indexEntity(this.repositoryId, {
-          entityId: entity.id,
-          entityType: entity.entityType,
-          label: entity.label,
-          summary: entity.summary,
-          properties: entity.properties,
-          data: entity.data,
-        });
+  /**
+   * Create entities (see `EntityManager.create` for the batch contract). With
+   * a search provider configured, every stored entity is indexed, including
+   * the stored members of a batch that fails part-way with
+   * `BatchPartialFailureError`. Indexing is best-effort: see
+   * {@link MemoryRepository.indexBestEffort}.
+   */
+  public async createEntities(inputs: CreateEntityInput[]): Promise<Entity[]> {
+    let entities: Entity[];
+    try {
+      entities = await this.entityManager.create(inputs);
+    } catch (err) {
+      if (err instanceof BatchPartialFailureError) {
+        for (const member of err.created) {
+          if ('entityType' in member) await this.indexBestEffort(member);
+        }
       }
+      throw err;
+    }
+
+    for (const entity of entities) {
+      await this.indexBestEffort(entity);
     }
 
     return entities;
   }
 
-  async updateEntity(entityId: string, updates: UpdateEntityInput): Promise<Entity> {
+  /** Update an entity and, with a search provider configured, re-index it best-effort */
+  public async updateEntity(entityId: string, updates: UpdateEntityInput): Promise<Entity> {
     const entity = await this.entityManager.update(entityId, updates);
+    await this.indexBestEffort(entity);
+    return entity;
+  }
 
-    // Re-index in search provider if available
-    if (this.search) {
+  /**
+   * Bring the search index up to date for an entity whose write has
+   * committed. The write stands whatever happens here, so an indexing
+   * failure must not report the operation as failed (a caller told so would
+   * resend it and duplicate the write). It is announced as
+   * `search:index_failed` instead, leaving the entity stored but missing or
+   * stale in the search index until it is indexed again.
+   */
+  private async indexBestEffort(entity: Entity): Promise<void> {
+    if (!this.search) return;
+    try {
       await this.search.indexEntity(this.repositoryId, {
         entityId: entity.id,
         entityType: entity.entityType,
@@ -207,9 +238,28 @@ export class MemoryRepository {
         properties: entity.properties,
         data: entity.data,
       });
+    } catch (err) {
+      await this.announceIndexFailure(entity.id, err);
     }
+  }
 
-    return entity;
+  /**
+   * Emit `search:index_failed` for an entity whose committed write could not
+   * be reflected in the search index. A handler that throws is ignored: the
+   * announcement is a side channel, and letting its error escape would
+   * report a committed write as failed or replace the write's own outcome
+   * (such as a `BatchPartialFailureError` that tells the caller which
+   * members were stored).
+   */
+  private async announceIndexFailure(entityId: string, cause: unknown): Promise<void> {
+    try {
+      await this.eventBus.emit('search:index_failed', {
+        entityId,
+        error: toError(cause).message,
+      });
+    } catch {
+      // Ignored by design; see the method comment.
+    }
   }
 
   async getEntity(
@@ -237,12 +287,22 @@ export class MemoryRepository {
     return this.searchOrchestrator.findEntities(query);
   }
 
-  async deleteEntities(ids: string[]): Promise<DeleteEntitiesResult> {
+  /**
+   * Delete entities and, with a search provider configured, remove them from
+   * the search index. The removal is best-effort for the same reason indexing
+   * is (see {@link MemoryRepository.indexBestEffort}): a failure is announced
+   * as `search:index_failed` and the committed delete is still reported.
+   */
+  public async deleteEntities(ids: string[]): Promise<DeleteEntitiesResult> {
     const result = await this.entityManager.deleteMany(ids);
 
-    if (this.search && result.deleted.length > 0) {
+    if (this.search) {
       for (const id of result.deleted) {
-        await this.search.removeEntity(this.repositoryId, id);
+        try {
+          await this.search.removeEntity(this.repositoryId, id);
+        } catch (err) {
+          await this.announceIndexFailure(id, err);
+        }
       }
     }
 

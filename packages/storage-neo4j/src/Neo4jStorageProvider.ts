@@ -47,9 +47,9 @@ import type {
 } from '@utaba/deep-memory/types';
 import {
   DuplicateRepositoryError,
+  InvalidInputError,
   ProviderError,
   RepositoryNotFoundError,
-  VocabularyVersionConflictError,
   createEmptyVocabulary,
   createSafeSink,
   matchesPropertyFilters,
@@ -73,6 +73,7 @@ import * as relationshipQueries from './queries/relationship.js';
 import * as repositoryQueries from './queries/repository.js';
 import {
   assertRepositoryMarker,
+  CHANGE_LOG_DRAIN_QUERY,
   ENTITY_DRAIN_QUERY,
   RELATIONSHIP_DRAIN_QUERY,
   type RepositoryMarkerOperation,
@@ -89,23 +90,40 @@ import {
 const PROVIDER_NAME = 'neo4j';
 const DELETE_BATCH_SIZE = 500;
 /**
- * Most edges one relationship-drain statement buffers and deletes (see
- * `RELATIONSHIP_DRAIN_QUERY`). Twenty inner transactions' worth at
- * `DELETE_BATCH_SIZE`: enough that an ordinary batch of entities finishes in
- * one statement, small enough that a hub entity's edges cannot exhaust the
- * transaction memory limit.
+ * Most edges one relationship-drain, relationship type delete or entity type
+ * delete statement buffers and deletes (see `RELATIONSHIP_DRAIN_QUERY`,
+ * `buildDeleteRelationshipsByTypeQuery` and `ENTITY_DELETE_BY_TYPE_QUERY`).
+ * Twenty inner transactions' worth at `DELETE_BATCH_SIZE`: enough that an
+ * ordinary batch of entities finishes in one statement, small enough that a
+ * hub entity's edges cannot exhaust the transaction memory limit.
  */
 const DELETE_EDGE_CAP = 10_000;
 
 /**
- * Lifetime of an entry in the per-process vocabulary cache. The vocabulary is
- * compile-time context for traversal — it changes on the order of once per
- * session, but a naïve read pays one round-trip per call on the hot path.
- * 60 s bounds cross-process staleness; writes inside this process invalidate
- * immediately via `invalidateVocabularyCache`. Direct port of the Cosmos
- * `VOCABULARY_CACHE_TTL_MS` constant.
+ * Default lifetime of an entry in the per-process vocabulary cache. The
+ * vocabulary is compile-time context for traversal and the schema writes are
+ * validated against — it changes on the order of once per session, but a
+ * naïve read pays one round-trip per call on the hot path. 60 s bounds
+ * cross-process staleness; writes inside this process invalidate immediately
+ * via `invalidateVocabularyCache`. Hosts override it with
+ * `vocabularyCacheTtlMs`.
  */
-const VOCABULARY_CACHE_TTL_MS = 60_000;
+const DEFAULT_VOCABULARY_CACHE_TTL_MS = 60_000;
+
+/**
+ * The vocabulary cache lifetime a config asks for: the default when absent,
+ * the value itself when it is a non-negative finite number of milliseconds.
+ * Anything else is refused at construction, so a mistyped value cannot
+ * silently disable the cache or make its entries permanent.
+ */
+function resolveVocabularyCacheTtlMs(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_VOCABULARY_CACHE_TTL_MS;
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  throw new InvalidInputError(
+    'vocabularyCacheTtlMs',
+    `Neo4j vocabularyCacheTtlMs must be a non-negative finite number of milliseconds, got ${String(value)}.`,
+  );
+}
 
 /**
  * Public methods that emit a usage record per call. The value extracts the
@@ -199,6 +217,15 @@ export interface Neo4jStorageProviderConfig extends Neo4jConnectionConfig {
    * isolation option. See `Neo4jSearchScoring`.
    */
   searchScoring?: Neo4jSearchScoring;
+  /**
+   * Lifetime in milliseconds of an entry in the per-process vocabulary cache.
+   * Defaults to 60 000. A vocabulary change made by another process reaches
+   * this one's cached reads, and so the validation of its writes, within this
+   * window. `0` disables the cache: every `getVocabulary` reads the stored
+   * vocabulary. Must be a non-negative finite number; anything else is
+   * refused with `InvalidInputError`.
+   */
+  vocabularyCacheTtlMs?: number;
 }
 
 /**
@@ -216,12 +243,16 @@ export class Neo4jStorageProvider {
   /**
    * In-process vocabulary cache. Reads hit this map first; writes inside this
    * process invalidate the entry so cache hits stay coherent with the local
-   * write. Cross-process staleness is bounded by `VOCABULARY_CACHE_TTL_MS`.
+   * write. Cross-process staleness is bounded by `vocabularyCacheTtlMs`.
    */
   private readonly vocabularyCache = new Map<
     string,
     { vocab: MemoryVocabulary; expiresAt: number }
   >();
+  /** Cache entry lifetime in ms; `0` keeps nothing in the cache. */
+  private readonly vocabularyCacheTtlMs: number;
+  /** Bumped by every invalidation, so a read that raced one is not cached. */
+  private vocabularyCacheGeneration = 0;
   /**
    * Captured at construction so `exportAll`'s `trackIterable` can emit
    * outside the Proxy's promise-resolution path. The Proxy itself relies on
@@ -230,15 +261,17 @@ export class Neo4jStorageProvider {
    */
   private readonly reportUsage: UsageSink | undefined;
   /**
-   * Most edges one relationship-drain statement takes; see
-   * `DELETE_EDGE_CAP`. Not configuration: a subclass lowers it only to drive
-   * the repeat-at-cap path with a small repository.
+   * Most edges one relationship-drain, relationship type delete or entity
+   * type delete statement takes; see `DELETE_EDGE_CAP`. Not configuration:
+   * a subclass lowers it only to drive the repeat-at-cap path with a small
+   * repository.
    */
   protected readonly relationshipDrainEdgeCap: number = DELETE_EDGE_CAP;
 
   constructor(config: Neo4jStorageProviderConfig) {
     // Validated before the driver is created, so a refused config opens nothing.
     this.searchScoring = resolveSearchScoring(config.searchScoring);
+    this.vocabularyCacheTtlMs = resolveVocabularyCacheTtlMs(config.vocabularyCacheTtlMs);
     this.connection = new Neo4jConnection(config);
     this.traversalExecutor = new Neo4jTraversalExecutor(this.connection, {
       profileTraversals: config.profileTraversals === true,
@@ -771,11 +804,7 @@ export class Neo4jStorageProvider {
 
     while (true) {
       const { summary } = await this.runDrainStatement(
-        `CALL () {
-           MATCH (n:_VocabularyChangeLog {repositoryId: $rid})
-           WITH n LIMIT $batchSize
-           DETACH DELETE n
-         } IN TRANSACTIONS OF $batchSize ROWS`,
+        CHANGE_LOG_DRAIN_QUERY,
         // BigInt so the Cypher LIMIT clause sees a Cypher INTEGER, not FLOAT.
         { batchSize: BigInt(DELETE_BATCH_SIZE) },
         repositoryId,
@@ -956,13 +985,12 @@ export class Neo4jStorageProvider {
     options?: VocabularyReadOptions,
   ): Promise<MemoryVocabulary> {
     if (options?.fresh === true) {
+      const readAt = Date.now();
+      const generation = this.vocabularyCacheGeneration;
       const vocab = await this.forgetMissingRepository(repositoryId, () =>
         vocabQueries.getVocabulary(this.connection, repositoryId),
       );
-      this.vocabularyCache.set(repositoryId, {
-        vocab,
-        expiresAt: Date.now() + VOCABULARY_CACHE_TTL_MS,
-      });
+      this.cacheVocabulary(repositoryId, vocab, readAt, generation);
       return vocab;
     }
     return this.getVocabularyCached(repositoryId);
@@ -985,21 +1013,40 @@ export class Neo4jStorageProvider {
     if (cached && cached.expiresAt > now) {
       return cached.vocab;
     }
+    const generation = this.vocabularyCacheGeneration;
     const vocab = await this.forgetMissingRepository(repositoryId, () =>
       vocabQueries.getVocabulary(this.connection, repositoryId),
     );
-    this.vocabularyCache.set(repositoryId, {
-      vocab,
-      expiresAt: now + VOCABULARY_CACHE_TTL_MS,
-    });
+    this.cacheVocabulary(repositoryId, vocab, now, generation);
     return vocab;
   }
 
   /**
+   * Store a vocabulary read in the cache, valid for the configured TTL from
+   * `readAt`. With a TTL of `0` nothing is stored, so every read goes to the
+   * database. `generation` is the invalidation count captured before the
+   * read started: an invalidation that landed while the read was in flight
+   * may mean the read saw the vocabulary from before a write, and caching it
+   * would hide that write for a whole TTL, so such a read is not stored.
+   */
+  private cacheVocabulary(
+    repositoryId: string,
+    vocab: MemoryVocabulary,
+    readAt: number,
+    generation: number,
+  ): void {
+    if (this.vocabularyCacheTtlMs === 0) return;
+    if (generation !== this.vocabularyCacheGeneration) return;
+    this.vocabularyCache.set(repositoryId, { vocab, expiresAt: readAt + this.vocabularyCacheTtlMs });
+  }
+
+  /**
    * Drop the cache entry for a repository — call after every vocabulary
-   * write, and whenever the repository turns out to be missing.
+   * write, when a repository is created or deleted, and whenever the
+   * repository turns out to be missing.
    */
   private invalidateVocabularyCache(repositoryId: string): void {
+    this.vocabularyCacheGeneration++;
     this.vocabularyCache.delete(repositoryId);
   }
 
@@ -1021,35 +1068,38 @@ export class Neo4jStorageProvider {
   /**
    * Compare-and-set write of the vocabulary — lands only when the stored
    * version equals `expectedVersion`. Throws `VocabularyVersionConflictError`
-   * on a mismatch and `RepositoryNotFoundError` when the repository's
-   * vocabulary node does not exist; never creates the node.
+   * on a mismatch and `RepositoryNotFoundError` when the repository marker or
+   * its vocabulary node does not exist; never creates the node. A
+   * `changeRecord` is written as a `_VocabularyChangeLog` node in the same
+   * statement, and only when the vocabulary write lands.
    *
-   * Invalidates the in-process cache on success, so subsequent reads observe
-   * the new state immediately within this process, and on a conflict, because
-   * the conflict proves the cached copy is stale (cross-process staleness is
-   * otherwise bounded by the 60 s TTL).
+   * Invalidates the in-process cache however the call ends: on success, so
+   * subsequent reads observe the new state immediately within this process;
+   * on a conflict, because the conflict proves the cached copy is stale; and
+   * on any other failure, because the write may have landed before the
+   * failure was reported (a lost acknowledgement), so the cached copy can no
+   * longer be trusted. Cross-process staleness is otherwise bounded by the
+   * cache TTL.
    */
   public async saveVocabulary(
     repositoryId: string,
     vocabulary: MemoryVocabulary,
     expectedVersion: string,
+    changeRecord?: VocabularyChangeRecord,
   ): Promise<void> {
     try {
-      await vocabQueries.saveVocabulary(this.connection, repositoryId, vocabulary, expectedVersion);
-    } catch (err) {
-      if (err instanceof VocabularyVersionConflictError || err instanceof RepositoryNotFoundError) {
-        this.invalidateVocabularyCache(repositoryId);
-      }
-      throw err;
+      await vocabQueries.saveVocabulary(this.connection, repositoryId, vocabulary, expectedVersion, changeRecord);
+    } finally {
+      this.invalidateVocabularyCache(repositoryId);
     }
-    this.invalidateVocabularyCache(repositoryId);
   }
 
   /**
-   * Page the vocabulary change-log newest first. Writes land in
-   * `proposeVocabularyExtension` (out of scope here) — this method only reads
-   * the `_VocabularyChangeLog` nodes back, ordered by `proposedAt` to match
-   * the audit semantic on `VocabularyChangeRecord`.
+   * Page the vocabulary change-log newest first. The records are the
+   * `_VocabularyChangeLog` nodes `saveVocabulary` writes with each landed
+   * vocabulary change, read back ordered by `proposedAt` to match the audit
+   * semantic on `VocabularyChangeRecord`. A missing repository marker →
+   * `RepositoryNotFoundError`.
    */
   public async getVocabularyChangeLog(
     repositoryId: string,
@@ -1168,19 +1218,24 @@ export class Neo4jStorageProvider {
   }
 
   /**
-   * Delete every entity of a type plus their incident relationships, with
-   * exact counts (entity + relationship) returned in one round-trip — a
-   * strict improvement over Cosmos's `deletedRelationships: undefined` path
-   * (Gremlin would fan out across every partition the type touches). A
-   * missing repository marker → `RepositoryNotFoundError`, and nothing is
-   * deleted.
+   * Delete every entity of a type plus their incident relationships, in
+   * batches of at most `DELETE_BATCH_SIZE` entities and
+   * `relationshipDrainEdgeCap` edges until none of the type is left, so a
+   * large type or a hub entity cannot outlast the server's transaction
+   * timeout. Returns exact counts (entity + relationship) summed over the
+   * batches. A missing repository marker → `RepositoryNotFoundError`, checked
+   * before anything is deleted. A batch the server fails transiently is run
+   * again a bounded number of times (see `entityQueries.deleteEntitiesByType`).
    */
   public async deleteEntitiesByType(
     repositoryId: string,
     entityType: string,
   ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
     return this.forgetMissingRepository(repositoryId, () =>
-      entityQueries.deleteEntitiesByType(this.connection, repositoryId, entityType),
+      entityQueries.deleteEntitiesByType(this.connection, repositoryId, entityType, {
+        batchSize: DELETE_BATCH_SIZE,
+        edgeCap: this.relationshipDrainEdgeCap,
+      }),
     );
   }
 
@@ -1290,16 +1345,22 @@ export class Neo4jStorageProvider {
   }
 
   /**
-   * Drop every relationship of a type in the repository. Returns an exact
-   * delete count in a single round-trip. A missing repository marker →
-   * `RepositoryNotFoundError`, and nothing is deleted.
+   * Drop every relationship of a type in the repository, in batches walked
+   * as a keyset cursor over the repository's entities (at most
+   * `DELETE_BATCH_SIZE` edges per transaction), so a large type cannot
+   * outlast the server's transaction timeout. Returns the exact count summed
+   * over the batches. A missing repository marker → `RepositoryNotFoundError`,
+   * checked before anything is deleted.
    */
   public async deleteRelationshipsByType(
     repositoryId: string,
     relationshipType: string,
   ): Promise<{ deletedRelationships: number }> {
     return this.forgetMissingRepository(repositoryId, () =>
-      relationshipQueries.deleteRelationshipsByType(this.connection, repositoryId, relationshipType),
+      relationshipQueries.deleteRelationshipsByType(this.connection, repositoryId, relationshipType, {
+        batchSize: DELETE_BATCH_SIZE,
+        edgeCap: this.relationshipDrainEdgeCap,
+      }),
     );
   }
 
@@ -1422,7 +1483,7 @@ export class Neo4jStorageProvider {
           if (!stored) {
             throw new ProviderError(
               'Unpacking Cypher path: entity referenced by path is missing from the result.',
-              'Inspect compiledQuery — this indicates a path emission shape mismatch.',
+              'This is a fault in the provider, not in the request: the compiled path query and its result unpacking disagree. Report it with the traversal spec that produced it.',
             );
           }
           return projectStoredEntity(stored);
@@ -1432,7 +1493,7 @@ export class Neo4jStorageProvider {
           if (!stored) {
             throw new ProviderError(
               'Unpacking Cypher path: relationship referenced by path is missing from the result.',
-              'Inspect compiledQuery — this indicates a path emission shape mismatch.',
+              'This is a fault in the provider, not in the request: the compiled path query and its result unpacking disagree. Report it with the traversal spec that produced it.',
             );
           }
           return projectStoredRelationship(stored, row.relationshipDirections[i] ?? 'out');

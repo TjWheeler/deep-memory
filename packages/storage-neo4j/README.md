@@ -51,6 +51,7 @@ For local development with Docker, see [Local development setup](#local-developm
 | `reportUsage` | `UsageSink` | `undefined` | Optional sink invoked once per public method call with the server-side time (ms) consumed. See [Usage tracking](#usage-tracking). |
 | `profileTraversals` | `boolean` | `false` | When `true`, prepends `PROFILE` to compiled traversal queries and surfaces the plan summary on the sink record. `PROFILE` more than doubles wall-clock on short traversals — turn it on only when actively investigating planner behaviour. |
 | `searchScoring` | `'relevance' \| 'isolated'` | `'relevance'` | How `findEntities` orders the hits of a `searchTerm` query. `'relevance'` orders by full-text score; `'isolated'` orders by `label`, then `id`, so no statistic computed from other repositories reaches the order. See [Search ordering and tenant isolation](#search-ordering-and-tenant-isolation). |
+| `vocabularyCacheTtlMs` | `number` | `60000` | Lifetime (ms) of an entry in the in-process vocabulary cache. A vocabulary change made by another process reaches this one's cached reads, and so the validation of its writes, within this window. `0` disables the cache: every `getVocabulary` reads the stored vocabulary. A negative, non-finite or non-number value is refused with `InvalidInputError` at construction. See [Vocabulary cache](#vocabulary-cache). |
 
 The provider holds a single Neo4j `Driver` per instance, per the driver's documented "create once, share, close on shutdown" lifecycle.
 
@@ -78,13 +79,11 @@ Neo4j Community Edition has a single user database, so multiple repositories sha
 
 Operators who need physical isolation between tenants can run one Neo4j instance per tenant and create one `Neo4jStorageProvider` per URI — that is an operations choice, not a provider feature.
 
-Repository-scoped statements are planned so that their cost grows with the repository, not with the database. Lookups and deletes by relationship id (`getRelationship`, `deleteRelationship`, `deleteRelationships`), `deleteRelationshipsByType`, `findEntities` without a search term, `getEntityRelationships`, the `getRepositoryStats` counts and the batched drains of `deleteRepository` / `deleteAllContents` anchor on the repository's entities through an entity index, usually with `(e:_Entity {repositoryId: $rid}) WHERE e.id IS NOT NULL` (the relationship drain uses a range on `e.id` instead, as a keyset cursor that visits each entity once; `getEntityRelationships` seeks its entity by id; a filtered `findEntities` may seek another `(repositoryId, …)` entity index): the id predicate lets the planner seek the `(repositoryId, id)` unique index, where a bare `repositoryId` anchor would scan every `_Entity` in the database and an unanchored relationship pattern would scan every relationship. `Neo4jStorageProvider.queryPlans.test.ts` checks these plans with `EXPLAIN`.
+Repository-scoped statements are planned so that their cost grows with the repository, not with the database. Lookups and deletes by relationship id (`getRelationship`, `deleteRelationship`, `deleteRelationships`), `deleteRelationshipsByType`, `findEntities` without a search term, `getEntityRelationships`, the `getRepositoryStats` counts and the batched drains of `deleteRepository` / `deleteAllContents` anchor on the repository's entities through an entity index, usually with `(e:_Entity {repositoryId: $rid}) WHERE e.id IS NOT NULL` (the relationship drain and `deleteRelationshipsByType` use a range on `e.id` instead, as a keyset cursor that visits each entity once; `getEntityRelationships` seeks its entity by id; a filtered `findEntities` may seek another `(repositoryId, …)` entity index): the id predicate lets the planner seek the `(repositoryId, id)` unique index, where a bare `repositoryId` anchor would scan every `_Entity` in the database and an unanchored relationship pattern would scan every relationship. `Neo4jStorageProvider.queryPlans.test.ts` checks these plans with `EXPLAIN`.
 
 The exceptions, whose cost grows with the database:
 
 - **Full-text matching.** The `dm_entity_text` index covers every repository; see [Search ordering and tenant isolation](#search-ordering-and-tenant-isolation).
-- **Vocabulary reads.** `_Vocabulary` and `_VocabularyChangeLog` have no index on `repositoryId`, so a `getVocabulary` cache miss scans the `_Vocabulary` label (one node per repository) and `getVocabularyChangeLog` scans the `_VocabularyChangeLog` label across every repository.
-- **The `_VocabularyChangeLog` drain** in `deleteRepository`, a scan of that label across every repository.
 - **The untyped-node sweep** in `deleteRepository`, which removes nodes with any label carrying the `repositoryId` (written through `executeNativeQuery`) and has no label to seek on, so each of its batches scans every node in the database. It runs once per delete, after the labelled drains.
 
 ### Label scheme
@@ -94,7 +93,7 @@ The exceptions, whose cost grows with the database:
 | Entity | `:_Entity` | Single umbrella label. The entity type lives in `n.entityType` (indexed). Per-type labels are deliberately **not** written — the steady-state per-call cost of interpolating a parameter into the label slot is not worth the query-convenience benefit. |
 | Repository | `:_Repository` | One node per repository. |
 | Vocabulary | `:_Vocabulary` | One node per repository; stores the vocabulary as a JSON string. |
-| Vocabulary change log | `:_VocabularyChangeLog` | Append-only audit trail. |
+| Vocabulary change log | `:_VocabularyChangeLog` | Append-only audit trail, one node per landed vocabulary change, unique on `(repositoryId, changeId)`. |
 | Schema meta | `:_Meta` | Singleton; carries `schemaVersion`. |
 
 Relationship types in Cypher are the vocabulary relationship type slug, uppercased per Cypher convention (e.g. `:KNOWS`, `:REPORTS_TO`). Stored on `StoredRelationship.type` verbatim — the provider applies a deterministic case transform at the boundary.
@@ -104,9 +103,9 @@ Relationship types in Cypher are the vocabulary relationship type slug, uppercas
 | Data | Storage | Notes |
 |------|---------|-------|
 | Schema-managed scalars (`entityType`, `slug`, provenance fields, timestamps) | Native Neo4j properties on the node | Indexed where appropriate. Timestamps are ISO-8601 strings — the driver does not auto-convert `Date` ↔ string, so keeping strings avoids a conversion dance on every read/write. |
-| User-supplied entity properties | **Both** native Neo4j scalars (one property per key) **and** a `properties` JSON string | Native scalars exist so `findEntities` predicates resolve to exact server-side equality checks. The JSON blob remains authoritative for round-trip fidelity — values Neo4j cannot represent natively (nested objects, `null`, heterogeneous arrays) preserve their shape via the blob but are **not** predicate-queryable. User keys are validated against the bare-Cypher-identifier shape and the reserved schema-field list on every write. |
+| User-supplied entity properties | **Both** native Neo4j scalars (one property per key) **and** a `properties` JSON string | Native scalars exist so `findEntities` predicates resolve to exact server-side equality checks. The JSON blob remains authoritative for round-trip fidelity — values Neo4j cannot represent natively (nested objects, `null`, heterogeneous arrays) preserve their shape via the blob but are **not** predicate-queryable. User keys must be identifiers and must not be one of the reserved system-field names that core exports (`RESERVED_ENTITY_PROPERTY_KEYS` / `RESERVED_RELATIONSHIP_PROPERTY_KEYS` from `@utaba/deep-memory`). Entity and relationship writes check this on every call and refuse a bad key with `InvalidInputError` (field `properties.<key>`); a bulk import records it as an `INVALID_INPUT` row error. An `updateEntity` checks only the keys it sets (new, or with a changed value): a key stored before these rules and carried over unchanged is kept in the JSON blob only, never written as a native property, and can be removed by leaving it out. |
 | Embeddings | Native `list<float>` on the node (`embedding`) | Pass-through, no JSON encoding step. Excluded from read projections unless `loadEmbeddings: true`. |
-| Vocabulary | Single JSON string on the `_Vocabulary` node | Cached in-process for 60 s (see [Vocabulary cache](#vocabulary-cache)). |
+| Vocabulary | Single JSON string on the `_Vocabulary` node | Cached in-process for `vocabularyCacheTtlMs`, 60 s by default (see [Vocabulary cache](#vocabulary-cache)). |
 
 ### Schema DDL
 
@@ -121,6 +120,12 @@ FOR (n:_Entity) REQUIRE (n.repositoryId, n.slug) IS UNIQUE;
 
 CREATE CONSTRAINT dm_repository_unique IF NOT EXISTS
 FOR (n:_Repository) REQUIRE n.repositoryId IS UNIQUE;
+
+CREATE CONSTRAINT dm_vocabulary_change_unique IF NOT EXISTS
+FOR (n:_VocabularyChangeLog) REQUIRE (n.repositoryId, n.changeId) IS UNIQUE;
+
+CREATE INDEX dm_vocabulary_repository IF NOT EXISTS
+FOR (n:_Vocabulary) ON (n.repositoryId);
 
 CREATE INDEX dm_entity_type_lookup IF NOT EXISTS
 FOR (n:_Entity) ON (n.repositoryId, n.entityType);
@@ -142,13 +147,19 @@ import { getSchemaCypher, SCHEMA_VERSION } from '@utaba/deep-memory-storage-neo4
 const statements = getSchemaCypher(); // string[]
 ```
 
+### Slug uniqueness
+
+Slugs are unique per repository, enforced atomically by the `dm_entity_slug_unique` constraint. A `createEntity` or `updateEntity` that would put a slug another entity already holds fails with `SlugConflictError` (`SLUG_CONFLICT`), distinct from `DuplicateEntityError`, which means the entity id is taken. The engine answers a slug clash by retrying with the next slug suffix, up to three times. In `importBulk`, a slug clash is a `SLUG_CONFLICT` row error.
+
 ### Vocabulary cache
 
-`getVocabulary` reads through a 60-second in-process cache (per `repositoryId`). Vocabulary is compile-time context for graph traversal and changes rarely; the cache turns the hot path into zero round-trips. Cross-process staleness is bounded by the 60 s TTL. Writes inside this process invalidate the entry immediately, and so does a version conflict. `getVocabulary(id, { fresh: true })` skips the cache, reads the node (one round-trip) and replaces the cache entry with the result.
+`getVocabulary` reads through an in-process cache (per `repositoryId`) whose entries live for `vocabularyCacheTtlMs`, 60 seconds by default. Vocabulary is compile-time context for graph traversal and changes rarely; the cache turns the hot path into zero round-trips. Cross-process staleness is bounded by the TTL; set it to `0` to read the stored vocabulary on every call. A `saveVocabulary` call in this process invalidates the entry however it ends: on success, on a version conflict, and on any other failure (the write may have landed before the failure was reported). `getVocabulary(id, { fresh: true })` skips the cache, reads the node (one round-trip) and replaces the cache entry with the result.
 
 ### Vocabulary writes
 
 The vocabulary version is stored twice: inside the JSON blob and as a `version` property on the `_Vocabulary` node, so the database can compare it. `saveVocabulary(id, vocabulary, expectedVersion)` is compare-and-set. It takes the node's write lock before it checks the version, so two concurrent writers against the same base version cannot both land. A mismatch throws `VocabularyVersionConflictError`. `saveVocabulary` never creates the node, because `createRepository` writes it together with the `_Repository` node. When neither exists, it throws `RepositoryNotFoundError`. A node with a missing or stale `version` property throws `ProviderError`, and the message says to run `ensureSchema()`.
+
+`saveVocabulary(id, vocabulary, expectedVersion, changeRecord)` writes the change record as a `_VocabularyChangeLog` node in the same statement as the vocabulary, and only when the compare-and-set lands: a version conflict or a missing repository leaves the change log as it was. The statement write-locks the `_Repository` marker first, like a create, and refuses with `RepositoryNotFoundError` once the marker is gone, so a save racing `deleteRepository` either commits before the change-log drain (which then removes its record) or writes nothing. `getVocabularyChangeLog` pages the records newest first by `proposedAt`. The change-log statements seek the `dm_vocabulary_change_unique` index (records proposed in the same millisecond page in descending `changeId` order), and `getVocabulary`, `saveVocabulary` and its outcome read reach the `_Vocabulary` node through `dm_vocabulary_repository`.
 
 ### Repository delete
 
@@ -156,9 +167,23 @@ The vocabulary version is stored twice: inside the JSON blob and as a `version` 
 
 Once the marker is gone, every repository-scoped call throws `RepositoryNotFoundError`, even while an interrupted delete has left data behind: reads, writes, type deletes, `getTimeline`, `getVocabularyChangeLog`, `exportAll`, `importBulk` and the traversals (`traverse`, `exploreNeighborhood`, `findPaths`). Each checks the marker before any per-id or empty-result answer, in the same statement where it can. A traversal checks it whatever the vocabulary cache holds, and the refusal drops the cached vocabulary. The only call that can still answer is a `getVocabulary` served from the cache within its TTL.
 
+### Type deletes
+
+`deleteEntitiesByType` and `deleteRelationshipsByType` delete in batches, each committed in its own transaction, until none of the type is left, so a large type cannot outlast the server's transaction timeout. `deleteEntitiesByType` takes 500 entities of the type per statement (a seek of `dm_entity_type_lookup`) and up to 10,000 of their edges, and deletes the edges; only when it took fewer than 10,000 does it delete the entities too, so however many edges a hub entity has, no statement holds more than that many. One transaction does each statement's deleting, and a statement the server fails with a transient error (a deadlock, say; not a memory limit) is run again, up to three times. `deleteRelationshipsByType` walks the repository's entities with the same keyset cursor as the relationship drain and deletes their outgoing edges of the type, 500 per transaction. Both return the exact numbers removed, summed over the batches, and `0` when nothing of the type was left; the vocabulary engine relies on that when a type deletion is resent. Every batch checks the repository marker first and throws `RepositoryNotFoundError` when it is gone. A delete that fails part-way leaves its committed batches deleted; calling it again removes the rest.
+
+A `deleteRelationshipsByType` batch is not re-run on a transient error, unlike an entity batch: one statement deletes its edges over several inner transactions, and a failure in a later one loses the counts of those already committed, so a re-run could not report an exact count. The error reaches the caller, and resending the type deletion removes the rest. A type delete that fails after its last batch committed (the connection lost before the acknowledgement, say) has already removed the whole type, so resending the type deletion answers "not found": treat that answer as done.
+
 ### Upgrading
 
-After upgrading this package, run `ensureSchema()` once, after **every** process that writes to the database has moved to the new release. This repairs the `version` property on vocabularies written by earlier releases. The local MCP server runs `ensureSchema()` at startup, and the indexer runs it before each import. Running old and new releases against one database at the same time is unsupported, because an older release rewrites the vocabulary blob without updating the `version` property.
+After upgrading this package, run `ensureSchema()` once, after **every** process that writes to the database has moved to the new release. This repairs the `version` property on vocabularies written by earlier releases, and on a database at an older schema version it creates the constraints and indexes added since (such as `dm_vocabulary_change_unique`). The local MCP server runs `ensureSchema()` at startup, and the indexer runs it before each import. Running old and new releases against one database at the same time is unsupported, because an older release rewrites the vocabulary blob without updating the `version` property.
+
+**Schema version 2.** `SCHEMA_VERSION` 2 adds the `dm_vocabulary_change_unique` constraint and the `dm_vocabulary_repository` index. `ensureSchema()` refuses a database whose `_Meta.schemaVersion` is newer than the package's, so once a database is at version 2, a release on schema version 1 fails its `ensureSchema()` with `ProviderError` (the local MCP server fails at startup). To roll back to such a release, set the version back first:
+
+```cypher
+MATCH (m:_Meta {key: 'schema'}) SET m.schemaVersion = 1
+```
+
+This is safe: the extra constraint and index are inert for the older release. Upgrading again later runs `ensureSchema()`, which re-applies the DDL idempotently and sets the version to 2.
 
 ## Search behaviour (`findEntities`)
 
@@ -234,6 +259,12 @@ Use `skipExistenceCheck: true` when the caller knows the data is fresh (faster p
 
 `result.errors` is not in input order: entity rows come before relationship rows, and among relationships the repeats an insert refuses come before each chunk's failures, in chunk order. Each record's `item` names its row.
 
+What becomes a row error and what stops the import:
+
+- **Row errors** (recorded with their `code`; the rest of the import continues): a property key that is not an identifier or is reserved (`INVALID_INPUT`, refused before the write); a missing endpoint (`ENTITY_NOT_FOUND`); a reused relationship id (`RELATIONSHIP_ALREADY_EXISTS`); an id or slug clash (`ENTITY_ALREADY_EXISTS`, `SLUG_CONFLICT`). A chunk that fails because of its rows (a uniqueness clash, a value the server refuses, or the per-transaction memory limit) is written again row by row so the good rows still land.
+- **Store failures** (the import stops and rejects with the typed error; rows written before that point stay written): a timeout (`QueryTimeoutError`), an unavailable or expired connection, an exhausted server-wide memory pool, and any other failure that is not about one row. Retrying every row would multiply the load and hide the cause.
+- **A missing repository marker** stops the import with `RepositoryNotFoundError`, including when every row was refused before any write.
+
 `createRelationship` checks a caller-supplied id the same way as upsert, and refuses any existing edge with `DuplicateRelationshipError`. The check seeks the repository's entities through the `(repositoryId, id)` index and then reads their edges, so its cost grows with the repository's relationship count, and it runs under the marker lock. When the engine minted the id (`createRelationship(rid, relationship, { idMinted: true })`, which `RelationshipManager` passes whenever the caller gave no id), the id is a random UUID and the check is skipped: the statement locks the marker, seeks the two endpoints and `MERGE`s the edge between them on its id and the call's write token, so its cost does not grow with the repository.
 
 ## Native query escape hatch
@@ -250,11 +281,15 @@ All errors use the `@utaba/deep-memory` error hierarchy. Mapping is by `error.co
 
 | Driver code | Maps to |
 |-------------|---------|
-| `Neo.ClientError.Schema.ConstraintValidationFailed` (entity scope) | `DuplicateEntityError` |
-| `Neo.ClientError.Schema.ConstraintValidationFailed` (repository scope) | `DuplicateRepositoryError` |
+| `Neo.ClientError.Schema.ConstraintValidationFailed` on `dm_entity_unique` | `DuplicateEntityError` |
+| `Neo.ClientError.Schema.ConstraintValidationFailed` on `dm_entity_slug_unique` | `SlugConflictError` |
+| `Neo.ClientError.Schema.ConstraintValidationFailed` on `dm_repository_unique` | `DuplicateRepositoryError` |
+| A server-side transaction timeout (GQL status `25N14`, or a `…TransactionTimedOut` code) | `QueryTimeoutError` |
 | `Neo.ClientError.Statement.SyntaxError` | `ProviderError` |
 | `Neo.ClientError.Security.*` | `ProviderError` (original code attached) |
 | Anything else | `ProviderError` with `cause: error` |
+
+A constraint violation is mapped by the constraint that fired, read from the driver message (its label and key), or else from a constraint name in the error; only when the error names neither does the operation decide. Every mapped error keeps the driver error as `cause`. A property key that breaks the [property-name rules](#property-storage) is refused before any statement runs, with `InvalidInputError`.
 
 `DuplicateRelationshipError` does not come from a driver constraint: Neo4j relationship constraints cover one type only, so relationship id uniqueness is checked by the create statement itself (`createRelationship`), and the import reports a clash as an `id-exists` row outcome (`RELATIONSHIP_ALREADY_EXISTS`).
 
@@ -272,7 +307,7 @@ Creates, deletes by id and insert imports are retry-safe. The driver re-runs a t
 
 `_attempt` is a reserved property: it cannot be used as an entity property key, typed reads never return it on entities, relationships or repositories, and a traversal that filters on or projects it is refused with `TraversalValidationError`. `executeNativeQuery` returns stored properties as they are, so a native query that returns whole nodes or relationships includes it. Records written by an upsert import (`skipExistenceCheck: false`) carry no token; upserts MERGE on the id and are safe to re-run as they are.
 
-Other writes are retried the same way without a token, and a re-run of them leaves the store correct: `updateEntity` and `updateRepository` re-apply the same values, which is harmless. The one answer a re-run can change is a count: a re-run of a committed `deleteEntitiesByType` or `deleteRelationshipsByType` reports only what was left to delete.
+Other writes are retried the same way without a token, and a re-run of them leaves the store correct: `updateEntity` and `updateRepository` re-apply the same values, which is harmless. `saveVocabulary` is compare-and-set, so a re-run of a committed save finds its own write (see [Vocabulary writes](#vocabulary-writes)); its change record is `MERGE`d on `(repositoryId, changeId)`, so it is never written twice. `deleteEntitiesByType` and `deleteRelationshipsByType` run their batches on an auto-commit session, which the driver never re-runs, so the counts they return are exact.
 
 `maxTransactionRetryTime` only bounds how long the driver keeps retrying. Setting it to `0` does not disable retry (the driver can still re-run once), and is not needed for correct write outcomes.
 

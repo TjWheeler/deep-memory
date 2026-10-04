@@ -847,16 +847,18 @@ describe('DeepMemory deletes and relationship id origin', () => {
       returnMode: 'terminal' as const,
       limit: 10,
     };
-    // The handle validates the spec against the vocabulary it cached before
-    // the delete, so the traversal reaches the fallback executor's own reads.
     await expect(repo.traverse(spec)).resolves.toMatchObject({ entities: [expect.objectContaining({ id: bobId })] });
+    const vocabularyBeforeDelete = await storage.getVocabulary(repositoryId);
     await memory.deleteRepository(repositoryId);
-    const vocabularyRead = vi.spyOn(storage, 'getVocabulary');
+    // A provider vocabulary cache may still answer with the deleted
+    // repository's vocabulary, so the spec validates and the traversal
+    // reaches the fallback executor's own reads, which must refuse.
+    const vocabularyRead = vi.spyOn(storage, 'getVocabulary').mockResolvedValue(vocabularyBeforeDelete);
     const entityRead = vi.spyOn(storage, 'getEntity');
 
     await expect(repo.traverse(spec)).rejects.toBeInstanceOf(RepositoryNotFoundError);
 
-    expect(vocabularyRead).not.toHaveBeenCalled();
+    expect(vocabularyRead).toHaveBeenCalledWith(repositoryId);
     expect(entityRead).toHaveBeenCalledWith(repositoryId, aliceId);
   });
 });

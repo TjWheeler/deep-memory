@@ -48,6 +48,7 @@ import type {
 } from '../types/portability.js';
 import { matchesPropertyFilters } from '../relationships/PropertyFilterMatcher.js';
 import { createEmptyVocabulary } from '../vocabulary/VocabularySchema.js';
+import { assertWritablePropertyKeys } from '../validation/propertyNames.js';
 import {
   RepositoryNotFoundError,
   DuplicateRepositoryError,
@@ -225,28 +226,46 @@ export class InMemoryStorageProvider implements StorageProvider {
     return store.vocabulary;
   }
 
-  async saveVocabulary(
+  public async saveVocabulary(
     repositoryId: string,
     vocabulary: MemoryVocabulary,
     expectedVersion: string,
+    changeRecord?: VocabularyChangeRecord,
   ): Promise<void> {
     const store = this.getStore(repositoryId);
-    // Check and assign run without an intervening await, so the
-    // compare-and-set is atomic on the single JS thread.
+    // Check, assign and record run without an intervening await, so the
+    // compare-and-set and its change-log record are atomic on the single JS
+    // thread.
     if (store.vocabulary.version !== expectedVersion) {
       throw new VocabularyVersionConflictError(repositoryId, expectedVersion, store.vocabulary.version);
     }
     store.vocabulary = vocabulary;
+    if (changeRecord) {
+      store.vocabularyChangeLog.push(changeRecord);
+    }
   }
 
-  async getVocabularyChangeLog(
+  /**
+   * Newest first by `proposedAt`, then by `changeId` descending between
+   * records with the same stamp. The order records were saved in need not
+   * follow `proposedAt` (a record is stamped when its proposal is evaluated,
+   * and a slower writer can save after a faster one stamped later), so the
+   * log is sorted on read rather than trusted in save order. The `changeId`
+   * tiebreak gives equal stamps the same order on every read, which paging
+   * needs.
+   */
+  public async getVocabularyChangeLog(
     repositoryId: string,
     options?: PaginationOptions,
   ): Promise<PaginatedResult<VocabularyChangeRecord>> {
     const store = this.getStore(repositoryId);
     const limit = options?.limit ?? 10;
     const offset = options?.offset ?? 0;
-    const items = store.vocabularyChangeLog.slice(offset, offset + limit);
+    // ISO 8601 timestamps order correctly as strings.
+    const sorted = [...store.vocabularyChangeLog].sort(
+      (a, b) => compareDescending(a.proposedAt, b.proposedAt) || compareDescending(a.changeId, b.changeId),
+    );
+    const items = sorted.slice(offset, offset + limit);
 
     return {
       items,
@@ -261,6 +280,7 @@ export class InMemoryStorageProvider implements StorageProvider {
 
   public async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
     const store = this.getStore(repositoryId);
+    assertWritablePropertyKeys(entity.properties, 'entity');
     if (store.entities.has(entity.id)) {
       throw new DuplicateEntityError(entity.id);
     }
@@ -322,6 +342,13 @@ export class InMemoryStorageProvider implements StorageProvider {
     const existing = store.entities.get(entityId);
     if (!existing) {
       throw new EntityNotFoundError(entityId);
+    }
+    // The update carries the entity's whole property bag. Only the keys it
+    // writes (new keys, or keys whose value changes) are held to the key
+    // rules, so a key stored before the rules existed can be carried along
+    // unchanged or dropped from the bag.
+    if (updates.properties) {
+      assertWritablePropertyKeys(writtenProperties(existing.properties, updates.properties), 'entity');
     }
     if (updates.slug !== undefined && updates.slug !== existing.slug) {
       const holder = this.slugHolder(store, updates.slug);
@@ -466,6 +493,7 @@ export class InMemoryStorageProvider implements StorageProvider {
     _options?: RelationshipCreateOptions,
   ): Promise<StoredRelationship> {
     const store = this.getStore(repositoryId);
+    assertWritablePropertyKeys(relationship.properties, 'relationship');
     if (store.relationships.has(relationship.id)) {
       throw new DuplicateRelationshipError(relationship.id);
     }
@@ -942,12 +970,26 @@ export class InMemoryStorageProvider implements StorageProvider {
     }
   }
 
+  /**
+   * Relationship ids are never re-pointed. In upsert mode (the default) a row
+   * whose id is stored on an edge of the same type and endpoints updates it
+   * in place, applied in input order; one whose id is stored with a different
+   * type or endpoints is refused with `RELATIONSHIP_ALREADY_EXISTS`. In
+   * insert mode (`skipExistenceCheck`) every id must be new: a repeat within
+   * the call is refused whatever its first occurrence's outcome, and so is an
+   * id already stored, because the store has no room for a second edge under
+   * one id and overwriting would re-point the first. Endpoints are checked
+   * before the id, so a row with a missing endpoint reports
+   * `ENTITY_NOT_FOUND`.
+   */
   public async importBulk(
     repositoryId: string,
     data: ImportChunk[],
-    _options?: BulkImportOptions,
+    options?: BulkImportOptions,
   ): Promise<BulkImportResult> {
     const store = this.getStore(repositoryId);
+    const insertOnly = options?.skipExistenceCheck === true;
+    const relationshipIdsSeen = new Set<string>();
     let entitiesImported = 0;
     let relationshipsImported = 0;
     const errors: BulkImportItemError[] = [];
@@ -967,12 +1009,19 @@ export class InMemoryStorageProvider implements StorageProvider {
 
       if (chunk.relationships) {
         for (const rel of chunk.relationships) {
+          const repeated = relationshipIdsSeen.has(rel.id);
+          relationshipIdsSeen.add(rel.id);
           try {
             // An edge needs both endpoints. A missing one becomes this row's
             // error rather than a dangling edge or a failed import.
             for (const endpointId of [rel.sourceEntityId, rel.targetEntityId]) {
               if (!store.entities.has(endpointId)) throw new EntityNotFoundError(endpointId);
             }
+            const stored = store.relationships.get(rel.id);
+            const refused = insertOnly
+              ? repeated || stored !== undefined
+              : stored !== undefined && !isSameEdge(stored, rel);
+            if (refused) throw new DuplicateRelationshipError(rel.id);
             store.relationships.set(rel.id, rel);
             relationshipsImported++;
           } catch (err) {
@@ -984,6 +1033,39 @@ export class InMemoryStorageProvider implements StorageProvider {
 
     return { entitiesImported, relationshipsImported, errors };
   }
+}
+
+/** Ordinal comparison of two strings for a descending sort. */
+function compareDescending(a: string, b: string): number {
+  return a < b ? 1 : a > b ? -1 : 0;
+}
+
+/**
+ * The entries of `next` that write something new compared with `stored`: a
+ * key `stored` lacks, or one whose value differs. Values are JSON, so they
+ * are compared by their serialised form.
+ */
+function writtenProperties(
+  stored: Readonly<Record<string, unknown>>,
+  next: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const written: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(next)) {
+    const unchanged =
+      Object.prototype.hasOwnProperty.call(stored, key) &&
+      (Object.is(stored[key], value) || JSON.stringify(stored[key]) === JSON.stringify(value));
+    if (!unchanged) written[key] = value;
+  }
+  return written;
+}
+
+/** Whether two relationships are the same edge: the same type and the same endpoints. */
+function isSameEdge(a: StoredRelationship, b: StoredRelationship): boolean {
+  return (
+    a.relationshipType === b.relationshipType &&
+    a.sourceEntityId === b.sourceEntityId &&
+    a.targetEntityId === b.targetEntityId
+  );
 }
 
 /** A bulk-import row error, carrying the typed error's code when it has one. */

@@ -12,6 +12,7 @@ import {
 import {
   isEntityUniquenessViolation,
   isMemoryLimitFailure,
+  isRetryableTransientFailure,
   isRowShapedFailure,
   isTransactionMemoryLimit,
   isTransactionTimeout,
@@ -85,6 +86,16 @@ describe('mapDriverError', () => {
       const err = fakeDriverError(CONSTRAINT_VIOLATION, REPOSITORY_VIOLATION);
       const result = mapped(err, { kind: 'repository', repositoryId: 'r1', operation: 'createRepository' });
       expect(result).toBeInstanceOf(DuplicateRepositoryError);
+    });
+
+    it('maps the change-log constraint to ProviderError, whatever context.kind says', () => {
+      const err = fakeDriverError(
+        CONSTRAINT_VIOLATION,
+        "Node(10730) already exists with label `_VocabularyChangeLog` and properties `repositoryId` = 'r1', `changeId` = 'c1'",
+      );
+      const result = mapped(err, ENTITY_CONTEXT);
+      expect(result).toBeInstanceOf(ProviderError);
+      expect(result.cause).toBe(err);
     });
 
     it('prefers the constraint in the message over a conflicting context.kind', () => {
@@ -342,5 +353,24 @@ describe('transaction memory limits', () => {
     // Neither is a row-shaped failure on its own.
     expect(isRowShapedFailure(txLimit)).toBe(false);
     expect(isRowShapedFailure(pool)).toBe(false);
+  });
+});
+
+describe('isRetryableTransientFailure', () => {
+  it('accepts a transient server failure', () => {
+    expect(isRetryableTransientFailure(fakeDriverError('Neo.TransientError.Transaction.DeadlockDetected', 'deadlock'))).toBe(true);
+    expect(isRetryableTransientFailure(fakeDriverError('Neo.TransientError.Transaction.LockClientStopped', 'stopped'))).toBe(true);
+  });
+
+  it('refuses the memory limits, which a re-run of the same statement hits again', () => {
+    expect(isRetryableTransientFailure(fakeDriverError(TRANSACTION_MEMORY_LIMIT_CODE, 'limit'))).toBe(false);
+    expect(isRetryableTransientFailure(fakeDriverError(MEMORY_POOL_EXHAUSTED_CODE, 'pool'))).toBe(false);
+  });
+
+  it('refuses client, database and connection failures', () => {
+    expect(isRetryableTransientFailure(fakeDriverError('Neo.ClientError.Statement.EntityNotFound', 'gone'))).toBe(false);
+    expect(isRetryableTransientFailure(fakeDriverError('Neo.DatabaseError.General.UnknownError', 'x'))).toBe(false);
+    expect(isRetryableTransientFailure(fakeDriverError('ServiceUnavailable', 'x'))).toBe(false);
+    expect(isRetryableTransientFailure(null)).toBe(false);
   });
 });

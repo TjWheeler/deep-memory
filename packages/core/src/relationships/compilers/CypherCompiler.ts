@@ -15,6 +15,7 @@ import type { TraversalCompiler, CompiledQuery } from './TraversalCompiler.js';
 import {
   assertList,
   assertPositiveSafeInteger,
+  assertProjectableProperty,
   assertPropertyFilterList,
   assertSafeIdentifier,
   assertStepList,
@@ -180,7 +181,7 @@ export class CypherCompiler implements TraversalCompiler {
       // they pass the same identifier rule as filter keys.
       assertList(projection.properties, 'projection.properties');
       const projectionColumns = projection.properties.map((prop) => {
-        assertSafeIdentifier(prop, 'projection property name');
+        assertProjectableProperty(prop);
         return `${lastNode}.${prop} AS ${prop}`;
       });
 

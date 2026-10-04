@@ -100,7 +100,7 @@ describe('importBulk failure handling', () => {
     });
 
     expect(result.relationshipsImported).toBe(1);
-    expect(result.errors).toEqual([{ item: 'relationship:r1', code: 'RELATIONSHIP_ALREADY_EXISTS', error: 'conflict' }]);
+    expect(result.errors).toEqual([{ item: 'relationship:r1', code: 'RELATIONSHIP_ALREADY_EXISTS', error: 'Relationship "r1" already exists' }]);
   });
 
   it('records a row whose properties the mapping refuses, without submitting it', async () => {
@@ -111,7 +111,7 @@ describe('importBulk failure handling', () => {
     expect(submitted).toEqual(['e2']);
     expect(result.entitiesImported).toBe(1);
     expect(result.errors).toHaveLength(1);
-    expect(result.errors[0]).toMatchObject({ item: 'entity:e1', code: 'PROVIDER_ERROR' });
+    expect(result.errors[0]).toMatchObject({ item: 'entity:e1', code: 'INVALID_INPUT' });
   });
 
   it('rejects with a typed error when the container is gone (404) and stops dispatching rows', async () => {
@@ -176,6 +176,100 @@ describe('importBulk failure handling', () => {
       name: 'ProviderError',
       cause: lost,
     });
+  });
+});
+
+describe('importBulk relationship ids', () => {
+  /** Captures the statements a relationship import submits, keyed by row id. */
+  function capturingConnection(respond: (relId: string, attempt: number) => Error | undefined): {
+    conn: CosmosDbConnection;
+    queries: Map<string, string[]>;
+  } {
+    const queries = new Map<string, string[]>();
+    const fake = {
+      async submit(query: string, bindings: Record<string, unknown> = {}): Promise<GremlinResult> {
+        if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [1] };
+        const relId = String(bindings['relId']);
+        const sent = queries.get(relId) ?? [];
+        sent.push(query);
+        queries.set(relId, sent);
+        const failure = respond(relId, sent.length);
+        if (failure !== undefined) throw failure;
+        return { items: [{}] };
+      },
+    };
+    return { conn: fake as unknown as CosmosDbConnection, queries };
+  }
+
+  const conflict = (): Error => cosmosError(409, 'Resource with specified id or name already exists.');
+
+  it('upserts from one lookup of both endpoints and updates only the edge with the row type and endpoints', async () => {
+    const { conn, queries } = capturingConnection(() => undefined);
+
+    await importBulk(conn, RID, [{ relationships: [relationship('r1')] }]);
+
+    const query = queries.get('r1')![0]!;
+    expect(query).toMatch(
+      /^g\.V\(\)\.has\('repositoryId', rid\)\.hasId\(within\(srcId, tgtId\)\)\.has\('entityType'\)\.fold\(\)\.as\('vs'\)/,
+    );
+    expect(query).toContain(
+      ".coalesce(__.outE(edgeLabel).hasId(relId).where(__.inV().hasId(tgtId))",
+    );
+    expect(query).toContain(", __.addE(edgeLabel).to('t').property('id', relId).property('repositoryId', rid)");
+    // No edge scan by id and no lookup after the first step.
+    expect(query).not.toContain('g.E()');
+    expect(query.match(/[.(]V\(\)/g)).toHaveLength(1);
+  });
+
+  it('refuses an upserted row whose id another edge holds with RELATIONSHIP_ALREADY_EXISTS after one resubmit', async () => {
+    const { conn, queries } = capturingConnection((relId) => (relId === 'r1' ? conflict() : undefined));
+
+    const result = await importBulk(conn, RID, [{ relationships: [relationship('r1'), relationship('r2')] }]);
+
+    expect(queries.get('r1')).toHaveLength(2);
+    expect(queries.get('r2')).toHaveLength(1);
+    expect(result.relationshipsImported).toBe(1);
+    expect(result.errors).toEqual([
+      { item: 'relationship:r1', code: 'RELATIONSHIP_ALREADY_EXISTS', error: 'Relationship "r1" already exists' },
+    ]);
+  });
+
+  it('imports an upserted row whose resubmit finds the edge an earlier row of the import wrote', async () => {
+    const { conn, queries } = capturingConnection((_relId, attempt) => (attempt === 1 ? conflict() : undefined));
+
+    const result = await importBulk(conn, RID, [{ relationships: [relationship('r1')] }]);
+
+    expect(queries.get('r1')).toHaveLength(2);
+    expect(result).toMatchObject({ relationshipsImported: 1, errors: [] });
+  });
+
+  it('does not resubmit an inserted row the store refuses with a 409', async () => {
+    const { conn, queries } = capturingConnection(() => conflict());
+
+    const result = await importBulk(conn, RID, [{ relationships: [relationship('r1')] }], { skipExistenceCheck: true });
+
+    expect(queries.get('r1')).toHaveLength(1);
+    expect(result.errors).toEqual([
+      { item: 'relationship:r1', code: 'RELATIONSHIP_ALREADY_EXISTS', error: 'Relationship "r1" already exists' },
+    ]);
+  });
+
+  it('does not resubmit an upserted entity the store refuses with a 409', async () => {
+    const queries: string[] = [];
+    const fake = {
+      async submit(query: string): Promise<GremlinResult> {
+        if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [1] };
+        queries.push(query);
+        throw conflict();
+      },
+    };
+
+    const result = await importBulk(fake as unknown as CosmosDbConnection, RID, [{ entities: [entity('e1')] }]);
+
+    expect(queries).toHaveLength(1);
+    expect(result.errors).toEqual([
+      { item: 'entity:e1', code: 'ENTITY_ALREADY_EXISTS', error: expect.stringContaining('already exists') },
+    ]);
   });
 });
 

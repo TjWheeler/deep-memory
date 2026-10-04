@@ -36,10 +36,12 @@ const vocabulary = {
 describe('Portability', () => {
   let memory: DeepMemory;
   let repo: MemoryRepository;
+  let storage: InMemoryStorageProvider;
 
   beforeEach(async () => {
+    storage = new InMemoryStorageProvider();
     memory = new DeepMemory({
-      storage: new InMemoryStorageProvider(),
+      storage,
       provenance: { actorId: 'test-agent', actorType: 'agent' },
     });
 
@@ -262,6 +264,28 @@ describe('Portability', () => {
       ).rejects.toThrow(InvalidInputError);
       expect(await storedVersion()).toBe('1.0.0');
     });
+
+    it('upserts the rows of an archive imported again into the repository it created', async () => {
+      const archive = await memory.exportRepository('10000000-0000-4000-a000-000000000001');
+      const reimportId = '10000000-0000-4000-a000-00000000000c';
+      const target = { mode: 'create' as const, repositoryId: reimportId, config: { label: 'Re-imported' } };
+
+      const first = await memory.importRepository(archive, { target });
+      const importBulk = vi.spyOn(storage, 'importBulk');
+      const second = await memory.importRepository(archive, { target });
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(true);
+      expect(second.statistics.entitiesImported).toBe(3);
+      expect(second.statistics.relationshipsImported).toBe(2);
+      expect(second.warnings.filter((w) => w.code === 'import_error')).toEqual([]);
+      for (const [, , options] of importBulk.mock.calls) {
+        expect(options?.skipExistenceCheck).toBe(false);
+      }
+      const stats = await (await memory.openRepository(reimportId)).getStats();
+      expect(stats.entityCount).toBe(3);
+      expect(stats.relationshipCount).toBe(2);
+    });
   });
 
   // ─── Merge Import ──────────────────────────────────────────
@@ -418,6 +442,36 @@ describe('Portability', () => {
         (w) => w.code === 'relationship_skipped',
       );
       expect(skipWarning).toBeDefined();
+    });
+
+    it('skips and reports an entity whose property name the store refuses, importing the rest', async () => {
+      const alice = archive.entities.find((e) => e.slug === 'person:alice')!;
+      const failures: Array<{ itemId: string; code?: string }> = [];
+      memory.on('import:item-failed', (e) => {
+        failures.push({ itemId: e.payload.itemId, code: e.payload.code });
+      });
+      const legacyArchive = {
+        ...archive,
+        entities: archive.entities.map((e) =>
+          e.id === alice.id ? { ...e, properties: { 'start-date': '2020-01-01' } } : e,
+        ),
+      };
+
+      const result = await memory.importRepository(legacyArchive, {
+        target: { mode: 'merge', repositoryId: '10000000-0000-4000-a000-000000000004' },
+        vocabularyConflict: 'extend',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.statistics.entitiesImported).toBe(2);
+      expect(result.statistics.entitiesSkipped).toBe(1);
+      expect(result.warnings).toContainEqual(
+        expect.objectContaining({ code: 'import_error', id: alice.id, errorCode: 'INVALID_INPUT' }),
+      );
+      // Alice's relationship has no source to attach to.
+      expect(result.statistics.relationshipsImported).toBe(1);
+      expect(result.statistics.relationshipsSkipped).toBe(1);
+      expect(failures).toContainEqual({ itemId: alice.id, code: 'INVALID_INPUT' });
     });
 
     it('skips orphaned relationships', async () => {

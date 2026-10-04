@@ -9,10 +9,13 @@ import {
 } from '@utaba/deep-memory';
 import type { StoredEntity } from '@utaba/deep-memory/types';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
+import { batchConnection } from './batchConnection.test-support.js';
 import {
   buildFindEntitiesWhere,
   buildFulltextFindQuery,
   createEntity,
+  deleteEntitiesByType,
+  ENTITY_DELETE_BY_TYPE_QUERY,
   findEntities,
   escapeLuceneQuery,
   resolveSearchScoring,
@@ -68,7 +71,7 @@ describe('buildFindEntitiesWhere', () => {
         { properties: { 'has-dash': 'x' }, limit: 10, offset: 0 },
         { alias: 'n', includeRepositoryPredicate: true },
       ),
-    ).toThrowError(ProviderError);
+    ).toThrowError(InvalidInputError);
   });
 
   it('rejects user-property keys that collide with reserved schema field names', () => {
@@ -77,7 +80,7 @@ describe('buildFindEntitiesWhere', () => {
         { properties: { entityType: 'Person' }, limit: 10, offset: 0 },
         { alias: 'n', includeRepositoryPredicate: true },
       ),
-    ).toThrowError(ProviderError);
+    ).toThrowError(InvalidInputError);
   });
 
   it('rejects property-filter values that Neo4j cannot store as a native scalar', () => {
@@ -523,5 +526,224 @@ describe('findEntities on a failing page', () => {
     );
     expect(thrown).toBeInstanceOf(DeepMemoryError);
     expect((thrown as Error).cause).toBe(DRIVER_FAILURE);
+  });
+});
+
+describe('deleteEntitiesByType in batches', () => {
+  const RID = 'repo-by-type';
+  const BATCHING = { batchSize: 2, edgeCap: 3 };
+
+  it('runs batches until one finds fewer than the batch size, and sums their counters', async () => {
+    const { conn, calls } = batchConnection(RID, [
+      { row: { repositoryExists: true, edges: 2n, entities: 2n }, counters: { nodesDeleted: 2, relationshipsDeleted: 2 } },
+      { row: { repositoryExists: true, edges: 1n, entities: 2n }, counters: { nodesDeleted: 2, relationshipsDeleted: 1 } },
+      { row: { repositoryExists: true, edges: 0n, entities: 1n }, counters: { nodesDeleted: 1 } },
+    ]);
+
+    const result = await deleteEntitiesByType(conn, RID, 'person', BATCHING);
+
+    expect(result).toEqual({ deletedEntities: 5, deletedRelationships: 3 });
+    expect(calls).toHaveLength(3);
+    expect(calls[0]?.params).toEqual({ entityType: 'person', batchSize: 2n, edgeCap: 3n });
+  });
+
+  it('runs again while a batch reaches the edge cap, then deletes the entities', async () => {
+    const { conn, calls } = batchConnection(RID, [
+      { row: { repositoryExists: true, edges: 3n, entities: 0n }, counters: { relationshipsDeleted: 3 } },
+      { row: { repositoryExists: true, edges: 3n, entities: 0n }, counters: { relationshipsDeleted: 3 } },
+      { row: { repositoryExists: true, edges: 1n, entities: 1n }, counters: { nodesDeleted: 1, relationshipsDeleted: 1 } },
+    ]);
+
+    expect(await deleteEntitiesByType(conn, RID, 'person', BATCHING)).toEqual({
+      deletedEntities: 1,
+      deletedRelationships: 7,
+    });
+    expect(calls).toHaveLength(3);
+  });
+
+  it('reports 0 when nothing of the type is left', async () => {
+    const { conn, calls } = batchConnection(RID, [{ row: { repositoryExists: true, edges: 0n, entities: 0n } }]);
+    expect(await deleteEntitiesByType(conn, RID, 'person', BATCHING)).toEqual({
+      deletedEntities: 0,
+      deletedRelationships: 0,
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('throws RepositoryNotFoundError from the first batch when the marker is missing', async () => {
+    const { conn, calls } = batchConnection(RID, [{ row: { repositoryExists: false, edges: 0n, entities: 0n } }]);
+    await expect(deleteEntitiesByType(conn, RID, 'person', BATCHING)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('throws RepositoryNotFoundError when the repository is deleted between batches', async () => {
+    const { conn } = batchConnection(RID, [
+      { row: { repositoryExists: true, edges: 0n, entities: 2n }, counters: { nodesDeleted: 2 } },
+      { row: { repositoryExists: false, edges: 0n, entities: 0n } },
+    ]);
+    await expect(deleteEntitiesByType(conn, RID, 'person', BATCHING)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+  });
+
+  it('runs a batch again after a transient failure, keeping the counts exact', async () => {
+    const deadlock = Object.assign(new Error('deadlock'), { code: 'Neo.TransientError.Transaction.DeadlockDetected' });
+    const { conn, calls } = batchConnection(RID, [
+      { row: { repositoryExists: true, edges: 1n, entities: 2n }, counters: { nodesDeleted: 2, relationshipsDeleted: 1 } },
+      { error: deadlock },
+      { error: deadlock },
+      { row: { repositoryExists: true, edges: 0n, entities: 1n }, counters: { nodesDeleted: 1 } },
+    ]);
+
+    expect(await deleteEntitiesByType(conn, RID, 'person', BATCHING)).toEqual({
+      deletedEntities: 3,
+      deletedRelationships: 1,
+    });
+    expect(calls).toHaveLength(4);
+    expect(calls[3]?.params).toEqual(calls[1]?.params);
+  });
+
+  it('raises a transient failure that outlasts the retries as a typed error', async () => {
+    const deadlock = Object.assign(new Error('deadlock'), { code: 'Neo.TransientError.Transaction.DeadlockDetected' });
+    const { conn, calls } = batchConnection(RID, [{ error: deadlock }, { error: deadlock }, { error: deadlock }, { error: deadlock }]);
+    const thrown: unknown = await deleteEntitiesByType(conn, RID, 'person', BATCHING).catch((err: unknown) => err);
+    expect(thrown).toBeInstanceOf(DeepMemoryError);
+    expect((thrown as Error).cause).toBe(deadlock);
+    expect(calls).toHaveLength(4);
+  });
+
+  it('does not run a batch again after a memory-limit failure', async () => {
+    const memory = Object.assign(new Error('memory'), { code: 'Neo.TransientError.General.TransactionMemoryLimit' });
+    const { conn, calls } = batchConnection(RID, [{ error: memory }]);
+    const thrown: unknown = await deleteEntitiesByType(conn, RID, 'person', BATCHING).catch((err: unknown) => err);
+    expect(thrown).toBeInstanceOf(DeepMemoryError);
+    expect((thrown as Error).cause).toBe(memory);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('raises a failed batch as a typed error', async () => {
+    const failure = Object.assign(new Error('database unavailable'), { code: 'Neo.DatabaseError.General.UnknownError' });
+    const { conn, calls } = batchConnection(RID, [{ error: failure }]);
+    const thrown: unknown = await deleteEntitiesByType(conn, RID, 'person', BATCHING).catch((err: unknown) => err);
+    expect(thrown).toBeInstanceOf(DeepMemoryError);
+    expect((thrown as Error).cause).toBe(failure);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('reports a batch with no row as ProviderError', async () => {
+    const { conn } = batchConnection(RID, [{}]);
+    await expect(deleteEntitiesByType(conn, RID, 'person', BATCHING)).rejects.toBeInstanceOf(ProviderError);
+  });
+
+  it('takes the edges up to the cap and deletes the entities only below it', () => {
+    expect(ENTITY_DELETE_BY_TYPE_QUERY).toContain('WHERE repo IS NOT NULL');
+    expect(ENTITY_DELETE_BY_TYPE_QUERY).toContain('WITH DISTINCT r LIMIT $edgeCap');
+    expect(ENTITY_DELETE_BY_TYPE_QUERY).toContain('CASE WHEN edgeCount < $edgeCap THEN batch ELSE [] END AS doomed');
+    expect(ENTITY_DELETE_BY_TYPE_QUERY).toContain('FOREACH (n IN doomed | DETACH DELETE n)');
+  });
+});
+
+describe('updateEntity with stored keys the property-name rules refuse', () => {
+  const provenance = {
+    createdBy: 't',
+    createdByType: 'agent' as const,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    modifiedBy: 't',
+    modifiedByType: 'agent' as const,
+    modifiedAt: '2026-01-01T00:00:00.000Z',
+  };
+
+  /**
+   * A connection over one stored entity node. `blob` is its JSON user
+   * properties and `native` the user properties it also holds as node
+   * properties. The pre-read answers the node's properties; the write is
+   * recorded and answers the node as the write leaves it.
+   */
+  function nodeConnection(blob: Record<string, unknown>, native: Record<string, unknown> = {}) {
+    const node: Record<string, unknown> = {
+      id: 'e1',
+      entityType: 'test-type',
+      label: 'System label',
+      slug: 'test-type:system-label',
+      properties: JSON.stringify(blob),
+      ...provenance,
+      ...native,
+    };
+    const writes: Array<{ cypher: string; params: Record<string, unknown> }> = [];
+    const conn = {
+      async executeQuery(cypher: string, params: Record<string, unknown>) {
+        if (cypher.includes('properties(n) AS props')) {
+          const row: Record<string, unknown> = { repositoryExists: true, props: { ...node } };
+          return { records: [{ keys: Object.keys(row), get: (key: string) => row[key] }] };
+        }
+        writes.push({ cypher, params });
+        const after: Record<string, unknown> = { ...node, ...(params['userProperties'] as Record<string, unknown>) };
+        if (typeof params['properties'] === 'string') after['properties'] = params['properties'];
+        const row: Record<string, unknown> = { repositoryExists: true, entityFound: true, ...after };
+        return { records: [{ keys: Object.keys(row), get: (key: string) => row[key] }] };
+      },
+    };
+    return { conn: conn as unknown as Neo4jConnection, writes };
+  }
+
+  /** The SET / REMOVE part of an update statement, ahead of its projection. */
+  function writeClauses(cypher: string | undefined): string {
+    return (cypher ?? '').split(' RETURN ')[0] ?? '';
+  }
+
+  it('carries over an unchanged invalid key while another key changes, keeping it out of the query text', async () => {
+    const { conn, writes } = nodeConnection({ 'start-date': '2020', ok: 1 }, { ok: 1 });
+
+    const updated = await updateEntity(conn, 'r1', 'e1', {
+      properties: { 'start-date': '2020', ok: 2 },
+      provenance,
+    });
+
+    expect(updated.properties).toEqual({ 'start-date': '2020', ok: 2 });
+    const [write] = writes;
+    expect(write?.params['userProperties']).toEqual({ ok: 2 });
+    expect(write?.cypher).not.toContain('start-date');
+    expect(JSON.parse(write?.params['properties'] as string)).toEqual({ 'start-date': '2020', ok: 2 });
+  });
+
+  it('carries over an unchanged reserved key in the blob without touching the system field', async () => {
+    const { conn, writes } = nodeConnection({ label: 'user value', ok: 1 }, { ok: 1 });
+
+    const updated = await updateEntity(conn, 'r1', 'e1', { properties: { label: 'user value', ok: 2 }, provenance });
+
+    expect(updated.label).toBe('System label');
+    expect(updated.properties).toEqual({ label: 'user value', ok: 2 });
+    const [write] = writes;
+    expect(write?.params['userProperties']).toEqual({ ok: 2 });
+    expect(writeClauses(write?.cypher)).not.toContain('n.label');
+  });
+
+  it('removes stored invalid and reserved keys the merged map drops, leaving system fields alone', async () => {
+    const { conn, writes } = nodeConnection(
+      { 'start-date': '2020', label: 'user value', ok: 1, old: 'x' },
+      { ok: 1, old: 'x' },
+    );
+
+    const updated = await updateEntity(conn, 'r1', 'e1', { properties: { ok: 1 }, provenance });
+
+    expect(updated.label).toBe('System label');
+    expect(updated.properties).toEqual({ ok: 1 });
+    const [write] = writes;
+    expect(write?.cypher).not.toContain('start-date');
+    expect(writeClauses(write?.cypher)).toContain('REMOVE n.old');
+    expect(writeClauses(write?.cypher)).not.toContain('n.label');
+    expect(write?.params['userProperties']).toEqual({ ok: 1 });
+  });
+
+  it.each([
+    ['a new invalid key', { ok: 1 }, { ok: 1, 'start-date': '2020' }, 'properties.start-date'],
+    ['a new reserved key', { ok: 1 }, { ok: 1, createdBy: 'someone' }, 'properties.createdBy'],
+    ['a new value for a stored invalid key', { 'start-date': '2020' }, { 'start-date': '2021' }, 'properties.start-date'],
+  ])('refuses %s with INVALID_INPUT and writes nothing', async (_what, blob, properties, field) => {
+    const { conn, writes } = nodeConnection(blob);
+
+    const rejection = updateEntity(conn, 'r1', 'e1', { properties, provenance });
+
+    await expect(rejection).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(rejection).rejects.toMatchObject({ code: 'INVALID_INPUT', field });
+    expect(writes).toHaveLength(0);
   });
 });

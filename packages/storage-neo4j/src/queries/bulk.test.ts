@@ -316,6 +316,12 @@ describe('importBulk failure handling', () => {
         'WHERE e.id IS NOT NULL AND held.id IN $ids',
     );
     expect(upsert).toContain('MERGE (s)-[r:KNOWS {repositoryId: $rid, id: row.id}]->(t)');
+    // The id counts as in use unless the edge holding it has the row's type and both its endpoints.
+    expect(upsert).toContain(
+      'WHEN any(x IN held WHERE x.id = row.id\n' +
+        '      AND NOT (type(x) = row.relationshipType AND startNode(x) = s AND endNode(x) = t))\n' +
+        "      THEN 'id-exists'",
+    );
     expect(upsert).not.toContain('$writeAttempt');
     const insert = cyphers.get(true)!;
     expect(insert).not.toContain('held');
@@ -534,7 +540,7 @@ describe('importBulk failure handling', () => {
     expect(calls.map((rows) => rows.map((row) => row.id))).toEqual([['e1', 'e3']]);
     expect(result.entitiesImported).toBe(2);
     expect(result.errors).toHaveLength(1);
-    expect(result.errors[0]).toMatchObject({ item: 'entity:e2', code: 'PROVIDER_ERROR' });
+    expect(result.errors[0]).toMatchObject({ item: 'entity:e2', code: 'INVALID_INPUT' });
   });
 
   it('records every row of a relationship group whose type the guard refuses', async () => {
@@ -551,8 +557,25 @@ describe('importBulk failure handling', () => {
     expect(calls.map((rows) => rows.map((row) => row.id))).toEqual([['r3']]);
     expect(result.relationshipsImported).toBe(1);
     expect(result.errors.map((e) => [e.item, e.code])).toEqual([
-      ['relationship:r1', 'PROVIDER_ERROR'],
-      ['relationship:r2', 'PROVIDER_ERROR'],
+      ['relationship:r1', 'INVALID_INPUT'],
+      ['relationship:r2', 'INVALID_INPUT'],
+    ]);
+  });
+
+  it('records a relationship row whose property key the mapping refuses and imports the rest of its group', async () => {
+    const { conn, calls } = fakeConnection(() => undefined);
+
+    const result = await importBulk(
+      conn,
+      RID,
+      [{ relationships: [relationship('r1'), { ...relationship('r2'), properties: { label: 'x' } }, relationship('r3')] }],
+      options(10),
+    );
+
+    expect(calls.map((rows) => rows.map((row) => row.id))).toEqual([['r1', 'r3']]);
+    expect(result.relationshipsImported).toBe(2);
+    expect(result.errors).toEqual([
+      { item: 'relationship:r2', code: 'INVALID_INPUT', error: expect.stringContaining('reserved') },
     ]);
   });
 

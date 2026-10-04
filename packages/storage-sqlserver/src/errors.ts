@@ -18,7 +18,7 @@ import {
   DuplicateRepositoryError,
   SlugConflictError,
 } from '@utaba/deep-memory';
-import type { DeepMemoryError } from '@utaba/deep-memory';
+import type { DeepMemoryError, InvalidInputError } from '@utaba/deep-memory';
 
 /** Violation of a PRIMARY KEY or UNIQUE constraint. */
 const UNIQUE_CONSTRAINT_VIOLATION = 2627;
@@ -142,16 +142,29 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * The error an import rejects with after rolling back. A unique-key clash on
- * a row becomes an ImportError naming the row, with the typed clash
- * (Duplicate*Error / SlugConflictError) as `cause`; any other failure a
- * ProviderError with the SQL Server error as `cause`.
+ * A row's typed refusal raised by the import itself (a relationship id
+ * already stored on another edge) rather than by SQL Server.
+ */
+function rowRefusal(err: unknown): DeepMemoryError | undefined {
+  return err instanceof DuplicateEntityError ||
+    err instanceof DuplicateRelationshipError ||
+    err instanceof SlugConflictError
+    ? err
+    : undefined;
+}
+
+/**
+ * The error an import rejects with after rolling back. A refused row (a
+ * unique-key clash, or a clash the import detected itself) becomes an
+ * ImportError naming the row, with the typed clash (Duplicate*Error /
+ * SlugConflictError) as `cause`; any other failure a ProviderError with the
+ * underlying error as `cause`.
  */
 export function importFailure(err: unknown, row: ImportRow | undefined, rollbackError: unknown): DeepMemoryError {
   const rollbackNote =
     rollbackError === undefined ? '' : ` (the rollback also failed: ${errorMessage(rollbackError)})`;
   const suggestion = 'Nothing from this import was written. Fix the row and re-run the import.';
-  const clash = row === undefined ? undefined : mapUniqueViolation(err, row.context);
+  const clash = row === undefined ? undefined : rowRefusal(err) ?? mapUniqueViolation(err, row.context);
   if (row !== undefined && clash !== undefined) {
     return new ImportError(
       `SQL Server import rolled back: ${row.item} failed: ${clash.message}${rollbackNote}`,
@@ -164,5 +177,19 @@ export function importFailure(err: unknown, row: ImportRow | undefined, rollback
     `SQL Server import rolled back: ${where}: ${errorMessage(err)}${rollbackNote}`,
     suggestion,
     { cause: err },
+  );
+}
+
+/**
+ * The error an import rejects with when a row is refused before anything is
+ * written (a property key that cannot be stored): an ImportError naming the
+ * row, with the row's InvalidInputError as `cause`, so a refusal caught up
+ * front reads the same as one that rolls the import back.
+ */
+export function importRowRejected(row: ImportRow, refusal: InvalidInputError): ImportError {
+  return new ImportError(
+    `SQL Server import refused: ${row.item} failed: ${refusal.message}`,
+    'Nothing from this import was written. Fix the row and re-run the import.',
+    { cause: refusal },
   );
 }

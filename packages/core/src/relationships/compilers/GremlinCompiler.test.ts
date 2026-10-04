@@ -541,6 +541,18 @@ describe('GremlinCompiler', () => {
       );
     });
 
+    it.each(['createdInConversation', 'entityLabel', 'embedding', '_attempt'])(
+      'rejects projecting the entity system field %s',
+      (name) => {
+        const spec: TraversalSpec = {
+          start: { entityType: 'Organization' },
+          returnMode: 'terminal',
+          projection: { properties: [name] },
+        };
+        expect(() => compiler.compile(spec, emptyVocab)).toThrow(/reserved for an entity system field/);
+      },
+    );
+
     it('drops projection silently when returnMode is path', () => {
       const spec: TraversalSpec = {
         start: { entityId: 'a' },

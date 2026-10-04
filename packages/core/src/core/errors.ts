@@ -1,5 +1,8 @@
 // Error hierarchy — typed errors with actionable suggestions
 
+import type { Entity } from '../types/entities.js';
+import type { Relationship } from '../types/relationships.js';
+
 /** Error codes for all Deep Memory errors */
 export type DeepMemoryErrorCode =
   | 'INVALID_INPUT'
@@ -26,7 +29,8 @@ export type DeepMemoryErrorCode =
   | 'TRAVERSAL_VOCABULARY_ERROR'
   | 'TRAVERSAL_TIMEOUT'
   | 'QUERY_TIMEOUT'
-  | 'UNSUPPORTED_QUERY';
+  | 'UNSUPPORTED_QUERY'
+  | 'BATCH_PARTIAL_FAILURE';
 
 /**
  * True when `err` is an error carrying the Deep Memory `code`.
@@ -526,4 +530,54 @@ export class UnsupportedQueryError extends DeepMemoryError {
     this.name = 'UnsupportedQueryError';
     this.provider = provider;
   }
+}
+
+/** A member a batch create stores: an entity or a relationship. */
+export type BatchMember = Entity | Relationship;
+
+/**
+ * Thrown by a batch create (`createEntities` / `createRelationships`) when a
+ * member fails after one or more members have already been stored.
+ *
+ * A batch is validated in full before anything is written, so this error
+ * only reports failures the store or a hook raised while writing. Members are
+ * written one at a time, each in its own store transaction, so the members
+ * stored before the failure stay stored. `created` lists them, in input order,
+ * exactly as a successful call would have returned them; `failedIndex` is the
+ * input index of the member whose processing failed; `cause` is that
+ * failure. Members after `failedIndex` were not attempted.
+ *
+ * `created` normally holds the members before `failedIndex`. It also holds
+ * the member at `failedIndex` when that member was stored and a
+ * `*:created` event handler then failed.
+ *
+ * When the failure leaves nothing stored, the batch throws the original error
+ * instead, exactly as a single-member create would.
+ */
+export class BatchPartialFailureError<T extends BatchMember = BatchMember> extends DeepMemoryError {
+  readonly created: T[];
+  readonly failedIndex: number;
+  override readonly cause: Error;
+
+  constructor(created: T[], failedIndex: number, total: number, cause: Error) {
+    super(
+      'BATCH_PARTIAL_FAILURE',
+      `Batch create failed at member ${failedIndex} after ${created.length} of ${total} members were stored: ${cause.message}`,
+      `The members listed in "created" are stored. Fix the cause, then resend only the members that are not in "created": resending a stored member creates it again under a new id.`,
+      { cause },
+    );
+    this.name = 'BatchPartialFailureError';
+    this.created = created;
+    this.failedIndex = failedIndex;
+    this.cause = cause;
+  }
+}
+
+/**
+ * `err` as an `Error`, for carrying a caught value as a typed error's
+ * `cause`. A thrown non-`Error` value is wrapped in a `ProviderError` whose
+ * message is the value's string form.
+ */
+export function toError(err: unknown): Error {
+  return err instanceof Error ? err : new ProviderError(String(err));
 }

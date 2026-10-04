@@ -6,7 +6,14 @@ import type { Provenance } from '@utaba/deep-memory/types';
 import type { StoredRepository, StoredRepositorySummary } from '@utaba/deep-memory/types';
 import type { GovernanceConfig } from '@utaba/deep-memory/types';
 import type { VocabularyChangeRecord } from '@utaba/deep-memory/types';
-import { ProviderError } from '@utaba/deep-memory';
+import {
+  InvalidInputError,
+  SAFE_IDENTIFIER_PATTERN,
+  isReservedPropertyName,
+  isSafeIdentifier,
+  propertyNameRefusal,
+} from '@utaba/deep-memory';
+import type { PropertyOwner } from '@utaba/deep-memory';
 
 // ─── Projection field lists ───────────────────────────────────────
 //
@@ -183,8 +190,8 @@ export function entityFromGremlin(props: Record<string, unknown>): StoredEntity 
 // Cosmos NoSQL (Document) endpoint sees Gremlin-managed properties as
 // `[{ _value, id }]` arrays rather than flat scalars. The Gremlin reserved
 // scalars (`id`, the partition-key `repositoryId`, the vertex `label` token)
-// stay flat on the document. Probed and confirmed 2026-05-26 — see
-// local-tests/baseline/phase-cosmos-sql-shape-probe-results.md.
+// stay flat on the document. Confirmed against the live Document endpoint;
+// see "Path conventions" in docs/cosmosdb-gremlin-compatibility.md.
 
 /** Pluck the underlying value of a Gremlin-managed property from a Document-endpoint doc. */
 export function pluckDocValue(doc: Record<string, unknown>, key: string): unknown {
@@ -292,19 +299,28 @@ export function repositorySummaryFromGremlin(props: Record<string, unknown>): St
 
 // ─── Vocabulary change-log mapping ────────────────────────────────
 
+/**
+ * Map a `_vocabularyChangeLog` vertex back to its record. An optional field
+ * the write left out (see `buildChangeRecordPropertyLadder`) is absent from
+ * the vertex and stays absent from the record.
+ */
 export function changeRecordFromGremlin(props: Record<string, unknown>): VocabularyChangeRecord {
-  return {
+  const record: VocabularyChangeRecord = {
     changeId: unwrapStr(props['changeId']),
     changeType: unwrapStr(props['changeType']) as VocabularyChangeRecord['changeType'],
     typeName: unwrapStr(props['typeName']),
-    previousVersion: unwrapOptStr(props['previousVersion']),
     newVersion: unwrapStr(props['newVersion']),
     proposedBy: unwrapStr(props['proposedBy']),
     proposedAt: unwrapStr(props['proposedAt']),
-    approvedBy: unwrapOptStr(props['approvedBy']),
-    approvedAt: unwrapOptStr(props['approvedAt']),
     reason: unwrapStr(props['reason']),
   };
+  const previousVersion = unwrapOptStr(props['previousVersion']);
+  if (previousVersion !== undefined) record.previousVersion = previousVersion;
+  const approvedBy = unwrapOptStr(props['approvedBy']);
+  if (approvedBy !== undefined) record.approvedBy = approvedBy;
+  const approvedAt = unwrapOptStr(props['approvedAt']);
+  if (approvedAt !== undefined) record.approvedAt = approvedAt;
+  return record;
 }
 
 // ─── Fixed-shape property ladders ─────────────────────────────────
@@ -325,7 +341,7 @@ export function changeRecordFromGremlin(props: Record<string, unknown>): Vocabul
 // Slot order is FIXED. Adding a new slot goes at the END only; reordering
 // or removing breaks the cached plan + introduces a different query string.
 //
-// Live-validated 2026-05-26 — see docs/cosmosdb-gremlin-compatibility.md
+// Validated against a live container — see docs/cosmosdb-gremlin-compatibility.md
 // (choose-skip / fixed-ladder entries).
 
 /** Binding value used to signal an absent optional string slot. */
@@ -511,6 +527,51 @@ export function relationshipToLadderBindings(
   return bindings;
 }
 
+const CHANGE_RECORD_REQUIRED_SLOTS = [
+  'changeId',
+  'changeType',
+  'typeName',
+  'newVersion',
+  'proposedBy',
+  'proposedAt',
+  'reason',
+] as const;
+
+const CHANGE_RECORD_OPTIONAL_SLOTS = [
+  'previousVersion',
+  'approvedBy',
+  'approvedAt',
+] as const;
+
+/**
+ * Vocabulary change-record property ladder, bound as `c0`…`c9` so it can sit
+ * in the same traversal as the vocabulary write without colliding with that
+ * write's bindings. An absent optional field is not written.
+ */
+export function buildChangeRecordPropertyLadder(): string {
+  return buildLadder(CHANGE_RECORD_REQUIRED_SLOTS, CHANGE_RECORD_OPTIONAL_SLOTS, 'c');
+}
+
+/** Build the change-record ladder bindings (c0..c9 + absentSentinel). */
+export function changeRecordToLadderBindings(
+  record: VocabularyChangeRecord,
+): Record<string, string | number | boolean> {
+  const bindings = buildLadderBindings(CHANGE_RECORD_REQUIRED_SLOTS, CHANGE_RECORD_OPTIONAL_SLOTS, 'c', {
+    changeId: record.changeId,
+    changeType: record.changeType,
+    typeName: record.typeName,
+    newVersion: record.newVersion,
+    proposedBy: record.proposedBy,
+    proposedAt: record.proposedAt,
+    reason: record.reason,
+    previousVersion: record.previousVersion,
+    approvedBy: record.approvedBy,
+    approvedAt: record.approvedAt,
+  });
+  bindings[SENTINEL_BINDING] = ABSENT_STRING_SENTINEL;
+  return bindings;
+}
+
 /**
  * Repository property ladder — slot list matches the writable surface of
  * StorageRepositoryConfig (the `id` and `repositoryId` slots are written
@@ -564,88 +625,52 @@ export function repositoryConfigToLadderBindings(
 // scalars alongside the canonical blob. The blob stays authoritative for
 // round-trip; the scalars exist purely to support server-side predicates.
 //
-// Reserved-key collision guard, identifier shape, and storable-value subset
-// are byte-identical to the Neo4j side (see packages/storage-neo4j/src/mapping.ts).
+// The reserved-name and identifier rules are core's, shared with every
+// provider; the storable-value subset is byte-identical to the Neo4j side
+// (see packages/storage-neo4j/src/mapping.ts).
 // The shapes that round-trip through Bolt also round-trip through a Cosmos
 // Gremlin `.property(key, value)` binding: string, finite number, boolean,
 // homogeneous arrays of those. Nested objects, null, heterogeneous arrays,
 // and arrays of objects live only in the blob and are not predicate-queryable.
 
 /**
- * Schema-managed property names on an entity vertex. User-supplied
- * `entity.properties` keys cannot collide with these — a collision would
- * clobber a schema scalar via the dual-write (e.g. user-property `entityLabel`
- * would overwrite the ladder-written one and break round-trip).
+ * Apply the property-name rules core enforces on every provider: a bare
+ * identifier that is not reserved for a system field of `owner`'s kind.
+ * Both rules matter on Cosmos: Gremlin property-name positions
+ * (`.property('key', val)`, `.properties('key').drop()`, `values('key')`)
+ * are not parameterisable, so the key is baked into the query string; and the
+ * dual-write puts user scalars beside the ladder-written schema fields (and
+ * the Gremlin `'label'` token on edges), which a colliding key would clobber.
+ * Core's reserved sets cover every ladder slot (the drift test in
+ * `mapping.test.ts` checks this).
  *
- * Derived from the entity ladder slot arrays plus `id` and `repositoryId`
- * (both written outside the ladder). Kept as a frozen `Set` for O(1)
- * membership checks on the write hot path. The Phase 1 drift test asserts
- * every slot-array entry is present in this set, so adding a slot in the
- * future fails loudly if the reserved set is forgotten.
+ * The caller chose the key, so a refusal is an input error the caller can
+ * correct (`InvalidInputError`, field `properties.<key>`) rather than a store
+ * failure.
  */
-export const RESERVED_ENTITY_PROPERTY_KEYS: ReadonlySet<string> = new Set<string>([
-  'id',
-  'repositoryId',
-  ...ENTITY_REQUIRED_SLOTS,
-  ...ENTITY_OPTIONAL_SLOTS,
-]);
-
-/**
- * Schema-managed property names on a relationship edge. Includes the Gremlin
- * `'label'` token — Cosmos Gremlin uses it as the edge label and a user
- * property of the same name would collide at write time.
- */
-export const RESERVED_RELATIONSHIP_PROPERTY_KEYS: ReadonlySet<string> = new Set<string>([
-  'id',
-  'repositoryId',
-  'label',
-  ...RELATIONSHIP_REQUIRED_SLOTS,
-  ...RELATIONSHIP_OPTIONAL_SLOTS,
-]);
-
-/**
- * Cosmos Gremlin property-name positions (`.property('key', val)`,
- * `.properties('key').drop()`, `values('key')`) are not parameterisable —
- * the key is baked into the query string. Restrict user keys to the bare
- * Gremlin-identifier shape so the interpolation cannot widen the injection
- * surface, matching the regex Neo4j uses on its Cypher equivalent.
- */
-const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-function assertSafeUserPropertyKey(
-  key: string,
-  reserved: ReadonlySet<string>,
-  scope: 'Entity' | 'Relationship',
-): string {
-  if (!USER_PROPERTY_KEY_PATTERN.test(key)) {
-    throw new ProviderError(
-      `${scope} property key "${key}" is not a valid Gremlin identifier — must match ` +
-        `${USER_PROPERTY_KEY_PATTERN.source}. User-property keys are interpolated into ` +
-        `Gremlin .property(...) / values(...) / .drop() slots (the key slot cannot be ` +
-        `parameterised), so an unsafe value would widen the injection surface.`,
-    );
-  }
-  if (reserved.has(key)) {
-    throw new ProviderError(
-      `${scope} property key "${key}" collides with a schema-managed field. ` +
-        `Reserved names: ${Array.from(reserved).join(', ')}.`,
+function assertSafeUserPropertyKey(key: string, owner: PropertyOwner): string {
+  const refusal = propertyNameRefusal(key, owner);
+  if (refusal !== undefined) {
+    throw new InvalidInputError(
+      `properties.${key}`,
+      refusal,
+      `Rename the property to a name matching ${SAFE_IDENTIFIER_PATTERN.source} that is not a reserved system field.`,
     );
   }
   return key;
 }
 
 /**
- * Validate a user-supplied entity property key. Throws `ProviderError` when
- * the key is not a bare Gremlin identifier or collides with a schema-managed
- * field name. Returns the key on success so the call can chain.
+ * Validate a user-supplied entity property key. Throws `InvalidInputError` when
+ * the key is not a bare identifier or is reserved for a system field. Returns the key on success so the call can chain.
  */
 export function assertSafeEntityUserPropertyKey(key: string): string {
-  return assertSafeUserPropertyKey(key, RESERVED_ENTITY_PROPERTY_KEYS, 'Entity');
+  return assertSafeUserPropertyKey(key, 'entity');
 }
 
-/** Relationship counterpart — uses the relationship reserved set. */
+/** Relationship counterpart — applies the relationship reserved names. */
 export function assertSafeRelationshipUserPropertyKey(key: string): string {
-  return assertSafeUserPropertyKey(key, RESERVED_RELATIONSHIP_PROPERTY_KEYS, 'Relationship');
+  return assertSafeUserPropertyKey(key, 'relationship');
 }
 
 /**
@@ -709,6 +734,46 @@ export function entityUserPropertyParams(
 }
 
 /**
+ * The update form of `entityUserPropertyParams`: project an update's merged
+ * property map to the ordered `{ key, value }` entries of the dual-write
+ * suffix, given the user properties the entity holds now (its JSON blob).
+ *
+ * Key rules govern the names the update writes: a key that is new, or whose
+ * value changes, must pass them (`InvalidInputError`, field
+ * `properties.<key>`). A key the rules refuse that is carried over unchanged
+ * (stored before the rules existed) is not refused, so the entity stays
+ * updatable, but it gets no entry: its name is never written into the
+ * Gremlin string, and a reserved name never overwrites the system property
+ * it shares the vertex with. It lives on only in the JSON blob, which is what
+ * `entity.properties` reads back from. A key the update drops is removed from
+ * the blob by the blob being rewritten; no check applies to it.
+ */
+export function entityUpdatePropertyParams(
+  properties: Record<string, unknown>,
+  stored: Readonly<Record<string, unknown>>,
+): Array<{ key: string; value: unknown }> {
+  const out: Array<{ key: string; value: unknown }> = [];
+  for (const [key, value] of Object.entries(properties)) {
+    if (propertyNameRefusal(key, 'entity') !== undefined) {
+      if (value === null || isUnchangedProperty(stored, key, value)) continue;
+      assertSafeEntityUserPropertyKey(key);
+    }
+    if (isNativeStorableValue(value)) {
+      out.push({ key, value });
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether `stored` holds `value` under `key`. Values compare by their JSON
+ * form, which is how the blob stores them.
+ */
+function isUnchangedProperty(stored: Readonly<Record<string, unknown>>, key: string, value: unknown): boolean {
+  return Object.hasOwn(stored, key) && JSON.stringify(stored[key]) === JSON.stringify(value);
+}
+
+/**
  * Relationship counterpart — uses the relationship reserved set. Same ordered-
  * list semantic as `entityUserPropertyParams` for the same plan-cache reason:
  * per-key emission is inline, so the array order is part of the Gremlin string.
@@ -737,7 +802,8 @@ export function relationshipUserPropertyParams(
  * Unsafe identifiers, reserved-name collisions, and non-storable values are
  * silently skipped (not thrown). The blob may carry pre-validation or pre-
  * migration keys that never had a scalar written for them; failing the
- * update on those would defeat the lazy-migration contract (§2.7).
+ * update on those would block lazy migration, under which an entity written
+ * before its scalars existed gains them on its next update.
  */
 export function existingEntityScalarUserKeys(
   blob: Record<string, unknown> | null | undefined,
@@ -745,8 +811,8 @@ export function existingEntityScalarUserKeys(
   if (blob == null) return [];
   const out: string[] = [];
   for (const [key, value] of Object.entries(blob)) {
-    if (!USER_PROPERTY_KEY_PATTERN.test(key)) continue;
-    if (RESERVED_ENTITY_PROPERTY_KEYS.has(key)) continue;
+    if (!isSafeIdentifier(key)) continue;
+    if (isReservedPropertyName(key, 'entity')) continue;
     if (!isNativeStorableValue(value)) continue;
     out.push(key);
   }
@@ -765,8 +831,8 @@ export function existingRelationshipScalarUserKeys(
   if (blob == null) return [];
   const out: string[] = [];
   for (const [key, value] of Object.entries(blob)) {
-    if (!USER_PROPERTY_KEY_PATTERN.test(key)) continue;
-    if (RESERVED_RELATIONSHIP_PROPERTY_KEYS.has(key)) continue;
+    if (!isSafeIdentifier(key)) continue;
+    if (isReservedPropertyName(key, 'relationship')) continue;
     if (!isNativeStorableValue(value)) continue;
     out.push(key);
   }

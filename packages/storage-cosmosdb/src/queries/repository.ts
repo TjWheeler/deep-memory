@@ -455,11 +455,17 @@ export const DELETE_INDEX_ENTRY_QUERY =
  *
  * A create already executing when the marker is dropped can still land after
  * the drain has passed it; re-running `deleteRepository` removes it.
+ *
+ * `onMarkerGone` runs once step 1 has returned, before the probe and the
+ * drain: from then on the repository is gone to every reader, so a caller
+ * holding state derived from it (a vocabulary cache) drops it there rather
+ * than serving it for as long as the drain runs.
  */
 export async function deleteRepository(
   conn: CosmosDbConnection,
   repositoryId: string,
   onProgress?: DeleteProgressCallback,
+  onMarkerGone?: () => void,
 ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
   // Same aggregate-then-drop shape as deleteEntities: the bucket holds the id
   // of the marker actually dropped, so an empty bucket means there was none.
@@ -468,6 +474,7 @@ export async function deleteRepository(
       ".aggregate('found').by('id').drop().cap('found')",
     { rid: repositoryId, vid: repoVertexId(repositoryId) },
   );
+  onMarkerGone?.();
   const markerBucket = marker.items[0];
   const markerDropped = Array.isArray(markerBucket) && markerBucket.length > 0;
 

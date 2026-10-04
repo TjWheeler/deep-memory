@@ -9,8 +9,8 @@ import { TraversalValidationError } from '../../core/errors.js';
 import {
   assertList,
   assertPositiveSafeInteger,
+  assertProjectableProperty,
   assertPropertyFilterList,
-  assertSafeIdentifier,
   assertStepList,
   rejectUnsupported,
 } from './compilerGuards.js';
@@ -554,7 +554,7 @@ function emitProjectionTerminal(projection: TraversalProjection): string {
 
   assertList(properties, 'projection.properties');
   for (const prop of properties) {
-    assertSafeIdentifier(prop, 'projection property name');
+    assertProjectableProperty(prop);
   }
 
   const singleProperty = properties.length === 1;

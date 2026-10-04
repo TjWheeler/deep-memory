@@ -151,6 +151,16 @@ Governance modes control vocabulary evolution:
 - **managed** — changes require validation (and optionally human approval)
 - **open** — validated changes auto-approve (with deduplication)
 
+**Name rules.** New entity and relationship type names, and every property name, must match `SAFE_IDENTIFIER_PATTERN` (`^[A-Za-z_][A-Za-z0-9_]*$`): `start_date`, not `start-date`. Property names must also not be reserved for a system field (`RESERVED_ENTITY_PROPERTY_KEYS` / `RESERVED_RELATIONSHIP_PROPERTY_KEYS`, e.g. `label`, `slug`, `createdAt`). The rules are the same on every storage provider: a proposal that breaks them is rejected, and a write throws `InvalidInputError` (field `properties.<key>`). An update may still remove, or carry over unchanged, a key stored before these rules.
+
+**Change log and type deletes.** Every landed vocabulary change is recorded with it, and `getVocabularyChangeLog` lists them newest first. A type deletion writes the vocabulary first, then deletes the type's data; if the data delete fails part-way, resend the same proposal: it finishes the delete and answers `approved`, or `rejected` "not found" when nothing was left.
+
+**Vocabulary freshness.** Writes are validated against the vocabulary the storage provider returns. The persistent providers cache it for `vocabularyCacheTtlMs` (60 s by default; `0` disables the cache), so a change made by another process is enforced here within that window. To enforce changes at once, at the cost of a store read per validation, open the repository with fresh reads:
+
+```typescript
+const repo = await memory.openRepository('legal', { freshVocabulary: true });
+```
+
 ## Events & Hooks
 
 ```typescript
@@ -168,6 +178,9 @@ repo.onHook('entity:creating', (event) => {
 });
 ```
 
+- **`search:index_failed`** (`{ entityId, error }`) — a committed entity create, update or delete whose `SearchProvider` update failed. Search indexing is best-effort: the write stands and the call does not reject; reindex the entity to repair the search index.
+- **`delete:started`** is `{ repositoryId }`. Repository deletes do not count the repository first, so `delete:progress` carries the running counts removed so far (no totals), and `delete:completed` the counts actually removed.
+
 ## Error Handling
 
 All errors extend `DeepMemoryError` with a `code` and actionable `suggestion`:
@@ -184,6 +197,13 @@ try {
   }
 }
 ```
+
+Errors worth handling specifically:
+
+- **`RepositoryNotFoundError`** — every call on a repository that does not exist, or has been deleted, throws it, ahead of any not-found or empty answer. That includes a merge-mode `importRepository`.
+- **`SlugConflictError`** (`SLUG_CONFLICT`) — another entity holds the slug. Creates and updates retry with the next slug suffix before this reaches you.
+- **`BatchPartialFailureError`** (`BATCH_PARTIAL_FAILURE`) — `createEntities` / `createRelationships` validate every member first and write nothing if one fails validation. If a write fails after some members were stored, this error carries `created` (the stored members), `failedIndex` and `cause`. Resend only the members not in `created`: resending a stored member creates it again under a new id.
+- **`TraversalValidationError`** — traversal options out of bounds (explore `depth` 1–3; findPaths `maxDepth` 1–5, `limit` 1–200, `offset` 0–1,000; traverse `limit` 1–200, `offset` 0–1,000), a relationship type or filter key that is not an identifier, or a projection of a reserved field. Checked before storage runs, on every provider.
 
 ## Export / Import
 

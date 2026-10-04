@@ -10,7 +10,7 @@
 //     entry) with no offsetting benefit, because every provider read filters
 //     by the indexed `n.entityType` property.
 //   - The `properties` JSON blob is the source of truth for user-supplied
-//     entity properties round-trip (O1). User-supplied keys are ALSO written
+//     entity properties round-trip. User-supplied keys are ALSO written
 //     as native Neo4j scalar properties on the node alongside the blob, so
 //     `findEntities` can emit server-side `n.<key> = $val` predicates against
 //     them and keep `total` exact. The CREATE template stays plan-cache-keyed
@@ -53,6 +53,7 @@
 //     avoiding a per-id existence pre-check.
 
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
 import type {
   PaginatedResult,
@@ -68,12 +69,19 @@ import {
   type DriverRecord,
   entityFromRecord,
   entityToParams,
+  entityUpdatePropertyParams,
   entityUserPropertyParams,
+  parsePropertiesBlob,
   isNativeStorableValue,
-  RESERVED_ENTITY_PROPERTY_KEYS,
   WRITE_ATTEMPT_PROPERTY,
 } from '../mapping.js';
-import { isDeletedEntityFailure, mapDriverError, settledValue, toTypedError } from '../errors.js';
+import {
+  isDeletedEntityFailure,
+  isRetryableTransientFailure,
+  mapDriverError,
+  settledValue,
+  toTypedError,
+} from '../errors.js';
 import { LOCK_REPOSITORY_MARKER } from './repositoryLock.js';
 import { deleteByIds } from './deleteByIds.js';
 import {
@@ -83,6 +91,7 @@ import {
   ProviderError,
   RepositoryNotFoundError,
   SlugConflictError,
+  propertyNameRefusal,
 } from '@utaba/deep-memory';
 
 /**
@@ -423,21 +432,21 @@ export async function updateEntity(
   entityId: string,
   updates: StoredEntityUpdate,
 ): Promise<StoredEntity> {
-  // Validate + project the new user-property shape before any round-trip.
-  // The validation throws `ProviderError` on reserved-name collision or
-  // malformed identifier — the read-side round-trip is wasted work if the
-  // write would have failed anyway.
-  let userProperties: Record<string, unknown> | null = null;
-  if (updates.properties !== undefined) {
-    userProperties = entityUserPropertyParams(updates.properties);
-  }
-
+  // The user-property shape is validated and projected once the pre-read
+  // has returned the stored properties: key rules apply only to keys the
+  // update writes (new, or with a changed value), so a key stored before the
+  // rules existed and carried over unchanged does not block the update. See
+  // `entityUpdatePropertyParams`.
+  //
   // Native scalar keys to REMOVE on update: pre-update user-property keys
   // minus the new user-property keys that will survive as native scalars.
   // Keys that move from native-storable → non-storable (e.g. string → nested
   // object) also land in `keysToRemove` so the stale native scalar leaves.
+  // A native key the rules refuse is never named in a REMOVE: its name
+  // cannot be written into query text, and a reserved name is a system field.
+  let userProperties: Record<string, unknown> | null = null;
   let keysToRemove: string[] = [];
-  if (userProperties !== null) {
+  if (updates.properties !== undefined) {
     const readResult = await conn.executeQuery(
       `${UPDATE_ENTITY_MATCH} RETURN repo IS NOT NULL AS repositoryExists, properties(n) AS props`,
       { id: entityId },
@@ -452,10 +461,12 @@ export async function updateEntity(
       typeof props === 'object' && props !== null && !Array.isArray(props)
         ? (props as Record<string, unknown>)
         : {};
+    const projected = entityUpdatePropertyParams(updates.properties, parsePropertiesBlob(existingProps));
+    userProperties = projected;
     const existingUserKeys = Object.keys(existingProps).filter(
-      (k) => !RESERVED_ENTITY_PROPERTY_KEYS.has(k),
+      (k) => propertyNameRefusal(k, 'entity') === undefined,
     );
-    keysToRemove = existingUserKeys.filter((k) => !(k in userProperties!));
+    keysToRemove = existingUserKeys.filter((k) => !(k in projected));
   }
 
   const setParts: string[] = [];
@@ -935,57 +946,124 @@ export async function findEntities(
 }
 
 /**
- * Delete every entity of a type plus their incident relationships, only while
- * the repository marker exists. The marker is a seek of its unique constraint
- * index and the entities a seek of the `(repositoryId, entityType)` index.
- * The subquery aggregates, so the statement returns exactly one row
- * (`repositoryExists`, `entities`, `rels`) whether or not anything matched;
- * with no marker the subquery deletes nothing.
+ * One batch of a type delete, only while the repository marker exists. The
+ * marker is a seek of its unique constraint index and the entities a seek of
+ * the `(repositoryId, entityType)` index.
  *
- * Counting via `sum(count{(n)-[]-()})` double-counts any edge whose two
- * endpoints are both in the matched same-type set, because each endpoint
- * sees and counts the edge independently. `OPTIONAL MATCH (n)-[r]-()` with
- * `count(DISTINCT r)` aggregates across the whole match and dedupes by
- * relationship identity, so every edge is counted exactly once.
+ * The statement takes up to `$batchSize` entities of the type and up to
+ * `$edgeCap` of their incident relationships, expanded from those entities
+ * (`DISTINCT`, so an edge between two of them, or a self-loop, is taken
+ * once), and deletes the edges. Only when it took fewer than `$edgeCap`
+ * edges, so the batch's entities have none left, does it delete the
+ * entities too; `DETACH` still removes an edge a concurrent create attached
+ * after the expansion. A batch at the cap deletes no entity, and the caller
+ * runs the next batch to take more edges. However many edges a hub entity
+ * has, no statement deletes more than `$edgeCap` edges and `$batchSize`
+ * entities, so one statement cannot outgrow the transaction memory limit or
+ * the server timeout and then fail again on every resend.
  *
- * Aggregating before the delete (Cypher loses access to deleted variables in
- * a downstream RETURN) requires running the delete inside a `CALL` subquery
- * so the outer query can still RETURN the pre-aggregated counts.
+ * Both lists are collected in subqueries that aggregate, so the statement
+ * returns exactly one row whatever matched: `repositoryExists`, the number
+ * of edges it took as `edges`, and the number of entities it deleted as
+ * `entities` (both zero when the marker is missing). The relationships and
+ * nodes removed, including any `DETACH` removed, are on the update counters.
+ * One transaction does all of the statement's deleting, so it either
+ * commits whole or leaves nothing deleted. `$batchSize` and `$edgeCap` must
+ * be bound as BigInts so each `LIMIT` sees a Cypher INTEGER.
  */
 export const ENTITY_DELETE_BY_TYPE_QUERY = `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
 CALL (repo) {
   MATCH (n:_Entity {repositoryId: $rid, entityType: $entityType})
   WHERE repo IS NOT NULL
-  OPTIONAL MATCH (n)-[r]-()
-  WITH collect(DISTINCT n) AS nodes,
-       count(DISTINCT n) AS entities,
-       count(DISTINCT r) AS rels
-  CALL (nodes) {
-    UNWIND nodes AS node
-    DETACH DELETE node
-  }
-  RETURN entities, rels
+  WITH n LIMIT $batchSize
+  RETURN collect(n) AS batch
 }
-RETURN repo IS NOT NULL AS repositoryExists, entities, rels`;
+CALL (batch) {
+  UNWIND batch AS n
+  MATCH (n)-[r]-()
+  WITH DISTINCT r LIMIT $edgeCap
+  RETURN collect(r) AS edges
+}
+WITH repo, batch, edges, size(edges) AS edgeCount
+WITH repo, edges, edgeCount, CASE WHEN edgeCount < $edgeCap THEN batch ELSE [] END AS doomed
+FOREACH (r IN edges | DELETE r)
+FOREACH (n IN doomed | DETACH DELETE n)
+RETURN repo IS NOT NULL AS repositoryExists, edgeCount AS edges, size(doomed) AS entities`;
+
+/** Times a type-delete batch is re-run after a transient failure before the failure is raised. */
+const TRANSIENT_BATCH_RETRIES = 3;
+/** Delay before the first re-run of a batch; each later re-run waits one step longer. */
+const TRANSIENT_BATCH_RETRY_DELAY_MS = 50;
 
 /**
- * Delete every entity of a type plus their incident relationships
- * (`ENTITY_DELETE_BY_TYPE_QUERY`), returning exact counts in a single
- * round-trip — strict improvement over the `deletedRelationships: undefined`
- * path Cosmos has to live with (Gremlin `bothE().count()` would fan out
- * across every partition the type touches). Throws `RepositoryNotFoundError`
- * when the repository marker is absent, and nothing is deleted.
+ * Delete every entity of a type plus their incident relationships, one batch
+ * (`ENTITY_DELETE_BY_TYPE_QUERY`) at a time. A batch at the edge cap has
+ * drained only some of its entities' edges and runs again; a batch under the
+ * cap deletes its entities, and the delete ends with the first such batch
+ * that finds fewer than `batchSize` entities. No single transaction holds a
+ * whole type, or a whole hub's edges, however large either is. Returns the
+ * exact numbers removed, summed from each batch's update counters (zero when
+ * nothing of the type was left).
+ *
+ * Every batch checks the repository marker before it deletes anything:
+ * `RepositoryNotFoundError` when it is absent, so a missing repository is
+ * refused ahead of any delete. The statements run on an auto-commit session,
+ * which the driver never re-runs, so a batch's counters are never lost to a
+ * re-run that finds its own committed delete and reports nothing.
+ *
+ * A batch the server fails with a transient error (`isRetryableTransientFailure`:
+ * a deadlock with a concurrent write, say) is run again, up to
+ * `TRANSIENT_BATCH_RETRIES` times. That keeps the counts exact, because one
+ * transaction does all of a batch's deleting and the failure rolled it back.
+ * Any other failure surfaces as a typed error; the batches already committed
+ * stay deleted, and calling again removes the rest. A call that fails after
+ * its last deleting batch committed (the connection lost before the
+ * acknowledgement, say) has removed the whole type, so a resend of the type
+ * delete finds nothing left to remove and the engine answers "not found".
  */
 export async function deleteEntitiesByType(
   conn: Neo4jConnection,
   repositoryId: string,
   entityType: string,
-): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
-  const result = await conn.executeQuery(ENTITY_DELETE_BY_TYPE_QUERY, { entityType }, { repositoryId });
-  const record = result.records[0];
-  if (record === undefined) throw new ProviderError('Neo4j delete by entity type returned no row.');
-  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
-  const deletedEntities = bigintToSafeNumber(record.get('entities') ?? 0);
-  const deletedRelationships = bigintToSafeNumber(record.get('rels') ?? 0);
+  batching: { batchSize: number; edgeCap: number },
+): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+  const { batchSize, edgeCap } = batching;
+  const params = { entityType, batchSize: BigInt(batchSize), edgeCap: BigInt(edgeCap) };
+  let deletedEntities = 0;
+  let deletedRelationships = 0;
+  while (true) {
+    const result = await runEntityTypeBatch(conn, repositoryId, params);
+    const record = result.records[0];
+    if (record === undefined) throw new ProviderError('Neo4j delete by entity type returned no row.');
+    if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+    const counters = result.summary.counters.updates();
+    deletedEntities += counters['nodesDeleted'] ?? 0;
+    deletedRelationships += counters['relationshipsDeleted'] ?? 0;
+    // At the cap, the batch's entities may still have edges: take more before deleting them.
+    if (bigintToSafeNumber(record.get('edges') ?? 0) >= edgeCap) continue;
+    if (bigintToSafeNumber(record.get('entities') ?? 0) < batchSize) break;
+  }
   return { deletedEntities, deletedRelationships };
+}
+
+/**
+ * Run one type-delete batch, re-running it after a transient failure (see
+ * `deleteEntitiesByType`). Any other failure, or a transient one that
+ * outlasts the retries, is raised as a typed error.
+ */
+async function runEntityTypeBatch(
+  conn: Neo4jConnection,
+  repositoryId: string,
+  params: { entityType: string; batchSize: bigint; edgeCap: bigint },
+): Promise<Awaited<ReturnType<Neo4jConnection['executeImplicitInTransactions']>>> {
+  for (let retry = 0; ; retry++) {
+    try {
+      return await conn.executeImplicitInTransactions(ENTITY_DELETE_BY_TYPE_QUERY, params, { repositoryId });
+    } catch (err) {
+      if (retry >= TRANSIENT_BATCH_RETRIES || !isRetryableTransientFailure(err)) {
+        mapDriverError(err, { repositoryId, operation: 'deleteEntitiesByType' });
+      }
+    }
+    await delay(TRANSIENT_BATCH_RETRY_DELAY_MS * (retry + 1));
+  }
 }

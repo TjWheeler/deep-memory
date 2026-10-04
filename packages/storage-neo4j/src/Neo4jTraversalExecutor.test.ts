@@ -106,7 +106,7 @@ describe('Neo4jTraversalExecutor bookkeeping-property guard', () => {
   const refusedSpecs: Array<[string, TraversalSpec]> = [
     [
       'a projected property',
-      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['label', '_attempt'] } },
+      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['city', '_attempt'] } },
     ],
     [
       'a start filter key',
@@ -155,7 +155,7 @@ describe('Neo4jTraversalExecutor bookkeeping-property guard', () => {
 
     await executor.execute(
       'repo-a',
-      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['label'] } },
+      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['city'] } },
       vocabulary,
     );
 
@@ -199,7 +199,7 @@ describe('Neo4jTraversalExecutor repository marker check', () => {
 
     const raw = await executor.execute(
       'repo-a',
-      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['label'] } },
+      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['city'] } },
       vocabulary,
     );
 
@@ -208,17 +208,17 @@ describe('Neo4jTraversalExecutor repository marker check', () => {
 
   it('keeps every traversal row, including one whose projected values are null', async () => {
     const { executor } = executorAnswering([
-      fakeRecord({ 'dm-repository-exists': true, 'dm-traversal-row': true, label: null }),
-      fakeRecord({ 'dm-repository-exists': true, 'dm-traversal-row': true, label: 'b' }),
+      fakeRecord({ 'dm-repository-exists': true, 'dm-traversal-row': true, city: null }),
+      fakeRecord({ 'dm-repository-exists': true, 'dm-traversal-row': true, city: 'b' }),
     ]);
 
     const raw = await executor.execute(
       'repo-a',
-      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['label'] } },
+      { start: { entityType: 'Thing' }, returnMode: 'terminal', projection: { properties: ['city'] } },
       vocabulary,
     );
 
-    expect(raw.aggregations).toEqual([{ values: { label: null } }, { values: { label: 'b' } }]);
+    expect(raw.aggregations).toEqual([{ values: { city: null } }, { values: { city: 'b' } }]);
   });
 
   it('refuses a compiled query whose RETURN / LIMIT tail it does not recognise', () => {

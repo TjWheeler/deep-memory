@@ -84,7 +84,7 @@ export interface DriverErrorContext {
 }
 
 /** Which uniqueness rule a constraint violation broke. */
-type ConstraintTarget = 'entity-id' | 'entity-slug' | 'repository' | 'relationship';
+type ConstraintTarget = 'entity-id' | 'entity-slug' | 'repository' | 'relationship' | 'vocabulary-change';
 
 /**
  * The node uniqueness constraints `ensureSchema` creates (see `schema.ts`),
@@ -101,6 +101,7 @@ const NODE_UNIQUENESS_CONSTRAINTS: ReadonlyArray<{
   { name: 'dm_entity_unique', label: '_Entity', key: 'id', target: 'entity-id' },
   { name: 'dm_entity_slug_unique', label: '_Entity', key: 'slug', target: 'entity-slug' },
   { name: 'dm_repository_unique', label: '_Repository', key: 'repositoryId', target: 'repository' },
+  { name: 'dm_vocabulary_change_unique', label: '_VocabularyChangeLog', key: 'changeId', target: 'vocabulary-change' },
 ];
 
 /** Exported for the test that keeps this table in step with the schema DDL. */
@@ -242,6 +243,9 @@ function buildDuplicateError(
       return context.relationshipId !== undefined
         ? new DuplicateRelationshipError(context.relationshipId, options)
         : undefined;
+    // The change-log write merges on its key, so a violation is not a caller
+    // error with a typed answer; it surfaces as ProviderError.
+    case 'vocabulary-change':
     case undefined:
       return undefined;
   }
@@ -385,6 +389,21 @@ export function isTransactionMemoryLimit(error: unknown): boolean {
 export function isMemoryLimitFailure(error: unknown): boolean {
   const code = driverCode(error);
   return code === TRANSACTION_MEMORY_LIMIT_CODE || code === MEMORY_POOL_EXHAUSTED_CODE;
+}
+
+/** Prefix of the status codes the server reports for a transient failure. */
+const TRANSIENT_ERROR_PREFIX = 'Neo.TransientError.';
+
+/**
+ * True when the server reported a transient failure (a deadlock, a lock
+ * wait that was stopped, a leader switch) that running the same statement
+ * again may clear. The server rolled back the transaction that failed, so
+ * nothing that transaction wrote committed. Memory-limit failures are excluded: the same statement
+ * asks for the same memory, so a re-run only fails the same way.
+ */
+export function isRetryableTransientFailure(error: unknown): boolean {
+  const code = driverCode(error);
+  return code !== undefined && code.startsWith(TRANSIENT_ERROR_PREFIX) && !isMemoryLimitFailure(error);
 }
 
 /**

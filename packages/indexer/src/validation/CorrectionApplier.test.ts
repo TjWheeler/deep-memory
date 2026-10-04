@@ -194,7 +194,7 @@ describe('CorrectionApplier', () => {
     expect(result.outcome).toBe('no-matches');
   });
 
-  // ── Ported operations ───────────────────────────────────────────────
+  // ── Update, remove-property and delete ──────────────────────────────
 
   it('applies entity update and remove-property, and writes a backup', async () => {
     await seed({

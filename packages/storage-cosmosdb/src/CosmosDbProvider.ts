@@ -46,7 +46,6 @@ import {
   ProviderError,
   InvalidInputError,
   RepositoryNotFoundError,
-  VocabularyVersionConflictError,
   isValidUuid,
   projectEntity,
   createSafeSink,
@@ -94,6 +93,15 @@ export interface CosmosDbProviderConfig {
    * deliberately does not plumb this sink through.
    */
   reportUsage?: UsageSink;
+  /**
+   * Lifetime in milliseconds of an entry in the per-process vocabulary cache
+   * that `getVocabulary` (and so write validation) and traversal compilation
+   * read (default: 60000). A vocabulary change made by another process
+   * reaches this one within this window. `0` disables the cache: every read
+   * goes to the stored vocabulary. Must be a non-negative finite number; anything else is
+   * refused with `InvalidInputError`.
+   */
+  vocabularyCacheTtlMs?: number;
 }
 
 const PROVIDER_NAME = 'cosmosdb';
@@ -165,11 +173,27 @@ interface RawTraversalResult {
 }
 
 /**
- * Vocabulary TTL for the per-process cache. Vocabulary changes are rare
- * (governance-gated writes); a 60 s window bounds cross-process staleness
- * acceptably while eliminating the one extra round-trip on every traversal.
+ * Default vocabulary TTL for the per-process cache. Vocabulary changes are
+ * rare (governance-gated writes); a 60 s window bounds cross-process
+ * staleness acceptably while eliminating the one extra round-trip on every
+ * vocabulary read and traversal. Hosts override it with `vocabularyCacheTtlMs`.
  */
-const VOCABULARY_CACHE_TTL_MS = 60_000;
+const DEFAULT_VOCABULARY_CACHE_TTL_MS = 60_000;
+
+/**
+ * The vocabulary cache lifetime a config asks for: the default when absent,
+ * the value itself when it is a non-negative finite number of milliseconds.
+ * Anything else is refused at construction, so a mistyped value cannot
+ * silently disable the cache or make its entries permanent.
+ */
+function resolveVocabularyCacheTtlMs(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_VOCABULARY_CACHE_TTL_MS;
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  throw new InvalidInputError(
+    'vocabularyCacheTtlMs',
+    `CosmosDB vocabularyCacheTtlMs must be a non-negative finite number of milliseconds, got ${String(value)}.`,
+  );
+}
 
 /**
  * CosmosDB Gremlin storage provider for deep-memory.
@@ -183,16 +207,22 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   private readonly reportUsage: UsageSink | undefined;
   /**
    * Per-process vocabulary cache, keyed by repositoryId. Read lazily by
-   * traversal compilation via `getVocabularyCached`; refreshed by
-   * `getVocabulary({ fresh: true })`; invalidated by `saveVocabulary` (on
-   * success and on a version conflict), `createRepository` and
-   * `deleteRepository`.
+   * `getVocabulary` and traversal compilation via `getVocabularyCached`;
+   * refreshed by `getVocabulary({ fresh: true })`; invalidated by
+   * `saveVocabulary` (however it ends), `createRepository`,
+   * `deleteRepository` and any call that finds the repository missing.
    * Each provider instance owns its own cache so isolated test providers do
    * not share state.
    */
   private readonly vocabularyCache = new Map<string, { vocab: MemoryVocabulary; expiresAt: number }>();
+  /** Cache entry lifetime in ms; `0` keeps nothing in the cache. */
+  private readonly vocabularyCacheTtlMs: number;
+  /** Bumped by every invalidation, so a read that raced one is not cached. */
+  private vocabularyCacheGeneration = 0;
 
   constructor(config: CosmosDbProviderConfig) {
+    // Validated before any client is created, so a refused config opens nothing.
+    this.vocabularyCacheTtlMs = resolveVocabularyCacheTtlMs(config.vocabularyCacheTtlMs);
     this.config = config;
     this.reportUsage = createSafeSink(config.reportUsage);
     this.conn = new CosmosDbConnection({
@@ -501,8 +531,10 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    * Delete the repository — see `repoQueries.deleteRepository` for the
    * marker-first ordering and how a retry finishes an interrupted delete.
    * The cached vocabulary belongs to the repository being removed; a
-   * repository later re-created under the same id must not be served it, so
-   * the entry is dropped whether or not the delete succeeds.
+   * repository later re-created under the same id must not be served it. The
+   * entry is dropped as soon as the marker is gone, so cached reads stop
+   * answering for the repository while the drain runs, and again however the
+   * delete ends.
    */
   public async deleteRepository(
     repositoryId: string,
@@ -511,7 +543,9 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     this.assertValidRepositoryId(repositoryId);
     return this.track('deleteRepository', repositoryId, async () => {
       try {
-        return await repoQueries.deleteRepository(this.conn, repositoryId, onProgress);
+        return await repoQueries.deleteRepository(this.conn, repositoryId, onProgress, () =>
+          this.invalidateVocabularyCache(repositoryId),
+        );
       } finally {
         this.invalidateVocabularyCache(repositoryId);
       }
@@ -537,20 +571,29 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   // ─── Vocabulary ────────────────────────────────────────────────────
 
   /**
-   * Read the stored vocabulary. Always a round-trip: the per-process cache
-   * serves traversal compilation only, never this method, so `options.fresh`
-   * changes nothing about what is returned. It does refresh the traversal
-   * cache entry with the result, because a caller that asks for a fresh read
-   * is about to act on the stored version and traversal compilation should
-   * see it too.
+   * Read the vocabulary for a repository. Cache-aware: within the TTL a
+   * cached copy is returned with no round-trip (the usage record then shows
+   * no server work). Write validation reads the vocabulary on every call, so
+   * the cache is what keeps that from costing a round-trip per write.
    *
-   * Throws `RepositoryNotFoundError` when the repository marker is absent,
-   * as does every other call here that finds the marker gone; each drops the
-   * repository's traversal cache entry as it throws, and this provider's own
-   * `deleteRepository` drops it too. A traversal that compiles against a
+   * `{ fresh: true }` skips the cache lookup and always reads the stored
+   * vocabulary (one round-trip). Callers about to modify the vocabulary need
+   * this: the version they pass to `saveVocabulary` must be the stored one,
+   * and a cached copy can be up to the TTL behind another process's write.
+   * The fresh result replaces the cache entry so later cached reads see it
+   * too. With a TTL of `0` every call reads the stored vocabulary.
+   *
+   * A read that goes to the database throws `RepositoryNotFoundError` when
+   * the repository marker is absent, and so does every other call here that
+   * finds the marker gone; each drops the repository's cache entry as it
+   * throws, and this provider's own `deleteRepository` drops it too. A cache
+   * hit is not checked against the database: within the TTL it can still
+   * return the vocabulary of a repository another process has deleted.
+   * Closing that window would cost a round-trip on every cached read, which
+   * is what the cache exists to avoid; pass `{ fresh: true }` when the answer
+   * must reflect the stored state. (A traversal that compiles against a
    * cached vocabulary still checks the marker, with a point read alongside
-   * the traversal, so a repository another process has deleted is refused
-   * within the TTL as well.
+   * the traversal.)
    */
   public async getVocabulary(
     repositoryId: string,
@@ -558,24 +601,24 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
   ): Promise<MemoryVocabulary> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('getVocabulary', repositoryId, async () => {
+      if (options?.fresh !== true) return this.getVocabularyCached(repositoryId);
+      const readAt = Date.now();
+      const generation = this.vocabularyCacheGeneration;
       const vocab = await this.forgetMissingRepository(repositoryId, () =>
         vocabQueries.getVocabulary(this.conn, repositoryId),
       );
-      if (options?.fresh === true) {
-        this.vocabularyCache.set(repositoryId, {
-          vocab,
-          expiresAt: Date.now() + VOCABULARY_CACHE_TTL_MS,
-        });
-      }
+      this.cacheVocabulary(repositoryId, vocab, readAt, generation);
       return vocab;
     });
   }
 
   /**
-   * Cached vocabulary read used by traversal compilation. The vocabulary is
-   * compile-time context for the GremlinCompiler — it changes on the order of
-   * once per session, but the traversal hot path pays one round-trip per call
-   * to fetch it. The cache flips that to one round-trip per TTL window.
+   * Cached vocabulary read used by `getVocabulary` and by traversal
+   * compilation. The vocabulary is compile-time context for the
+   * GremlinCompiler and the reference for write validation — it changes on
+   * the order of once per session, but each of those paths would otherwise
+   * pay one round-trip per call to fetch it. The cache flips that to one
+   * round-trip per TTL window.
    *
    * Reads inside an active usage scope are still recorded if a fetch happens
    * (cache miss); cache hits emit no round-trip and therefore no usage entry.
@@ -586,29 +629,48 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
     if (cached && cached.expiresAt > now) {
       return cached.vocab;
     }
+    const generation = this.vocabularyCacheGeneration;
     const vocab = await this.forgetMissingRepository(repositoryId, () =>
       vocabQueries.getVocabulary(this.conn, repositoryId),
     );
-    this.vocabularyCache.set(repositoryId, {
-      vocab,
-      expiresAt: now + VOCABULARY_CACHE_TTL_MS,
-    });
+    this.cacheVocabulary(repositoryId, vocab, now, generation);
     return vocab;
   }
 
   /**
+   * Store a vocabulary read in the cache, valid for the configured TTL from
+   * `readAt`. With a TTL of `0` nothing is stored, so every read goes to
+   * the database. `generation` is the invalidation count captured before the
+   * read started: an invalidation that landed while the read was in flight
+   * may mean the read saw the vocabulary from before a write, and caching it
+   * would hide that write for a whole TTL, so such a read is not stored.
+   */
+  private cacheVocabulary(
+    repositoryId: string,
+    vocab: MemoryVocabulary,
+    readAt: number,
+    generation: number,
+  ): void {
+    if (this.vocabularyCacheTtlMs === 0) return;
+    if (generation !== this.vocabularyCacheGeneration) return;
+    this.vocabularyCache.set(repositoryId, { vocab, expiresAt: readAt + this.vocabularyCacheTtlMs });
+  }
+
+  /**
    * Drop the cache entry for a repository — call after any vocabulary write,
-   * and whenever the repository turns out to be missing.
+   * when a repository is created or deleted, and whenever the repository
+   * turns out to be missing.
    */
   private invalidateVocabularyCache(repositoryId: string): void {
+    this.vocabularyCacheGeneration++;
     this.vocabularyCache.delete(repositoryId);
   }
 
   /**
    * Run a repository-scoped call, dropping the repository's cached vocabulary
    * when the call reports the repository missing: the repository was
-   * deleted, so a later traversal must read the vocabulary again (and throw)
-   * rather than compile against its old vocabulary.
+   * deleted, so a later cached read must go to the database (and throw)
+   * rather than serve its old vocabulary.
    */
   private async forgetMissingRepository<T>(repositoryId: string, call: () => Promise<T>): Promise<T> {
     try {
@@ -669,29 +731,30 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
    * Compare-and-set write of the vocabulary — lands only when the stored
    * version equals `expectedVersion`. Throws `VocabularyVersionConflictError`
    * on a mismatch and `RepositoryNotFoundError` when the repository's
-   * vocabulary vertex does not exist; never creates the vertex.
+   * marker or vocabulary vertex does not exist; never creates the vocabulary
+   * vertex. A `changeRecord` is added as a change-log vertex in the same
+   * traversal, only when the compare-and-set write lands — see
+   * `vocabQueries.saveVocabulary`.
    *
-   * Invalidates the traversal cache on success, so later traversals compile
-   * against the new state within this process, and on a conflict, because
-   * the conflict proves the cached copy is stale (cross-process staleness is
-   * otherwise bounded by the 60 s TTL).
+   * Invalidates the vocabulary cache on success, so later reads and
+   * traversals see the new state within this process, and on any failure: a
+   * conflict or a missing repository proves the cached copy is stale, and any
+   * other error can follow a write that landed (cross-process staleness is
+   * otherwise bounded by the cache TTL).
    */
   public async saveVocabulary(
     repositoryId: string,
     vocabulary: MemoryVocabulary,
     expectedVersion: string,
+    changeRecord?: VocabularyChangeRecord,
   ): Promise<void> {
     this.assertValidRepositoryId(repositoryId);
     return this.track('saveVocabulary', repositoryId, async () => {
       try {
-        await vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary, expectedVersion);
-      } catch (err) {
-        if (err instanceof VocabularyVersionConflictError || err instanceof RepositoryNotFoundError) {
-          this.invalidateVocabularyCache(repositoryId);
-        }
-        throw err;
+        await vocabQueries.saveVocabulary(this.conn, repositoryId, vocabulary, expectedVersion, changeRecord);
+      } finally {
+        this.invalidateVocabularyCache(repositoryId);
       }
-      this.invalidateVocabularyCache(repositoryId);
     });
   }
 
@@ -1363,7 +1426,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
           if (!stored) {
             throw new ProviderError(
               'Unpacking Gremlin path: entity referenced by path is missing from the result',
-              'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+              'This is a fault in the provider, not in the request: the Gremlin response shape and its path unpacking disagree. Report it with the traversal spec that produced it.',
             );
           }
           return projectStoredEntity(stored);
@@ -1373,7 +1436,7 @@ export class CosmosDbProvider implements StorageProvider, GraphTraversalProvider
           if (!stored) {
             throw new ProviderError(
               'Unpacking Gremlin path: relationship referenced by path is missing from the result',
-              'This indicates a Gremlin response shape mismatch — inspect compiledQuery.',
+              'This is a fault in the provider, not in the request: the Gremlin response shape and its path unpacking disagree. Report it with the traversal spec that produced it.',
             );
           }
           return projectStoredRelationship(stored, row.relationshipDirections[i]!);

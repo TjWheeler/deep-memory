@@ -49,6 +49,7 @@ For local development with the CosmosDB emulator, see [Local emulator setup](#lo
 | `maxRetries` | `number` | `3` | Retries for transient errors (429 throttling, 503 unavailable) |
 | `defaultTimeoutMs` | `number` | `30000` | Default query timeout |
 | `rejectUnauthorized` | `boolean` | `true` | Set `false` for the local emulator (self-signed certs) |
+| `vocabularyCacheTtlMs` | `number` | `60000` | Lifetime (ms) of an entry in the in-process vocabulary cache that `getVocabulary` (and so write validation) and traversal compilation read. A vocabulary change made by another process reaches this one within this window. `0` disables the cache: every read goes to the stored vocabulary. A negative, non-finite or non-number value is refused with `InvalidInputError` at construction. |
 
 CosmosDB Gremlin API does **not** support managed identity for data plane operations — authentication always uses an account key.
 
@@ -83,18 +84,28 @@ All data is partitioned by `repositoryId` — every vertex and edge stores it. T
 | `_meta` | Schema version tracking | `_meta:schema` |
 | `_repository` | Repository definitions and governance config | `repo:{repositoryId}` |
 | `_vocabulary` | One vocabulary JSON document per repository | `vocab:{repositoryId}` |
-| `_vocabularyChangeLog` | Audit trail for vocabulary changes | `vocablog:{changeId}` |
+| `_vocabularyChangeLog` | One record per vocabulary change, written with the change | `vocablog:{changeId}` |
 | `{entityType}` | Graph nodes — vertex label is the entity type | Entity GUID |
 
 ### Edge Types
 
 Edge labels are relationship types. Each edge stores `sourceEntityId`, `targetEntityId`, `bidirectional`, user properties (dual-written — see [Property Storage](#property-storage)), and provenance.
 
-Vertices and edges share one id space per partition, so `createRelationship` refuses a relationship id equal to any existing document id in the repository's partition (an entity, the repository marker or a vocabulary vertex) with `DuplicateRelationshipError`.
+Vertices and edges share one id space per partition, so `createRelationship` refuses a relationship id equal to any existing document id in the repository's partition (an entity, the repository marker, a vocabulary vertex or a vocabulary change record) with `DuplicateRelationshipError`.
+
+### Slug uniqueness
+
+Slugs are unique per repository, but CosmosDB has no unique constraint on a property and no multi-document transaction, so the provider checks for a clash rather than the store enforcing it:
+
+- **Create.** `createEntity` checks the slug in the same request as the write (the guarded create's slug branch). A slug another entity holds throws `SlugConflictError` and writes nothing. Two creates in flight with the same slug can both pass the check and both write.
+- **Update.** An `updateEntity` that sets a slug reads its holders in a separate request before the write, so its race window is wider than a create's, and a slug-changing update costs that extra read. An entity that already holds the slug keeps it.
+- **Import.** `importBulk` does not check slugs.
+
+The engine answers `SlugConflictError` by retrying with the next slug suffix. Id uniqueness, by contrast, is enforced by the store (a 409 on a second document with the same id). Neo4j, SQL Server and the in-memory provider enforce slug uniqueness atomically.
 
 ### Property Storage
 
-User-supplied properties on entities and relationships are **dual-written**: the full payload is JSON-stringified into the `properties` slot (round-trip authoritative — every shape JS can serialise survives), and every key whose value is natively Cosmos-storable (`string`, finite `number`, `boolean`, homogeneous arrays of those) is mirrored as a per-key native vertex/edge scalar so it can be reached by server-side Gremlin predicates (`has('orgType', 'company')`, `values('orgType')`, `group().by(...)`) and the exact-path `findEntities` SQL prefilter. Nested objects, `null`, mixed arrays, and arrays of objects live only in the blob and are not predicate-queryable. Schema-slot collisions on user keys (`entityType`, `id`, `'label'` on edges, …) throw `ProviderError` synchronously on every write path AND on `findEntities` property filters. See the [Properties model section in the Gremlin compatibility doc](https://github.com/TjWheeler/deep-memory/blob/main/docs/cosmosdb-gremlin-compatibility.md#properties-model) for the full contract.
+User-supplied properties on entities and relationships are **dual-written**: the full payload is JSON-stringified into the `properties` slot (round-trip authoritative — every shape JS can serialise survives), and every key whose value is natively Cosmos-storable (`string`, finite `number`, `boolean`, homogeneous arrays of those) is mirrored as a per-key native vertex/edge scalar so it can be reached by server-side Gremlin predicates (`has('orgType', 'company')`, `values('orgType')`, `group().by(...)`) and the exact-path `findEntities` SQL prefilter. Nested objects, `null`, mixed arrays, and arrays of objects live only in the blob and are not predicate-queryable. Schema-slot collisions on user keys (`entityType`, `id`, `'label'` on edges, …) throw `InvalidInputError` (field `properties.<key>`) on every write path AND on `findEntities` property filters. An `updateEntity` checks only the keys it sets (new, or with a changed value): a key stored before these rules and carried over unchanged is kept in the blob only, never mirrored as a native scalar, and can be removed by leaving it out. See the [Properties model section in the Gremlin compatibility doc](https://github.com/TjWheeler/deep-memory/blob/main/docs/cosmosdb-gremlin-compatibility.md#properties-model) for the full contract.
 
 | Data | Storage | Notes |
 |------|---------|-------|
@@ -105,7 +116,7 @@ User-supplied properties on entities and relationships are **dual-written**: the
 
 ### Vocabulary writes
 
-The vocabulary version is stored twice: inside the JSON blob and as a `version` property on the `_vocabulary` vertex, so the database can compare it. `saveVocabulary(id, vocabulary, expectedVersion)` is compare-and-set in a single partition-scoped traversal, and a mismatch throws `VocabularyVersionConflictError`. `saveVocabulary` never creates the vertex. `createRepository` writes it before the `_repository` vertex and its index entry, and a missing vertex throws `RepositoryNotFoundError`. A vertex with a missing or stale `version` property throws `ProviderError`, and the message says to run `ensureSchema()`. `getVocabulary` always reads from the database. The in-process cache serves only traversal compilation, and `getVocabulary(id, { fresh: true })` refreshes that cache with the stored value.
+The vocabulary version is stored twice: inside the JSON blob and as a `version` property on the `_vocabulary` vertex, so the database can compare it. `saveVocabulary(id, vocabulary, expectedVersion, changeRecord?)` is compare-and-set in a single partition-scoped traversal that fetches the `_repository` marker with the vocabulary vertex and writes only past the marker, and a mismatch throws `VocabularyVersionConflictError`. When a `changeRecord` is given, the same traversal adds it as a `_vocabularyChangeLog` vertex after the vocabulary write, so a stale version or a missing repository writes no record. The record's id is derived from its `changeId`, so a retried save that finds its own vocabulary already stored adds the record only if it is not there yet, and writes its properties either way, completing a record an earlier attempt left part-written. The traversal is not a transaction: a failure after the vocabulary write (other than a lost race, which fails before it) can leave the vocabulary changed without its record, and the error reaches the caller. `getVocabularyChangeLog` pages the records newest first by `proposedAt`, then by `changeId` descending. `saveVocabulary` never creates the vocabulary vertex. `createRepository` writes it before the `_repository` vertex and its index entry, and a missing vertex throws `RepositoryNotFoundError`. A vertex with a missing or stale `version` property throws `ProviderError`, and the message says to run `ensureSchema()`. `getVocabulary` and traversal compilation share an in-process cache whose entries live for `vocabularyCacheTtlMs` (60 s by default; `0` disables it, so every read goes to the database). `getVocabulary(id, { fresh: true })` bypasses the cache, reads the stored value and refreshes the cache with it. `saveVocabulary` drops the entry however it ends, and so does any call that finds the repository missing.
 
 ### Repository delete
 
@@ -115,9 +126,11 @@ The vocabulary version is stored twice: inside the JSON blob and as a `version` 
 
 Every other call that takes a repository id refuses a repository whose marker is gone with `RepositoryNotFoundError`, ahead of any not-found or empty outcome, even while an unfinished delete leaves data in the partition. How the marker is checked depends on where the call starts:
 
-- **In the same request.** Reads that start from entity ids or a slug (`getEntity`, `getEntityBySlug`, `getEntities`, `getEntityRelationships`, `getTimeline`), `deleteEntitiesByType`, the entity deletes (`deleteEntities`, `deleteEntity`), `updateEntity` and the creates fetch the marker in their first, index-backed step, at no extra cost.
+- **In the same request.** Reads that start from entity ids or a slug (`getEntity`, `getEntityBySlug`, `getEntities`, `getEntityRelationships`, `getTimeline`), the entity deletes (`deleteEntities`, `deleteEntity`, and each drop of `deleteEntitiesByType`), `updateEntity`, `saveVocabulary` and the creates fetch the marker in their first, index-backed step, at no extra cost.
 - **Alongside the read.** Calls that cannot fetch it in their first step — `getRelationship` (an edge start), `getVocabularyChangeLog` (a label start), `findEntities` (the Document endpoint) and traversals on a warm vocabulary cache — issue a partition-scoped marker point read concurrently with their read, and a missing marker wins over whatever the read answered. A traversal on a cold cache relies on its vocabulary read, which checks the marker first.
-- **First, and not atomic with what follows.** The relationship deletes (`deleteRelationships`, `deleteRelationship`, `deleteRelationshipsByType`), an empty-list `getEntities` or `deleteEntities`, `importBulk` (before each chunk) and `exportAll` (before the first page) read the marker in a separate request before they work.
+- **First, and not atomic with what follows.** The relationship deletes (`deleteRelationships`, `deleteRelationship`, and `deleteRelationshipsByType` before each batch), an empty-list `getEntities` or `deleteEntities`, a `deleteEntitiesByType` that finds nothing of the type, `importBulk` (before each chunk) and `exportAll` (before the first page) read the marker in a separate request before they work.
+
+`deleteEntitiesByType` and `deleteRelationshipsByType` work in batches of 500 until nothing of the type is left, so a large type does not run into the request timeout, and a delete stopped part-way is finished by calling it again. Each entity batch reads up to 500 ids of the type (bounded in the first, index-backed step), then drops them through the marker-guarded delete, 100 ids per request; each relationship batch drops up to 500 edges of the type in one request that reports their ids. The counts returned are the sum of what each batch's drops reported, `0` when nothing of the type is left. A count is never more than was removed, and may be fewer when a transient error (429 / 503) makes the connection re-send a drop that had already partly applied: the re-sent request reports only what was still there. An entity delete whose batches twice in a row read entities of the type but drop none stops with a `ProviderError`; calling it again resumes it. `deleteEntitiesByType` still returns `deletedRelationships: undefined`.
 
 The shapes, their RU cost, and the windows a racing `deleteRepository` opens for the calls that check in a separate request are in the [Gremlin compatibility doc](https://github.com/TjWheeler/deep-memory/blob/main/docs/cosmosdb-gremlin-compatibility.md#repository-marker-checks-on-reads-traversals-by-type-deletes-and-import).
 
@@ -135,7 +148,7 @@ After upgrading this package, run `ensureSchema()` once, after **every** process
   - no filter → `PaginatedResult.total` is an exact `number`
   - every value native-storable → exact prefilter (`c.<key>[0]._value = @val` per clause against the dual-written scalar column); `total` is an exact `number`
   - any value non-storable → fallback `CONTAINS` substring on the JSON blob; `total: undefined` (the count branch is skipped because the substring prefilter over-reports)
-  - Reserved-key collisions in `query.properties` throw `ProviderError` synchronously
+  - Reserved-key collisions in `query.properties` throw `InvalidInputError` synchronously
 - **Pagination** — SQL `ORDER BY c.id OFFSET @off LIMIT @lim`; data and count queries share one `WHERE` clause so `total` is consistent with the data page by construction
 
 `GraphTraversalProvider` capabilities:
@@ -166,9 +179,31 @@ RU cost is reported in `QueryMetadata.resourceCost` for graph traversal operatio
 
 `exportAll()` returns an async iterable of chunks (batches of 100), entities first then relationships. `importBulk()` uses upsert semantics and adapts concurrency to RU-constrained tiers — see [Adaptive import deep-dive](https://github.com/TjWheeler/deep-memory/blob/main/docs/storage-cosmosdb-adaptive-import.md) for the control loop, throttle detection, and circuit breaker behavior.
 
+Relationship ids are unique within a repository's partition, across its vertices and edges, and the store refuses a second document with the same id (409):
+
+- **Insert** (`skipExistenceCheck: true`) writes each edge without looking for its id. An id already stored, or repeated within the call, is refused by the store and recorded with `RELATIONSHIP_ALREADY_EXISTS`.
+- **Upsert** (`skipExistenceCheck: false`, the default) updates an edge in place when it has the row's id, type and endpoints. An id held by an edge of another type or between other endpoints, or by a vertex, makes the row fail with `RELATIONSHIP_ALREADY_EXISTS` and nothing is written, so an edge's stored `relationshipType`, `sourceEntityId` and `targetEntityId` always agree with its label and endpoints. The endpoints are checked first: a row with a missing endpoint reports `ENTITY_NOT_FOUND` even when its id is in use. A row the store refuses is submitted once more, so an id repeated within one import with the same type and endpoints updates the edge its first occurrence wrote.
+
+Rows are written one per request, and each failure is classified on its own:
+
+- **Row errors** (recorded in `result.errors` with a `code`; the import continues): a property key that is not an identifier or is reserved (`INVALID_INPUT`), a missing endpoint (`ENTITY_NOT_FOUND`), and a status that belongs to the row (400 refused value, 409 id taken, 413 document too large).
+- **Throttling** never becomes a row error. A row whose 429/503 retries run out is re-queued and sent again once the adaptive controller has backed off; only the circuit breaker (`ImportThrottleAbortError`) stops an import for throttling.
+- **Store failures** stop the import and reject: a 404 (database or container gone), a connection failure, or a missing repository marker (`RepositoryNotFoundError`, checked before each chunk).
+
+See the [adaptive import deep-dive](https://github.com/TjWheeler/deep-memory/blob/main/docs/storage-cosmosdb-adaptive-import.md#throttle-exhausted-rows-are-re-queued) for the re-queue and the insert-mode 503 caveat.
+
 ## Error Handling
 
 All errors use the `@utaba/deep-memory` error hierarchy (`ProviderError`, `RepositoryNotFoundError`, `DuplicateEntityError`, etc.). Transient errors (429 throttling, 503 unavailable) are automatically retried with exponential backoff up to `maxRetries`.
+
+| Error | When |
+|-------|------|
+| `RepositoryNotFoundError` | The repository marker is gone (see [Repository delete](#repository-delete)) |
+| `DuplicateEntityError` / `DuplicateRelationshipError` | The id is already used in the partition (409), with the store error as `cause` |
+| `SlugConflictError` | Another entity holds the slug (see [Slug uniqueness](#slug-uniqueness)) |
+| `EntityNotFoundError` | A relationship's source or target is missing, or the entity to update or delete is |
+| `InvalidInputError` | A property key is not an identifier or collides with a reserved name (field `properties.<key>`) |
+| `ProviderError` | Any other store or connection failure, with the original error as `cause` |
 
 ## Local emulator setup
 

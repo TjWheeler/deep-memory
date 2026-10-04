@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 import type { StoredRelationship } from '@utaba/deep-memory/types';
 import { DeepMemoryError, RepositoryNotFoundError } from '@utaba/deep-memory';
 import type { Neo4jConnection } from '../Neo4jConnection.js';
+import { batchConnection } from './batchConnection.test-support.js';
 import {
   RELATIONSHIP_CREATE_OUTCOME,
   buildCreateMintedRelationshipQuery,
   buildCreateRelationshipQuery,
+  buildDeleteRelationshipsByTypeQuery,
   createRelationship,
+  deleteRelationshipsByType,
   getEntityRelationships,
 } from './relationship.js';
 import { LOCK_REPOSITORY_MARKER_OPTIONAL } from './repositoryLock.js';
@@ -122,7 +125,7 @@ describe('createRelationship outcome mapping', () => {
 
     await expect(
       createRelationship(conn, RID, relationship({ relationshipType: 'KNOWS]->() DETACH DELETE (x' }), false),
-    ).rejects.toMatchObject({ name: 'ProviderError' });
+    ).rejects.toMatchObject({ name: 'InvalidInputError', code: 'INVALID_INPUT', field: 'relationshipType' });
     expect(calls).toHaveLength(0);
   });
 
@@ -525,5 +528,80 @@ describe('getEntityRelationships on a failing count', () => {
     const thrown: unknown = await getEntityRelationships(conn, 'repo-rels', 'e1').catch((err: unknown) => err);
     expect(thrown).toBeInstanceOf(DeepMemoryError);
     expect((thrown as Error).cause).toBe(DRIVER_FAILURE);
+  });
+});
+
+
+describe('deleteRelationshipsByType in batches', () => {
+  const BATCHING = { batchSize: 2, edgeCap: 3 };
+
+  it('walks the entity cursor, repeats a batch that reached the edge cap, and sums the counters', async () => {
+    const { conn, calls } = batchConnection(RID, [
+      { row: { repositoryExists: true, lastId: 'b', edges: 3n }, counters: { relationshipsDeleted: 3 } },
+      { row: { repositoryExists: true, lastId: 'b', edges: 1n }, counters: { relationshipsDeleted: 1 } },
+      { row: { repositoryExists: true, lastId: 'd', edges: 0n } },
+      { row: { repositoryExists: true, lastId: null, edges: 0n } },
+    ]);
+
+    const result = await deleteRelationshipsByType(conn, RID, 'knows', BATCHING);
+
+    expect(result).toEqual({ deletedRelationships: 4 });
+    expect(calls.map((c) => c.params['after'])).toEqual(['', '', 'b', 'd']);
+    expect(calls[0]?.params).toEqual({ after: '', batchSize: 2n, edgeCap: 3n });
+    // One statement text for the whole walk, with the type in its edge pattern.
+    expect(new Set(calls.map((c) => c.cypher)).size).toBe(1);
+    expect(calls[0]?.cypher).toContain('MATCH (e)-[r:knows {repositoryId: $rid}]->()');
+  });
+
+  it('reports 0 when none of the type is left', async () => {
+    const { conn } = batchConnection(RID, [{ row: { repositoryExists: true, lastId: null, edges: 0n } }]);
+    expect(await deleteRelationshipsByType(conn, RID, 'knows', BATCHING)).toEqual({ deletedRelationships: 0 });
+  });
+
+  it('throws RepositoryNotFoundError from the first batch when the marker is missing', async () => {
+    const { conn, calls } = batchConnection(RID, [{ row: { repositoryExists: false, lastId: null, edges: 0n } }]);
+    await expect(deleteRelationshipsByType(conn, RID, 'knows', BATCHING)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('throws RepositoryNotFoundError when the repository is deleted part-way through the walk', async () => {
+    const { conn, calls } = batchConnection(RID, [
+      { row: { repositoryExists: true, lastId: 'b', edges: 2n }, counters: { relationshipsDeleted: 2 } },
+      { row: { repositoryExists: false, lastId: null, edges: 0n } },
+    ]);
+    await expect(deleteRelationshipsByType(conn, RID, 'knows', BATCHING)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(calls.map((c) => c.params['after'])).toEqual(['', 'b']);
+  });
+
+  it('refuses an unsafe relationship type before any round-trip', async () => {
+    const { conn, calls } = batchConnection(RID, []);
+    await expect(deleteRelationshipsByType(conn, RID, 'knows]->() DETACH DELETE e //', BATCHING)).rejects.toBeInstanceOf(
+      DeepMemoryError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('raises a failed batch as a typed error', async () => {
+    const failure = Object.assign(new Error('database unavailable'), { code: 'Neo.DatabaseError.General.UnknownError' });
+    const { conn } = batchConnection(RID, [{ error: failure }]);
+    const thrown: unknown = await deleteRelationshipsByType(conn, RID, 'knows', BATCHING).catch((err: unknown) => err);
+    expect(thrown).toBeInstanceOf(DeepMemoryError);
+    expect((thrown as Error).cause).toBe(failure);
+  });
+
+  it('does not run a batch again after a transient failure, whose committed inner transactions went uncounted', async () => {
+    const deadlock = Object.assign(new Error('deadlock'), { code: 'Neo.TransientError.Transaction.DeadlockDetected' });
+    const { conn, calls } = batchConnection(RID, [{ error: deadlock }]);
+    const thrown: unknown = await deleteRelationshipsByType(conn, RID, 'knows', BATCHING).catch((err: unknown) => err);
+    expect(thrown).toBeInstanceOf(DeepMemoryError);
+    expect((thrown as Error).cause).toBe(deadlock);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('anchors on the entity cursor and deletes in top-level inner transactions', () => {
+    const cypher = buildDeleteRelationshipsByTypeQuery('KNOWS');
+    expect(cypher).toContain('WHERE repo IS NOT NULL AND e.id > $after');
+    expect(cypher).toContain('UNWIND batchEdges + [null] AS r');
+    expect(cypher).toMatch(/\}\s*IN TRANSACTIONS OF \$batchSize ROWS\s*RETURN repo IS NOT NULL AS repositoryExists, lastId/);
   });
 });

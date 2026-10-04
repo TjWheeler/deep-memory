@@ -623,17 +623,30 @@ export async function deleteRelationship(
 }
 
 /**
- * Drop every relationship of a type in the repository, only while the
- * repository marker exists, and count what was dropped. The marker is a seek
- * of its unique constraint index; the edges are reached from the
- * repository's entities, sought through the `(repositoryId, id)` unique
- * index (`WHERE e.id IS NOT NULL`) and expanded one entity at a time in a
- * subquery. Matching the typed edge pattern directly lets the planner scan
- * every relationship of the type in the database instead. Directional
- * pattern — edges are stored directionally, so `->` reaches each
- * relationship exactly once, from its source. The subquery aggregates, so the
- * statement returns exactly one row (`repositoryExists`, `deleted`); with no
- * marker it deletes nothing.
+ * One batch of a relationship type delete, walked as a keyset cursor over the
+ * repository's entities (the shape of `RELATIONSHIP_DRAIN_QUERY`), only while
+ * the repository marker exists. The marker is a seek of its unique
+ * constraint index. The statement takes the next `$batchSize` entities in id
+ * order after `$after` (a range seek of the `(repositoryId, id)` index, read
+ * in index order and stopped at the limit; the sort keys repeat the index's
+ * key order so no sort is planned) and collects up to `$edgeCap` of their
+ * outgoing edges of the type. Matching the typed edge pattern directly would
+ * let the planner scan every relationship of the type in the database.
+ * Directional pattern: edges are stored directionally, so `->` reaches each
+ * relationship exactly once, from its source.
+ *
+ * The collecting subquery aggregates, so it yields one row whatever matched
+ * (no entities and a null `lastId` when the marker is missing), and the
+ * unwound list carries a trailing `null` (deleting null is a no-op) so the
+ * statement always returns that row. The deletes run `$batchSize` edges per
+ * inner transaction at the top level: `IN TRANSACTIONS` cannot nest inside a
+ * subquery, and it runs only on an auto-commit session
+ * (`Neo4jConnection.executeImplicitInTransactions`). `$edgeCap` bounds the
+ * edges buffered before the inner transactions run, whatever the degree of
+ * the batch's entities. The statement returns `repositoryExists`, the batch's
+ * last entity id as `lastId` and the number of edges it took as `edges`.
+ * `$batchSize` and `$edgeCap` must be bound as BigInts so each `LIMIT` sees a
+ * Cypher INTEGER.
  *
  * The type slot is interpolated (Cypher 25 cannot parameterise it); callers
  * pass it through `assertSafeRelationshipType` first.
@@ -642,34 +655,84 @@ export function buildDeleteRelationshipsByTypeQuery(relType: string): string {
   return `OPTIONAL MATCH (repo:_Repository {repositoryId: $rid})
 CALL (repo) {
   MATCH (e:_Entity {repositoryId: $rid})
-  WHERE repo IS NOT NULL AND e.id IS NOT NULL
-  CALL (e) {
+  WHERE repo IS NOT NULL AND e.id > $after
+  WITH e ORDER BY e.repositoryId ASC, e.id ASC LIMIT $batchSize
+  WITH collect(e) AS entities, max(e.id) AS lastId
+  CALL (entities) {
+    UNWIND entities AS e
     MATCH (e)-[r:${relType} {repositoryId: $rid}]->()
-    DELETE r
-    RETURN count(*) AS edges
+    WITH r LIMIT $edgeCap
+    RETURN collect(r) AS batchEdges
   }
-  RETURN sum(edges) AS deleted
+  RETURN lastId, batchEdges
 }
-RETURN repo IS NOT NULL AS repositoryExists, deleted`;
+UNWIND batchEdges + [null] AS r
+CALL (r) {
+  DELETE r
+} IN TRANSACTIONS OF $batchSize ROWS
+RETURN repo IS NOT NULL AS repositoryExists, lastId, count(r) AS edges`;
 }
 
 /**
- * Drop every relationship of a type in the repository
- * (`buildDeleteRelationshipsByTypeQuery`), returning an exact count in a
- * single round-trip. Throws `RepositoryNotFoundError` when the repository
- * marker is absent, and nothing is deleted.
+ * Drop every relationship of a type in the repository, in batches
+ * (`buildDeleteRelationshipsByTypeQuery`), so no single transaction holds a
+ * whole type however large it is. The cursor starts at `''`. When a batch
+ * took fewer than `edgeCap` edges, its entities have none of the type left
+ * and the next batch starts after its `lastId`; at the cap the same batch
+ * runs again, since the edges it took are gone. The delete ends when no
+ * entity remains past the cursor (`lastId` null). Returns the exact number
+ * removed, summed from each batch's update counters (zero when none of the
+ * type was left).
+ *
+ * Every batch checks the repository marker before it deletes anything:
+ * `RepositoryNotFoundError` when it is absent, so a missing repository is
+ * refused ahead of any delete. The statements run on an auto-commit session,
+ * which the driver never re-runs, so a batch's count is never lost to a
+ * re-run that finds its own committed delete and reports nothing.
+ *
+ * A failed batch surfaces as a typed error, transient or not; the batches
+ * already committed stay deleted, and calling again removes the rest. A
+ * failed batch is not re-run here, unlike an entity type batch: one
+ * statement deletes its edges over several inner transactions, and a failure
+ * in a later one leaves the earlier ones committed with their counters lost
+ * with the statement, so a re-run could not report an exact count. A call
+ * that fails after its last deleting inner transaction committed (the
+ * connection lost before the acknowledgement, say) has removed the whole
+ * type, so a resend of the type delete finds nothing left to remove and the
+ * engine answers "not found".
  */
 export async function deleteRelationshipsByType(
   conn: Neo4jConnection,
   repositoryId: string,
   relationshipType: string,
+  batching: { batchSize: number; edgeCap: number },
 ): Promise<{ deletedRelationships: number }> {
-  const relType = assertSafeRelationshipType(relationshipType);
-  const result = await conn.executeQuery(buildDeleteRelationshipsByTypeQuery(relType), {}, { repositoryId });
-  const record = result.records[0];
-  if (record === undefined) throw new ProviderError('Neo4j delete by relationship type returned no row.');
-  if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
-  return { deletedRelationships: bigintToSafeNumber(record.get('deleted') ?? 0) };
+  const cypher = buildDeleteRelationshipsByTypeQuery(assertSafeRelationshipType(relationshipType));
+  const { batchSize, edgeCap } = batching;
+  let deletedRelationships = 0;
+  let after = '';
+  while (true) {
+    let result: Awaited<ReturnType<Neo4jConnection['executeImplicitInTransactions']>>;
+    try {
+      result = await conn.executeImplicitInTransactions(
+        cypher,
+        { after, batchSize: BigInt(batchSize), edgeCap: BigInt(edgeCap) },
+        { repositoryId },
+      );
+    } catch (err) {
+      mapDriverError(err, { repositoryId, operation: 'deleteRelationshipsByType' });
+    }
+    const record = result.records[0];
+    if (record === undefined) throw new ProviderError('Neo4j delete by relationship type returned no row.');
+    if (record.get('repositoryExists') !== true) throw new RepositoryNotFoundError(repositoryId);
+    deletedRelationships += result.summary.counters.updates()['relationshipsDeleted'] ?? 0;
+    // At the cap, the batch's entities may still have edges of the type: run it again.
+    if (bigintToSafeNumber(record.get('edges') ?? 0) >= edgeCap) continue;
+    const lastId: unknown = record.get('lastId');
+    if (typeof lastId !== 'string') break;
+    after = lastId;
+  }
+  return { deletedRelationships };
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────

@@ -414,6 +414,22 @@ describe('CypherCompiler', () => {
       ).toThrow(TraversalValidationError);
     });
 
+    it.each(['createdInConversation', 'slug', 'embedding', '_attempt'])(
+      'rejects projecting the entity system field %s',
+      (name) => {
+        expect(() =>
+          compiler.compile(
+            {
+              start: { entityType: 'Organization' },
+              returnMode: 'terminal',
+              projection: { properties: [name] },
+            },
+            emptyVocab,
+          ),
+        ).toThrow(/reserved for an entity system field/);
+      },
+    );
+
     it.each([
       ['a fractional depth', 1.5],
       ['a numeric string', asNumber('3')],

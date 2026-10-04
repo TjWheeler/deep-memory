@@ -1,4 +1,6 @@
+import { BatchPartialFailureError } from '@utaba/deep-memory';
 import { BaseToolController } from '../base/BaseToolController.js';
+import { batchPartialFailureResponse } from '../base/batchPartialFailure.js';
 
 interface EntityInput {
   entityType: string;
@@ -11,7 +13,7 @@ interface EntityInput {
 
 export class CreateEntitiesTool extends BaseToolController {
   get name() { return 'memory_create_entities'; }
-  get description() { return 'Create one or more entities (nodes) in a repository. Entity types and properties must match the repository vocabulary — call memory_open_repository first to see valid types.'; }
+  get description() { return 'Create one or more entities (nodes) in a repository. Entity types and properties must match the repository vocabulary — call memory_open_repository first to see valid types. Property names must match ^[A-Za-z_][A-Za-z0-9_]*$ and must not be reserved system fields (label, slug, createdAt, ...). Every entity is validated before any is written: if one fails validation, nothing is created. If storing fails part-way, the error response lists code BATCH_PARTIAL_FAILURE, failedIndex and the entities already stored in "created"; resend only the entities not in "created", because resending a stored entity creates a duplicate.'; }
   get inputSchema() {
     return {
       type: 'object',
@@ -42,13 +44,19 @@ export class CreateEntitiesTool extends BaseToolController {
   protected async handleExecute(params: Record<string, unknown>) {
     const repo = await this.context.getRepository(params['repositoryId'] as string);
     const entities = params['entities'] as EntityInput[];
-    return repo.createEntities(entities.map((e) => ({
-      entityType: e.entityType,
-      label: e.label,
-      summary: e.summary,
-      properties: e.properties,
-      data: e.data,
-      dataFormat: e.dataFormat,
-    })));
+    try {
+      return await repo.createEntities(entities.map((e) => ({
+        entityType: e.entityType,
+        label: e.label,
+        summary: e.summary,
+        properties: e.properties,
+        data: e.data,
+        dataFormat: e.dataFormat,
+      })));
+    } catch (error: unknown) {
+      if (!(error instanceof BatchPartialFailureError)) throw error;
+      this.logger.error(this.name, `Execution failed: ${error.message}`);
+      return batchPartialFailureResponse(error);
+    }
   }
 }

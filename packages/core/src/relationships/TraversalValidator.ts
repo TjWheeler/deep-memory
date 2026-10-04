@@ -11,6 +11,7 @@ import {
   isPositiveSafeInteger,
   isSafeIdentifier,
 } from '../validation/identifier.js';
+import { isReservedPropertyName } from '../validation/propertyNames.js';
 
 export interface ValidationResult {
   valid: boolean;
@@ -102,6 +103,26 @@ function checkStringList(
       errors.push(`${location}[${i}] must be a string; got ${describeRejectedValue(item)}`);
     } else if (requireIdentifiers) {
       checkIdentifier(item, `${location}[${i}]`, errors);
+    }
+  });
+}
+
+/**
+ * Record an error for each projected name that is reserved for an entity
+ * system field. Projection reads user properties; a graph store keeps system
+ * fields (provenance, slug, embedding, write tokens) on the same node, so a
+ * reserved name would read the system field there while reading nothing on a
+ * provider that projects from the user properties alone. No user property
+ * can carry a reserved name, so refusing one loses nothing. Non-string and
+ * malformed entries were already reported by `checkStringList`.
+ */
+function checkProjectableNames(value: readonly string[], errors: string[]): void {
+  if (!Array.isArray(value)) return;
+  value.forEach((item, i) => {
+    if (typeof item === 'string' && isSafeIdentifier(item) && isReservedPropertyName(item, 'entity')) {
+      errors.push(
+        `projection.properties[${i}] "${item}" is reserved for an entity system field and cannot be projected; projection reads user properties only`,
+      );
     }
   });
 }
@@ -296,6 +317,7 @@ export function validateTraversalSpec(
       errors.push('projection.properties must contain at least one property name');
     } else {
       checkStringList(spec.projection.properties, 'projection.properties', errors, true);
+      checkProjectableNames(spec.projection.properties, errors);
     }
     if (spec.projection.mode && !['count', 'values'].includes(spec.projection.mode)) {
       errors.push("projection.mode must be 'count' or 'values'");

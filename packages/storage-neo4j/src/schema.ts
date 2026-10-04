@@ -1,6 +1,6 @@
 // Neo4j schema for @utaba/deep-memory StorageProvider
 //
-// Label and property conventions (per D4–D7 of plans/neo4j-provider.md):
+// Label and property conventions:
 //   System labels:   _Entity, _Repository, _Vocabulary, _VocabularyChangeLog, _Meta
 //   Entity nodes:    :_Entity (umbrella) only. The entity-type discriminator
 //                    lives in `n.entityType` and is indexed by
@@ -16,7 +16,7 @@
 // All statements are valid Cypher 25. Each statement runs as its own round-trip
 // because Neo4j parses one statement per `executeQuery` / `tx.run` call.
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * Returns the constraint / index DDL for the deep-memory Neo4j schema as an
@@ -26,7 +26,8 @@ export const SCHEMA_VERSION = 1;
  * one.
  *
  * Composite uniqueness and lookup indexes all lead with `repositoryId` so the
- * planner uses it as the cheap discriminator — see D3b layer 1 in the plan.
+ * planner uses it as the cheap discriminator, so a repository-scoped lookup
+ * seeks the index instead of scanning every repository's nodes.
  * The fulltext index is unfiltered; callers that query it must add an
  * explicit `WHERE node.repositoryId = $rid` post-filter.
  */
@@ -46,6 +47,19 @@ FOR (n:_Entity) REQUIRE (n.repositoryId, n.slug) IS UNIQUE`,
     `CREATE CONSTRAINT dm_repository_unique IF NOT EXISTS
 FOR (n:_Repository) REQUIRE n.repositoryId IS UNIQUE`,
 
+    // Change-log uniqueness on (repositoryId, changeId) — the index every
+    // change-log read and drain seeks (`WHERE n.changeId IS NOT NULL`), and
+    // what keeps the MERGE in saveVocabulary to one node per change when the
+    // driver re-runs a committed write.
+    `CREATE CONSTRAINT dm_vocabulary_change_unique IF NOT EXISTS
+FOR (n:_VocabularyChangeLog) REQUIRE (n.repositoryId, n.changeId) IS UNIQUE`,
+
+    // Range index on the vocabulary node's repositoryId — backs getVocabulary,
+    // saveVocabulary and its outcome read, so each reaches its repository's
+    // one vocabulary node without scanning every repository's.
+    `CREATE INDEX dm_vocabulary_repository IF NOT EXISTS
+FOR (n:_Vocabulary) ON (n.repositoryId)`,
+
     // Range index (default for `CREATE INDEX` without a type keyword) covering
     // (repositoryId, entityType) — backs findEntities type-filter and
     // deleteEntitiesByType.
@@ -53,14 +67,15 @@ FOR (n:_Repository) REQUIRE n.repositoryId IS UNIQUE`,
 FOR (n:_Entity) ON (n.repositoryId, n.entityType)`,
 
     // Range index on (repositoryId, modifiedAt) — backs timeline and recency
-    // ordering. Date is stored as ISO-8601 string (D6), lexicographic order
-    // matches chronological order.
+    // ordering. Dates are stored as ISO-8601 strings, whose lexicographic
+    // order matches chronological order.
     `CREATE INDEX dm_entity_modified IF NOT EXISTS
 FOR (n:_Entity) ON (n.repositoryId, n.modifiedAt)`,
 
     // Fulltext index on entity label + summary — backs the findEntities
     // searchTerm branch via CALL db.index.fulltext.queryNodes(...). Unfiltered
-    // by design; query callers must post-filter by repositoryId (see D3b).
+    // by design (an index per repository would make the index count
+    // unbounded); query callers must post-filter by repositoryId.
     `CREATE FULLTEXT INDEX dm_entity_text IF NOT EXISTS
 FOR (n:_Entity) ON EACH [n.label, n.summary]`,
   ];

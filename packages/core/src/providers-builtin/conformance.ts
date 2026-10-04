@@ -11,8 +11,15 @@ import type { GraphTraversalProvider } from '../providers/GraphTraversalProvider
 import type { StoredEntity } from '../types/entities.js';
 import type { StoredRelationship } from '../types/relationships.js';
 import type { Provenance } from '../types/provenance.js';
-import type { MemoryVocabulary } from '../types/vocabulary.js';
+import type {
+  EntityTypeDefinition,
+  MemoryVocabulary,
+  VocabularyChangeRecord,
+  VocabularyProposal,
+} from '../types/vocabulary.js';
 import type { DeepMemoryErrorCode } from '../core/errors.js';
+import { DeepMemory } from '../core/DeepMemory.js';
+import type { MemoryRepository } from '../core/MemoryRepository.js';
 
 /**
  * Error shape asserted for typed provider errors.
@@ -84,6 +91,39 @@ function makeRelationship(
     properties: {},
     bidirectional,
     provenance: makeProvenance(),
+  };
+}
+
+function makeEntityTypeDefinition(type: string): EntityTypeDefinition {
+  const now = new Date().toISOString();
+  return {
+    type,
+    description: `Entity type ${type}`,
+    version: '1.0.0',
+    properties: [],
+    createdAt: now,
+    createdBy: 'conformance-test',
+    modifiedAt: now,
+    modifiedBy: 'conformance-test',
+  };
+}
+
+/**
+ * A change record with every field set, so a round trip through the store
+ * checks each one. `proposedAt` is fixed by the caller so the newest-first
+ * order is deterministic.
+ */
+function makeChangeRecord(
+  changeId: string,
+  fields: Pick<VocabularyChangeRecord, 'changeType' | 'typeName' | 'previousVersion' | 'newVersion' | 'proposedAt'>,
+): VocabularyChangeRecord {
+  return {
+    changeId,
+    ...fields,
+    proposedBy: 'conformance-proposer',
+    approvedBy: 'conformance-approver',
+    approvedAt: fields.proposedAt,
+    reason: `Reason for ${changeId}`,
   };
 }
 
@@ -279,6 +319,169 @@ export function runStorageProviderConformanceTests(
         const log = await provider.getVocabularyChangeLog(repoId);
         expect(Array.isArray(log.items)).toBe(true);
       });
+
+      it('saveVocabulary stores its change record with the vocabulary', async () => {
+        const v0 = await provider.getVocabulary(repoId, { fresh: true });
+        const record = makeChangeRecord('change-added', {
+          changeType: 'entity_type_added',
+          typeName: 'logged-type',
+          previousVersion: v0.version,
+          newVersion: '1.0.0',
+          proposedAt: '2026-01-01T00:00:00.000Z',
+        });
+        await provider.saveVocabulary(
+          repoId,
+          { ...v0, version: '1.0.0', entityTypes: [makeEntityTypeDefinition('logged-type')] },
+          v0.version,
+          record,
+        );
+
+        const log = await provider.getVocabularyChangeLog(repoId);
+        expect(log.total).toBe(1);
+        expect(log.items).toEqual([record]);
+
+        // A save without a record leaves the log as it was.
+        await provider.saveVocabulary(repoId, { ...v0, version: '1.1.0' }, '1.0.0');
+        const after = await provider.getVocabularyChangeLog(repoId);
+        expect(after.total).toBe(1);
+        expect(after.items.map((r) => r.changeId)).toEqual(['change-added']);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('getVocabularyChangeLog pages records newest first', async () => {
+        const v0 = await provider.getVocabulary(repoId, { fresh: true });
+        const older = makeChangeRecord('change-older', {
+          changeType: 'entity_type_added',
+          typeName: 'first-type',
+          previousVersion: v0.version,
+          newVersion: '1.0.0',
+          proposedAt: '2026-01-01T00:00:00.000Z',
+        });
+        const newer = makeChangeRecord('change-newer', {
+          changeType: 'entity_type_modified',
+          typeName: 'first-type',
+          previousVersion: '1.0.0',
+          newVersion: '1.1.0',
+          proposedAt: '2026-01-02T00:00:00.000Z',
+        });
+        await provider.saveVocabulary(repoId, { ...v0, version: '1.0.0' }, v0.version, older);
+        await provider.saveVocabulary(repoId, { ...v0, version: '1.1.0' }, '1.0.0', newer);
+
+        const first = await provider.getVocabularyChangeLog(repoId, { limit: 1 });
+        expect(first.total).toBe(2);
+        expect(first.hasMore).toBe(true);
+        expect(first.items.map((r) => r.changeId)).toEqual(['change-newer']);
+
+        const second = await provider.getVocabularyChangeLog(repoId, { limit: 1, offset: 1 });
+        expect(second.hasMore).toBe(false);
+        expect(second.items.map((r) => r.changeId)).toEqual(['change-older']);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('a saveVocabulary that fails its compare-and-set writes no change record', async () => {
+        const v0 = await provider.getVocabulary(repoId, { fresh: true });
+        const landed = makeChangeRecord('change-landed', {
+          changeType: 'entity_type_added',
+          typeName: 'landed-type',
+          previousVersion: v0.version,
+          newVersion: '1.0.0',
+          proposedAt: '2026-01-01T00:00:00.000Z',
+        });
+        const stale = makeChangeRecord('change-stale', {
+          changeType: 'entity_type_added',
+          typeName: 'stale-type',
+          previousVersion: v0.version,
+          newVersion: '1.0.1',
+          proposedAt: '2026-01-02T00:00:00.000Z',
+        });
+        await provider.saveVocabulary(repoId, { ...v0, version: '1.0.0' }, v0.version, landed);
+
+        await expect(
+          provider.saveVocabulary(repoId, { ...v0, version: '1.0.1' }, v0.version, stale),
+        ).rejects.toMatchObject(typedError('VocabularyVersionConflictError', 'VOCABULARY_VERSION_CONFLICT'));
+
+        const log = await provider.getVocabularyChangeLog(repoId);
+        expect(log.total).toBe(1);
+        expect(log.items.map((r) => r.changeId)).toEqual(['change-landed']);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('a saveVocabulary on a deleted repository writes no change record', async () => {
+        const v0 = await provider.getVocabulary(repoId, { fresh: true });
+        await provider.deleteRepository(repoId);
+        const orphan = makeChangeRecord('change-orphan', {
+          changeType: 'entity_type_added',
+          typeName: 'orphan-type',
+          previousVersion: v0.version,
+          newVersion: '1.0.0',
+          proposedAt: '2026-01-01T00:00:00.000Z',
+        });
+
+        await expect(
+          provider.saveVocabulary(repoId, { ...v0, version: '1.0.0' }, v0.version, orphan),
+        ).rejects.toMatchObject(typedError('RepositoryNotFoundError', 'REPOSITORY_NOT_FOUND'));
+
+        // A record written against the missing repository would surface once
+        // a repository with the same id exists again.
+        await createConformanceRepository();
+        const log = await provider.getVocabularyChangeLog(repoId);
+        expect(log.total).toBe(0);
+        expect(log.items).toEqual([]);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleting an entity type: the vocabulary drops it, its data goes, and a second delete finds nothing', async () => {
+        const v0 = await provider.getVocabulary(repoId, { fresh: true });
+        await provider.saveVocabulary(
+          repoId,
+          { ...v0, version: '1.0.0', entityTypes: [makeEntityTypeDefinition('doomed-type')] },
+          v0.version,
+        );
+        await provider.createEntity(repoId, makeEntity('d1', 'doomed-type'));
+        await provider.createEntity(repoId, makeEntity('d2', 'doomed-type'));
+        await provider.createEntity(repoId, makeEntity('k1'));
+        await provider.createRelationship(repoId, makeRelationship('rd1', 'connects', 'd1', 'k1'));
+
+        const removal = makeChangeRecord('change-removed', {
+          changeType: 'entity_type_removed',
+          typeName: 'doomed-type',
+          previousVersion: '1.0.0',
+          newVersion: '2.0.0',
+          proposedAt: '2026-01-01T00:00:00.000Z',
+        });
+        const v1 = await provider.getVocabulary(repoId, { fresh: true });
+        await provider.saveVocabulary(repoId, { ...v1, version: '2.0.0', entityTypes: [] }, '1.0.0', removal);
+        const cascade = await provider.deleteEntitiesByType(repoId, 'doomed-type');
+        expect(cascade.deletedEntities).toBe(2);
+
+        const stored = await provider.getVocabulary(repoId, { fresh: true });
+        expect(stored.version).toBe('2.0.0');
+        expect(stored.entityTypes.map((t) => t.type)).toEqual([]);
+        expect(await provider.getEntity(repoId, 'd1')).toBeNull();
+        expect(await provider.getEntity(repoId, 'd2')).toBeNull();
+        expect(await provider.getRelationship(repoId, 'rd1')).toBeNull();
+        expect((await provider.getEntity(repoId, 'k1'))?.id).toBe('k1');
+        expect((await provider.getVocabularyChangeLog(repoId)).items).toEqual([removal]);
+
+        // Resuming a finished deletion removes nothing, and says so.
+        const again = await provider.deleteEntitiesByType(repoId, 'doomed-type');
+        expect(again.deletedEntities).toBe(0);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('deleteRelationshipsByType removes only that type, and reports 0 once none is left', async () => {
+        await provider.createEntity(repoId, makeEntity('a'));
+        await provider.createEntity(repoId, makeEntity('b'));
+        await provider.createRelationship(repoId, makeRelationship('rx1', 'doomed_rel', 'a', 'b'));
+        await provider.createRelationship(repoId, makeRelationship('rx2', 'doomed_rel', 'b', 'a'));
+        await provider.createRelationship(repoId, makeRelationship('rk', 'connects', 'a', 'b'));
+
+        const cascade = await provider.deleteRelationshipsByType(repoId, 'doomed_rel');
+        expect(cascade.deletedRelationships).toBe(2);
+        expect(await provider.getRelationship(repoId, 'rx1')).toBeNull();
+        expect(await provider.getRelationship(repoId, 'rx2')).toBeNull();
+        expect((await provider.getRelationship(repoId, 'rk'))?.id).toBe('rk');
+        const survivors = await provider.getEntities(repoId, ['a', 'b']);
+        expect([...survivors.keys()].sort()).toEqual(['a', 'b']);
+
+        const again = await provider.deleteRelationshipsByType(repoId, 'doomed_rel');
+        expect(again.deletedRelationships).toBe(0);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
     });
 
     // ─── Entities ───────────────────────────────────────────
@@ -1056,6 +1259,59 @@ export function runStorageProviderConformanceTests(
       });
     });
 
+    // ─── Import relationship ids ────────────────────────────
+
+    describe('importBulk refuses a reused relationship id with a different type or endpoints', () => {
+      beforeEach(async () => {
+        for (const id of ['e1', 'e2', 'e3']) await provider.createEntity(repoId, makeEntity(id));
+        await provider.createRelationship(repoId, makeRelationship('r1', 'links', 'e1', 'e2'));
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      /**
+       * The code an upsert import reports for `item`. A provider that imports
+       * row by row records a refused row in `result.errors` and lands the
+       * rest; a provider whose import is one transaction rejects the whole
+       * import with an `ImportError` whose `cause` is the row's typed error.
+       * The row's code is the same either way.
+       */
+      async function importRowCode(
+        chunks: Parameters<StorageProvider['importBulk']>[1],
+        item: string,
+      ): Promise<string | undefined> {
+        try {
+          const result = await provider.importBulk(repoId, chunks);
+          return result.errors.find((error) => error.item === item)?.code;
+        } catch (err) {
+          expect(err).toMatchObject(typedError('ImportError', 'IMPORT_ERROR'));
+          return (err as { cause?: { code?: string } }).cause?.code;
+        }
+      }
+
+      it.each([
+        ['type', makeRelationship('r1', 'other', 'e1', 'e2')],
+        ['source', makeRelationship('r1', 'links', 'e3', 'e2')],
+        ['target', makeRelationship('r1', 'links', 'e1', 'e3')],
+      ])('refuses a stored id with a different %s and leaves the stored edge unchanged', async (_field, reused) => {
+        const code = await importRowCode([{ relationships: [reused] }], 'relationship:r1');
+
+        expect(code).toBe('RELATIONSHIP_ALREADY_EXISTS');
+        const stored = await provider.getRelationship(repoId, 'r1');
+        expect(stored).toMatchObject({ relationshipType: 'links', sourceEntityId: 'e1', targetEntityId: 'e2' });
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('updates a stored id with the same type and endpoints in place', async () => {
+        const same = { ...makeRelationship('r1', 'links', 'e1', 'e2'), properties: { note: 'updated' } };
+
+        const result = await provider.importBulk(repoId, [{ relationships: [same] }]);
+
+        expect(result.errors).toEqual([]);
+        expect(result.relationshipsImported).toBe(1);
+        const stored = await provider.getRelationship(repoId, 'r1');
+        expect(stored).toMatchObject({ relationshipType: 'links', sourceEntityId: 'e1', targetEntityId: 'e2' });
+        expect(stored?.properties).toEqual({ note: 'updated' });
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+    });
+
     // ─── Delete All Contents ───────────────────────────────
 
     describe('deleteAllContents', () => {
@@ -1438,6 +1694,172 @@ export function runStorageProviderConformanceTests(
 
         await expect(provider.getVocabulary(repoId)).rejects.toMatchObject(repositoryNotFound);
         await expect(provider.getRepositoryStats(repoId)).rejects.toMatchObject(repositoryNotFound);
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+    });
+
+    // ─── Property and type names ────────────────────────────
+
+    // A property or type name some provider could not store is refused on
+    // every provider: at proposal time (core governance over this provider's
+    // vocabulary storage), on the provider's own write calls, and in a
+    // traversal projection, which reads user properties only.
+    describe('property and type names', () => {
+      const invalidInput = (field: string): Record<string, string> =>
+        typedError('InvalidInputError', 'INVALID_INPUT', { field });
+
+      async function openThroughEngine(): Promise<MemoryRepository> {
+        const memory = new DeepMemory({
+          storage: provider,
+          graphTraversal: isGraphTraversalProvider(provider) ? provider : undefined,
+          provenance: { actorId: 'conformance-test', actorType: 'agent' },
+        });
+        return memory.openRepository(repoId);
+      }
+
+      async function expectProposalRejected(proposal: VocabularyProposal, mention: string): Promise<void> {
+        const before = await provider.getVocabulary(repoId, { fresh: true });
+        const repo = await openThroughEngine();
+        const result = await repo.proposeVocabularyChange(proposal);
+        expect(result.status).toBe('rejected');
+        expect(result.reason).toContain(mention);
+        const after = await provider.getVocabulary(repoId, { fresh: true });
+        expect(after.version).toBe(before.version);
+      }
+
+      it('rejects an entity type declaring a non-identifier property name', async () => {
+        await expectProposalRejected(
+          {
+            proposalType: 'entity_type',
+            entityType: {
+              type: 'Event',
+              description: 'An event',
+              properties: [{ name: 'start-date', type: 'string', required: false }],
+            },
+            justification: 'conformance',
+          },
+          'start-date',
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('rejects an entity type declaring a reserved property name', async () => {
+        await expectProposalRejected(
+          {
+            proposalType: 'entity_type',
+            entityType: {
+              type: 'Event',
+              description: 'An event',
+              properties: [{ name: 'label', type: 'string', required: false }],
+            },
+            justification: 'conformance',
+          },
+          'label',
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('rejects a relationship type declaring a reserved property name', async () => {
+        await expectProposalRejected(
+          {
+            proposalType: 'relationship_type',
+            relationshipType: {
+              type: 'FOLLOWS',
+              description: 'Comes after',
+              allowedSourceTypes: ['test-type'],
+              allowedTargetTypes: ['test-type'],
+              properties: [{ name: 'label', type: 'string', required: false }],
+            },
+            justification: 'conformance',
+          },
+          'label',
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('rejects a relationship type whose stored name starts with a digit', async () => {
+        await expectProposalRejected(
+          {
+            proposalType: 'relationship_type',
+            relationshipType: {
+              type: '2nd degree',
+              description: 'Second-degree link',
+              allowedSourceTypes: ['test-type'],
+              allowedTargetTypes: ['test-type'],
+            },
+            justification: 'conformance',
+          },
+          '2ND_DEGREE',
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('rejects an entity type whose name is not an identifier', async () => {
+        await expectProposalRejected(
+          {
+            proposalType: 'entity_type',
+            entityType: { type: '2ND_DEGREE', description: 'Not an identifier' },
+            justification: 'conformance',
+          },
+          '2ND_DEGREE',
+        );
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('createEntity refuses a non-identifier or reserved property key', async () => {
+        for (const key of ['start-date', 'label', 'createdInConversation']) {
+          const entity = { ...makeEntity(`bad-${key}`), properties: { [key]: 'x' } };
+          await expect(provider.createEntity(repoId, entity)).rejects.toMatchObject(
+            invalidInput(`properties.${key}`),
+          );
+          expect(await provider.getEntity(repoId, entity.id)).toBeNull();
+        }
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('updateEntity refuses a non-identifier or reserved property key', async () => {
+        await provider.createEntity(repoId, makeEntity('e1'));
+        for (const key of ['start-date', 'slug']) {
+          await expect(
+            provider.updateEntity(repoId, 'e1', {
+              properties: { key: 'value', [key]: 'x' },
+              provenance: makeProvenance(),
+            }),
+          ).rejects.toMatchObject(invalidInput(`properties.${key}`));
+        }
+        expect((await provider.getEntity(repoId, 'e1'))?.properties).toEqual({ key: 'value' });
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('createRelationship refuses a non-identifier or reserved property key', async () => {
+        await provider.createEntity(repoId, makeEntity('e1'));
+        await provider.createEntity(repoId, makeEntity('e2'));
+        for (const key of ['start-date', 'label']) {
+          const relationship = { ...makeRelationship(`r-${key}`, 'connects', 'e1', 'e2'), properties: { [key]: 'x' } };
+          await expect(provider.createRelationship(repoId, relationship)).rejects.toMatchObject(
+            invalidInput(`properties.${key}`),
+          );
+          expect(await provider.getRelationship(repoId, relationship.id)).toBeNull();
+        }
+      }, MULTI_STEP_TEST_TIMEOUT_MS);
+
+      it('a traversal cannot project provenance or other system fields', async () => {
+        await provider.createEntity(repoId, makeEntity('e1'));
+        const repo = await openThroughEngine();
+        for (const name of ['createdInConversation', 'createdBy', 'slug']) {
+          await expect(
+            repo.traverse({
+              start: { entityType: 'test-type' },
+              returnMode: 'terminal',
+              projection: { properties: [name] },
+              includeProvenance: false,
+              limit: 10,
+            }),
+          ).rejects.toMatchObject(typedError('TraversalValidationError', 'TRAVERSAL_VALIDATION_FAILED'));
+          // A native traversal called directly applies the same rule.
+          if (isGraphTraversalProvider(provider)) {
+            await expect(
+              provider.traverse(repoId, {
+                start: { entityType: 'test-type' },
+                returnMode: 'terminal',
+                projection: { properties: [name] },
+                limit: 10,
+              }),
+            ).rejects.toMatchObject(typedError('TraversalValidationError', 'TRAVERSAL_VALIDATION_FAILED'));
+          }
+        }
       }, MULTI_STEP_TEST_TIMEOUT_MS);
     });
   });

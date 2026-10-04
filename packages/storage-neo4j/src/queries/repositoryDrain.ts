@@ -97,6 +97,21 @@ export const ENTITY_DRAIN_QUERY = `CALL () {
 } IN TRANSACTIONS OF $batchSize ROWS`;
 
 /**
+ * One batch of the repository's vocabulary change log. The records are a
+ * seek of the `(repositoryId, changeId)` constraint index
+ * (`WHERE n.changeId IS NOT NULL`); a bare `repositoryId` anchor would scan
+ * every repository's change log for each batch. A change-log node without a
+ * `changeId` is not one this provider wrote, and the untyped node sweep that
+ * follows removes it.
+ */
+export const CHANGE_LOG_DRAIN_QUERY = `CALL () {
+  MATCH (n:_VocabularyChangeLog {repositoryId: $rid})
+  WHERE n.changeId IS NOT NULL
+  WITH n LIMIT $batchSize
+  DETACH DELETE n
+} IN TRANSACTIONS OF $batchSize ROWS`;
+
+/**
  * Whether the repository marker exists, for a call that must refuse a
  * missing repository but has no statement of its own to carry the check
  * (see `assertRepositoryMarker`). `{repositoryId: $rid}` on `_Repository` is

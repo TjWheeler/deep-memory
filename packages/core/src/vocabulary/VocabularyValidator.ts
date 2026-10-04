@@ -9,6 +9,12 @@ import type {
   RelationshipTypeDefinition,
 } from '../types/vocabulary.js';
 import { toScreamingSnakeCase } from './similarity.js';
+import {
+  SAFE_IDENTIFIER_PATTERN,
+  describeRejectedValue,
+  isSafeIdentifier,
+} from '../validation/identifier.js';
+import { propertyNameRefusal, type PropertyOwner } from '../validation/propertyNames.js';
 
 /** A single validation error with optional suggestion */
 export interface ValidationError {
@@ -47,8 +53,21 @@ function findClosestType(typeName: string, types: Array<{ type: string }>): stri
   return match?.type;
 }
 
-/** Validate a PropertySchema definition — catches invalid embeddable declarations */
-export function validatePropertySchema(schema: PropertySchema): ValidationResult {
+/**
+ * Validate a PropertySchema definition declared on a type of `owner`'s kind.
+ * Refuses a name that could not be written on every storage provider (not a
+ * safe identifier, or reserved for a system field), and an embeddable flag on
+ * a non-string property.
+ */
+export function validatePropertySchema(schema: PropertySchema, owner: PropertyOwner): ValidationResult {
+  const nameRefusal = propertyNameRefusal(schema.name, owner);
+  if (nameRefusal !== undefined) {
+    return fail({
+      field: `properties.${schema.name}`,
+      message: nameRefusal,
+      suggestion: `Use a name matching ${SAFE_IDENTIFIER_PATTERN.source} that is not a reserved system field.`,
+    });
+  }
   if (schema.embeddable === true && schema.type !== 'string') {
     return fail({
       field: `properties.${schema.name}`,
@@ -56,6 +75,27 @@ export function validatePropertySchema(schema: PropertySchema): ValidationResult
     });
   }
   return ok();
+}
+
+/**
+ * Validate the name of a type an add proposal introduces. A relationship
+ * type is checked in the SCREAMING_SNAKE_CASE form it is stored and queried
+ * under, so `2nd degree` is refused as `2ND_DEGREE`. Graph stores write
+ * relationship type names into query text, and every type name must be
+ * usable on every provider, so both kinds must be safe identifiers.
+ */
+export function validateNewTypeName(name: string, kind: 'entity' | 'relationship'): ValidationResult {
+  const stored = kind === 'relationship' && typeof name === 'string' ? toScreamingSnakeCase(name) : name;
+  if (isSafeIdentifier(stored)) {
+    return ok();
+  }
+  const described = describeRejectedValue(name);
+  const asStored = stored === name ? '' : ` (stored as ${describeRejectedValue(stored)})`;
+  return fail({
+    field: 'type',
+    message: `${kind === 'entity' ? 'Entity' : 'Relationship'} type name ${described}${asStored} is not a valid identifier; type names must match ${SAFE_IDENTIFIER_PATTERN.source}`,
+    suggestion: 'Start the name with a letter and use only letters, digits and underscores.',
+  });
 }
 
 /** Validate a property value against its schema */

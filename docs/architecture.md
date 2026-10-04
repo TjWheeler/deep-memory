@@ -98,7 +98,7 @@ Orchestrates relationship creation and removal with vocabulary constraint valida
 2. Validate relationship type against vocabulary (including allowedSourceTypes/allowedTargetTypes)
 3. Fire `relationship:creating` hook
 4. Check bidirectional flag from vocabulary
-5. Generate deterministic ID (`{type}:{sourceId}→{targetId}`)
+5. Use the caller's ID, or generate a random one (GUID)
 6. Stamp provenance
 7. Persist via StorageProvider
 8. Emit `relationship:created` event
@@ -116,14 +116,22 @@ Central authority for vocabulary operations. Validates all mutations against the
 - **SemanticDeduplicator** — detects duplicate type proposals using embedding similarity (if EmbeddingProvider available) or Jaro-Winkler string similarity as fallback.
 - **VocabularyDiff** — computes differences between vocabulary versions (used by MigrationEngine during import).
 
-**Caching:** The resolved vocabulary is cached in memory and invalidated after any mutation.
+**Vocabulary freshness:** The engine keeps no copy of its own. Every validation reads through `StorageProvider.getVocabulary`, so it sees what the provider's cache holds: the persistent providers cache for `vocabularyCacheTtlMs` (60 s by default; `0` disables the cache), so a change made by another process reaches this one's write validation within that window. `openRepository(id, { freshVocabulary: true })` makes the handle validate writes against `{ fresh: true }` reads, bypassing the cache. A batch create reads the vocabulary once for the whole batch.
+
+**Name rules:** New entity and relationship type names, and every property name (in a proposal and on every write), must match `SAFE_IDENTIFIER_PATTERN` (`^[A-Za-z_][A-Za-z0-9_]*$`). Property names must also not be reserved system-field names (`RESERVED_ENTITY_PROPERTY_KEYS` / `RESERVED_RELATIONSHIP_PROPERTY_KEYS`). The rules are the same on every provider, because graph stores write these names into query text, where they cannot be bound as parameters. A write that breaks them throws `InvalidInputError` (field `properties.<key>`).
+
+**Change log:** An approved vocabulary change is saved together with its change record (`saveVocabulary(…, changeRecord)`), so `getVocabularyChangeLog` lists every landed change, newest first.
+
+**Resumable type deletes:** A `delete_*_type` proposal writes the vocabulary first, then deletes the type's data. If the data delete fails part-way, resending the proposal finds the type already absent, runs the data delete again, and answers `approved` (no new vocabulary version) when it removed anything, or `rejected` "not found" when nothing was left.
 
 ### GraphTraversal
 
 BFS-based graph exploration and path finding.
 
 - **exploreNeighbourhood** — from a centre entity, expand outward by depth (1–3 hops). Returns layers grouped by relationship type, with per-type entity lists. Supports filtering by relationship types, entity types, and direction.
-- **findPaths** — BFS from source to target, returns multiple paths (default limit 5, max depth 3). Each path includes the sequence of entities and relationships traversed.
+- **findPaths** — BFS from source to target, returns multiple paths (`maxDepth` default 3, max 5; `limit` default 5, max 200; `offset` max 1,000). Each path includes the sequence of entities and relationships traversed.
+
+Options are validated before storage runs: out-of-range or non-integer bounds, and relationship type names or property-filter keys that are not identifiers (`SAFE_IDENTIFIER_PATTERN`), throw `TraversalValidationError` on every provider. `traverse` applies the same rule to its steps and filters, caps `limit` at 200 and `offset` at 1,000, and refuses a projection of a reserved or system field name.
 
 Both methods delegate the raw traversal to StorageProvider and map results to public types.
 
@@ -138,7 +146,9 @@ Coordinates multiple providers to serve search queries.
 
 Zero-dependency typed event emitter supporting both fire-and-forget events and pre-mutation hooks.
 
-**Event types (20+):** `repository:created`, `entity:creating`, `entity:created`, `entity:updating`, `entity:updated`, `entity:deleting`, `entity:deleted`, `relationship:creating`, `relationship:created`, `relationship:removing`, `relationship:removed`, `vocabulary:updated`, `vocabulary:extension:proposed`, `vocabulary:extension:approved`, `vocabulary:extension:rejected`, `validation:failed`, `search:executed`, `export:completed`, `import:completed`.
+**Event types (20+):** `repository:created`, `entity:creating`, `entity:created`, `entity:updating`, `entity:updated`, `entity:deleting`, `entity:deleted`, `relationship:creating`, `relationship:created`, `relationship:removing`, `relationship:removed`, `vocabulary:updated`, `vocabulary:extension:proposed`, `vocabulary:extension:approved`, `vocabulary:extension:rejected`, `validation:failed`, `search:executed`, `search:index_failed`, `export:completed`, `import:completed`, `delete:started`, `delete:progress`, `delete:completed`.
+
+`search:index_failed` (`{ entityId, error }`) reports a committed entity create, update or delete whose SearchProvider update failed; the write stands. The repository-delete events carry no up-front totals, because nothing counts the repository before deleting it: `delete:started` is `{ repositoryId }`, `delete:progress` carries the running counts removed so far, and `delete:completed` the counts actually removed.
 
 **Hooks:** Pre-mutation hooks (`entity:creating`, `entity:updating`, `entity:deleting`, `relationship:creating`, `relationship:removing`) can return `{ cancel: true, reason }` to abort the operation. Multiple hooks run in registration order; first cancellation wins.
 
@@ -176,7 +186,16 @@ The primary persistence interface. Every read and write goes through this provid
 **Vocabulary contract for implementers:**
 - `createRepository(config)` must also persist the repository's vocabulary — `config.vocabulary` when supplied, otherwise `createEmptyVocabulary(config.createdBy)`. This is the only place a vocabulary is created.
 - `getVocabulary(repositoryId, options?: { fresh?: boolean })` — `fresh: true` bypasses any provider-side cache. Providers without a cache ignore it.
-- `saveVocabulary(repositoryId, vocabulary, expectedVersion)` is compare-and-set. The write lands only if the stored version equals `expectedVersion`, and the check and the write must be atomic. A mismatch throws `VocabularyVersionConflictError` (code `VOCABULARY_VERSION_CONFLICT`, carrying `repositoryId`, `expectedVersion` and `actualVersion`) and leaves the stored vocabulary unchanged. It never creates: when the repository or its vocabulary does not exist it throws `RepositoryNotFoundError`.
+- `saveVocabulary(repositoryId, vocabulary, expectedVersion, changeRecord?)` is compare-and-set. The write lands only if the stored version equals `expectedVersion`, and the check and the write must be atomic. A mismatch throws `VocabularyVersionConflictError` (code `VOCABULARY_VERSION_CONFLICT`, carrying `repositoryId`, `expectedVersion` and `actualVersion`) and leaves the stored vocabulary unchanged. It never creates: when the repository or its vocabulary does not exist it throws `RepositoryNotFoundError`. A `changeRecord` is persisted with the write (in the same transaction where the store has one) and only when the write lands; `getVocabularyChangeLog` returns the records newest first by `proposedAt`, then `changeId`.
+- `deleteEntitiesByType` / `deleteRelationshipsByType` return exact counts, `0` when nothing of the type is left; the engine relies on that to resume a type deletion.
+
+**Other contract points for implementers** (each has a case in the conformance suite):
+- **Missing repository.** Every repository-scoped call throws `RepositoryNotFoundError` when the repository is gone, ahead of any not-found, empty or per-id answer — including while an interrupted delete has left data behind. The only exception is a cached `getVocabulary` hit within the cache's TTL. CosmosDB checks some calls in a separate request from their work; the `StorageProvider` JSDoc lists those windows.
+- **Slugs** are unique per repository. `createEntity` / `updateEntity` throw `SlugConflictError` when another entity holds the slug; `DuplicateEntityError` means the id is taken. The engine retries a slug clash with the next suffix.
+- **Relationship creates** throw `EntityNotFoundError` for a missing endpoint and `DuplicateRelationshipError` for a used id. `createRelationship(…, { idMinted: true })` tells the provider the engine generated the id, so it may skip the id check.
+- **`deleteRepository`** returns `{ deletedEntities, deletedRelationships }`. It does not count the repository first.
+- **`importBulk`** refuses a relationship id that already exists with a different type or endpoints (`RELATIONSHIP_ALREADY_EXISTS`); the same id, type and endpoints update in place. Most providers record it as a row error; SQL Server's import is all-or-nothing and rejects the whole import with an `ImportError` whose `cause` carries the code.
+- **Property names** that break the [name rules](#vocabularyengine) are refused with `InvalidInputError`.
 
 **Included implementation:** `InMemoryStorageProvider` — uses `Map`s, no persistence across process restarts. A conformance test suite (`runStorageProviderConformanceTests`) validates any implementation.
 
@@ -217,11 +236,13 @@ EntityManager.create(input)
   ├── EventBus.emitHook('entity:creating', ...)  ← can cancel
   ├── EntityIdGenerator.generateUniqueEntityId(...)
   ├── ProvenanceTracker.stampCreate()
-  ├── StorageProvider.createEntity(storedEntity)
-  ├── SearchProvider?.indexEntity(entity)         ← if available
+  ├── StorageProvider.createEntity(storedEntity)  ← SlugConflictError → next slug suffix, up to 3 retries
+  ├── SearchProvider?.indexEntity(entity)         ← if available; best-effort (failure → 'search:index_failed')
   ├── EventBus.emit('entity:created', ...)
   └── return Entity
 ```
+
+**Batch creates** (`createEntities` / `createRelationships`) validate every member first and write nothing if any member fails validation. Members are then written one at a time. If a write fails after one or more members were stored, the call throws `BatchPartialFailureError` (code `BATCH_PARTIAL_FAILURE`) carrying `created` (the stored members, as a successful call would return them), `failedIndex` and `cause`; the caller should resend only the members not in `created`. A failure with nothing stored throws the original error.
 
 ### Vocabulary Extension
 
@@ -243,7 +264,7 @@ VocabularyEngine.proposeChange(proposal, actorId)
         │     ├── canPropose(governance, proposal)
         │     └── apply or queue based on mode
         ├── if approved:
-        │     ├── StorageProvider.saveVocabulary(updated, readVersion)   ← compare-and-set
+        │     ├── StorageProvider.saveVocabulary(updated, readVersion, changeRecord)   ← compare-and-set
         │     └── cascade-delete data                    ← delete proposals, after the write
         ├── VocabularyVersionConflictError → next attempt (re-evaluates everything)
         └── return VocabularyProposalResult

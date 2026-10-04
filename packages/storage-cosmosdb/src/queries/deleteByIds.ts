@@ -13,6 +13,13 @@
 // marker and drops in the same request; an edge chunk takes two, a marker
 // read and then the drop. Cosmos Gremlin has no transaction across requests, so a
 // chunk that finds the marker gone leaves the chunks before it deleted.
+//
+// A drop reports the ids its own request found, so what it reports was
+// removed. It can report too few: the connection re-sends a request that
+// failed with a transient error (429 / 503), and when the failed attempt had
+// already dropped part of the chunk, the re-sent request finds only the rest.
+// The ids the first attempt dropped are then missing from the report (a
+// delete by id lists them as not found).
 
 import type { CosmosDbConnection } from '../CosmosDbConnection.js';
 import { ProviderError, RepositoryNotFoundError } from '@utaba/deep-memory';
@@ -79,6 +86,24 @@ export function buildGuardedEntityDeleteQuery(names: string): string {
 }
 
 /**
+ * The guarded entity delete restricted to one entity type (`etype`): only
+ * entities still of the type are reported and dropped. Same shape and marker
+ * check as `buildGuardedEntityDeleteQuery`; the marker filter in the first
+ * `or` carries `hasNot('entityType')` too, so an entity labelled
+ * `_repository` but typed otherwise is neither dropped nor counted.
+ */
+export function buildGuardedTypedEntityDeleteQuery(names: string): string {
+  return (
+    `g.V().has('repositoryId', rid).hasId(within(mid, ${names}))` +
+    ".or(__.hasLabel('_repository').hasNot('entityType'), __.has('entityType', etype))" +
+    ".aggregate('found').by('id')" +
+    ".fold().as('vs').unfold().hasLabel('_repository').hasNot('entityType')" +
+    ".select('vs').unfold().has('entityType', etype).drop()" +
+    ".cap('found')"
+  );
+}
+
+/**
  * Drop the edges among `id0, id1, …`, reporting the ids dropped. Runs after a
  * marker point read: an edge traversal cannot start from the marker vertex in
  * the same indexed step.
@@ -133,6 +158,38 @@ export async function deleteEntitiesByIds(
     deleted.push(...found.filter((id) => id !== markerId));
   }
   return split(ids, deleted);
+}
+
+/**
+ * Drop the entities among `ids` that are still of `entityType` (and their
+ * edges), one guarded request per chunk of 100 ids, and return how many the
+ * drops reported: never more than were removed, fewer when a re-sent request
+ * found part of its chunk already gone (see the module comment). `ids` must
+ * not be empty.
+ *
+ * @throws RepositoryNotFoundError when the marker is absent; the chunk that
+ *   finds it absent drops nothing.
+ */
+export async function deleteTypedEntitiesByIds(
+  conn: CosmosDbConnection,
+  repositoryId: string,
+  entityType: string,
+  ids: string[],
+): Promise<number> {
+  const markerId = repoVertexId(repositoryId);
+  let dropped = 0;
+  for (const chunk of idChunks(ids)) {
+    const result = await conn.submit(buildGuardedTypedEntityDeleteQuery(chunk.names), {
+      rid: repositoryId,
+      mid: markerId,
+      etype: entityType,
+      ...chunk.bindings,
+    });
+    const found = bucketIds(result.items, 'guarded type delete');
+    if (!found.includes(markerId)) throw new RepositoryNotFoundError(repositoryId);
+    dropped += found.filter((id) => id !== markerId).length;
+  }
+  return dropped;
 }
 
 /**

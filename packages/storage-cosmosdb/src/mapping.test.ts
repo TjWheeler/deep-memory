@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   GREMLIN_VERTEX_PROJECTION_FIELDS,
   GREMLIN_EDGE_PROJECTION_FIELDS,
-  ProviderError,
+  InvalidInputError,
+  RESERVED_ENTITY_PROPERTY_KEYS,
+  RESERVED_RELATIONSHIP_PROPERTY_KEYS,
   buildVertexProjectChain,
   buildEdgeProjectChain,
 } from '@utaba/deep-memory';
@@ -12,19 +14,21 @@ import {
   ENTITY_REQUIRED_SLOTS,
   RELATIONSHIP_OPTIONAL_SLOTS,
   RELATIONSHIP_REQUIRED_SLOTS,
-  RESERVED_ENTITY_PROPERTY_KEYS,
-  RESERVED_RELATIONSHIP_PROPERTY_KEYS,
   STORED_ENTITY_FIELDS,
   STORED_RELATIONSHIP_FIELDS,
   STORED_REPOSITORY_FIELDS,
   assertSafeEntityUserPropertyKey,
   assertSafeRelationshipUserPropertyKey,
+  buildChangeRecordPropertyLadder,
   buildEntityPropertyLadder,
   buildRelationshipPropertyLadder,
   buildRepositoryProjectChain,
   buildRepositoryPropertyLadder,
+  changeRecordFromGremlin,
+  changeRecordToLadderBindings,
   entityFromDocument,
   entityToLadderBindings,
+  entityUpdatePropertyParams,
   entityUserPropertyParams,
   existingEntityScalarUserKeys,
   existingRelationshipScalarUserKeys,
@@ -33,7 +37,7 @@ import {
   relationshipUserPropertyParams,
   repositoryConfigToLadderBindings,
 } from './mapping.js';
-import type { StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
+import type { StoredEntity, StoredRelationship, VocabularyChangeRecord } from '@utaba/deep-memory/types';
 
 // Cross-package projection contract: the GremlinCompiler emits a fixed
 // project chain listing the keys the storage-cosmosdb mappers consume. The
@@ -94,9 +98,9 @@ describe('buildVertexProjectChain / buildEdgeProjectChain', () => {
 });
 
 describe('entityFromDocument (Cosmos NoSQL Document-endpoint shape)', () => {
-  // Probe results 2026-05-26: every Gremlin-managed property is stored as
+  // On the Document endpoint every Gremlin-managed property is stored as
   // `[{_value, id}]`; only `id`, `repositoryId`, and the vertex `label` token
-  // are flat scalars. The probe explicitly caught the entityType-path gotcha:
+  // are flat scalars. The entityType path is the gotcha:
   // `c.entityType[0]._value` is the authoritative type — `c.label` is the
   // Gremlin reserved vertex-label token that aliases entityType at create-
   // time but goes stale on update. entityFromDocument reads the property,
@@ -226,7 +230,7 @@ describe('buildRepositoryProjectChain', () => {
 //      slot is present (even when absent — sentinel-filled), and the slot
 //      order matches the chain's parameter order so the choose-skip steps
 //      can read the right value.
-// Validated live against the emulator 2026-05-26.
+// The ladder shape is validated live against the emulator.
 
 describe('entity property ladder', () => {
   const baseEntity: StoredEntity = {
@@ -411,6 +415,56 @@ describe('repository property ladder', () => {
   });
 });
 
+describe('change-record property ladder', () => {
+  const record: VocabularyChangeRecord = {
+    changeId: 'change-1',
+    changeType: 'relationship_type_modified',
+    typeName: 'WORKS_AT',
+    previousVersion: '1.0.0',
+    newVersion: '1.1.0',
+    proposedBy: 'agent-a',
+    proposedAt: '2026-10-04T00:00:00.000Z',
+    approvedBy: 'agent-b',
+    approvedAt: '2026-10-04T00:00:01.000Z',
+    reason: 'Widens WORKS_AT',
+  };
+
+  it('binds as c0..c9 and writes the optional fields through choose-skip', () => {
+    const chain = buildChangeRecordPropertyLadder();
+    for (const slot of ['changeId', 'changeType', 'typeName', 'newVersion', 'proposedBy', 'proposedAt', 'reason']) {
+      expect(chain).toMatch(new RegExp(`\\.property\\('${slot}',\\s*c\\d\\)`));
+    }
+    for (const slot of ['previousVersion', 'approvedBy', 'approvedAt']) {
+      expect(chain).toMatch(
+        new RegExp(`__\\.constant\\(c\\d\\)\\.is\\(neq\\(absentSentinel\\)\\),\\s*__\\.property\\('${slot}',\\s*c\\d\\)`),
+      );
+    }
+    expect(chain).not.toMatch(/\bp\d/);
+  });
+
+  it('round-trips every field, and leaves absent optional fields absent', () => {
+    const bindings = changeRecordToLadderBindings(record);
+    expect(bindings['absentSentinel']).toBe(ABSENT_STRING_SENTINEL);
+    // What a valueMap(true) of the written vertex hands back: every value array-wrapped.
+    const stored: Record<string, unknown> = { id: 'vocablog:change-1', label: '_vocabularyChangeLog' };
+    const chain = buildChangeRecordPropertyLadder();
+    for (const match of chain.matchAll(/property\('(\w+)', (c\d)\)/g)) {
+      const value = bindings[match[2]!];
+      if (value !== ABSENT_STRING_SENTINEL) stored[match[1]!] = [value];
+    }
+    expect(changeRecordFromGremlin(stored)).toEqual(record);
+
+    const { previousVersion: _p, approvedBy: _b, approvedAt: _a, ...required } = record;
+    const sparse = changeRecordToLadderBindings(required);
+    expect([sparse['c7'], sparse['c8'], sparse['c9']]).toEqual(['', '', '']);
+    const mapped = changeRecordFromGremlin({
+      changeId: ['change-1'], changeType: ['relationship_type_modified'], typeName: ['WORKS_AT'],
+      newVersion: ['1.1.0'], proposedBy: ['agent-a'], proposedAt: ['2026-10-04T00:00:00.000Z'], reason: ['Widens WORKS_AT'],
+    });
+    expect(mapped).toStrictEqual(required);
+  });
+});
+
 // ─── User-property scalars (dual-write primitives) ────────────────
 //
 // Pure mapping helpers — no Gremlin emission, no callers wired yet. The
@@ -429,15 +483,15 @@ describe('assertSafeEntityUserPropertyKey', () => {
 
   it('rejects keys that violate the identifier shape', () => {
     for (const bad of [' orgType', 'orgType ', '1key', 'org-type', 'org.type', '', 'has space']) {
-      expect(() => assertSafeEntityUserPropertyKey(bad)).toThrow(ProviderError);
-      expect(() => assertSafeEntityUserPropertyKey(bad)).toThrow(/not a valid Gremlin identifier/);
+      expect(() => assertSafeEntityUserPropertyKey(bad)).toThrow(InvalidInputError);
+      expect(() => assertSafeEntityUserPropertyKey(bad)).toThrow(/not a valid identifier/);
     }
   });
 
   it('rejects every name in the entity reserved set', () => {
     for (const reserved of RESERVED_ENTITY_PROPERTY_KEYS) {
-      expect(() => assertSafeEntityUserPropertyKey(reserved)).toThrow(ProviderError);
-      expect(() => assertSafeEntityUserPropertyKey(reserved)).toThrow(/collides with a schema-managed field/);
+      expect(() => assertSafeEntityUserPropertyKey(reserved)).toThrow(InvalidInputError);
+      expect(() => assertSafeEntityUserPropertyKey(reserved)).toThrow(/reserved for a system field/);
     }
   });
 });
@@ -449,22 +503,30 @@ describe('assertSafeRelationshipUserPropertyKey', () => {
 
   it('rejects every name in the relationship reserved set', () => {
     for (const reserved of RESERVED_RELATIONSHIP_PROPERTY_KEYS) {
-      expect(() => assertSafeRelationshipUserPropertyKey(reserved)).toThrow(ProviderError);
+      expect(() => assertSafeRelationshipUserPropertyKey(reserved)).toThrow(InvalidInputError);
     }
   });
 
   it("rejects the Gremlin 'label' token specifically — it is the edge-label slot", () => {
-    expect(() => assertSafeRelationshipUserPropertyKey('label')).toThrow(/collides/);
+    expect(() => assertSafeRelationshipUserPropertyKey('label')).toThrow(/reserved for a system field/);
+  });
+
+  it('names the refused key as the input field, with code INVALID_INPUT', () => {
+    expect(() => assertSafeRelationshipUserPropertyKey('label')).toThrow(
+      expect.objectContaining({ code: 'INVALID_INPUT', field: 'properties.label' }),
+    );
+    expect(() => assertSafeEntityUserPropertyKey('org-type')).toThrow(
+      expect.objectContaining({ code: 'INVALID_INPUT', field: 'properties.org-type' }),
+    );
   });
 });
 
-describe('RESERVED_*_PROPERTY_KEYS drift guards', () => {
-  // The reserved sets MUST contain every name in the corresponding ladder slot
-  // array — adding a slot without updating the reserved set would let a user
-  // property silently overwrite a schema scalar at write time. The reserved
-  // sets are derived via spread, so drift is structurally impossible, but
-  // these assertions document the contract and lock it against a future
-  // refactor that switches to a hand-list.
+describe('core reserved property names cover the Cosmos layout', () => {
+  // Core's reserved sets MUST contain every name in the corresponding ladder
+  // slot array — adding a slot that core does not reserve would let a user
+  // property silently overwrite a schema scalar at write time through the
+  // dual-write. Core owns the sets, so these assertions fail loudly when the
+  // ladder grows a slot core does not know about.
 
   it('entity reserved set contains every entity slot name plus id and repositoryId', () => {
     for (const slot of ENTITY_REQUIRED_SLOTS) {
@@ -571,16 +633,39 @@ describe('entityUserPropertyParams', () => {
     ]);
   });
 
-  it('throws ProviderError on an unsafe identifier — no scalars survive the validation pass', () => {
+  it('throws InvalidInputError on an unsafe identifier — no scalars survive the validation pass', () => {
     expect(() =>
       entityUserPropertyParams({ 'has-dash': 'x' }),
-    ).toThrow(ProviderError);
+    ).toThrow(InvalidInputError);
   });
 
-  it('throws ProviderError on a reserved-name collision', () => {
+  it('throws InvalidInputError on a reserved-name collision', () => {
     expect(() =>
       entityUserPropertyParams({ entityLabel: 'X' }),
-    ).toThrow(/collides with a schema-managed field/);
+    ).toThrow(/reserved for a system field/);
+  });
+});
+
+describe('entityUpdatePropertyParams', () => {
+  it('gives an unchanged stored key the rules refuse no entry instead of refusing it', () => {
+    const stored = { 'has-dash': { nested: [1] }, entityLabel: 'user value', ok: 1 };
+
+    expect(
+      entityUpdatePropertyParams({ 'has-dash': { nested: [1] }, entityLabel: 'user value', ok: 2 }, stored),
+    ).toEqual([{ key: 'ok', value: 2 }]);
+  });
+
+  it('refuses a key the rules refuse when it is new or its value changes', () => {
+    expect(() => entityUpdatePropertyParams({ 'has-dash': 'x' }, {})).toThrow(InvalidInputError);
+    expect(() => entityUpdatePropertyParams({ entityLabel: 'changed' }, { entityLabel: 'user value' })).toThrow(
+      InvalidInputError,
+    );
+  });
+
+  it('projects valid keys as entityUserPropertyParams does', () => {
+    expect(entityUpdatePropertyParams({ orgType: 'company', meta: { a: 1 } }, { orgType: 'firm' })).toEqual([
+      { key: 'orgType', value: 'company' },
+    ]);
   });
 });
 
@@ -600,7 +685,7 @@ describe('relationshipUserPropertyParams', () => {
   it("throws on a 'label' collision (Gremlin edge-label slot)", () => {
     expect(() =>
       relationshipUserPropertyParams({ label: 'X' }),
-    ).toThrow(/collides/);
+    ).toThrow(/reserved for a system field/);
   });
 });
 
@@ -609,8 +694,9 @@ describe('existingEntityScalarUserKeys', () => {
   // dropped when the new properties payload omits them. Unsafe / reserved /
   // non-storable keys are skipped (silently — no throw) because the blob
   // may carry pre-validation or pre-migration data that never had a scalar
-  // written for it, and failing the update on those would defeat the
-  // lazy-migration contract (plans/cosmosdb-user-property-scalars.md §2.7).
+  // written for it, and failing the update on those would block lazy
+  // migration (an entity written before its scalars existed gains them on
+  // its next update).
 
   it('returns an empty list for null / undefined / empty input', () => {
     expect(existingEntityScalarUserKeys(null)).toEqual([]);

@@ -251,7 +251,9 @@ export class Neo4jConnection {
    * `summary.counters.updates()`.
    *
    * An auto-commit statement is not retried by the driver, so a statement run
-   * here executes at most once per call.
+   * here executes at most once per call. That is also why a single-transaction
+   * statement whose update counters must not be lost to a re-run (a batch of
+   * `deleteEntitiesByType`) runs here.
    */
   public async executeImplicitInTransactions<T extends RecordShape = RecordShape>(
     cypher: string,
@@ -260,7 +262,12 @@ export class Neo4jConnection {
   ): Promise<QueryResult<T>> {
     this.assertRepositoryId(options.repositoryId);
     this.assertScoped(cypher);
-    const session = this.driver.session({ database: this.database });
+    // Join the bookmark chain `executeQuery` uses, so a read that follows a
+    // drain or a type delete in a cluster sees what it removed.
+    const session = this.driver.session({
+      database: this.database,
+      bookmarkManager: this.driver.executeQueryBookmarkManager,
+    });
     try {
       const result = await translateTimeout(() =>
         session.run<T>(cypher, { ...params, rid: options.repositoryId }),

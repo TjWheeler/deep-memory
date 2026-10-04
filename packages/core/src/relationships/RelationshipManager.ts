@@ -14,12 +14,16 @@ import type { ProvenanceTracker } from '../core/ProvenanceTracker.js';
 import type { EventBus } from '../core/EventBus.js';
 import { generateRelationshipId } from '../entities/IdGenerator.js';
 import { toScreamingSnakeCase } from '../vocabulary/similarity.js';
+import { assertWritablePropertyKeys } from '../validation/propertyNames.js';
 import {
   EntityNotFoundError,
   VocabularyValidationError,
   OperationCancelledError,
   SelfReferentialRelationshipError,
+  BatchPartialFailureError,
+  toError,
 } from '../core/errors.js';
+import type { MemoryVocabulary } from '../types/vocabulary.js';
 
 export class RelationshipManager {
   constructor(
@@ -35,16 +39,27 @@ export class RelationshipManager {
    * and events. Storage's entity read answers a deleted repository with
    * `RepositoryNotFoundError` before any miss, so a missing endpoint is
    * reported as `EntityNotFoundError`.
+   *
+   * Every member is checked before any member is written: no self-reference,
+   * both endpoints exist, and the relationship is valid against a single read
+   * of the vocabulary. Any refusal writes nothing and throws that member's
+   * error. Members are then written in input order, each in its own store
+   * transaction. A failure while writing (a hook cancellation, a store error)
+   * once at least one member is stored throws `BatchPartialFailureError`,
+   * which carries the stored members; a failure that leaves nothing stored
+   * throws the original error.
    */
   public async create(inputs: CreateRelationshipInput[]): Promise<Relationship[]> {
-    const results: Relationship[] = [];
+    if (inputs.length === 0) return [];
+    for (const input of inputs) assertWritablePropertyKeys(input.properties, 'relationship');
 
+    // Resolve source and target entity types for constraint validation
+    const checked: Array<{ input: CreateRelationshipInput; sourceType: string; targetType: string }> = [];
     for (const input of inputs) {
       if (input.sourceEntityId === input.targetEntityId) {
         throw new SelfReferentialRelationshipError(input.sourceEntityId, input.relationshipType);
       }
 
-      // Resolve source and target entity types for constraint validation
       const sourceEntity = await this.storage.getEntity(this.repositoryId, input.sourceEntityId);
       if (!sourceEntity) {
         throw new EntityNotFoundError(input.sourceEntityId);
@@ -55,11 +70,17 @@ export class RelationshipManager {
         throw new EntityNotFoundError(input.targetEntityId);
       }
 
-      // Validate against vocabulary
+      checked.push({ input, sourceType: sourceEntity.entityType, targetType: targetEntity.entityType });
+    }
+
+    // Validate against vocabulary
+    const vocabulary = await this.vocabularyEngine.getVocabulary();
+    for (const { input, sourceType, targetType } of checked) {
       const validation = await this.vocabularyEngine.validateRelationship(
         input,
-        sourceEntity.entityType,
-        targetEntity.entityType,
+        sourceType,
+        targetType,
+        vocabulary,
       );
       if (!validation.valid) {
         await this.eventBus.emit('validation:failed', {
@@ -69,65 +90,78 @@ export class RelationshipManager {
         });
         throw new VocabularyValidationError(validation.errors);
       }
+    }
 
-      // Pre-mutation hook
-      const hookResult = await this.eventBus.emitHook('relationship:creating', { input });
-      if (hookResult.cancelled) {
-        throw new OperationCancelledError(
-          'Relationship creation', hookResult.reason ?? 'cancelled by hook',
-        );
+    const results: Relationship[] = [];
+    for (const [index, input] of inputs.entries()) {
+      try {
+        const relationship = await this.writeOne(input, vocabulary);
+        // Recorded before the event so `created` on a later failure includes
+        // this member even when a `relationship:created` handler is what failed.
+        results.push(relationship);
+        await this.eventBus.emit('relationship:created', { relationship });
+      } catch (err) {
+        if (results.length === 0) throw err;
+        throw new BatchPartialFailureError(results, index, inputs.length, toError(err));
       }
-
-      // Normalize relationship type to SCREAMING_SNAKE_CASE
-      const normalizedType = toScreamingSnakeCase(input.relationshipType);
-
-      // Get relationship type definition for bidirectional flag
-      const vocabulary = await this.vocabularyEngine.getVocabulary();
-      const relType = vocabulary.relationshipTypes.find((rt) => rt.type === normalizedType);
-      const bidirectional = relType?.bidirectional ?? false;
-
-      // Generate GUID (or use provided). The id and its origin come from one
-      // branch: `idMinted` lets the provider skip checking the repository for
-      // the id, so it is set only when this call generated the id. A missing
-      // id (`undefined`, or `null` from an untyped caller) is minted; any
-      // string the caller supplied, empty included, is checked.
-      let id: string;
-      let idMinted: boolean;
-      if (typeof input.id === 'string') {
-        id = input.id;
-        idMinted = false;
-      } else {
-        id = generateRelationshipId();
-        idMinted = true;
-      }
-
-      // Stamp provenance
-      const provenance = this.provenanceTracker.stampCreate();
-
-      // Build stored relationship
-      const storedRelationship: StoredRelationship = {
-        id,
-        relationshipType: normalizedType,
-        sourceEntityId: input.sourceEntityId,
-        targetEntityId: input.targetEntityId,
-        properties: input.properties ?? {},
-        bidirectional,
-        provenance,
-      };
-
-      // Persist
-      const created = await this.storage.createRelationship(this.repositoryId, storedRelationship, { idMinted });
-
-      // Map to public type
-      const relationship = storedToRelationship(created);
-
-      // Emit created event
-      await this.eventBus.emit('relationship:created', { relationship });
-
-      results.push(relationship);
     }
 
     return results;
+  }
+
+  /** Run the pre-mutation hook for one validated create input and store it */
+  private async writeOne(
+    input: CreateRelationshipInput,
+    vocabulary: MemoryVocabulary,
+  ): Promise<Relationship> {
+    // Pre-mutation hook
+    const hookResult = await this.eventBus.emitHook('relationship:creating', { input });
+    if (hookResult.cancelled) {
+      throw new OperationCancelledError(
+        'Relationship creation', hookResult.reason ?? 'cancelled by hook',
+      );
+    }
+
+    // Normalize relationship type to SCREAMING_SNAKE_CASE
+    const normalizedType = toScreamingSnakeCase(input.relationshipType);
+
+    // Get relationship type definition for bidirectional flag
+    const relType = vocabulary.relationshipTypes.find((rt) => rt.type === normalizedType);
+    const bidirectional = relType?.bidirectional ?? false;
+
+    // Generate GUID (or use provided). The id and its origin come from one
+    // branch: `idMinted` lets the provider skip checking the repository for
+    // the id, so it is set only when this call generated the id. A missing
+    // id (`undefined`, or `null` from an untyped caller) is minted; any
+    // string the caller supplied, empty included, is checked.
+    let id: string;
+    let idMinted: boolean;
+    if (typeof input.id === 'string') {
+      id = input.id;
+      idMinted = false;
+    } else {
+      id = generateRelationshipId();
+      idMinted = true;
+    }
+
+    // Stamp provenance
+    const provenance = this.provenanceTracker.stampCreate();
+
+    // Build stored relationship
+    const storedRelationship: StoredRelationship = {
+      id,
+      relationshipType: normalizedType,
+      sourceEntityId: input.sourceEntityId,
+      targetEntityId: input.targetEntityId,
+      properties: input.properties ?? {},
+      bidirectional,
+      provenance,
+    };
+
+    // Persist
+    const created = await this.storage.createRelationship(this.repositoryId, storedRelationship, { idMinted });
+
+    return storedToRelationship(created);
   }
 
   /** Remove one or more relationships in a single batch storage operation */

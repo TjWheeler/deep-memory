@@ -1,6 +1,6 @@
-// EntityManager — slug-conflict retry on create and update
+// EntityManager — slug-conflict retry on create and update, and batch create outcomes
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DeepMemory } from '../core/DeepMemory.js';
 import type { MemoryRepository } from '../core/MemoryRepository.js';
 import { VocabularyEngine } from '../core/VocabularyEngine.js';
@@ -8,7 +8,13 @@ import { ProvenanceTracker } from '../core/ProvenanceTracker.js';
 import { EventBus } from '../core/EventBus.js';
 import { EntityManager } from './EntityManager.js';
 import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
-import { DuplicateEntityError, ProviderError, SlugConflictError } from '../core/errors.js';
+import {
+  BatchPartialFailureError,
+  DuplicateEntityError,
+  ProviderError,
+  SlugConflictError,
+  VocabularyValidationError,
+} from '../core/errors.js';
 import type { StoredEntity, StoredEntityUpdate } from '../types/entities.js';
 
 const REPO_ID = '00000000-0000-4000-a000-0000000000e1';
@@ -273,5 +279,197 @@ describe('EntityManager concurrent creates on the in-memory provider', () => {
     expect([a!.slug, b!.slug].sort()).toEqual(['person:alex', 'person:alex-2']);
     expect(await repo.getEntity(a!.id)).not.toBeNull();
     expect(await repo.getEntity(b!.id)).not.toBeNull();
+  });
+});
+
+/** Storage that refuses the `failOnCall`-th entity create (1-based) with `failure`. */
+class FailingCreateStorage extends InMemoryStorageProvider {
+  public failOnCall = 0;
+  public failure: Error = new ProviderError('store unavailable');
+  private calls = 0;
+
+  public override async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
+    this.calls++;
+    if (this.calls === this.failOnCall) throw this.failure;
+    return super.createEntity(repositoryId, entity);
+  }
+}
+
+describe('EntityManager.create batch outcome', () => {
+  let storage: FailingCreateStorage;
+  let repo: MemoryRepository;
+
+  beforeEach(async () => {
+    storage = new FailingCreateStorage();
+    const memory = new DeepMemory({
+      storage,
+      provenance: { actorId: 'test-agent', actorType: 'agent' },
+    });
+    repo = await memory.createRepository({
+      repositoryId: REPO_ID,
+      label: 'Batch outcome',
+      vocabulary: {
+        entityTypes: [
+          {
+            type: 'Note',
+            description: 'A note',
+            properties: [{ name: 'title', type: 'string', required: true }],
+          },
+        ],
+        relationshipTypes: [],
+      },
+      governance: { mode: 'open' },
+    });
+  });
+
+  async function storedNotes(): Promise<string[]> {
+    const page = await repo.findEntities({ entityTypes: ['Note'] });
+    return page.items.map((e) => e.label).sort();
+  }
+
+  it('writes nothing when a later member fails vocabulary validation', async () => {
+    await expect(
+      repo.createEntities([
+        { entityType: 'Note', label: 'a', properties: { title: 'x' } },
+        { entityType: 'Note', label: 'b' },
+      ]),
+    ).rejects.toBeInstanceOf(VocabularyValidationError);
+
+    expect(await storedNotes()).toEqual([]);
+  });
+
+  it('reports the stored members and the failed index when a later member fails to store', async () => {
+    storage.failOnCall = 2;
+
+    const err = await repo
+      .createEntities([
+        { entityType: 'Note', label: 'a', properties: { title: 'x' } },
+        { entityType: 'Note', label: 'b', properties: { title: 'y' } },
+        { entityType: 'Note', label: 'c', properties: { title: 'z' } },
+      ])
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BatchPartialFailureError);
+    const failure = err as BatchPartialFailureError;
+    expect(failure.code).toBe('BATCH_PARTIAL_FAILURE');
+    expect(failure.failedIndex).toBe(1);
+    expect(failure.created).toHaveLength(1);
+    expect(failure.created[0]).toMatchObject({ entityType: 'Note', label: 'a' });
+    expect(failure.cause).toBe(storage.failure);
+    // The member before the failure stays stored; the ones after it were not attempted.
+    expect(await storedNotes()).toEqual(['a']);
+  });
+
+  it('throws the original error when the first member fails to store', async () => {
+    storage.failOnCall = 1;
+
+    await expect(
+      repo.createEntities([
+        { entityType: 'Note', label: 'a', properties: { title: 'x' } },
+        { entityType: 'Note', label: 'b', properties: { title: 'y' } },
+      ]),
+    ).rejects.toBe(storage.failure);
+    expect(await storedNotes()).toEqual([]);
+  });
+
+  it('reports a hook cancellation after a stored member as a partial failure', async () => {
+    let seen = 0;
+    repo.onHook('entity:creating', () => (++seen === 2 ? { cancel: true, reason: 'second refused' } : {}));
+
+    const err = await repo
+      .createEntities([
+        { entityType: 'Note', label: 'a', properties: { title: 'x' } },
+        { entityType: 'Note', label: 'b', properties: { title: 'y' } },
+      ])
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BatchPartialFailureError);
+    const failure = err as BatchPartialFailureError;
+    expect(failure.failedIndex).toBe(1);
+    expect(failure.created.map((m) => m.id)).toHaveLength(1);
+    expect(failure.cause).toMatchObject({ code: 'OPERATION_CANCELLED' });
+  });
+
+  it('returns every created entity when the whole batch stores', async () => {
+    const created = await repo.createEntities([
+      { entityType: 'Note', label: 'a', properties: { title: 'x' } },
+      { entityType: 'Note', label: 'b', properties: { title: 'y' } },
+    ]);
+
+    expect(created.map((e) => e.label)).toEqual(['a', 'b']);
+    expect(await storedNotes()).toEqual(['a', 'b']);
+  });
+
+  it('reads the vocabulary once for the whole batch', async () => {
+    const getVocabulary = vi.spyOn(storage, 'getVocabulary');
+
+    await repo.createEntities([
+      { entityType: 'Note', label: 'a', properties: { title: 'x' } },
+      { entityType: 'Note', label: 'b', properties: { title: 'y' } },
+      { entityType: 'Note', label: 'c', properties: { title: 'z' } },
+    ]);
+
+    expect(getVocabulary).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('EntityManager.update with a stored property name the key rules refuse', () => {
+  let storage: InMemoryStorageProvider;
+  let repo: MemoryRepository;
+  let entityId: string;
+
+  beforeEach(async () => {
+    storage = new InMemoryStorageProvider();
+    const memory = new DeepMemory({
+      storage,
+      provenance: { actorId: 'test-agent', actorType: 'agent' },
+    });
+    repo = await memory.createRepository({
+      repositoryId: REPO_ID,
+      label: 'Stored property names',
+      vocabulary: { entityTypes: [{ type: 'person', description: 'A person' }], relationshipTypes: [] },
+      governance: { mode: 'open' },
+    });
+    const [created] = await repo.createEntities([{ entityType: 'person', label: 'Alex' }]);
+    entityId = created!.id;
+    // A bulk import writes rows as given, so it can hold a name written
+    // before the key rules existed.
+    const stored = (await storage.getEntity(REPO_ID, entityId))!;
+    await storage.importBulk(REPO_ID, [
+      { entities: [{ ...stored, properties: { 'start-date': '2020-01-01' } }] },
+    ]);
+  });
+
+  it('updates other properties and keeps the stored name', async () => {
+    const updated = await repo.updateEntity(entityId, { properties: { note: 'n' } });
+
+    expect(updated.properties).toEqual({ 'start-date': '2020-01-01', note: 'n' });
+  });
+
+  it('removes the stored name with a null', async () => {
+    const updated = await repo.updateEntity(entityId, { properties: { 'start-date': null } });
+
+    expect(updated.properties).toEqual({});
+    expect((await storage.getEntity(REPO_ID, entityId))?.properties).toEqual({});
+  });
+
+  it('allows a null for a reserved name', async () => {
+    const updated = await repo.updateEntity(entityId, { properties: { slug: null, note: 'n' } });
+
+    expect(updated.properties).toEqual({ 'start-date': '2020-01-01', note: 'n' });
+  });
+
+  it('refuses a new value for the stored name', async () => {
+    await expect(
+      repo.updateEntity(entityId, { properties: { 'start-date': '2021-01-01' } }),
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT', field: 'properties.start-date' });
+    expect((await storage.getEntity(REPO_ID, entityId))?.properties).toEqual({ 'start-date': '2020-01-01' });
+  });
+
+  it('refuses a reserved name given a value', async () => {
+    await expect(repo.updateEntity(entityId, { properties: { slug: 'x' } })).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+      field: 'properties.slug',
+    });
   });
 });

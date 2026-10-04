@@ -5,9 +5,12 @@ import {
   createEntityTypeDefinition,
   incrementVersion,
 } from '../vocabulary/VocabularySchema.js';
-import type { MemoryVocabulary } from '../types/vocabulary.js';
+import type { MemoryVocabulary, VocabularyProposal } from '../types/vocabulary.js';
+import type { StoredEntity } from '../types/entities.js';
+import type { StoredRelationship } from '../types/relationships.js';
+import { InMemoryStorageProvider } from '../providers-builtin/InMemoryStorageProvider.js';
 import type { StorageProvider, VocabularyReadOptions } from '../providers/StorageProvider.js';
-import { InvalidInputError, VocabularyVersionConflictError } from './errors.js';
+import { InvalidInputError, ProviderError, VocabularyVersionConflictError } from './errors.js';
 
 interface MockStorageHooks {
   /** Ordered log of storage method names, for asserting call order and attempt counts */
@@ -20,7 +23,12 @@ interface MockStorageHooks {
   concurrentWrite?: (readNumber: number, stored: MemoryVocabulary) => MemoryVocabulary | undefined;
 }
 
-/** Minimal mock StorageProvider — only implements vocabulary methods, with compare-and-set saves */
+/**
+ * Minimal mock StorageProvider — only implements vocabulary methods, with
+ * compare-and-set saves. Each type the initial vocabulary declares starts
+ * with a few entities or relationships, which a by-type delete removes, so a
+ * second delete of the same type reports nothing removed.
+ */
 function createMockStorage(
   initialVocab: MemoryVocabulary,
   hooks: MockStorageHooks = {},
@@ -28,6 +36,8 @@ function createMockStorage(
   let vocab = initialVocab;
   let reads = 0;
   const calls = hooks.calls;
+  const entitiesByType = new Map(initialVocab.entityTypes.map((t) => [t.type, 3]));
+  const relationshipsByType = new Map(initialVocab.relationshipTypes.map((t) => [t.type, 2]));
   return {
     async getVocabulary(_repositoryId: string, _options?: VocabularyReadOptions) {
       calls?.push('getVocabulary');
@@ -45,13 +55,17 @@ function createMockStorage(
       }
       vocab = vocabulary;
     },
-    async deleteEntitiesByType(_repositoryId: string, _entityType: string) {
+    async deleteEntitiesByType(_repositoryId: string, entityType: string) {
       calls?.push('deleteEntitiesByType');
-      return { deletedEntities: 3, deletedRelationships: 5 };
+      const deletedEntities = entitiesByType.get(entityType) ?? 0;
+      entitiesByType.delete(entityType);
+      return { deletedEntities, deletedRelationships: deletedEntities > 0 ? 5 : 0 };
     },
-    async deleteRelationshipsByType(_repositoryId: string, _relationshipType: string) {
+    async deleteRelationshipsByType(_repositoryId: string, relationshipType: string) {
       calls?.push('deleteRelationshipsByType');
-      return { deletedRelationships: 2 };
+      const deletedRelationships = relationshipsByType.get(relationshipType) ?? 0;
+      relationshipsByType.delete(relationshipType);
+      return { deletedRelationships };
     },
   };
 }
@@ -112,17 +126,51 @@ describe('VocabularyEngine', () => {
       expect(vocab.relationshipTypes).toHaveLength(1);
     });
 
-    it('caches vocabulary', async () => {
-      const v1 = await engine.getVocabulary();
-      const v2 = await engine.getVocabulary();
-      expect(v1).toBe(v2); // same reference — cached
+    it('reads through storage on every call, holding no copy of its own', async () => {
+      const reads: Array<VocabularyReadOptions | undefined> = [];
+      const inner = createMockStorage(testVocab);
+      const counting: Partial<StorageProvider> = {
+        ...inner,
+        async getVocabulary(repositoryId: string, options?: VocabularyReadOptions) {
+          reads.push(options);
+          return inner.getVocabulary!(repositoryId, options);
+        },
+      };
+      const reading = new VocabularyEngine({
+        repositoryId: '20000000-0000-4000-a000-000000000001',
+        storageProvider: counting as StorageProvider,
+        governanceConfig: { mode: 'open' },
+      });
+
+      await reading.getVocabulary();
+      await reading.validateEntity({ entityType: 'project', label: 'P' });
+      await reading.getResolvedVocabulary();
+
+      // Default reads go through the provider's cache: no `fresh` option.
+      expect(reads).toEqual([undefined, undefined, undefined]);
     });
 
-    it('invalidates cache', async () => {
-      const v1 = await engine.getVocabulary();
-      engine.invalidateCache();
-      const v2 = await engine.getVocabulary();
-      expect(v1).not.toBe(v2); // different reference — refetched
+    it('reads fresh from the store on every call when opened with freshVocabulary', async () => {
+      const reads: Array<VocabularyReadOptions | undefined> = [];
+      const inner = createMockStorage(testVocab);
+      const counting: Partial<StorageProvider> = {
+        ...inner,
+        async getVocabulary(repositoryId: string, options?: VocabularyReadOptions) {
+          reads.push(options);
+          return inner.getVocabulary!(repositoryId, options);
+        },
+      };
+      const reading = new VocabularyEngine({
+        repositoryId: '20000000-0000-4000-a000-000000000001',
+        storageProvider: counting as StorageProvider,
+        governanceConfig: { mode: 'open' },
+        freshVocabulary: true,
+      });
+
+      await reading.getVocabulary();
+      await reading.validateEntity({ entityType: 'project', label: 'P' });
+
+      expect(reads).toEqual([{ fresh: true }, { fresh: true }]);
     });
   });
 
@@ -720,6 +768,398 @@ describe('VocabularyEngine', () => {
         ),
       ).rejects.toThrow(InvalidInputError);
       expect(calls).not.toContain('saveVocabulary');
+    });
+  });
+
+  describe('proposeChange — change log and resumable type deletion', () => {
+    const repositoryId = '20000000-0000-4000-a000-000000000002';
+
+    /**
+     * In-memory storage whose next by-type delete can be made to fail, the way
+     * a server timeout fails the data step of a type deletion after the
+     * vocabulary write has landed. With `looseTypeMatch` it compares type
+     * names the way a case-insensitive store does: an entity type in lower
+     * case, a relationship type in upper case, both trimmed.
+     */
+    class CascadeFailingStorage extends InMemoryStorageProvider {
+      public readonly calls: string[] = [];
+      public failNextCascade = false;
+      public looseTypeMatch = false;
+      /** Runs inside a by-type delete, before it deletes anything */
+      public duringCascade: (() => Promise<void>) | undefined;
+
+      public override async saveVocabulary(
+        ...args: Parameters<InMemoryStorageProvider['saveVocabulary']>
+      ): Promise<void> {
+        this.calls.push('saveVocabulary');
+        return super.saveVocabulary(...args);
+      }
+
+      public override async deleteEntitiesByType(
+        repoId: string,
+        entityType: string,
+      ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+        this.calls.push('deleteEntitiesByType');
+        this.throwIfFailing();
+        await this.duringCascade?.();
+        return super.deleteEntitiesByType(
+          repoId,
+          this.looseTypeMatch ? entityType.trim().toLowerCase() : entityType,
+        );
+      }
+
+      public override async deleteRelationshipsByType(
+        repoId: string,
+        relationshipType: string,
+      ): Promise<{ deletedRelationships: number }> {
+        this.calls.push('deleteRelationshipsByType');
+        this.throwIfFailing();
+        await this.duringCascade?.();
+        return super.deleteRelationshipsByType(
+          repoId,
+          this.looseTypeMatch ? relationshipType.trim().toUpperCase() : relationshipType,
+        );
+      }
+
+      private throwIfFailing(): void {
+        if (this.failNextCascade) {
+          this.failNextCascade = false;
+          throw new ProviderError('The transaction timed out');
+        }
+      }
+    }
+
+    function storedEntity(id: string, entityType: string): StoredEntity {
+      const now = new Date().toISOString();
+      return {
+        id,
+        slug: `${entityType}:${id}`,
+        entityType,
+        label: id,
+        properties: {},
+        provenance: {
+          createdBy: 'test',
+          createdByType: 'agent',
+          createdAt: now,
+          modifiedBy: 'test',
+          modifiedByType: 'agent',
+          modifiedAt: now,
+        },
+      };
+    }
+
+    function storedRelationship(id: string, sourceId: string, targetId: string): StoredRelationship {
+      const { provenance } = storedEntity(id, 'unused');
+      return {
+        id,
+        relationshipType: 'WORKS_ON',
+        sourceEntityId: sourceId,
+        targetEntityId: targetId,
+        properties: {},
+        bidirectional: false,
+        provenance,
+      };
+    }
+
+    let storage: CascadeFailingStorage;
+    let engine: VocabularyEngine;
+
+    beforeEach(async () => {
+      storage = new CascadeFailingStorage();
+      await storage.createRepository({
+        repositoryId,
+        label: 'Resumable deletion',
+        governanceConfig: { mode: 'open' },
+        vocabulary: testVocab,
+        createdAt: new Date().toISOString(),
+        createdBy: 'admin',
+      });
+      await storage.createEntity(repositoryId, storedEntity('ada', 'person'));
+      await storage.createEntity(repositoryId, storedEntity('apollo', 'project'));
+      await storage.createEntity(repositoryId, storedEntity('gemini', 'project'));
+      await storage.createRelationship(repositoryId, storedRelationship('r1', 'ada', 'apollo'));
+      await storage.createRelationship(repositoryId, storedRelationship('r2', 'ada', 'gemini'));
+      engine = new VocabularyEngine({
+        repositoryId,
+        storageProvider: storage,
+        governanceConfig: { mode: 'open' },
+      });
+    });
+
+    it('an approved proposal stores its change record with the vocabulary', async () => {
+      const before = await storage.getVocabulary(repositoryId);
+
+      const result = await engine.proposeChange(
+        { proposalType: 'entity_type', entityType: { type: 'team', description: 'A team of people' }, justification: 'Need teams' },
+        'agent-x',
+      );
+
+      expect(result.status).toBe('approved');
+      const log = await storage.getVocabularyChangeLog(repositoryId);
+      expect(log.total).toBe(1);
+      expect(log.items[0]).toMatchObject({
+        changeType: 'entity_type_added',
+        typeName: 'team',
+        proposedBy: 'agent-x',
+        previousVersion: before.version,
+        newVersion: result.vocabularyVersion,
+        reason: 'Need teams',
+      });
+    });
+
+    it('a rejected proposal stores no change record', async () => {
+      const result = await engine.proposeChange(
+        { proposalType: 'edit_entity_type', editEntityType: { type: 'nonexistent', description: 'x' }, justification: 'No such type' },
+        'agent',
+      );
+
+      expect(result.status).toBe('rejected');
+      expect((await storage.getVocabularyChangeLog(repositoryId)).total).toBe(0);
+    });
+
+    it('a resend completes an entity type deletion whose data step failed', async () => {
+      const proposal: VocabularyProposal = {
+        proposalType: 'delete_entity_type',
+        deleteEntityType: { type: 'project' },
+        justification: 'No longer needed',
+      };
+      storage.failNextCascade = true;
+      await expect(engine.proposeChange(proposal, 'agent')).rejects.toThrow(ProviderError);
+
+      // The vocabulary change landed with its record; the data did not go.
+      const afterFailure = await storage.getVocabulary(repositoryId);
+      expect(afterFailure.entityTypes.map((t) => t.type)).not.toContain('project');
+      expect(await storage.getEntity(repositoryId, 'apollo')).not.toBeNull();
+      expect((await storage.getVocabularyChangeLog(repositoryId)).total).toBe(1);
+
+      storage.calls.length = 0;
+      const result = await engine.proposeChange(proposal, 'agent');
+
+      expect(result).toEqual({ status: 'approved', type: 'project', vocabularyVersion: afterFailure.version });
+      expect(storage.calls).toEqual(['deleteEntitiesByType']);
+      expect(await storage.getEntity(repositoryId, 'apollo')).toBeNull();
+      expect(await storage.getEntity(repositoryId, 'gemini')).toBeNull();
+      expect(await storage.getRelationship(repositoryId, 'r1')).toBeNull();
+      expect(await storage.getEntity(repositoryId, 'ada')).not.toBeNull();
+      expect((await storage.getVocabulary(repositoryId)).version).toBe(afterFailure.version);
+
+      const log = await storage.getVocabularyChangeLog(repositoryId);
+      expect(log.total).toBe(1);
+      expect(log.items[0]).toMatchObject({ changeType: 'entity_type_removed', typeName: 'project' });
+    });
+
+    it('a resend completes a relationship type deletion whose data step failed', async () => {
+      const proposal: VocabularyProposal = {
+        proposalType: 'delete_relationship_type',
+        deleteRelationshipType: { type: 'WORKS_ON' },
+        justification: 'Replacing with a different type',
+      };
+      storage.failNextCascade = true;
+      await expect(engine.proposeChange(proposal, 'agent')).rejects.toThrow(ProviderError);
+      const afterFailure = await storage.getVocabulary(repositoryId);
+      expect(await storage.getRelationship(repositoryId, 'r1')).not.toBeNull();
+
+      storage.calls.length = 0;
+      const result = await engine.proposeChange(proposal, 'agent');
+
+      expect(result).toEqual({ status: 'approved', type: 'WORKS_ON', vocabularyVersion: afterFailure.version });
+      expect(storage.calls).toEqual(['deleteRelationshipsByType']);
+      expect(await storage.getRelationship(repositoryId, 'r1')).toBeNull();
+      expect(await storage.getRelationship(repositoryId, 'r2')).toBeNull();
+      expect((await storage.getVocabularyChangeLog(repositoryId)).total).toBe(1);
+    });
+
+    it('a resend for a type with nothing left answers rejected "not found"', async () => {
+      const proposal: VocabularyProposal = {
+        proposalType: 'delete_entity_type',
+        deleteEntityType: { type: 'project' },
+        justification: 'No longer needed',
+      };
+      expect((await engine.proposeChange(proposal, 'agent')).status).toBe('approved');
+      const afterDelete = await storage.getVocabulary(repositoryId);
+
+      storage.calls.length = 0;
+      const result = await engine.proposeChange(proposal, 'agent');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reason).toContain('not found');
+      expect(storage.calls).toEqual(['deleteEntitiesByType']);
+      expect((await storage.getVocabulary(repositoryId)).version).toBe(afterDelete.version);
+      expect((await storage.getVocabularyChangeLog(repositoryId)).total).toBe(1);
+    });
+
+    it('a delete of a type that never existed changes nothing', async () => {
+      const result = await engine.proposeChange(
+        { proposalType: 'delete_entity_type', deleteEntityType: { type: 'nonexistent' }, justification: 'Does not exist' },
+        'agent',
+      );
+
+      expect(result.status).toBe('rejected');
+      expect(result.reason).toContain('not found');
+      expect(storage.calls).not.toContain('saveVocabulary');
+      expect(await storage.getEntity(repositoryId, 'apollo')).not.toBeNull();
+      expect((await storage.getVocabularyChangeLog(repositoryId)).total).toBe(0);
+    });
+
+    it('a resend answers with the vocabulary version as it stands after the data step', async () => {
+      const proposal: VocabularyProposal = {
+        proposalType: 'delete_entity_type',
+        deleteEntityType: { type: 'project' },
+        justification: 'No longer needed',
+      };
+      storage.failNextCascade = true;
+      await expect(engine.proposeChange(proposal, 'agent')).rejects.toThrow(ProviderError);
+      const afterFailure = await storage.getVocabulary(repositoryId);
+
+      // Another writer changes the vocabulary while the resend's data step runs.
+      const concurrentVersion = incrementVersion(afterFailure.version, 'minor');
+      storage.duringCascade = async () => {
+        storage.duringCascade = undefined;
+        const stored = await storage.getVocabulary(repositoryId);
+        await storage.saveVocabulary(repositoryId, { ...stored, version: concurrentVersion }, stored.version);
+      };
+
+      const result = await engine.proposeChange(proposal, 'agent');
+
+      expect(result).toEqual({ status: 'approved', type: 'project', vocabularyVersion: concurrentVersion });
+    });
+
+    it('a resend whose data step fails again propagates the failure, and a further resend completes it', async () => {
+      const proposal: VocabularyProposal = {
+        proposalType: 'delete_entity_type',
+        deleteEntityType: { type: 'project' },
+        justification: 'No longer needed',
+      };
+      storage.failNextCascade = true;
+      await expect(engine.proposeChange(proposal, 'agent')).rejects.toThrow(ProviderError);
+      const afterFailure = await storage.getVocabulary(repositoryId);
+
+      storage.failNextCascade = true;
+      await expect(engine.proposeChange(proposal, 'agent')).rejects.toThrow('The transaction timed out');
+      expect(await storage.getEntity(repositoryId, 'apollo')).not.toBeNull();
+      expect((await storage.getVocabulary(repositoryId)).version).toBe(afterFailure.version);
+
+      const result = await engine.proposeChange(proposal, 'agent');
+
+      expect(result.status).toBe('approved');
+      expect(await storage.getEntity(repositoryId, 'apollo')).toBeNull();
+      expect((await storage.getVocabularyChangeLog(repositoryId)).total).toBe(1);
+    });
+
+    it('a resend under a locked vocabulary is rejected without deleting data', async () => {
+      const proposal: VocabularyProposal = {
+        proposalType: 'delete_entity_type',
+        deleteEntityType: { type: 'project' },
+        justification: 'No longer needed',
+      };
+      storage.failNextCascade = true;
+      await expect(engine.proposeChange(proposal, 'agent')).rejects.toThrow(ProviderError);
+
+      const locked = new VocabularyEngine({
+        repositoryId,
+        storageProvider: storage,
+        governanceConfig: { mode: 'locked' },
+      });
+      storage.calls.length = 0;
+      const result = await locked.proposeChange(proposal, 'agent');
+
+      expect(result.status).toBe('rejected');
+      expect(result.reason).toContain('locked');
+      expect(storage.calls).toEqual([]);
+      expect(await storage.getEntity(repositoryId, 'apollo')).not.toBeNull();
+    });
+
+    it('a delete differing from a declared entity type only by case or whitespace deletes nothing', async () => {
+      storage.looseTypeMatch = true;
+      const before = await storage.getVocabulary(repositoryId);
+
+      for (const type of ['Project', ' project ', 'PROJECT']) {
+        const result = await engine.proposeChange(
+          { proposalType: 'delete_entity_type', deleteEntityType: { type }, justification: 'Near miss' },
+          'agent',
+        );
+        expect(result.status).toBe('rejected');
+        expect(result.reason).toContain('not found');
+      }
+
+      expect(storage.calls).toEqual([]);
+      expect(await storage.getEntity(repositoryId, 'apollo')).not.toBeNull();
+      expect(await storage.getEntity(repositoryId, 'gemini')).not.toBeNull();
+      expect((await storage.getVocabulary(repositoryId)).version).toBe(before.version);
+      expect((await storage.getVocabularyChangeLog(repositoryId)).total).toBe(0);
+    });
+
+    it('a delete matching a declared relationship type only once case is ignored deletes nothing', async () => {
+      // A vocabulary written before relationship type names were normalised
+      // can declare one in lower case.
+      const stored = await storage.getVocabulary(repositoryId);
+      await storage.saveVocabulary(
+        repositoryId,
+        {
+          ...stored,
+          version: incrementVersion(stored.version, 'patch'),
+          relationshipTypes: stored.relationshipTypes.map((rt) => ({ ...rt, type: 'works_on' })),
+        },
+        stored.version,
+      );
+      storage.looseTypeMatch = true;
+      storage.calls.length = 0;
+
+      const result = await engine.proposeChange(
+        { proposalType: 'delete_relationship_type', deleteRelationshipType: { type: 'Works_On' }, justification: 'Near miss' },
+        'agent',
+      );
+
+      expect(result).toMatchObject({ status: 'rejected', type: 'WORKS_ON' });
+      expect(result.reason).toContain('not found');
+      expect(storage.calls).toEqual([]);
+      expect(await storage.getRelationship(repositoryId, 'r1')).not.toBeNull();
+    });
+
+    it('a delete naming a declared relationship type exactly deletes it, even when its name is not normalised', async () => {
+      // A vocabulary written before relationship type names were normalised
+      // can declare one in lower case; the exact name is matched first.
+      const stored = await storage.getVocabulary(repositoryId);
+      await storage.saveVocabulary(
+        repositoryId,
+        {
+          ...stored,
+          version: incrementVersion(stored.version, 'patch'),
+          relationshipTypes: stored.relationshipTypes.map((rt) => ({ ...rt, type: 'works_on' })),
+        },
+        stored.version,
+      );
+      storage.calls.length = 0;
+
+      const result = await engine.proposeChange(
+        { proposalType: 'delete_relationship_type', deleteRelationshipType: { type: 'works_on' }, justification: 'Legacy name' },
+        'agent',
+      );
+
+      expect(result).toMatchObject({ status: 'approved', type: 'works_on' });
+      expect(storage.calls).toEqual(['saveVocabulary', 'deleteRelationshipsByType']);
+      expect((await storage.getVocabulary(repositoryId)).relationshipTypes).toEqual([]);
+    });
+
+    it('a relationship type proposed in another case deletes the normalised type it names', async () => {
+      const before = await storage.getVocabulary(repositoryId);
+
+      const result = await engine.proposeChange(
+        { proposalType: 'delete_relationship_type', deleteRelationshipType: { type: 'works_on' }, justification: 'Replacing it' },
+        'agent',
+      );
+
+      expect(result).toEqual({
+        status: 'approved',
+        type: 'WORKS_ON',
+        vocabularyVersion: incrementVersion(before.version, 'major'),
+      });
+      expect(storage.calls).toEqual(['saveVocabulary', 'deleteRelationshipsByType']);
+      expect((await storage.getVocabulary(repositoryId)).relationshipTypes).toEqual([]);
+      expect(await storage.getRelationship(repositoryId, 'r1')).toBeNull();
+      expect(await storage.getRelationship(repositoryId, 'r2')).toBeNull();
+      const log = await storage.getVocabularyChangeLog(repositoryId);
+      expect(log.items[0]).toMatchObject({ changeType: 'relationship_type_removed', typeName: 'WORKS_ON' });
     });
   });
 });

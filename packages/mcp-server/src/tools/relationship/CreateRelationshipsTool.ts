@@ -1,4 +1,6 @@
+import { BatchPartialFailureError } from '@utaba/deep-memory';
 import { BaseToolController } from '../base/BaseToolController.js';
+import { batchPartialFailureResponse } from '../base/batchPartialFailure.js';
 
 interface RelationshipInput {
   relationshipType: string;
@@ -9,7 +11,7 @@ interface RelationshipInput {
 
 export class CreateRelationshipsTool extends BaseToolController {
   get name() { return 'memory_create_relationships'; }
-  get description() { return 'Create one or more relationships (edges) between entities. Relationship types must be in the vocabulary. Entity references accept either GUID or slug.'; }
+  get description() { return 'Create one or more relationships (edges) between entities. Relationship types must be in the vocabulary. Entity references accept either GUID or slug. Property names must match ^[A-Za-z_][A-Za-z0-9_]*$ and must not be reserved system fields. Every relationship (including its endpoints) is validated before any is written: if one fails validation, nothing is created. If storing fails part-way, the error response lists code BATCH_PARTIAL_FAILURE, failedIndex and the relationships already stored in "created"; resend only the relationships not in "created", because resending a stored relationship creates a duplicate.'; }
   get inputSchema() {
     return {
       type: 'object',
@@ -49,6 +51,12 @@ export class CreateRelationshipsTool extends BaseToolController {
       })),
     );
 
-    return repo.createRelationships(resolved);
+    try {
+      return await repo.createRelationships(resolved);
+    } catch (error: unknown) {
+      if (!(error instanceof BatchPartialFailureError)) throw error;
+      this.logger.error(this.name, `Execution failed: ${error.message}`);
+      return batchPartialFailureResponse(error);
+    }
   }
 }

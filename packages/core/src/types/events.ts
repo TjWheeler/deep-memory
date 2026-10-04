@@ -35,6 +35,7 @@ export type DeepMemoryEventType =
   | 'validation:failed'
   // Search
   | 'search:executed'
+  | 'search:index_failed'
   // Re-embedding
   | 'reembed:started'
   | 'reembed:progress'
@@ -78,6 +79,10 @@ export type EventPayload<T extends DeepMemoryEventType> =
   T extends 'vocabulary:changed' ? { previousVersion: string; newVersion: string; change: VocabularyChangeRecord } :
   T extends 'validation:failed' ? { operation: string; error: string; suggestions?: string[] } :
   T extends 'search:executed' ? { query: string; resultCount: number } :
+  // A committed entity create, update or delete whose search-index update
+  // failed. The write stands; the search index is missing, stale or (after a
+  // delete) still holding `entityId` until that entity is indexed again.
+  T extends 'search:index_failed' ? { entityId: string; error: string } :
   T extends 'reembed:started' ? { repositoryId: string; totalEntities: number } :
   T extends 'reembed:progress' ? { repositoryId: string; processed: number; totalEntities: number; failed: number } :
   T extends 'reembed:item-failed' ? { repositoryId: string; entityId: string; error: string } :

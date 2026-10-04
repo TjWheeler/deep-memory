@@ -19,7 +19,7 @@ import {
   DuplicateRelationshipError,
   DuplicateRepositoryError,
   EntityNotFoundError,
-  ProviderError,
+  InvalidInputError,
   RepositoryNotFoundError,
   SlugConflictError,
   TraversalValidationError,
@@ -358,7 +358,7 @@ if (NEO4J_URI) {
         }),
       ).rejects.toBeInstanceOf(TraversalValidationError);
       await expect(provider.findEntities(repositoryId, { properties: { _attempt: 'x' }, limit: 10, offset: 0 })).rejects.toBeInstanceOf(
-        ProviderError,
+        InvalidInputError,
       );
     });
   });

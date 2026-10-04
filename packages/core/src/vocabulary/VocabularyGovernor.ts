@@ -3,6 +3,7 @@
 import type {
   GovernanceConfig,
   MemoryVocabulary,
+  RelationshipTypeDefinition,
   VocabularyProposal,
   VocabularyProposalResult,
   VocabularyChangeRecord,
@@ -14,6 +15,7 @@ import {
   mergeEntityTypeEdit,
   mergeRelationshipTypeEdit,
 } from './VocabularySchema.js';
+import { toScreamingSnakeCase } from './similarity.js';
 
 /** Why a proposal was denied */
 export interface GovernanceDenial {
@@ -46,6 +48,24 @@ export function canPropose(
   }
 }
 
+/** What governance made of a proposal */
+export interface ProposalOutcome {
+  result: VocabularyProposalResult;
+  /** The vocabulary to store, when the proposal is approved */
+  updatedVocabulary?: MemoryVocabulary;
+  /** The audit record to store with `updatedVocabulary`, when the proposal is approved */
+  changeRecord?: VocabularyChangeRecord;
+  /**
+   * `true` only on the "not found" rejection of a `delete_entity_type` or
+   * `delete_relationship_type` proposal whose type the vocabulary does not
+   * declare. A type deletion stores the vocabulary first and deletes the
+   * type's data afterwards, so an absent type may still have data left by a
+   * deletion whose data step failed; this flag lets the caller resume that
+   * step instead of treating the rejection as final.
+   */
+  typeAbsent?: true;
+}
+
 export interface ProcessProposalOptions {
   /** Pre-checked deduplication result — if duplicates were found, pass them here */
   duplicates?: Array<{ type: string; description: string; similarity: number }>;
@@ -62,11 +82,7 @@ export function processProposal(
   proposal: VocabularyProposal,
   governanceConfig: GovernanceConfig,
   options: ProcessProposalOptions,
-): {
-  result: VocabularyProposalResult;
-  updatedVocabulary?: MemoryVocabulary;
-  changeRecord?: VocabularyChangeRecord;
-} {
+): ProposalOutcome {
   const decision = canPropose(governanceConfig, proposal);
   if (!decision.allowed) {
     return {
@@ -119,7 +135,13 @@ export function processProposal(
   }
 }
 
-/** Apply an add proposal to the vocabulary */
+/**
+ * Apply an add proposal to the vocabulary.
+ *
+ * A relationship type is stored under its SCREAMING_SNAKE_CASE name, so the
+ * result and the change record carry that name rather than the one proposed:
+ * it is the name later edits, deletes and data refer to.
+ */
 function applyAddProposal(
   vocabulary: MemoryVocabulary,
   proposal: VocabularyProposal,
@@ -131,7 +153,7 @@ function applyAddProposal(
 } {
   const now = new Date().toISOString();
   const newVersion = incrementVersion(vocabulary.version, 'minor');
-  const typeName = getProposedTypeName(proposal);
+  let typeName = getProposedTypeName(proposal);
 
   let updatedVocabulary: MemoryVocabulary;
   let changeType: VocabularyChangeRecord['changeType'];
@@ -158,6 +180,7 @@ function applyAddProposal(
       },
       proposedBy,
     );
+    typeName = newType.type;
     updatedVocabulary = {
       ...vocabulary,
       version: newVersion,
@@ -205,7 +228,14 @@ function applyAddProposal(
   };
 }
 
-/** Apply an edit proposal to the vocabulary */
+/**
+ * Apply an edit proposal to the vocabulary.
+ *
+ * A relationship type is matched by the name as proposed, or failing that by
+ * its SCREAMING_SNAKE_CASE form (the form relationship types are stored in),
+ * so `works_on` edits `WORKS_ON`. The stored type keeps its name, and the
+ * result and the change record carry that stored name.
+ */
 function applyEditProposal(
   vocabulary: MemoryVocabulary,
   proposal: VocabularyProposal,
@@ -216,7 +246,7 @@ function applyEditProposal(
   changeRecord?: VocabularyChangeRecord;
 } {
   const now = new Date().toISOString();
-  const typeName = getProposedTypeName(proposal);
+  let typeName = getProposedTypeName(proposal);
   const newVersion = incrementVersion(vocabulary.version, 'minor');
 
   let updatedVocabulary: MemoryVocabulary;
@@ -243,18 +273,18 @@ function applyEditProposal(
     };
     changeType = 'entity_type_modified';
   } else if (proposal.proposalType === 'edit_relationship_type' && proposal.editRelationshipType) {
-    const existing = vocabulary.relationshipTypes.find(
-      (rt) => rt.type === proposal.editRelationshipType!.type,
-    );
+    const normalised = toScreamingSnakeCase(typeName);
+    const existing = findRelationshipType(vocabulary, typeName);
     if (!existing) {
       return {
         result: {
           status: 'rejected',
-          type: typeName,
-          reason: `Relationship type "${typeName}" not found in vocabulary`,
+          type: normalised,
+          reason: `Relationship type "${normalised}" not found in vocabulary`,
         },
       };
     }
+    typeName = existing.type;
     const merged = mergeRelationshipTypeEdit(existing, proposal.editRelationshipType, proposedBy);
     updatedVocabulary = {
       ...vocabulary,
@@ -262,7 +292,7 @@ function applyEditProposal(
       lastModified: now,
       modifiedBy: proposedBy,
       relationshipTypes: vocabulary.relationshipTypes.map((rt) =>
-        rt.type === typeName ? merged : rt,
+        rt === existing ? merged : rt,
       ),
     };
     changeType = 'relationship_type_modified';
@@ -295,25 +325,36 @@ function applyEditProposal(
   };
 }
 
-/** Apply a delete proposal to the vocabulary (vocabulary only — data cascade is handled by VocabularyEngine) */
+/**
+ * Apply a delete proposal to the vocabulary (vocabulary only — data cascade is
+ * handled by VocabularyEngine).
+ *
+ * A relationship type is matched the same way an edit matches it: by the
+ * name as proposed, or failing that by its SCREAMING_SNAKE_CASE form, so
+ * `works_on` deletes `WORKS_ON`. The exact match comes first because the
+ * conversion is not idempotent (`HAS_A1B` converts to `HAS_A1_B`), so a
+ * declared name is not always reachable through its converted form. The
+ * result's `type` is the declared name that matched; when nothing matched it
+ * is the SCREAMING_SNAKE_CASE form, the name new data is stored under.
+ */
 function applyDeleteProposal(
   vocabulary: MemoryVocabulary,
   proposal: VocabularyProposal,
   proposedBy: string,
-): {
-  result: VocabularyProposalResult;
-  updatedVocabulary?: MemoryVocabulary;
-  changeRecord?: VocabularyChangeRecord;
-} {
+): ProposalOutcome {
   const now = new Date().toISOString();
-  const typeName = getProposedTypeName(proposal);
+  const typeName =
+    proposal.proposalType === 'delete_relationship_type' && proposal.deleteRelationshipType
+      ? (findRelationshipType(vocabulary, proposal.deleteRelationshipType.type)?.type ??
+        toScreamingSnakeCase(proposal.deleteRelationshipType.type))
+      : getProposedTypeName(proposal);
   const newVersion = incrementVersion(vocabulary.version, 'major');
 
   let updatedVocabulary: MemoryVocabulary;
   let changeType: VocabularyChangeRecord['changeType'];
 
   if (proposal.proposalType === 'delete_entity_type' && proposal.deleteEntityType) {
-    const exists = vocabulary.entityTypes.some((et) => et.type === proposal.deleteEntityType!.type);
+    const exists = vocabulary.entityTypes.some((et) => et.type === typeName);
     if (!exists) {
       return {
         result: {
@@ -321,6 +362,7 @@ function applyDeleteProposal(
           type: typeName,
           reason: `Entity type "${typeName}" not found in vocabulary`,
         },
+        typeAbsent: true,
       };
     }
     updatedVocabulary = {
@@ -335,9 +377,7 @@ function applyDeleteProposal(
     proposal.proposalType === 'delete_relationship_type' &&
     proposal.deleteRelationshipType
   ) {
-    const exists = vocabulary.relationshipTypes.some(
-      (rt) => rt.type === proposal.deleteRelationshipType!.type,
-    );
+    const exists = vocabulary.relationshipTypes.some((rt) => rt.type === typeName);
     if (!exists) {
       return {
         result: {
@@ -345,6 +385,7 @@ function applyDeleteProposal(
           type: typeName,
           reason: `Relationship type "${typeName}" not found in vocabulary`,
         },
+        typeAbsent: true,
       };
     }
     updatedVocabulary = {
@@ -382,6 +423,21 @@ function applyDeleteProposal(
     updatedVocabulary,
     changeRecord,
   };
+}
+
+/**
+ * The relationship type `vocabulary` declares under `name` exactly, or
+ * failing that under `name`'s SCREAMING_SNAKE_CASE form.
+ */
+function findRelationshipType(
+  vocabulary: MemoryVocabulary,
+  name: string,
+): RelationshipTypeDefinition | undefined {
+  const normalised = toScreamingSnakeCase(name);
+  return (
+    vocabulary.relationshipTypes.find((rt) => rt.type === name) ??
+    vocabulary.relationshipTypes.find((rt) => rt.type === normalised)
+  );
 }
 
 function getProposedTypeName(proposal: VocabularyProposal): string {

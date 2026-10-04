@@ -4,7 +4,7 @@ import type { Neo4jConnection } from './Neo4jConnection.js';
 
 // `executeNativeQuery` is the cross-repository escape hatch. It MUST route
 // through `Neo4jConnection.executeSystemQuery({ crossRepository: true })` so
-// the call lands on the D3b allowlist path — bypassing `executeQuery` (which
+// the call lands on the connection's cross-repository allowlist path — bypassing `executeQuery` (which
 // would inject `$rid` and assert scope) is the whole point. These tests pin
 // that contract.
 

@@ -116,9 +116,11 @@ export interface RelationshipCreateOptions {
  * check runs ahead of any outcome for a particular id (repository → id →
  * source → target) and ahead of an empty result, so a caller can tell a
  * deleted repository from an empty one, from a missing id or from a lookup
- * that matched nothing. Such a call changes nothing. The one documented
- * exception is a `getVocabulary` answered from a provider's vocabulary cache
- * (see there); traversals check the repository whatever the cache holds.
+ * that matched nothing. A call that throws it before writing changes
+ * nothing; the windows below are the calls that can throw it, or miss it,
+ * after a partial write. The one documented exception to the check is a
+ * `getVocabulary` answered from a provider's vocabulary cache (see there);
+ * traversals check the repository whatever the cache holds.
  *
  * CosmosDB has no transaction across Gremlin requests, so a delete of the
  * repository that races a multi-request call opens these windows:
@@ -141,6 +143,12 @@ export interface RelationshipCreateOptions {
  *   delete lands between the two requests, answer with rows the delete has
  *   not drained yet, or `null` / empty, instead of throwing (the call only
  *   reads).
+ *
+ * `deleteEntitiesByType` and `deleteRelationshipsByType` run in batches on
+ * Neo4j and CosmosDB, one transaction or request per batch, so a large type
+ * does not outlast a server timeout. When a later batch finds the repository
+ * missing (`RepositoryNotFoundError`) or fails, the batches before it stay
+ * deleted. Resending the call deletes what is left.
  */
 export interface StorageProvider {
   // ─── Lifecycle ─────────────────────────────────────────────────────
@@ -231,12 +239,34 @@ export interface StorageProvider {
    * - Throws `RepositoryNotFoundError` when the repository or its vocabulary
    *   does not exist.
    * - Never creates a vocabulary — `createRepository` seeds it.
+   *
+   * When `changeRecord` is given, the provider persists it in the same
+   * statement or transaction as the compare-and-set write, so the vocabulary
+   * change and its audit record commit together or not at all. CosmosDB is
+   * the exception: it writes both in one Gremlin traversal, which is not a
+   * transaction, so a failure after the vocabulary write leaves the new
+   * vocabulary stored without its record, and the error propagates. A write that
+   * fails its compare-and-set (`VocabularyVersionConflictError`) or finds the
+   * repository missing (`RepositoryNotFoundError`) writes no record. Once the
+   * call returns, `getVocabularyChangeLog` includes the record. There is no
+   * separate append: a record written apart from the vocabulary could
+   * describe a change that never landed, or miss one that did.
    */
   saveVocabulary(
     repositoryId: string,
     vocabulary: MemoryVocabulary,
     expectedVersion: string,
+    changeRecord?: VocabularyChangeRecord,
   ): Promise<void>;
+  /**
+   * Page the repository's vocabulary change log, newest first: by
+   * `proposedAt` descending, then by `changeId` descending between records
+   * with the same `proposedAt`, so paging is stable. Records are written only by `saveVocabulary`, together
+   * with the vocabulary change they describe. `limit` defaults to 10 and
+   * `offset` to 0; `total` counts every record in the repository.
+   *
+   * @throws RepositoryNotFoundError when the repository is missing.
+   */
   getVocabularyChangeLog(
     repositoryId: string,
     options?: PaginationOptions,
@@ -315,10 +345,17 @@ export interface StorageProvider {
   /**
    * Delete all entities of a given type and their associated relationships.
    *
+   * `deletedEntities` is the exact number of entities removed, and `0` when
+   * none of the type is left. On CosmosDB it is never more than were removed,
+   * but may be fewer when a transient retry re-runs a partly applied drop.
+   * The vocabulary engine relies on it: resending the deletion of a type the
+   * vocabulary no longer declares re-runs this call, and answers `approved`
+   * only when it removed something.
+   *
    * `deletedRelationships` may be `undefined` when the provider does not count
    * cascaded edges. The CosmosDB provider skips the edge-count fan-out
    * (a `bothE()` walk across every partition the type touches) because the
-   * count itself is rarely consumed — vocabulary cascade-delete discards it.
+   * count itself is rarely consumed — the vocabulary cascade does not read it.
    * SQL Server and in-memory providers continue to return the exact number.
    */
   deleteEntitiesByType(
@@ -384,7 +421,15 @@ export interface StorageProvider {
     repositoryId: string,
     ids: string[],
   ): Promise<{ deleted: string[]; notFound: string[] }>;
-  /** Delete all relationships of a given type */
+  /**
+   * Delete all relationships of a given type.
+   *
+   * `deletedRelationships` is the exact number removed, and `0` when none of
+   * the type is left. On CosmosDB it is never more than were removed, but may
+   * be fewer when a transient retry re-runs a partly applied drop. The
+   * vocabulary engine reads it the same way as `deleteEntitiesByType`'s
+   * `deletedEntities`.
+   */
   deleteRelationshipsByType(
     repositoryId: string,
     relationshipType: string,

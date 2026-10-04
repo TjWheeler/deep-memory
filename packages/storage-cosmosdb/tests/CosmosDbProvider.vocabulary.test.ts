@@ -15,7 +15,13 @@
 //   COSMOSDB_REST_ENDPOINT=https://localhost:8081   (optional; derived from the Gremlin host otherwise)
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { MemoryVocabulary, OperationUsage, StoredEntity, StoredRelationship } from '@utaba/deep-memory/types';
+import type {
+  MemoryVocabulary,
+  OperationUsage,
+  StoredEntity,
+  StoredRelationship,
+  VocabularyChangeRecord,
+} from '@utaba/deep-memory/types';
 import {
   DuplicateEntityError,
   DuplicateRelationshipError,
@@ -53,6 +59,10 @@ const RID = {
   collision: '40000000-0000-4000-a000-0000000000cc',
   survivors: '40000000-0000-4000-a000-0000000000cd',
   typeDelete: '40000000-0000-4000-a000-0000000000ce',
+  bigTypeDelete: '40000000-0000-4000-a000-0000000000cf',
+  changeLog: '40000000-0000-4000-a000-0000000000d0',
+  partialRecord: '40000000-0000-4000-a000-0000000000d1',
+  importIds: '40000000-0000-4000-a000-0000000000d2',
 } as const;
 
 const skipIfNoEndpoint = !ENDPOINT || !KEY;
@@ -561,6 +571,223 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
     await expect(provider.deleteRepository(rid)).resolves.toEqual({ deletedEntities: 1, deletedRelationships: 0 });
   }, 60_000);
 
+  it('by-type deletes larger than one batch remove everything of the type and report the exact count', async () => {
+    const rid = RID.bigTypeDelete;
+    await freshRepository(rid);
+    const things = Array.from({ length: 1_200 }, (_, i) => makeEntity(`big-${i}`));
+    const others = Array.from({ length: 20 }, (_, i) => ({ ...makeEntity(`keep-${i}`), entityType: 'Other', slug: `Other:keep-${i}` }));
+    // 650 LINKS edges among the kept entities, plus one OTHER edge, and one
+    // LINKS edge from a Thing so the entity delete cascades through an edge.
+    const links = Array.from({ length: 650 }, (_, i) => makeRelationship(`link-${i}`, `keep-${i % 20}`, `keep-${(i + 1) % 20}`));
+    const otherEdge = { ...makeRelationship('other-edge', 'keep-0', 'keep-1'), relationshipType: 'OTHER' };
+    const thingEdge = makeRelationship('thing-edge', 'big-0', 'keep-0');
+    const chunks = [];
+    for (let i = 0; i < things.length; i += 500) chunks.push({ entities: things.slice(i, i + 500) });
+    chunks.push({ entities: others });
+    chunks.push({ relationships: [...links, otherEdge, thingEdge] });
+    const imported = await provider.importBulk(rid, chunks, { skipExistenceCheck: true });
+    expect(imported.errors).toEqual([]);
+
+    const entityCount = (type: string): Promise<number> =>
+      raw.submit("g.V().has('repositoryId', rid).has('entityType', etype).count()", { rid, etype: type }).then((r) =>
+        Number(r.items[0] ?? 0),
+      );
+    const edgeCount = (type: string): Promise<number> =>
+      raw.submit("g.E().has('repositoryId', rid).hasLabel(rtype).count()", { rid, rtype: type }).then((r) =>
+        Number(r.items[0] ?? 0),
+      );
+    expect(await entityCount('Thing')).toBe(1_200);
+    expect(await edgeCount('LINKS')).toBe(651);
+
+    await expect(provider.deleteEntitiesByType(rid, 'Thing')).resolves.toEqual({
+      deletedEntities: 1_200,
+      deletedRelationships: undefined,
+    });
+    expect(await entityCount('Thing')).toBe(0);
+    expect(await entityCount('Other')).toBe(20);
+    // The Thing's edge went with it.
+    expect(await provider.getRelationship(rid, 'thing-edge')).toBeNull();
+    await expect(provider.deleteEntitiesByType(rid, 'Thing')).resolves.toMatchObject({ deletedEntities: 0 });
+
+    await expect(provider.deleteRelationshipsByType(rid, 'LINKS')).resolves.toEqual({ deletedRelationships: 650 });
+    expect(await edgeCount('LINKS')).toBe(0);
+    expect(await edgeCount('OTHER')).toBe(1);
+    await expect(provider.deleteRelationshipsByType(rid, 'LINKS')).resolves.toEqual({ deletedRelationships: 0 });
+  }, 600_000);
+
+  it('importBulk upsert refuses a reused relationship id with another type or endpoints and updates the same edge', async () => {
+    const rid = RID.importIds;
+    await freshRepository(rid);
+    for (const id of ['a', 'b', 'c']) await provider.createEntity(rid, makeEntity(id));
+    await provider.createRelationship(rid, makeRelationship('taken', 'a', 'b'));
+    const upsert = (relationships: StoredRelationship[]) => provider.importBulk(rid, [{ relationships }]);
+    // The edge's label and endpoints as the graph holds them, and its stored fields.
+    const shape = async (relId: string) => {
+      const graph = await raw.submit(
+        "g.E().has('repositoryId', rid).hasId(relId).project('label', 'source', 'target').by(__.label()).by(__.outV().id()).by(__.inV().id())",
+        { rid, relId },
+      );
+      const stored = await provider.getRelationship(rid, relId);
+      return {
+        graph: graph.items,
+        stored: stored && {
+          relationshipType: stored.relationshipType,
+          sourceEntityId: stored.sourceEntityId,
+          targetEntityId: stored.targetEntityId,
+          properties: stored.properties,
+        },
+      };
+    };
+    const original = {
+      graph: [{ label: 'LINKS', source: 'a', target: 'b' }],
+      stored: { relationshipType: 'LINKS', sourceEntityId: 'a', targetEntityId: 'b', properties: {} },
+    };
+    const refused = [expect.objectContaining({ item: 'relationship:taken', code: 'RELATIONSHIP_ALREADY_EXISTS' })];
+
+    const otherType = await upsert([
+      { ...makeRelationship('taken', 'a', 'b'), relationshipType: 'OTHER' },
+      makeRelationship('fresh', 'b', 'c'),
+    ]);
+    expect(otherType).toMatchObject({ relationshipsImported: 1, errors: refused });
+    expect(await shape('taken')).toEqual(original);
+    expect((await shape('fresh')).graph).toEqual([{ label: 'LINKS', source: 'b', target: 'c' }]);
+
+    for (const [src, tgt] of [['b', 'c'], ['b', 'a'], ['a', 'c']] as const) {
+      expect(await upsert([makeRelationship('taken', src, tgt)])).toMatchObject({ relationshipsImported: 0, errors: refused });
+    }
+    expect(await shape('taken')).toEqual(original);
+
+    // A missing endpoint is reported ahead of the id.
+    expect(await upsert([makeRelationship('taken', 'a', 'missing')])).toMatchObject({
+      relationshipsImported: 0,
+      errors: [expect.objectContaining({ item: 'relationship:taken', code: 'ENTITY_NOT_FOUND' })],
+    });
+
+    // The same id, type and endpoints updates in place.
+    expect(await upsert([{ ...makeRelationship('taken', 'a', 'b'), properties: { weight: 2 } }])).toMatchObject({
+      relationshipsImported: 1,
+      errors: [],
+    });
+    expect(await shape('taken')).toEqual({ ...original, stored: { ...original.stored, properties: { weight: 2 } } });
+
+    // An id repeated within one upsert with the same type and endpoints lands as one edge.
+    expect(
+      await upsert([makeRelationship('twice', 'a', 'c'), { ...makeRelationship('twice', 'a', 'c'), properties: { n: 2 } }]),
+    ).toMatchObject({ relationshipsImported: 2, errors: [] });
+    expect((await shape('twice')).graph).toEqual([{ label: 'LINKS', source: 'a', target: 'c' }]);
+
+    // Insert mode leaves the id check to the store, which refuses the reused id.
+    expect(
+      await provider.importBulk(rid, [{ relationships: [makeRelationship('taken', 'a', 'b')] }], { skipExistenceCheck: true }),
+    ).toMatchObject({ relationshipsImported: 0, errors: refused });
+  }, 120_000);
+
+  it('the change record lands with the vocabulary, once, and only change-log vertices are read as records', async () => {
+    const rid = RID.changeLog;
+    await freshRepository(rid, makeVocabulary('1.0.0'));
+    const record: VocabularyChangeRecord = {
+      changeId: 'cl-change-1',
+      changeType: 'entity_type_added',
+      typeName: 'Thing',
+      previousVersion: '1.0.0',
+      newVersion: '1.1.0',
+      proposedBy: 'vocabulary-test',
+      proposedAt: '2026-05-27T03:00:00.000Z',
+      reason: 'Adds Thing',
+    };
+    const next = makeVocabulary('1.1.0');
+
+    // The vocabulary lands without its record, as when a first attempt stops
+    // between the two writes.
+    await provider.saveVocabulary(rid, next, '1.0.0');
+    expect((await provider.getVocabularyChangeLog(rid)).total).toBe(0);
+
+    // A retry of the same save finds its own vocabulary stored and writes the
+    // record; a second retry finds the record and adds nothing.
+    await provider.saveVocabulary(rid, next, '1.0.0', record);
+    await provider.saveVocabulary(rid, next, '1.0.0', record);
+    const log = await provider.getVocabularyChangeLog(rid);
+    expect(log.total).toBe(1);
+    expect(log.items).toEqual([record]);
+
+    // An entity typed `_vocabularyChangeLog` carries the record label but is not a record.
+    await provider.createEntity(rid, {
+      ...makeEntity('cl-impostor'),
+      entityType: '_vocabularyChangeLog',
+      slug: '_vocabularyChangeLog:cl-impostor',
+    });
+    expect((await provider.getVocabularyChangeLog(rid)).total).toBe(1);
+
+    // A compare-and-set with the marker gone writes neither the vocabulary nor a record.
+    await dropMarker(rid);
+    await expect(
+      provider.saveVocabulary(rid, makeVocabulary('1.2.0'), '1.1.0', { ...record, changeId: 'cl-change-2' }),
+    ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(await storedVersionProperty(rid)).toEqual(['1.1.0']);
+    expect(await count("g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').hasNot('entityType').count()", rid)).toBe(1);
+  }, 120_000);
+
+  it('a retried save completes a part-written change record in place, and the log orders ties by changeId', async () => {
+    const rid = RID.partialRecord;
+    await freshRepository(rid, makeVocabulary('1.0.0'));
+    const record: VocabularyChangeRecord = {
+      changeId: 'pr-change-b',
+      changeType: 'entity_type_added',
+      typeName: 'Thing',
+      previousVersion: '1.0.0',
+      newVersion: '1.1.0',
+      proposedBy: 'vocabulary-test',
+      proposedAt: '2026-05-27T04:00:00.000Z',
+      approvedBy: 'vocabulary-approver',
+      approvedAt: '2026-05-27T04:00:01.000Z',
+      reason: 'Adds Thing',
+    };
+    const next = makeVocabulary('1.1.0');
+
+    // A first attempt that wrote the vocabulary and stopped part-way through
+    // the record's properties.
+    await provider.saveVocabulary(rid, next, '1.0.0');
+    await raw.submit(
+      "g.addV('_vocabularyChangeLog').property('id', lid).property('repositoryId', rid).property('changeId', cid)",
+      { rid, lid: 'vocablog:pr-change-b', cid: 'pr-change-b' },
+    );
+
+    // The retry finds its own vocabulary stored and completes the record.
+    await provider.saveVocabulary(rid, next, '1.0.0', record);
+    const log = await provider.getVocabularyChangeLog(rid);
+    expect(log.total).toBe(1);
+    expect(log.items).toEqual([record]);
+    // The record kept its label and partition, and each property holds one value.
+    const stored = await raw.submit(
+      "g.V().has('repositoryId', rid).hasId(lid).project('label', 'pk', 'changeIds').by(label).by(values('repositoryId')).by(values('changeId').count())",
+      { rid, lid: 'vocablog:pr-change-b' },
+    );
+    expect(stored.items).toHaveLength(1);
+    const row = stored.items[0] as Record<string, unknown> | Map<string, unknown>;
+    const field = (key: string): unknown => (row instanceof Map ? row.get(key) : row[key]);
+    expect(field('label')).toBe('_vocabularyChangeLog');
+    expect(field('pk')).toBe(rid);
+    expect(Number(field('changeIds'))).toBe(1);
+
+    // Records proposed at the same instant come back by changeId, descending.
+    await provider.saveVocabulary(rid, makeVocabulary('1.2.0'), '1.1.0', {
+      ...record,
+      changeId: 'pr-change-a',
+      previousVersion: '1.1.0',
+      newVersion: '1.2.0',
+    });
+    await provider.saveVocabulary(rid, makeVocabulary('1.3.0'), '1.2.0', {
+      ...record,
+      changeId: 'pr-change-c',
+      previousVersion: '1.2.0',
+      newVersion: '1.3.0',
+    });
+    const all = await provider.getVocabularyChangeLog(rid);
+    expect(all.items.map((r) => r.changeId)).toEqual(['pr-change-c', 'pr-change-b', 'pr-change-a']);
+    const second = await provider.getVocabularyChangeLog(rid, { limit: 1, offset: 1 });
+    expect(second.items.map((r) => r.changeId)).toEqual(['pr-change-b']);
+  }, 120_000);
+
   // A repository whose marker is gone but whose data survives (a delete
   // that stopped after dropping the marker) must be refused by every read,
   // not only by the ones that would have found nothing: each call below is
@@ -571,15 +798,17 @@ function makeRelationship(id: string, src: string, tgt: string): StoredRelations
     for (const id of ['sv-a', 'sv-b', 'sv-c']) await provider.createEntity(rid, makeEntity(id));
     await provider.createRelationship(rid, makeRelationship('sv-r1', 'sv-a', 'sv-b'));
     await provider.createRelationship(rid, makeRelationship('sv-r2', 'sv-b', 'sv-c'));
-    // A vocabulary change-log row, so the change-log read has something to
-    // find. The provider does not write the log itself, so it is seeded here.
-    await raw.submit(
-      "g.addV('_vocabularyChangeLog').property('id', cid).property('repositoryId', rid)" +
-        ".property('changeId', cid).property('changeType', 'entity_type_added').property('typeName', 'Thing')" +
-        ".property('newVersion', '2.0.1').property('proposedBy', 'vocabulary-test')" +
-        ".property('proposedAt', '2026-05-27T02:00:00Z').property('reason', 'seeded')",
-      { rid, cid: 'sv-change-1' },
-    );
+    // A vocabulary change, with its record, so the change-log read has
+    // something to find.
+    await provider.saveVocabulary(rid, makeVocabulary('2.0.1'), '2.0.0', {
+      changeId: 'sv-change-1',
+      changeType: 'entity_type_added',
+      typeName: 'Thing',
+      newVersion: '2.0.1',
+      proposedBy: 'vocabulary-test',
+      proposedAt: '2026-05-27T02:00:00Z',
+      reason: 'seeded',
+    });
 
     const spec = {
       start: { entityId: 'sv-a' },

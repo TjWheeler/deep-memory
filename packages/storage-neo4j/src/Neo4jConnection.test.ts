@@ -176,7 +176,7 @@ describe('Neo4jConnection notifications surface', () => {
     try {
       // Swap the private driver with a stub that returns a known summary
       // shape — the chokepoint should warn when the notifications array is
-      // non-empty (the P15-validated rule).
+      // non-empty (the rule verified against a live server).
       const stubDriver = {
         executeQuery: async () => ({
           records: [],
@@ -483,5 +483,45 @@ describe('Neo4jConnection.executeWrite', () => {
 
     await expect(connection.executeWrite('', async () => 1)).rejects.toBeInstanceOf(ProviderError);
     expect(sessionConfigs).toHaveLength(0);
+  });
+});
+
+// ─── 7. executeImplicitInTransactions — session and bookmarks ────────────
+
+describe('Neo4jConnection.executeImplicitInTransactions session', () => {
+  it('binds $rid and joins the executeQuery bookmark chain', async () => {
+    const sessionConfigs: Array<Record<string, unknown>> = [];
+    const executed: Array<{ cypher: string; params: Record<string, unknown> }> = [];
+    let closed = 0;
+    const bookmarkManager = { name: 'execute-query-bookmarks' };
+    const stub = {
+      executeQueryBookmarkManager: bookmarkManager,
+      session: (config: Record<string, unknown>) => {
+        sessionConfigs.push(config);
+        return {
+          run: async (cypher: string, params: Record<string, unknown>) => {
+            executed.push({ cypher, params });
+            return { records: [], summary: { counters: { updates: () => ({}) } } };
+          },
+          close: async () => {
+            closed += 1;
+          },
+        };
+      },
+      close: async () => {},
+    };
+    const connection = new Neo4jConnection({ uri: 'bolt://localhost:7687', username: 'neo4j', password: 'unused' });
+    (connection as unknown as { driver: object }).driver = stub;
+
+    await connection.executeImplicitInTransactions(
+      'CALL () { MATCH (n:_Entity {repositoryId: $rid}) WITH n LIMIT $batchSize DETACH DELETE n } IN TRANSACTIONS OF $batchSize ROWS',
+      { batchSize: 500n },
+      { repositoryId: 'repo-a' },
+    );
+
+    expect(executed).toHaveLength(1);
+    expect(executed[0]!.params).toEqual({ batchSize: 500n, rid: 'repo-a' });
+    expect(sessionConfigs).toEqual([{ database: 'neo4j', bookmarkManager }]);
+    expect(closed).toBe(1);
   });
 });

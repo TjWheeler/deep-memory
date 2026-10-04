@@ -215,13 +215,13 @@ export function getRetryAfterMs(err: unknown, attempt: number): number {
  * `x-ms-request-charge` is typically 0 (its own delta) while
  * `x-ms-total-request-charge` carries the real cumulative charge.
  *
- * Therefore: always prefer the total. Falling back to the per-message value
- * with `??` (the previous behaviour) silently zeroed out every traversal
- * because 0 is not nullish.
+ * Therefore: always prefer the total. Preferring the per-message value and
+ * falling back with `??` would zero out every traversal, because 0 is not
+ * nullish.
  *
- * Verified against the Cosmos emulator with rate limiting enabled
- * (`local-tests/ru-raw-probe.mjs` 2026-05-25): a depth-2 path traversal
- * returns `{ x-ms-request-charge: 0, x-ms-total-request-charge: 29.72 }`.
+ * Verified against the Cosmos emulator with rate limiting enabled: a depth-2
+ * path traversal returns
+ * `{ x-ms-request-charge: 0, x-ms-total-request-charge: 29.72 }`.
  */
 function extractRequestCharge(resultSet: gremlin.driver.ResultSet): number | undefined {
   const attrs = resultSet.attributes as Record<string, unknown> | undefined;

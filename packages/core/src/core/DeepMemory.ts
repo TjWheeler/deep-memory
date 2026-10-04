@@ -71,6 +71,18 @@ export interface DeepMemoryConfig {
   provenance: ProvenanceContext;
 }
 
+/** Options for `DeepMemory.openRepository` */
+export interface OpenRepositoryOptions {
+  /**
+   * Validate writes, and answer `getVocabulary`, against a vocabulary read
+   * fresh from the store on every call, bypassing the storage provider's
+   * vocabulary cache. A vocabulary change made by another process is then
+   * enforced at once rather than within the cache's lifetime, at the cost
+   * of a store read per validation. Defaults to `false`.
+   */
+  freshVocabulary?: boolean;
+}
+
 export class DeepMemory {
   private readonly storage: StorageProvider;
   private readonly search?: SearchProvider;
@@ -241,8 +253,19 @@ export class DeepMemory {
     return repo;
   }
 
-  /** Open an existing repository */
-  public async openRepository(repositoryId: string): Promise<MemoryRepository> {
+  /**
+   * Open an existing repository.
+   *
+   * The handle holds no copy of the vocabulary: each validation and each
+   * `getVocabulary` reads through the storage provider, so a vocabulary
+   * change made elsewhere (another handle, another process) applies to this
+   * handle within the provider's vocabulary cache lifetime, or at once with
+   * `options.freshVocabulary`.
+   */
+  public async openRepository(
+    repositoryId: string,
+    options?: OpenRepositoryOptions,
+  ): Promise<MemoryRepository> {
     await this.ensureInitialized();
     this.validateRepositoryId(repositoryId);
 
@@ -267,6 +290,7 @@ export class DeepMemory {
       storageProvider: this.storage,
       governanceConfig: storedRepo.governanceConfig,
       embeddingProvider: embedding,
+      freshVocabulary: options?.freshVocabulary,
     });
 
     const repo = new MemoryRepository({

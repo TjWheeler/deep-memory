@@ -33,18 +33,27 @@ export {
   TraversalTimeoutError,
   QueryTimeoutError,
   UnsupportedQueryError,
+  BatchPartialFailureError,
 } from './core/errors.js';
-export type { DeepMemoryErrorCode } from './core/errors.js';
+export type { DeepMemoryErrorCode, BatchMember } from './core/errors.js';
 
 // Core classes
 export { DeepMemory, generateId, isValidUuid } from './core/DeepMemory.js';
-export type { DeepMemoryConfig } from './core/DeepMemory.js';
+export type { DeepMemoryConfig, OpenRepositoryOptions } from './core/DeepMemory.js';
 export { MemoryRepository } from './core/MemoryRepository.js';
 export { RepositoryValidator } from './validation/RepositoryValidator.js';
 
 // Utilities
 export { matchesPropertyFilters } from './relationships/PropertyFilterMatcher.js';
 export { SAFE_IDENTIFIER_PATTERN, isSafeIdentifier } from './validation/identifier.js';
+export {
+  RESERVED_ENTITY_PROPERTY_KEYS,
+  RESERVED_RELATIONSHIP_PROPERTY_KEYS,
+  isReservedPropertyName,
+  propertyNameRefusal,
+  assertWritablePropertyKeys,
+} from './validation/propertyNames.js';
+export type { PropertyOwner } from './validation/propertyNames.js';
 export { projectEntity } from './entities/entityProjection.js';
 export { createSafeSink } from './usage/safeSink.js';
 

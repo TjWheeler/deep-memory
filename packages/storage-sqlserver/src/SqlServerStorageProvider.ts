@@ -51,15 +51,19 @@ import {
   DuplicateEntityError,
   RelationshipNotFoundError,
   DuplicateRelationshipError,
+  InvalidInputError,
   ProviderError,
   VocabularyVersionConflictError,
   createEmptyVocabulary,
   matchesPropertyFilters,
   createSafeSink,
+  assertWritablePropertyKeys,
 } from '@utaba/deep-memory';
+import type { ImportError, PropertyOwner } from '@utaba/deep-memory';
 import { getSchemaSQL, SCHEMA_VERSION } from './schema.js';
 import {
   importFailure,
+  importRowRejected,
   isForeignKeyViolation,
   mapUniqueViolation,
   type ImportRow,
@@ -151,6 +155,39 @@ export interface SqlServerStorageProviderConfig {
    * wall-clock execution time in milliseconds. Never exposed to AI agents.
    */
   reportUsage?: UsageSink;
+  /**
+   * Lifetime in milliseconds of an entry in the per-process vocabulary cache.
+   * Defaults to 60 000. A vocabulary change made by another process reaches
+   * this one's cached reads, and so the validation of its writes, within this
+   * window. `0` disables the cache: every `getVocabulary` reads the stored
+   * vocabulary. Must be a non-negative finite number; anything else is
+   * refused with `InvalidInputError`.
+   */
+  vocabularyCacheTtlMs?: number;
+}
+
+/**
+ * Default lifetime of an entry in the per-process vocabulary cache. Every
+ * write is validated against the vocabulary, which changes rarely, so
+ * without a cache each write would pay an extra round trip for it. 60 s
+ * bounds how long another process's vocabulary change can go unseen; a
+ * change made through this provider takes effect here at once.
+ */
+const DEFAULT_VOCABULARY_CACHE_TTL_MS = 60_000;
+
+/**
+ * The vocabulary cache lifetime a config asks for: the default when absent,
+ * the value itself when it is a non-negative finite number of milliseconds.
+ * Anything else is refused at construction, so a mistyped value cannot
+ * silently disable the cache or make its entries permanent.
+ */
+function resolveVocabularyCacheTtlMs(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_VOCABULARY_CACHE_TTL_MS;
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  throw new InvalidInputError(
+    'vocabularyCacheTtlMs',
+    `SQL Server vocabularyCacheTtlMs must be a non-negative finite number of milliseconds, got ${String(value)}.`,
+  );
 }
 
 // ─── Column projection constants ───────────────────────────────────
@@ -168,9 +205,133 @@ const ENTITY_COLS_LIGHT = [
 /** All entity columns including embedding — used by getEntity, getEntities, exportAll */
 const ENTITY_COLS_FULL = `${ENTITY_COLS_LIGHT}, [embedding]`;
 
+/**
+ * An exact equality test of a type-name column against a parameter.
+ *
+ * The type columns use the database's default collation, which ignores case,
+ * and `=` ignores trailing spaces under every collation, so a plain `=` would
+ * let `Project` or `project ` match `project`. The plain `=` stays in front so
+ * the optimiser can still seek the `(repository_id, <type>)` index; the binary
+ * collation and the byte length then make the match exact, rejecting the rows
+ * the seek let through on case or trailing spaces.
+ */
+function exactTypeMatch(column: string, parameter: string): string {
+  return `${column} = ${parameter}
+    AND ${column} COLLATE Latin1_General_100_BIN2 = ${parameter}
+    AND DATALENGTH(${column}) = DATALENGTH(${parameter})`;
+}
+
+/** The columns an imported relationship row writes, in the order of `IMPORT_RELATIONSHIP_VALUES`. */
+const IMPORT_RELATIONSHIP_COLUMNS = [
+  'repository_id', 'relationship_id', 'relationship_type',
+  'source_entity_id', 'target_entity_id', 'properties', 'bidirectional',
+  'created_by', 'created_by_type', 'created_at',
+  'created_in_conversation', 'created_from_message',
+  'modified_by', 'modified_by_type', 'modified_at',
+  'modified_in_conversation', 'modified_from_message',
+].map(c => `[${c}]`).join(', ');
+
+/** The parameters `importBulk` binds for a relationship row, matching `IMPORT_RELATIONSHIP_COLUMNS`. */
+const IMPORT_RELATIONSHIP_VALUES = [
+  'repoId', 'relId', 'relType',
+  'sourceId', 'targetId', 'properties', 'bidirectional',
+  'createdBy', 'createdByType', 'createdAt',
+  'createdInConversation', 'createdFromMessage',
+  'modifiedBy', 'modifiedByType', 'modifiedAt',
+  'modifiedInConversation', 'modifiedFromMessage',
+].map(p => `@${p}`).join(', ');
+
+/** The import row an entity writes, naming it in a failed import's error. */
+function entityImportRow(entity: StoredEntity): ImportRow {
+  return {
+    item: `entity:${entity.id}`,
+    context: {
+      kind: 'entity',
+      entityId: entity.id,
+      slug: entity.slug,
+      entityType: entity.entityType,
+      label: entity.label,
+    },
+  };
+}
+
+/** The import row a relationship writes, naming it in a failed import's error. */
+function relationshipImportRow(relationship: StoredRelationship): ImportRow {
+  return {
+    item: `relationship:${relationship.id}`,
+    context: { kind: 'relationship', relationshipId: relationship.id },
+  };
+}
+
+/**
+ * The refusal for the first import row holding a property key that cannot
+ * be stored, or `undefined` when every row can be written. The import is
+ * all-or-nothing, so one bad row rejects the whole call with an
+ * `ImportError` naming the row, whose `cause` is the row's
+ * `InvalidInputError`. Returned rather than thrown so the caller can let a
+ * missing repository answer first.
+ */
+function findImportRowRefusal(data: readonly ImportChunk[]): ImportError | undefined {
+  const check = (
+    properties: StoredEntity['properties'] | StoredRelationship['properties'],
+    owner: PropertyOwner,
+    row: () => ImportRow,
+  ): ImportError | undefined => {
+    try {
+      assertWritablePropertyKeys(properties, owner);
+      return undefined;
+    } catch (err) {
+      if (err instanceof InvalidInputError) return importRowRejected(row(), err);
+      throw err;
+    }
+  };
+  for (const chunk of data) {
+    for (const entity of chunk.entities ?? []) {
+      const refusal = check(entity.properties, 'entity', () => entityImportRow(entity));
+      if (refusal !== undefined) return refusal;
+    }
+    for (const rel of chunk.relationships ?? []) {
+      const refusal = check(rel.properties, 'relationship', () => relationshipImportRow(rel));
+      if (refusal !== undefined) return refusal;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The entries of an update's merged property map that the update writes: a
+ * non-null value under a key the stored map lacks, or whose stored value
+ * differs. Values compare by their JSON form, which is how they are stored.
+ * `undefined` when the update leaves the properties as they are.
+ */
+function propertiesWritten(
+  next: Readonly<Record<string, unknown>> | undefined,
+  stored: Readonly<Record<string, unknown>>,
+): Record<string, unknown> | undefined {
+  if (next === undefined) return undefined;
+  const written: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(next)) {
+    if (value === null) continue;
+    if (Object.hasOwn(stored, key) && JSON.stringify(stored[key]) === JSON.stringify(value)) continue;
+    written[key] = value;
+  }
+  return written;
+}
+
 /** The row a batch headed by `repositoryCheckSql` returns first. */
 interface RepositoryCheckRow {
   repository_exists: number;
+}
+
+/**
+ * The row the `saveVocabulary` batch ends with. `vocabulary_exists` and
+ * `stored_version` are read only when the compare-and-set matched nothing.
+ */
+interface SaveVocabularyRow {
+  repository_exists: number;
+  updated: number;
+  vocabulary_exists: number;
+  stored_version: string | null;
 }
 
 /** The calls that read entities through `readEntitiesGuarded`. */
@@ -292,8 +453,21 @@ export class SqlServerStorageProvider implements StorageProvider {
   private ownsPool: boolean;
   private readonly config: SqlServerStorageProviderConfig;
   private readonly schema: string;
+  /**
+   * In-process vocabulary cache. Reads hit this map first; a vocabulary
+   * write through this provider, a repository create or delete, and any call
+   * that finds the repository missing drop the entry, so a cache hit never
+   * outlives a change this process made. Changes made by other processes are
+   * seen within `vocabularyCacheTtlMs`.
+   */
+  private readonly vocabularyCache = new Map<string, { vocab: MemoryVocabulary; expiresAt: number }>();
+  /** Cache entry lifetime in ms; `0` keeps nothing in the cache. */
+  private readonly vocabularyCacheTtlMs: number;
+  /** Bumped by every invalidation, so a read that raced one is not cached. */
+  private vocabularyCacheGeneration = 0;
 
   constructor(config: SqlServerStorageProviderConfig) {
+    this.vocabularyCacheTtlMs = resolveVocabularyCacheTtlMs(config.vocabularyCacheTtlMs);
     this.config = config;
     this.schema = config.schema ?? 'dbo';
     this.ownsPool = !(config.connection instanceof sql.ConnectionPool);
@@ -547,6 +721,9 @@ export class SqlServerStorageProvider implements StorageProvider {
         INSERT INTO ${this.t('dm_vocabularies')} ([repository_id], [vocabulary])
         VALUES (@id, @vocabulary)
       `);
+    // The id may belong to a repository deleted elsewhere whose vocabulary
+    // this process still holds.
+    this.invalidateVocabularyCache(config.repositoryId);
 
     return {
       repositoryId: config.repositoryId,
@@ -673,7 +850,7 @@ export class SqlServerStorageProvider implements StorageProvider {
     if (updates.metadata !== undefined) {
       // Shallow merge with existing metadata
       const existing = await this.getRepository(repositoryId);
-      if (!existing) throw new RepositoryNotFoundError(repositoryId);
+      if (!existing) throw this.repositoryNotFound(repositoryId);
       const merged = { ...existing.metadata, ...updates.metadata };
       setClauses.push('[metadata] = @metadata');
       request.input('metadata', sql.NVarChar, JSON.stringify(merged));
@@ -681,7 +858,7 @@ export class SqlServerStorageProvider implements StorageProvider {
 
     if (setClauses.length === 0) {
       const existing = await this.getRepository(repositoryId);
-      if (!existing) throw new RepositoryNotFoundError(repositoryId);
+      if (!existing) throw this.repositoryNotFound(repositoryId);
       return existing;
     }
 
@@ -690,11 +867,11 @@ export class SqlServerStorageProvider implements StorageProvider {
     );
 
     if (result.rowsAffected[0] === 0) {
-      throw new RepositoryNotFoundError(repositoryId);
+      throw this.repositoryNotFound(repositoryId);
     }
 
     const updated = await this.getRepository(repositoryId);
-    if (!updated) throw new RepositoryNotFoundError(repositoryId);
+    if (!updated) throw this.repositoryNotFound(repositoryId);
     return updated;
   }
 
@@ -719,6 +896,19 @@ export class SqlServerStorageProvider implements StorageProvider {
   public async deleteRepository(
     repositoryId: string,
     _onProgress?: DeleteProgressCallback,
+  ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
+    // Dropped once the batch has finished, whatever its outcome, so no read
+    // that ran alongside the delete can leave the old vocabulary cached.
+    try {
+      return await this.deleteRepositoryBatch(repositoryId);
+    } finally {
+      this.invalidateVocabularyCache(repositoryId);
+    }
+  }
+
+  /** The single-transaction delete behind `deleteRepository`. */
+  private async deleteRepositoryBatch(
+    repositoryId: string,
   ): Promise<{ deletedEntities: number; deletedRelationships: number }> {
     const pool = this.getPool();
     let counts: { relationships: number; entities: number; repositories: number } | undefined;
@@ -763,7 +953,7 @@ export class SqlServerStorageProvider implements StorageProvider {
       throw new ProviderError('SQL Server deleteRepository returned no result row.');
     }
     if (counts.repositories === 0) {
-      throw new RepositoryNotFoundError(repositoryId);
+      throw this.repositoryNotFound(repositoryId);
     }
     return { deletedEntities: counts.entities, deletedRelationships: counts.relationships };
   }
@@ -790,8 +980,9 @@ export class SqlServerStorageProvider implements StorageProvider {
   /**
    * Entity and relationship counts per type, plus the vocabulary version. The
    * counts and the vocabulary read run in parallel; the vocabulary read
-   * checks the repository row, so a missing repository throws
-   * `RepositoryNotFoundError` rather than reporting zero counts.
+   * bypasses the cache and checks the repository row, so a missing
+   * repository throws `RepositoryNotFoundError` rather than reporting zero
+   * counts, and the version reported is the stored one.
    */
   public async getRepositoryStats(repositoryId: string): Promise<RepositoryStats> {
     const pool = this.getPool();
@@ -811,7 +1002,7 @@ export class SqlServerStorageProvider implements StorageProvider {
            FROM ${this.t('dm_relationships')} WHERE [repository_id] = @id
            GROUP BY [relationship_type]`,
         ),
-      this.getVocabulary(repositoryId),
+      this.getVocabulary(repositoryId, { fresh: true }),
     ]);
 
     const entityTypeBreakdown: Record<string, number> = {};
@@ -840,15 +1031,68 @@ export class SqlServerStorageProvider implements StorageProvider {
   // ─── Vocabulary ──────────────────────────────────────────────────
 
   /**
-   * Read the stored vocabulary. This provider keeps no vocabulary cache, so
-   * every read already goes to the database and `fresh` needs no handling.
-   * One query reads the repository row and its vocabulary together: no
-   * repository row → `RepositoryNotFoundError`.
+   * Read the vocabulary through the in-process cache. An entry lives for
+   * `vocabularyCacheTtlMs` from the read that stored it.
+   *
+   * `{ fresh: true }` skips the cache lookup and always reads the stored
+   * vocabulary. Callers about to modify the vocabulary need this: the
+   * version they pass to `saveVocabulary` must be the stored one, and a
+   * cached copy can be up to the TTL behind another process's write. The
+   * fresh result replaces the cache entry so later cached reads see it too.
+   *
+   * A read that goes to the database throws `RepositoryNotFoundError` when
+   * the repository row is absent. A cache hit is not checked against the
+   * database: within the TTL it can still return the vocabulary of a
+   * repository another process has deleted. Closing that window would cost
+   * a round trip on every cached read, which is what the cache exists to
+   * avoid; pass `{ fresh: true }` when the answer must reflect the stored
+   * state.
    */
   public async getVocabulary(
     repositoryId: string,
-    _options?: VocabularyReadOptions,
+    options?: VocabularyReadOptions,
   ): Promise<MemoryVocabulary> {
+    const readAt = Date.now();
+    if (options?.fresh !== true) {
+      const cached = this.vocabularyCache.get(repositoryId);
+      if (cached !== undefined && cached.expiresAt > readAt) return cached.vocab;
+    }
+    const generation = this.vocabularyCacheGeneration;
+    const vocab = await this.readStoredVocabulary(repositoryId);
+    // An invalidation that landed while the read was in flight may mean the
+    // read saw the vocabulary from before a write; caching it would hide
+    // that write for a whole TTL.
+    if (this.vocabularyCacheTtlMs > 0 && generation === this.vocabularyCacheGeneration) {
+      this.vocabularyCache.set(repositoryId, { vocab, expiresAt: readAt + this.vocabularyCacheTtlMs });
+    }
+    return vocab;
+  }
+
+  /**
+   * Drop a repository's cache entry. Called after every vocabulary write,
+   * when a repository is created or deleted, and whenever a call finds the
+   * repository missing.
+   */
+  private invalidateVocabularyCache(repositoryId: string): void {
+    this.vocabularyCacheGeneration++;
+    this.vocabularyCache.delete(repositoryId);
+  }
+
+  /**
+   * The `RepositoryNotFoundError` for a repository a call found missing,
+   * after dropping its cache entry so a later cached read goes to the
+   * database (and throws) rather than serving the old vocabulary.
+   */
+  private repositoryNotFound(repositoryId: string): RepositoryNotFoundError {
+    this.invalidateVocabularyCache(repositoryId);
+    return new RepositoryNotFoundError(repositoryId);
+  }
+
+  /**
+   * One query reads the repository row and its vocabulary together: no
+   * repository row → `RepositoryNotFoundError`.
+   */
+  private async readStoredVocabulary(repositoryId: string): Promise<MemoryVocabulary> {
     const pool = this.getPool();
 
     const result = await pool.request()
@@ -861,7 +1105,7 @@ export class SqlServerStorageProvider implements StorageProvider {
       );
 
     const row = result.recordset[0];
-    if (!row) throw new RepositoryNotFoundError(repositoryId);
+    if (!row) throw this.repositoryNotFound(repositoryId);
     if (row.vocabulary === null) {
       // createRepository inserts the vocabulary row together with the
       // repository row, so an existing repository without one is corrupt
@@ -877,56 +1121,143 @@ export class SqlServerStorageProvider implements StorageProvider {
   }
 
   /**
-   * Compare-and-set write of the vocabulary.
+   * Compare-and-set write of the vocabulary, in one batch and one
+   * transaction.
+   *
+   * The batch takes the repository row first, with `HOLDLOCK` to the end of
+   * the transaction, in the same order as `deleteRepository` and
+   * `deleteByTypeGuarded`. Taking it later (through the change-log INSERT's
+   * foreign-key check, after the vocabulary row) would lock in the opposite
+   * order to `deleteRepository`, which holds the repository row while it
+   * waits for the vocabulary row, and the two could deadlock. With no
+   * repository row nothing is written.
    *
    * The version check and the write are one UPDATE, so two writers that read
    * the same base version cannot both land — the second matches zero rows.
    * The stored version is read out of the JSON document with JSON_VALUE
    * rather than kept in a dedicated column, so the table schema is unchanged.
-   * The comparison uses a binary collation so it is exact: the default
-   * collations ignore case and trailing spaces, which would let a different
-   * version string match.
+   * The comparison uses a binary collation so it is exact on case: the
+   * default collations ignore case, which would let a different version
+   * string match. `=` ignores trailing spaces under every collation,
+   * binary ones included, so the byte lengths must also be equal.
    *
-   * Zero rows affected means either the repository is gone or the version is
-   * stale; only on that path does a follow-up read decide which typed error to
-   * throw. The success path is a single round-trip — no up-front repository
-   * check, because the UPDATE's WHERE clause already covers a missing row.
+   * A `changeRecord` is inserted into `dm_vocabulary_change_log` in the same
+   * transaction, and only when the UPDATE matched, so the vocabulary change
+   * and its record commit together; with `XACT_ABORT` on, a failed INSERT
+   * rolls the UPDATE back too.
+   *
+   * When the UPDATE matches nothing, the same batch reads the stored version,
+   * so the one round trip decides between `RepositoryNotFoundError` (no
+   * repository row, or no vocabulary row) and
+   * `VocabularyVersionConflictError`.
+   *
+   * The repository's cache entry is dropped whatever the outcome: on success
+   * so this process sees the new vocabulary at once, and on any failure
+   * because a conflict proves the cached copy stale and any other error
+   * leaves the stored state unknown.
    */
   public async saveVocabulary(
     repositoryId: string,
     vocabulary: MemoryVocabulary,
     expectedVersion: string,
+    changeRecord?: VocabularyChangeRecord,
+  ): Promise<void> {
+    try {
+      await this.writeVocabulary(repositoryId, vocabulary, expectedVersion, changeRecord);
+    } finally {
+      this.invalidateVocabularyCache(repositoryId);
+    }
+  }
+
+  /** The compare-and-set batch behind `saveVocabulary`. */
+  private async writeVocabulary(
+    repositoryId: string,
+    vocabulary: MemoryVocabulary,
+    expectedVersion: string,
+    changeRecord: VocabularyChangeRecord | undefined,
   ): Promise<void> {
     const pool = this.getPool();
 
-    const update = await pool.request()
+    const request = pool.request()
       .input('id', sql.UniqueIdentifier, repositoryId)
       .input('vocabulary', sql.NVarChar, JSON.stringify(vocabulary))
-      .input('expectedVersion', sql.NVarChar, expectedVersion)
-      .query(`
-        UPDATE ${this.t('dm_vocabularies')}
-        SET [vocabulary] = @vocabulary
-        WHERE [repository_id] = @id
-          AND JSON_VALUE([vocabulary], '$.version') COLLATE Latin1_General_100_BIN2 = @expectedVersion
-      `);
+      .input('expectedVersion', sql.NVarChar, expectedVersion);
+    if (changeRecord !== undefined) {
+      request
+        .input('changeId', sql.NVarChar, changeRecord.changeId)
+        .input('changeType', sql.NVarChar, changeRecord.changeType)
+        .input('typeName', sql.NVarChar, changeRecord.typeName)
+        .input('previousVersion', sql.NVarChar, changeRecord.previousVersion ?? null)
+        .input('newVersion', sql.NVarChar, changeRecord.newVersion)
+        .input('proposedBy', sql.NVarChar, changeRecord.proposedBy)
+        .input('proposedAt', sql.NVarChar, changeRecord.proposedAt)
+        .input('approvedBy', sql.NVarChar, changeRecord.approvedBy ?? null)
+        .input('approvedAt', sql.NVarChar, changeRecord.approvedAt ?? null)
+        .input('reason', sql.NVarChar, changeRecord.reason);
+    }
+    const recordInsert = changeRecord === undefined
+      ? ''
+      : `IF @updated > 0
+            INSERT INTO ${this.t('dm_vocabulary_change_log')}
+              ([change_id], [repository_id], [change_type], [type_name], [previous_version], [new_version],
+               [proposed_by], [proposed_at], [approved_by], [approved_at], [reason])
+            VALUES
+              (@changeId, @id, @changeType, @typeName, @previousVersion, @newVersion,
+               @proposedBy, @proposedAt, @approvedBy, @approvedAt, @reason);`;
 
-    if ((update.rowsAffected[0] ?? 0) > 0) {
+    let row: SaveVocabularyRow | undefined;
+    try {
+      // A parameterised query runs through sp_executesql, so XACT_ABORT
+      // applies to this request only and reverts when the batch ends.
+      const result = await request.query<SaveVocabularyRow>(`
+        SET XACT_ABORT ON;
+        DECLARE @repositories INT = 0;
+        DECLARE @updated INT = 0;
+        DECLARE @vocabularies INT = 0;
+        DECLARE @storedVersion NVARCHAR(4000) = NULL;
+        BEGIN TRANSACTION;
+        SELECT @repositories = 1
+          FROM ${this.t('dm_repositories')} WITH (HOLDLOCK, ROWLOCK)
+          WHERE [repository_id] = @id;
+        IF @repositories = 1
+        BEGIN
+          UPDATE ${this.t('dm_vocabularies')}
+          SET [vocabulary] = @vocabulary
+          WHERE [repository_id] = @id
+            AND JSON_VALUE([vocabulary], '$.version') COLLATE Latin1_General_100_BIN2 = @expectedVersion
+            AND DATALENGTH(JSON_VALUE([vocabulary], '$.version')) = DATALENGTH(@expectedVersion);
+          SET @updated = @@ROWCOUNT;
+          ${recordInsert}
+          IF @updated = 0
+            SELECT @vocabularies = 1, @storedVersion = JSON_VALUE([vocabulary], '$.version')
+              FROM ${this.t('dm_vocabularies')}
+              WHERE [repository_id] = @id;
+        END
+        COMMIT TRANSACTION;
+        SELECT @repositories AS repository_exists,
+               @updated AS updated,
+               @vocabularies AS vocabulary_exists,
+               @storedVersion AS stored_version;
+      `);
+      row = result.recordset[0];
+    } catch (err) {
+      throw new ProviderError(
+        `SQL Server saveVocabulary failed: ${err instanceof Error ? err.message : String(err)}`,
+        'An error inside the batch rolls back the vocabulary write and its change record together. Re-read the vocabulary before retrying.',
+        { cause: err },
+      );
+    }
+
+    if (row === undefined) {
+      throw new ProviderError('SQL Server saveVocabulary returned no result row.');
+    }
+    if (row.updated > 0) {
       return;
     }
-
-    const current = await pool.request()
-      .input('id', sql.UniqueIdentifier, repositoryId)
-      .query<{ version: string | null }>(`
-        SELECT JSON_VALUE([vocabulary], '$.version') AS [version]
-        FROM ${this.t('dm_vocabularies')}
-        WHERE [repository_id] = @id
-      `);
-
-    const row = current.recordset[0];
-    if (!row) {
-      throw new RepositoryNotFoundError(repositoryId);
+    if (row.repository_exists !== 1 || row.vocabulary_exists !== 1) {
+      throw this.repositoryNotFound(repositoryId);
     }
-    if (row.version === null) {
+    if (row.stored_version === null) {
       // JSON_VALUE yields NULL when $.version is missing, not a scalar, or
       // longer than 4000 characters. No expectedVersion can ever match such a
       // row, so reporting a conflict would send callers into a futile retry.
@@ -935,7 +1266,7 @@ export class SqlServerStorageProvider implements StorageProvider {
         'The stored vocabulary document is malformed; its "version" must be a "major.minor.patch" string.',
       );
     }
-    throw new VocabularyVersionConflictError(repositoryId, expectedVersion, row.version);
+    throw new VocabularyVersionConflictError(repositoryId, expectedVersion, row.stored_version);
   }
 
   public async getVocabularyChangeLog(
@@ -956,7 +1287,7 @@ export class SqlServerStorageProvider implements StorageProvider {
          SELECT COUNT(*) AS cnt FROM ${this.t('dm_vocabulary_change_log')} WHERE [repository_id] = @repoId;
          SELECT * FROM ${this.t('dm_vocabulary_change_log')}
          WHERE [repository_id] = @repoId
-         ORDER BY [proposed_at] DESC
+         ORDER BY [proposed_at] DESC, [change_id] DESC
          OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;`,
       );
     this.assertRepositoryChecked(result.recordsets[0], repositoryId, 'getVocabularyChangeLog');
@@ -974,6 +1305,7 @@ export class SqlServerStorageProvider implements StorageProvider {
   // ─── Entities ────────────────────────────────────────────────────
 
   public async createEntity(repositoryId: string, entity: StoredEntity): Promise<StoredEntity> {
+    assertWritablePropertyKeys(entity.properties, 'entity');
     await this.assertRepository(repositoryId);
     const pool = this.getPool();
 
@@ -1074,6 +1406,12 @@ export class SqlServerStorageProvider implements StorageProvider {
     // missing entity.
     const existing = await this.getEntity(repositoryId, entityId);
     if (!existing) throw new EntityNotFoundError(entityId);
+
+    // Key rules govern the names this update writes: a key that is new or
+    // whose value changes. A key stored before the rules existed and carried
+    // over unchanged is not refused, so the entity stays updatable; removing
+    // one (leaving it out of the merged map) needs no check either.
+    assertWritablePropertyKeys(propertiesWritten(updates.properties, existing.properties), 'entity');
 
     // For optional string fields, null clears, undefined preserves, string sets.
     const updated: StoredEntity = {
@@ -1205,7 +1543,8 @@ export class SqlServerStorageProvider implements StorageProvider {
   /**
    * One batch and one transaction (see `deleteByTypeGuarded`): the
    * relationships with an endpoint of the type go first, by source and then
-   * by target, then the entities.
+   * by target, then the entities. The type name matches exactly, case and
+   * trailing spaces included (see `exactTypeMatch`).
    */
   public async deleteEntitiesByType(
     repositoryId: string,
@@ -1217,16 +1556,16 @@ export class SqlServerStorageProvider implements StorageProvider {
       INNER JOIN ${this.t('dm_entities')} e
         ON r.[repository_id] = e.[repository_id]
         AND r.[source_entity_id] = e.[entity_id]
-      WHERE e.[repository_id] = @repoId AND e.[entity_type] = @entityType;
+      WHERE e.[repository_id] = @repoId AND ${exactTypeMatch('e.[entity_type]', '@entityType')};
       SET @deletedRelationships += @@ROWCOUNT;
       DELETE r FROM ${this.t('dm_relationships')} r
       INNER JOIN ${this.t('dm_entities')} e
         ON r.[repository_id] = e.[repository_id]
         AND r.[target_entity_id] = e.[entity_id]
-      WHERE e.[repository_id] = @repoId AND e.[entity_type] = @entityType;
+      WHERE e.[repository_id] = @repoId AND ${exactTypeMatch('e.[entity_type]', '@entityType')};
       SET @deletedRelationships += @@ROWCOUNT;
       DELETE FROM ${this.t('dm_entities')}
-      WHERE [repository_id] = @repoId AND [entity_type] = @entityType;
+      WHERE [repository_id] = @repoId AND ${exactTypeMatch('[entity_type]', '@entityType')};
       SET @deletedEntities = @@ROWCOUNT;
     `);
   }
@@ -1313,12 +1652,13 @@ export class SqlServerStorageProvider implements StorageProvider {
     relationship: StoredRelationship,
     _options?: RelationshipCreateOptions,
   ): Promise<StoredRelationship> {
+    assertWritablePropertyKeys(relationship.properties, 'relationship');
     // Check first so the common failures get their typed errors without a
     // failed INSERT. The check and the INSERT are separate statements, so a
     // concurrent writer can still change the answer in between; the INSERT's
     // own failure is mapped below.
     const preconditions = await this.readRelationshipCreatePreconditions(repositoryId, relationship);
-    if (!preconditions.repositoryExists) throw new RepositoryNotFoundError(repositoryId);
+    if (!preconditions.repositoryExists) throw this.repositoryNotFound(repositoryId);
     if (preconditions.relationshipExists) throw new DuplicateRelationshipError(relationship.id);
     throwForMissingEndpoint(preconditions, relationship);
 
@@ -1414,7 +1754,7 @@ export class SqlServerStorageProvider implements StorageProvider {
     cause: unknown,
   ): Promise<never> {
     const preconditions = await this.readRelationshipCreatePreconditions(repositoryId, relationship);
-    if (!preconditions.repositoryExists) throw new RepositoryNotFoundError(repositoryId);
+    if (!preconditions.repositoryExists) throw this.repositoryNotFound(repositoryId);
     throwForMissingEndpoint(preconditions, relationship);
     throw new ProviderError(
       `SQL Server createRelationship failed on a foreign key although the repository and both endpoints exist.`,
@@ -1583,7 +1923,10 @@ export class SqlServerStorageProvider implements StorageProvider {
     `);
   }
 
-  /** One batch and one transaction (see `deleteByTypeGuarded`). */
+  /**
+   * One batch and one transaction (see `deleteByTypeGuarded`). The type name
+   * matches exactly, case and trailing spaces included (see `exactTypeMatch`).
+   */
   public async deleteRelationshipsByType(
     repositoryId: string,
     relationshipType: string,
@@ -1594,7 +1937,7 @@ export class SqlServerStorageProvider implements StorageProvider {
       'deleteRelationshipsByType',
       request,
       `DELETE FROM ${this.t('dm_relationships')}
-       WHERE [repository_id] = @repoId AND [relationship_type] = @relType;
+       WHERE [repository_id] = @repoId AND ${exactTypeMatch('[relationship_type]', '@relType')};
        SET @deletedRelationships = @@ROWCOUNT;`,
     );
     return { deletedRelationships };
@@ -1966,12 +2309,38 @@ export class SqlServerStorageProvider implements StorageProvider {
     }
   }
 
+  /**
+   * Import every chunk in one transaction (see below). Relationship ids are
+   * never re-pointed:
+   * - upsert (the default) updates a stored id in place only when the row
+   *   names the same edge, the same type and endpoints, and refuses it with
+   *   `RELATIONSHIP_ALREADY_EXISTS` otherwise. The type is compared exactly
+   *   (case and trailing spaces count, as vocabulary names do); the
+   *   endpoints are compared the way the entity key and the foreign keys
+   *   resolve them, so a row that names the stored endpoints is the same
+   *   edge. The update leaves the stored type and endpoints as they are.
+   * - insert (`skipExistenceCheck`) writes each relationship with a plain
+   *   INSERT and does not look for the id first; the primary key refuses an
+   *   id that is already stored or repeated within the call.
+   * A refused row rolls the whole import back, like any other failed row:
+   * the call rejects with an `ImportError` naming the row, whose `cause` is
+   * the `DuplicateRelationshipError`.
+   *
+   * A row whose property keys cannot be stored (not an identifier, or a
+   * reserved system field) is refused before any row is written: the call
+   * rejects with an `ImportError` naming the row, whose `cause` is the
+   * `InvalidInputError`, and nothing is written. A missing repository is
+   * reported ahead of a refused row, so a call on a deleted repository
+   * answers `RepositoryNotFoundError` whatever its rows hold.
+   */
   public async importBulk(
     repositoryId: string,
     data: ImportChunk[],
-    _options?: BulkImportOptions,
+    options?: BulkImportOptions,
   ): Promise<BulkImportResult> {
+    const refusal = findImportRowRefusal(data);
     const pool = this.getPool();
+    const insertOnly = options?.skipExistenceCheck === true;
     let entitiesImported = 0;
     let relationshipsImported = 0;
 
@@ -2024,23 +2393,29 @@ export class SqlServerStorageProvider implements StorageProvider {
       );
     }
     if (!repositoryExists) {
-      throw new RepositoryNotFoundError(repositoryId);
+      throw this.repositoryNotFound(repositoryId);
+    }
+    if (refusal !== undefined) {
+      // Nothing has been written yet; release the repository lock before
+      // refusing the row.
+      try {
+        await transaction.rollback();
+      } catch (rollbackErr) {
+        // The refusal stays the cause, so the rejected row is still named.
+        throw new ProviderError(
+          `${refusal.message} (the rollback also failed: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)})`,
+          refusal.suggestion,
+          { cause: refusal },
+        );
+      }
+      throw refusal;
     }
 
     try {
       for (const chunk of data) {
         if (chunk.entities) {
           for (const entity of chunk.entities) {
-            current = {
-              item: `entity:${entity.id}`,
-              context: {
-                kind: 'entity',
-                entityId: entity.id,
-                slug: entity.slug,
-                entityType: entity.entityType,
-                label: entity.label,
-              },
-            };
+            current = entityImportRow(entity);
             const req = transaction.request()
               .input('repoId', sql.UniqueIdentifier, repositoryId)
               .input('entityId', sql.NVarChar, entity.id)
@@ -2088,10 +2463,7 @@ export class SqlServerStorageProvider implements StorageProvider {
 
         if (chunk.relationships) {
           for (const rel of chunk.relationships) {
-            current = {
-              item: `relationship:${rel.id}`,
-              context: { kind: 'relationship', relationshipId: rel.id },
-            };
+            current = relationshipImportRow(rel);
             const req = transaction.request()
               .input('repoId', sql.UniqueIdentifier, repositoryId)
               .input('relId', sql.NVarChar, rel.id)
@@ -2103,33 +2475,37 @@ export class SqlServerStorageProvider implements StorageProvider {
 
             this.addProvenanceInputs(req, rel.provenance);
 
-            await req.query(`
-              MERGE ${this.t('dm_relationships')} AS target
-              USING (SELECT @repoId AS repository_id, @relId AS relationship_id) AS source
-              ON target.[repository_id] = source.repository_id AND target.[relationship_id] = source.relationship_id
-              WHEN MATCHED THEN UPDATE SET
-                [relationship_type] = @relType, [source_entity_id] = @sourceId,
-                [target_entity_id] = @targetId, [properties] = @properties,
-                [bidirectional] = @bidirectional,
-                [modified_by] = @modifiedBy, [modified_by_type] = @modifiedByType,
-                [modified_at] = @modifiedAt, [modified_in_conversation] = @modifiedInConversation,
-                [modified_from_message] = @modifiedFromMessage
-              WHEN NOT MATCHED THEN INSERT (
-                [repository_id], [relationship_id], [relationship_type],
-                [source_entity_id], [target_entity_id], [properties], [bidirectional],
-                [created_by], [created_by_type], [created_at],
-                [created_in_conversation], [created_from_message],
-                [modified_by], [modified_by_type], [modified_at],
-                [modified_in_conversation], [modified_from_message]
-              ) VALUES (
-                @repoId, @relId, @relType,
-                @sourceId, @targetId, @properties, @bidirectional,
-                @createdBy, @createdByType, @createdAt,
-                @createdInConversation, @createdFromMessage,
-                @modifiedBy, @modifiedByType, @modifiedAt,
-                @modifiedInConversation, @modifiedFromMessage
-              );
-            `);
+            if (insertOnly) {
+              await req.query(`
+                INSERT INTO ${this.t('dm_relationships')} (${IMPORT_RELATIONSHIP_COLUMNS})
+                VALUES (${IMPORT_RELATIONSHIP_VALUES});
+              `);
+            } else {
+              // A stored id whose type or endpoints differ matches no WHEN
+              // clause, so the MERGE writes nothing and the row is refused.
+              const written = await req.query<{ written: number }>(`
+                MERGE ${this.t('dm_relationships')} AS target
+                USING (SELECT @repoId AS repository_id, @relId AS relationship_id) AS source
+                ON target.[repository_id] = source.repository_id AND target.[relationship_id] = source.relationship_id
+                WHEN MATCHED
+                  AND ${exactTypeMatch('target.[relationship_type]', '@relType')}
+                  AND target.[source_entity_id] = @sourceId
+                  AND target.[target_entity_id] = @targetId
+                THEN UPDATE SET
+                  [properties] = @properties, [bidirectional] = @bidirectional,
+                  [modified_by] = @modifiedBy, [modified_by_type] = @modifiedByType,
+                  [modified_at] = @modifiedAt, [modified_in_conversation] = @modifiedInConversation,
+                  [modified_from_message] = @modifiedFromMessage
+                WHEN NOT MATCHED THEN INSERT (${IMPORT_RELATIONSHIP_COLUMNS})
+                  VALUES (${IMPORT_RELATIONSHIP_VALUES});
+                SELECT @@ROWCOUNT AS written;
+              `);
+              const writtenRow = written.recordset[0];
+              if (writtenRow === undefined) {
+                throw new ProviderError('SQL Server importBulk returned no row count for a relationship.');
+              }
+              if (writtenRow.written === 0) throw new DuplicateRelationshipError(rel.id);
+            }
             relationshipsImported++;
           }
         }
@@ -2385,7 +2761,7 @@ export class SqlServerStorageProvider implements StorageProvider {
     if (row === undefined) {
       throw new ProviderError(`SQL Server ${operation} returned no repository check row.`);
     }
-    if (row.repository_exists !== 1) throw new RepositoryNotFoundError(repositoryId);
+    if (row.repository_exists !== 1) throw this.repositoryNotFound(repositoryId);
   }
 
   /**
@@ -2437,14 +2813,14 @@ export class SqlServerStorageProvider implements StorageProvider {
     if (row === undefined) {
       throw new ProviderError(`SQL Server ${operation} returned no result row.`);
     }
-    if (row.repository_exists !== 1) throw new RepositoryNotFoundError(repositoryId);
+    if (row.repository_exists !== 1) throw this.repositoryNotFound(repositoryId);
     return { deletedEntities: row.deleted_entities, deletedRelationships: row.deleted_relationships };
   }
 
   private async assertRepository(repositoryId: string): Promise<void> {
     const repo = await this.getRepository(repositoryId);
     if (!repo) {
-      throw new RepositoryNotFoundError(repositoryId);
+      throw this.repositoryNotFound(repositoryId);
     }
   }
 

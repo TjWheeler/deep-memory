@@ -3,7 +3,7 @@ import { stripProvenance, stripProvenanceArray } from '../base/stripProvenance.j
 
 export class FindPathsTool extends BaseToolController {
   get name() { return 'memory_find_paths'; }
-  get description() { return 'Find paths between two entities in the knowledge graph. Accepts entity IDs (GUID) or slugs.'; }
+  get description() { return 'Find paths between two entities in the knowledge graph. Accepts entity IDs (GUID) or slugs. Bounds: maxDepth 1-5, limit 1-200, offset 0-1000, all integers. Relationship type names and filter keys must be identifiers matching ^[A-Za-z_][A-Za-z0-9_]*$ (e.g. WORKS_AT, start_date). Out-of-range values and other names are rejected with a validation error.'; }
   get inputSchema() {
     return {
       type: 'object',
@@ -12,12 +12,12 @@ export class FindPathsTool extends BaseToolController {
         sourceEntityId: { type: 'string', description: 'Starting entity ID (GUID) or slug' },
         targetEntityId: { type: 'string', description: 'Destination entity ID (GUID) or slug' },
         maxDepth: { type: 'number', description: 'Maximum path depth (default: 3, max: 5)' },
-        relationshipTypes: { type: 'array', items: { type: 'string' }, description: 'Filter allowed relationship types' },
+        relationshipTypes: { type: 'array', items: { type: 'string' }, description: 'Filter allowed relationship types; each must match ^[A-Za-z_][A-Za-z0-9_]*$' },
         entityTypes: { type: 'array', items: { type: 'string' }, description: 'Filter entities in paths by type(s)' },
         limit: { type: 'number', description: 'Maximum number of paths to return (default: 5, max: 200)' },
         offset: { type: 'number', description: 'Pagination offset (default: 0, max: 1000)' },
         detailLevel: { type: 'string', enum: ['brief', 'summary', 'full'], description: 'Detail level for returned entities (default: brief)' },
-        relationshipPropertyFilters: { type: 'array', items: { type: 'object', properties: { key: { type: 'string' }, operator: { type: 'string', enum: ['eq', 'neq', 'isNull', 'isNotNull', 'gt', 'lt', 'gte', 'lte', 'contains'] }, value: {} }, required: ['key', 'operator'] }, description: 'Filter relationships by property values (AND)' },
+        relationshipPropertyFilters: { type: 'array', items: { type: 'object', properties: { key: { type: 'string' }, operator: { type: 'string', enum: ['eq', 'neq', 'isNull', 'isNotNull', 'gt', 'lt', 'gte', 'lte', 'contains'] }, value: {} }, required: ['key', 'operator'] }, description: 'Filter relationships by property values (AND); each key must match ^[A-Za-z_][A-Za-z0-9_]*$' },
       },
       required: ['repositoryId', 'sourceEntityId', 'targetEntityId'],
     };

@@ -8,7 +8,7 @@
 // public method runs, so swap-after-construct is safe.
 
 import { describe, it, expect, vi } from 'vitest';
-import { CosmosDbProvider } from './CosmosDbProvider.js';
+import { CosmosDbProvider, type CosmosDbProviderConfig } from './CosmosDbProvider.js';
 import { buildEdgeDeleteQuery, buildGuardedEntityDeleteQuery } from './queries/deleteByIds.js';
 import type { CosmosDbConnection, GremlinResult } from './CosmosDbConnection.js';
 import type {
@@ -17,20 +17,26 @@ import type {
   StoredEntityUpdate,
   StoredRelationship,
   TraversalSpec,
+  VocabularyChangeRecord,
 } from '@utaba/deep-memory/types';
 import {
   DuplicateEntityError,
   DuplicateRelationshipError,
   DuplicateRepositoryError,
   EntityNotFoundError,
+  InvalidInputError,
   ProviderError,
   RelationshipNotFoundError,
   RepositoryNotFoundError,
   SlugConflictError,
   VocabularyVersionConflictError,
 } from '@utaba/deep-memory';
-import { DELETE_ENTITIES_BY_TYPE_QUERY, ENTITY_CREATE_QUERY, UPDATE_ENTITY_START } from './queries/entity.js';
-import { RELATIONSHIP_CREATE_QUERY, RELATIONSHIP_ID_TAKEN_SQL } from './queries/relationship.js';
+import { ENTITY_CREATE_QUERY, ENTITY_TYPE_BATCH_IDS_QUERY, UPDATE_ENTITY_START } from './queries/entity.js';
+import {
+  RELATIONSHIP_CREATE_QUERY,
+  RELATIONSHIP_ID_TAKEN_SQL,
+  RELATIONSHIP_TYPE_BATCH_DROP_QUERY,
+} from './queries/relationship.js';
 import {
   DELETE_ENTITY_BATCH_QUERY,
   DELETE_INDEX_ENTRY_QUERY,
@@ -47,10 +53,14 @@ import {
   REPOSITORY_PRESENT,
 } from './queries/marker.js';
 import {
+  CHANGE_LOG_COUNT_QUERY,
+  CHANGE_LOG_PAGE_QUERY,
+  CHANGE_RECORD_ENSURE_QUERY,
   VOCABULARY_BACKFILL_SCAN_SQL,
   VOCABULARY_BACKFILL_WRITE_QUERY,
   VOCABULARY_READ_QUERY,
   VOCABULARY_SAVE_QUERY,
+  VOCABULARY_SAVE_WITH_CHANGE_QUERY,
   VOCABULARY_STATE_QUERY,
   backfillVocabularyVersions,
 } from './queries/vocabulary.js';
@@ -83,7 +93,7 @@ interface SubmitStub {
   isVocabRead(call: SubmitCall): boolean;
 }
 
-function makeProvider(): { provider: CosmosDbProvider; stub: SubmitStub } {
+function makeProvider(config: Partial<CosmosDbProviderConfig> = {}): { provider: CosmosDbProvider; stub: SubmitStub } {
   const calls: SubmitCall[] = [];
 
   const stub: SubmitStub = {
@@ -95,7 +105,7 @@ function makeProvider(): { provider: CosmosDbProvider; stub: SubmitStub } {
       calls.push({ query, params });
       // Default: empty result. Tests override per-call by inspecting the
       // query string and returning shaped data.
-      if (query === VOCABULARY_SAVE_QUERY) {
+      if (query === VOCABULARY_SAVE_QUERY || query === VOCABULARY_SAVE_WITH_CHANGE_QUERY) {
         // Compare-and-set lands: one vertex written.
         return { items: [1] };
       }
@@ -141,6 +151,7 @@ function makeProvider(): { provider: CosmosDbProvider; stub: SubmitStub } {
     key: 'C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==',
     database: 'd',
     container: 'c',
+    ...config,
   });
   // Bracket-access to swap the real Gremlin connection (which would attempt a
   // real WebSocket open on .submit()) with the stub.
@@ -157,6 +168,22 @@ function makeVocabulary(version: string): MemoryVocabulary {
     entityTypes: [],
     relationshipTypes: [],
   };
+}
+
+/**
+ * Rows of the compare-and-set miss follow-up (`VOCABULARY_STATE_QUERY`): the
+ * marker's row, and the vocabulary vertex's when `state` is given. Pass
+ * `marker: false` for a repository whose marker is gone.
+ */
+function stateRows(
+  params: Record<string, unknown> | undefined,
+  state: { version: string; json: string } | null,
+  marker = true,
+): Array<Record<string, unknown>> {
+  const rows: Array<Record<string, unknown>> = [];
+  if (marker) rows.push({ id: params?.['mid'], version: '', json: '' });
+  if (state !== null) rows.push({ id: params?.['vid'], ...state });
+  return rows;
 }
 
 const SIMPLE_TRAVERSAL: TraversalSpec = {
@@ -207,7 +234,7 @@ describe('vocabulary cache', () => {
       }
       if (query === VOCABULARY_STATE_QUERY) {
         stub.calls.push({ query, params });
-        return { items: [{ version: '1.0.5', json: JSON.stringify(makeVocabulary('1.0.5')) }] };
+        return { items: stateRows(params, { version: '1.0.5', json: JSON.stringify(makeVocabulary('1.0.5')) }) };
       }
       return defaultSubmit(query, params);
     };
@@ -216,6 +243,27 @@ describe('vocabulary cache', () => {
     await expect(
       provider.saveVocabulary(TEST_REPO, makeVocabulary('1.0.1'), '1.0.0'),
     ).rejects.toBeInstanceOf(VocabularyVersionConflictError);
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('a saveVocabulary failure of any other kind invalidates the cache', async () => {
+    const { provider, stub } = makeProvider();
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query === VOCABULARY_SAVE_QUERY) {
+        stub.calls.push({ query, params });
+        // Not a lost race: the write may or may not have landed.
+        throw new ProviderError('connection reset');
+      }
+      return defaultSubmit(query, params);
+    };
+
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    await expect(
+      provider.saveVocabulary(TEST_REPO, makeVocabulary('1.0.1'), '1.0.0'),
+    ).rejects.toBeInstanceOf(ProviderError);
     await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
 
     expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
@@ -236,11 +284,84 @@ describe('vocabulary cache', () => {
     expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
   });
 
-  it('getVocabulary without fresh reads the database but leaves the traversal cache alone', async () => {
+  it('getVocabulary without fresh serves the cached copy while it is live', async () => {
     const { provider, stub } = makeProvider();
 
     await provider.getVocabulary(TEST_REPO);
+    await provider.getVocabulary(TEST_REPO);
     await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+  });
+
+  it('getVocabulary without fresh serves a copy a traversal cached', async () => {
+    const { provider, stub } = makeProvider();
+
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    await provider.getVocabulary(TEST_REPO);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+  });
+
+  it('getVocabulary without fresh reads the stored vocabulary again once the TTL passes', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { provider, stub } = makeProvider({ vocabularyCacheTtlMs: 5_000 });
+
+      await provider.getVocabulary(TEST_REPO);
+      vi.advanceTimersByTime(4_999);
+      await provider.getVocabulary(TEST_REPO);
+      expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+
+      vi.advanceTimersByTime(1);
+      await provider.getVocabulary(TEST_REPO);
+      expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('getVocabulary without fresh reads again after saveVocabulary, and serves the stored result', async () => {
+    const { provider, stub } = makeProvider();
+    let storedVersion = '1.0.0';
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query === VOCABULARY_READ_QUERY) {
+        stub.calls.push({ query, params });
+        return {
+          items: [
+            { id: params?.['mid'], json: '' },
+            { id: params?.['vid'], json: JSON.stringify(makeVocabulary(storedVersion)) },
+          ],
+        };
+      }
+      return defaultSubmit(query, params);
+    };
+
+    expect((await provider.getVocabulary(TEST_REPO)).version).toBe('1.0.0');
+    await provider.saveVocabulary(TEST_REPO, makeVocabulary('1.0.1'), '1.0.0');
+    storedVersion = '1.0.1';
+    expect((await provider.getVocabulary(TEST_REPO)).version).toBe('1.0.1');
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('a call that finds the repository missing drops the copy getVocabulary would serve', async () => {
+    const { provider, stub } = makeProvider();
+    await provider.getVocabulary(TEST_REPO); // fills the cache
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) {
+        stub.calls.push({ query, params });
+        return { items: [0] };
+      }
+      if (query === VOCABULARY_READ_QUERY) {
+        stub.calls.push({ query, params });
+        return { items: [] };
+      }
+      return defaultSubmit(query, params);
+    };
+
+    // The warm-cache traversal checks the marker alongside and finds it gone.
+    await expect(provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL)).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    await expect(provider.getVocabulary(TEST_REPO)).rejects.toBeInstanceOf(RepositoryNotFoundError);
     expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
   });
 
@@ -262,6 +383,71 @@ describe('vocabulary cache', () => {
     expect(vocabReads).toHaveLength(2);
   });
 
+  it('honours a configured vocabularyCacheTtlMs', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { provider, stub } = makeProvider({ vocabularyCacheTtlMs: 5_000 });
+
+      await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+      vi.advanceTimersByTime(4_999);
+      await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+      expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+
+      vi.advanceTimersByTime(1);
+      await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+      expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps an entry for 60 s by default', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { provider, stub } = makeProvider();
+
+      await provider.getVocabulary(TEST_REPO, { fresh: true });
+      vi.advanceTimersByTime(59_999);
+      await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+      expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(1);
+
+      vi.advanceTimersByTime(1);
+      await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+      expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a vocabularyCacheTtlMs of 0 reads the vocabulary for every traversal and getVocabulary call', async () => {
+    const { provider, stub } = makeProvider({ vocabularyCacheTtlMs: 0 });
+
+    await provider.getVocabulary(TEST_REPO, { fresh: true });
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    await provider.traverse(TEST_REPO, SIMPLE_TRAVERSAL);
+    await provider.getVocabulary(TEST_REPO);
+    await provider.getVocabulary(TEST_REPO);
+
+    // A traversal reads it twice: once to check the repository, once to
+    // compile; each getVocabulary call reads it once.
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(7);
+    // With nothing cached, no traversal takes the cache-hit path's marker point read.
+    expect(stub.calls.filter((c) => c.query === REPOSITORY_MARKER_COUNT_QUERY)).toHaveLength(0);
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
+    'refuses a vocabularyCacheTtlMs of %s at construction',
+    (vocabularyCacheTtlMs) => {
+      expect(() => makeProvider({ vocabularyCacheTtlMs })).toThrow(InvalidInputError);
+    },
+  );
+
+  it('refuses a vocabularyCacheTtlMs that is not a number at construction', () => {
+    // A host config parsed from JSON is not type-checked.
+    const hostConfig = JSON.parse('{"vocabularyCacheTtlMs":"60000"}') as Partial<CosmosDbProviderConfig>;
+    expect(() => makeProvider(hostConfig)).toThrow(InvalidInputError);
+  });
+
   it('separate provider instances do not share the cache', async () => {
     const a = makeProvider();
     const b = makeProvider();
@@ -271,6 +457,72 @@ describe('vocabulary cache', () => {
 
     expect(a.stub.calls.filter((c) => a.stub.isVocabRead(c))).toHaveLength(1);
     expect(b.stub.calls.filter((c) => b.stub.isVocabRead(c))).toHaveLength(1);
+  });
+
+  it.each([false, true])('does not cache a read (fresh: %s) that an invalidation overtook', async (fresh) => {
+    const { provider, stub } = makeProvider();
+    let storedVersion = '1.0.0';
+    let open: () => void = () => undefined;
+    let gate: Promise<void> | undefined = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query === VOCABULARY_READ_QUERY) {
+        stub.calls.push({ query, params });
+        const items = [
+          { id: params?.['mid'], json: '' },
+          { id: params?.['vid'], json: JSON.stringify(makeVocabulary(storedVersion)) },
+        ];
+        // The first read sees the store, then waits until the save has run.
+        const held = gate;
+        gate = undefined;
+        if (held !== undefined) await held;
+        return { items };
+      }
+      return defaultSubmit(query, params);
+    };
+
+    const pending = provider.getVocabulary(TEST_REPO, { fresh });
+    await provider.saveVocabulary(TEST_REPO, makeVocabulary('1.0.1'), '1.0.0');
+    storedVersion = '1.0.1';
+    open();
+    expect((await pending).version).toBe('1.0.0');
+
+    expect((await provider.getVocabulary(TEST_REPO)).version).toBe('1.0.1');
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
+  });
+
+  it('deleteRepository drops the entry once the marker is gone, before the drain runs', async () => {
+    const { provider, stub } = makeProvider();
+    await provider.getVocabulary(TEST_REPO); // fills the cache
+    let markerGone = false;
+    let readDuringDelete: Promise<MemoryVocabulary> | undefined;
+    const defaultSubmit = stub.submit;
+    stub.submit = async (query, params) => {
+      if (query.includes("hasLabel('_repository')") && query.endsWith(".drop().cap('found')")) {
+        stub.calls.push({ query, params });
+        markerGone = true;
+        return { items: [[`repo:${TEST_REPO}`]] };
+      }
+      if (query === "g.V().has('repositoryId', rid).limit(1).count()") {
+        stub.calls.push({ query, params });
+        // A reader arriving while the delete is under way.
+        readDuringDelete = provider.getVocabulary(TEST_REPO);
+        await readDuringDelete.catch(() => undefined);
+        return { items: [0] };
+      }
+      if (query === VOCABULARY_READ_QUERY && markerGone) {
+        stub.calls.push({ query, params });
+        return { items: [] };
+      }
+      return defaultSubmit(query, params);
+    };
+
+    await provider.deleteRepository(TEST_REPO);
+    expect(readDuringDelete).toBeDefined();
+    await expect(readDuringDelete).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.filter((c) => stub.isVocabRead(c))).toHaveLength(2);
   });
 });
 
@@ -1038,7 +1290,7 @@ describe('create maps a store-side 409 to the duplicate error', () => {
 //   2. Native-storable values → one `.property('<key>', p_user_<i>)` per key,
 //      emitted in insertion order, with values bound through the p_user_*
 //      slots (only keys are inline).
-//   3. Unsafe identifiers and reserved-set collisions → ProviderError thrown
+//   3. Unsafe identifiers and reserved-set collisions → InvalidInputError thrown
 //      synchronously, no round-trip.
 //   4. Non-storable values → silently dropped from the suffix; the canonical
 //      blob still carries them via the ladder `properties` slot.
@@ -1153,7 +1405,7 @@ describe('createEntity user-property scalars', () => {
     expect(params['p_user_2']).toBeUndefined();
   });
 
-  it('throws ProviderError on a reserved-key collision before any round-trip', async () => {
+  it('throws InvalidInputError on a reserved-key collision before any round-trip', async () => {
     const { provider, stub } = captureCreateQuery();
     const entity: StoredEntity = {
       ...makeEntity('40000000-0000-4000-a000-000000008005'),
@@ -1161,7 +1413,7 @@ describe('createEntity user-property scalars', () => {
     };
 
     const before = stub.calls.length;
-    await expect(provider.createEntity(TEST_REPO, entity)).rejects.toBeInstanceOf(ProviderError);
+    await expect(provider.createEntity(TEST_REPO, entity)).rejects.toBeInstanceOf(InvalidInputError);
     const after = stub.calls.length;
 
     // Validation runs synchronously — no submit issued. Vocabulary read is
@@ -1176,7 +1428,7 @@ describe('createEntity user-property scalars', () => {
     expect(createCalls).toHaveLength(0);
   });
 
-  it('throws ProviderError on an unsafe identifier (rejects before round-trip)', async () => {
+  it('throws InvalidInputError on an unsafe identifier (rejects before round-trip)', async () => {
     const { provider, stub } = captureCreateQuery();
     const entity: StoredEntity = {
       ...makeEntity('40000000-0000-4000-a000-000000008006'),
@@ -1185,7 +1437,7 @@ describe('createEntity user-property scalars', () => {
 
     const before = stub.calls.length;
     await expect(provider.createEntity(TEST_REPO, entity)).rejects.toThrow(
-      /not a valid Gremlin identifier/,
+      /not a valid identifier/,
     );
     const after = stub.calls.length;
     const createCalls = stub.calls
@@ -1238,7 +1490,7 @@ describe('createEntity user-property scalars', () => {
 //      payload (including keys whose value did not change — re-emit keeps
 //      the per-shape plan-cache entry stable).
 //   3. Reserved-name collision or unsafe identifier in the new payload
-//      throws ProviderError synchronously, BEFORE the pre-read.
+//      throws InvalidInputError synchronously, BEFORE the pre-read.
 //   4. Pre-read miss (entity not found) short-circuits to
 //      EntityNotFoundError without burning the write round-trip.
 
@@ -1472,25 +1724,81 @@ describe('updateEntity user-property scalars', () => {
     expect(writeA.query).toBe(writeB.query);
   });
 
-  it('reserved-key collision throws ProviderError synchronously — no pre-read, no write', async () => {
+  it.each([
+    ['a new reserved key', {}, { entityLabel: 'X' }, 'properties.entityLabel'],
+    ['a new invalid key', { ok: 1 }, { ok: 1, 'start-date': '2020' }, 'properties.start-date'],
+    ['a new value for a stored invalid key', { 'start-date': '2020' }, { 'start-date': '2021' }, 'properties.start-date'],
+  ])('refuses %s with INVALID_INPUT after the pre-read, with no write', async (_what, preReadBlob, properties, field) => {
+    const { provider, stub } = makeProvider();
+    setupUpdateStub(stub, { vertexId: VERTEX, preReadBlob, writeResultBlob: {} });
+
+    const rejection = provider.updateEntity(TEST_REPO, VERTEX, { properties, provenance: basicProvenanceUpdate() });
+
+    await expect(rejection).rejects.toBeInstanceOf(InvalidInputError);
+    await expect(rejection).rejects.toMatchObject({ code: 'INVALID_INPUT', field });
+    const { preRead, write } = findCalls(stub);
+    expect(preRead).toHaveLength(1);
+    expect(write).toHaveLength(0);
+  });
+
+  /** The JSON blob an update's write binds to the `properties` vertex property. */
+  function boundBlob(call: SubmitCall | undefined): unknown {
+    const match = /\.property\('properties', (p\d+)\)/.exec(call?.query ?? '');
+    const param = match?.[1];
+    return param === undefined ? undefined : JSON.parse(String(call?.params?.[param]));
+  }
+
+  it('carries over an unchanged invalid stored key while another key changes, keeping it out of the Gremlin text', async () => {
+    const { provider, stub } = makeProvider();
+    const merged = { 'start-date': '2020', ok: 2 };
+    setupUpdateStub(stub, {
+      vertexId: VERTEX,
+      preReadBlob: { 'start-date': '2020', ok: 1 },
+      writeResultBlob: merged,
+    });
+
+    const updated = await provider.updateEntity(TEST_REPO, VERTEX, {
+      properties: merged,
+      provenance: basicProvenanceUpdate(),
+    });
+
+    expect(updated.properties).toEqual(merged);
+    const { write } = findCalls(stub);
+    expect(write[0]!.query).not.toContain('start-date');
+    expect(write[0]!.query).toContain(".property('ok', p_user_0)");
+    expect(boundBlob(write[0])).toEqual(merged);
+  });
+
+  it('carries over an unchanged reserved stored key without writing the system property it names', async () => {
+    const { provider, stub } = makeProvider();
+    const merged = { slug: 'user value', ok: 2 };
+    setupUpdateStub(stub, { vertexId: VERTEX, preReadBlob: { slug: 'user value', ok: 1 }, writeResultBlob: merged });
+
+    await provider.updateEntity(TEST_REPO, VERTEX, { properties: merged, provenance: basicProvenanceUpdate() });
+
+    const { write } = findCalls(stub);
+    expect(write[0]!.query).not.toContain(".property('slug'");
+    expect(write[0]!.query).not.toContain("properties('slug')");
+    expect(boundBlob(write[0])).toEqual(merged);
+  });
+
+  it('removes invalid and reserved stored keys the merged map drops, from the blob only', async () => {
     const { provider, stub } = makeProvider();
     setupUpdateStub(stub, {
       vertexId: VERTEX,
-      preReadBlob: {},
-      writeResultBlob: {},
+      preReadBlob: { 'start-date': '2020', slug: 'user value', ok: 1, old: 'x' },
+      writeResultBlob: { ok: 1 },
     });
 
-    const before = stub.calls.length;
-    await expect(
-      provider.updateEntity(TEST_REPO, VERTEX, {
-        properties: { entityLabel: 'X' },
-        provenance: basicProvenanceUpdate(),
-      }),
-    ).rejects.toBeInstanceOf(ProviderError);
-    const after = stub.calls.length;
+    await provider.updateEntity(TEST_REPO, VERTEX, { properties: { ok: 1 }, provenance: basicProvenanceUpdate() });
 
-    // Validation runs before either round-trip — no calls issued at all.
-    expect(after - before).toBe(0);
+    const { write } = findCalls(stub);
+    const q = write[0]!.query;
+    expect(q).not.toContain('start-date');
+    expect(q).not.toContain("properties('slug')");
+    expect(q).not.toContain(".property('slug'");
+    expect(q).toContain(".sideEffect(properties('old').drop())");
+    expect(boundBlob(write[0])).toEqual({ ok: 1 });
   });
 
   it('pre-read miss short-circuits to EntityNotFoundError without burning the write', async () => {
@@ -1640,7 +1948,7 @@ describe('createRelationship user-property scalars', () => {
     expect(params['p_user_2']).toBeUndefined();
   });
 
-  it('throws ProviderError on a reserved-key collision before any round-trip', async () => {
+  it('throws InvalidInputError on a reserved-key collision before any round-trip', async () => {
     const { provider, stub } = captureRelationshipCreateQuery();
     const rel: StoredRelationship = {
       ...makeRelationship('40000000-0000-4000-a000-00000000a005', SRC, TGT),
@@ -1648,7 +1956,7 @@ describe('createRelationship user-property scalars', () => {
     };
 
     const before = stub.calls.length;
-    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(ProviderError);
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toBeInstanceOf(InvalidInputError);
     const after = stub.calls.length;
 
     const createCalls = stub.calls
@@ -1659,7 +1967,7 @@ describe('createRelationship user-property scalars', () => {
     expect(createCalls).toHaveLength(0);
   });
 
-  it("throws ProviderError on the Gremlin 'label' token collision (edge-label slot)", async () => {
+  it("throws InvalidInputError on the Gremlin 'label' token collision (edge-label slot)", async () => {
     const { provider, stub } = captureRelationshipCreateQuery();
     const rel: StoredRelationship = {
       ...makeRelationship('40000000-0000-4000-a000-00000000a006', SRC, TGT),
@@ -1667,7 +1975,7 @@ describe('createRelationship user-property scalars', () => {
     };
 
     const before = stub.calls.length;
-    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toThrow(/collides/);
+    await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toThrow(/reserved for a system field/);
     const after = stub.calls.length;
     const createCalls = stub.calls
       .slice(before, after)
@@ -1677,7 +1985,7 @@ describe('createRelationship user-property scalars', () => {
     expect(createCalls).toHaveLength(0);
   });
 
-  it('throws ProviderError on an unsafe identifier (rejects before round-trip)', async () => {
+  it('throws InvalidInputError on an unsafe identifier (rejects before round-trip)', async () => {
     const { provider, stub } = captureRelationshipCreateQuery();
     const rel: StoredRelationship = {
       ...makeRelationship('40000000-0000-4000-a000-00000000a007', SRC, TGT),
@@ -1686,7 +1994,7 @@ describe('createRelationship user-property scalars', () => {
 
     const before = stub.calls.length;
     await expect(provider.createRelationship(TEST_REPO, rel)).rejects.toThrow(
-      /not a valid Gremlin identifier/,
+      /not a valid identifier/,
     );
     const after = stub.calls.length;
     const createCalls = stub.calls
@@ -1768,16 +2076,18 @@ function makeStoredBulkRelationship(id: string, properties: Record<string, unkno
 }
 
 // Split an upsert coalesce(update, create) query into the two branches.
-// Branches are separated by `, ` at the depth of the unfold/addV terminal;
-// the ladder's optional-slot `choose(__.constant(...).is(neq(...)),
+// Branches are separated by `, ` at the top level of the outer coalesce; the
+// ladder's optional-slot `choose(__.constant(...).is(neq(...)),
 // __.property(...), __.identity())` blocks introduce their own `, ` at deeper
 // paren levels, so a naive first-`, ` scan splits inside the ladder rather
-// than at the branch boundary. Track paren depth and pick the comma at
-// depth 0 of the tail (which corresponds to depth 1 of the outer coalesce).
+// than at the branch boundary. Start inside the first `.coalesce(` (the
+// outer one: the ladder has none), track paren depth and pick the comma at
+// depth 0 of the tail.
 function splitCoalesceBranches(query: string): { update: string; create: string } {
-  const idx = query.indexOf('unfold()');
+  const open = '.coalesce(';
+  const idx = query.indexOf(open);
   expect(idx).toBeGreaterThan(-1);
-  const tail = query.slice(idx);
+  const tail = query.slice(idx + open.length);
   let depth = 0;
   for (let i = 0; i < tail.length - 1; i++) {
     const ch = tail[i];
@@ -1938,92 +2248,240 @@ describe('single-round-trip delete paths', () => {
     await expect(provider.deleteRelationship(TEST_REPO, 'rel-1')).resolves.toBeUndefined();
   });
 
-  it('deleteEntitiesByType issues one storage call and reports deletedRelationships as undefined', async () => {
-    const { provider, stub } = makeProvider();
-    stub.submit = async (query, params) => {
-      stub.calls.push({ query, params });
-      if (query === DELETE_ENTITIES_BY_TYPE_QUERY) {
-        return { items: [[`repo:${TEST_REPO}`, ENTITY_A, ENTITY_B]] };
+  describe('deleteEntitiesByType', () => {
+    const MARKER = `repo:${TEST_REPO}`;
+    const isTypedDrop = (query: string): boolean =>
+      query.startsWith("g.V().has('repositoryId', rid).hasId(within(mid, ") && query.includes("has('entityType', etype).drop()");
+
+    /** `n` distinct entity ids starting at `from`. */
+    function ids(from: number, n: number): string[] {
+      return Array.from({ length: n }, (_, i) => `e-${from + i}`);
+    }
+
+    /**
+     * A stub whose id reads answer `batches` in order (then nothing) and whose
+     * guarded drops report the marker plus every id they were bound to.
+     */
+    function stubBatches(batches: string[][]): { provider: CosmosDbProvider; stub: SubmitStub } {
+      const { provider, stub } = makeProvider();
+      let next = 0;
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === ENTITY_TYPE_BATCH_IDS_QUERY) return { items: batches[next++] ?? [] };
+        if (isTypedDrop(query)) {
+          const bound = Object.entries(params ?? {})
+            .filter(([k]) => /^id\d+$/.test(k))
+            .map(([, v]) => v);
+          return { items: [[MARKER, ...bound]] };
+        }
+        if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [1] };
+        return { items: [] };
+      };
+      return { provider, stub };
+    }
+
+    it('reads bounded batches of ids, drops each through the guarded typed delete, and sums the counts', async () => {
+      const { provider, stub } = stubBatches([ids(0, 500), ids(500, 2)]);
+
+      const result = await provider.deleteEntitiesByType(TEST_REPO, 'Person');
+
+      expect(result).toEqual({ deletedEntities: 502, deletedRelationships: undefined });
+      const reads = stub.calls.filter((c) => c.query === ENTITY_TYPE_BATCH_IDS_QUERY);
+      // Two batches with ids, then the read that finds none ends the loop.
+      expect(reads).toHaveLength(3);
+      for (const read of reads) expect(read.params).toEqual({ rid: TEST_REPO, etype: 'Person', batchSize: 500 });
+      // The bound sits on the first, indexed step.
+      expect(ENTITY_TYPE_BATCH_IDS_QUERY).toBe(
+        "g.V().has('repositoryId', rid).has('entityType', etype).limit(batchSize).id()",
+      );
+      // 500 ids drop in five guarded chunks of 100, the last batch in one.
+      const drops = stub.calls.filter((c) => isTypedDrop(c.query));
+      expect(drops).toHaveLength(6);
+      for (const drop of drops) {
+        expect(drop.params).toMatchObject({ rid: TEST_REPO, mid: MARKER, etype: 'Person' });
+        // The marker comes with the ids from the first step; no mid-traversal V().
+        expect(drop.query.split('V()')).toHaveLength(2);
+        expect(drop.query).toContain(".hasLabel('_repository').hasNot('entityType').select('vs')");
+        expect(drop.query).not.toContain('bothE()');
       }
-      return { items: [] };
-    };
+      // The repository was proven by the drops; no separate marker read.
+      expect(stub.calls.some((c) => c.query === REPOSITORY_MARKER_COUNT_QUERY)).toBe(false);
+    });
 
-    const before = stub.calls.length;
-    const result = await provider.deleteEntitiesByType(TEST_REPO, 'Person');
-    const after = stub.calls.length;
+    it('counts only the ids each guarded drop reports', async () => {
+      const { provider, stub } = makeProvider();
+      let reads = 0;
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === ENTITY_TYPE_BATCH_IDS_QUERY) return { items: reads++ === 0 ? ['a', 'b', 'c'] : [] };
+        // One of the three was gone by the time of the drop.
+        if (isTypedDrop(query)) return { items: [[MARKER, 'a', 'c']] };
+        return { items: [] };
+      };
 
-    expect(after - before).toBe(1);
-    expect(result.deletedEntities).toBe(2);
-    expect(result.deletedRelationships).toBeUndefined();
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).resolves.toEqual({
+        deletedEntities: 2,
+        deletedRelationships: undefined,
+      });
+    });
 
-    const issued = stub.calls[stub.calls.length - 1]!;
-    expect(issued.query).not.toContain('.count()');
-    expect(issued.query).not.toContain('bothE()');
-    expect(issued.params).toEqual({ rid: TEST_REPO, mid: `repo:${TEST_REPO}`, etype: 'Person' });
-    // The marker and the type come from the first, indexed step; the drop
-    // runs only past the marker, and there is no mid-traversal V().
-    expect(issued.query.startsWith("g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('entityType', etype))")).toBe(true);
-    expect(issued.query).toContain(".hasLabel('_repository').hasNot('entityType').aggregate('found').by('id')");
-    expect(issued.query.split('V()')).toHaveLength(2);
+    /**
+     * A stub whose id reads answer `reads` in order (then nothing) and whose
+     * guarded drops answer `drops` in order: each the ids reported besides
+     * the marker.
+     */
+    function stubReadsAndDrops(reads: string[][], drops: string[][]): { provider: CosmosDbProvider; stub: SubmitStub } {
+      const { provider, stub } = makeProvider();
+      let nextRead = 0;
+      let nextDrop = 0;
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === ENTITY_TYPE_BATCH_IDS_QUERY) return { items: reads[nextRead++] ?? [] };
+        if (isTypedDrop(query)) return { items: [[MARKER, ...(drops[nextDrop++] ?? [])]] };
+        return { items: [] };
+      };
+      return { provider, stub };
+    }
+
+    it('moves on after one batch that drops nothing', async () => {
+      // The second batch's ids were removed before its drop (a concurrent
+      // delete, or a re-sent drop whose first attempt removed them).
+      const { provider, stub } = stubReadsAndDrops([['a', 'b'], ['c'], ['d']], [['a', 'b'], [], ['d']]);
+
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).resolves.toEqual({
+        deletedEntities: 3,
+        deletedRelationships: undefined,
+      });
+      expect(stub.calls.filter((c) => c.query === ENTITY_TYPE_BATCH_IDS_QUERY)).toHaveLength(4);
+    });
+
+    it('a batch that drops something resets the count of batches that dropped nothing', async () => {
+      const { provider } = stubReadsAndDrops([['a'], ['b'], ['c'], ['d']], [[], ['b'], [], ['d']]);
+
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).resolves.toEqual({
+        deletedEntities: 2,
+        deletedRelationships: undefined,
+      });
+    });
+
+    it('stops with ProviderError after two batches in a row read ids but drop nothing', async () => {
+      // The reads keep returning ids the guarded drop does not remove.
+      const { provider, stub } = stubReadsAndDrops([['a'], ['x'], ['x'], ['x'], ['x']], [['a']]);
+
+      const err = await provider.deleteEntitiesByType(TEST_REPO, 'Person').catch((e: Error) => e);
+      expect(err).toBeInstanceOf(ProviderError);
+      expect((err as ProviderError).message).toContain('made no progress');
+      expect((err as ProviderError).message).toContain('1 dropped before that');
+      // One batch that dropped, then two that dropped nothing; no further read.
+      expect(stub.calls.filter((c) => c.query === ENTITY_TYPE_BATCH_IDS_QUERY)).toHaveLength(3);
+      expect(stub.calls.filter((c) => isTypedDrop(c.query))).toHaveLength(3);
+    });
+
+    it('with nothing of the type left, reads the marker and reports 0', async () => {
+      const { provider, stub } = stubBatches([]);
+
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).resolves.toEqual({
+        deletedEntities: 0,
+        deletedRelationships: undefined,
+      });
+      expect(stub.calls.map((c) => c.query)).toEqual([ENTITY_TYPE_BATCH_IDS_QUERY, REPOSITORY_MARKER_COUNT_QUERY]);
+    });
+
+    it('with nothing of the type and the marker gone, throws RepositoryNotFoundError', async () => {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [0] };
+        return { items: [] };
+      };
+
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    });
+
+    it('throws RepositoryNotFoundError when the guarded drop finds the marker gone, after dropping nothing', async () => {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === ENTITY_TYPE_BATCH_IDS_QUERY) return { items: ['a', 'b'] };
+        // Without the marker no traverser reaches the drop; `cap` still emits the bucket.
+        if (isTypedDrop(query)) return { items: [['a', 'b']] };
+        return { items: [] };
+      };
+
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+      expect(stub.calls).toHaveLength(2);
+    });
+
+    it.each([
+      ['no row', []],
+      ['a row that is not an id list', [3]],
+    ])('treats a guarded drop answering %s as a malformed response', async (_shape, items) => {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === ENTITY_TYPE_BATCH_IDS_QUERY) return { items: ['a'] };
+        return { items };
+      };
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(ProviderError);
+    });
+
+    it('treats an id read with a row that is not an id as a malformed response', async () => {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === ENTITY_TYPE_BATCH_IDS_QUERY) return { items: ['a', { id: 'b' }] };
+        return { items: [] };
+      };
+      await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(ProviderError);
+      expect(stub.calls).toHaveLength(1);
+    });
   });
 
-  it('deleteEntitiesByType throws RepositoryNotFoundError when the bucket lacks the marker id', async () => {
+  it('deleteRelationshipsByType reads the marker before each bounded batch and sums the batches', async () => {
     const { provider, stub } = makeProvider();
-    stub.submit = async (query, params) => {
-      stub.calls.push({ query, params });
-      // Without the marker no traverser reaches the drop; `cap` still emits the bucket.
-      if (query === DELETE_ENTITIES_BY_TYPE_QUERY) return { items: [[]] };
-      return { items: [] };
-    };
-    await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(RepositoryNotFoundError);
-    expect(stub.calls).toHaveLength(1);
-  });
-
-  it('deleteEntitiesByType treats a missing row as a malformed response', async () => {
-    const { provider, stub } = makeProvider();
-    stub.submit = async (query, params) => {
-      stub.calls.push({ query, params });
-      return { items: [] };
-    };
-    await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(ProviderError);
-  });
-
-  it('deleteEntitiesByType treats a row that is not an id list as a malformed response', async () => {
-    const { provider, stub } = makeProvider();
-    stub.submit = async (query, params) => {
-      stub.calls.push({ query, params });
-      if (query === DELETE_ENTITIES_BY_TYPE_QUERY) return { items: [3] };
-      return { items: [] };
-    };
-    await expect(provider.deleteEntitiesByType(TEST_REPO, 'Person')).rejects.toBeInstanceOf(ProviderError);
-  });
-
-  it('deleteRelationshipsByType reads the marker, then drops in one call, and returns the bucket count', async () => {
-    const { provider, stub } = makeProvider();
-    const REL_X = '40000000-0000-4000-a000-000000007020';
-    const REL_Y = '40000000-0000-4000-a000-000000007021';
-    const REL_Z = '40000000-0000-4000-a000-000000007022';
-
+    const batches = [Array.from({ length: 500 }, (_, i) => `rel-${i}`), ['rel-x', 'rel-y', 'rel-z'], []];
+    let next = 0;
     stub.submit = async (query, params) => {
       stub.calls.push({ query, params });
       if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [1] };
-      if (query.includes("aggregate('found')") && query.startsWith('g.E().')) {
-        return { items: [[REL_X, REL_Y, REL_Z]] };
-      }
+      if (query === RELATIONSHIP_TYPE_BATCH_DROP_QUERY) return { items: [batches[next++] ?? []] };
       return { items: [] };
     };
 
-    const before = stub.calls.length;
     const result = await provider.deleteRelationshipsByType(TEST_REPO, 'KNOWS');
-    const after = stub.calls.length;
 
-    expect(after - before).toBe(2);
-    expect(stub.calls[before]!.query).toBe(REPOSITORY_MARKER_COUNT_QUERY);
-    expect(result.deletedRelationships).toBe(3);
+    expect(result.deletedRelationships).toBe(503);
+    expect(stub.calls.map((c) => c.query)).toEqual([
+      REPOSITORY_MARKER_COUNT_QUERY,
+      RELATIONSHIP_TYPE_BATCH_DROP_QUERY,
+      REPOSITORY_MARKER_COUNT_QUERY,
+      RELATIONSHIP_TYPE_BATCH_DROP_QUERY,
+      REPOSITORY_MARKER_COUNT_QUERY,
+      RELATIONSHIP_TYPE_BATCH_DROP_QUERY,
+    ]);
+    const drop = stub.calls[1]!;
+    expect(drop.params).toEqual({ rid: TEST_REPO, rtype: 'KNOWS', batchSize: 500 });
+    // The bound precedes the bucket and the drop, and the bucket gives the exact count.
+    expect(drop.query.indexOf('limit(batchSize)')).toBeLessThan(drop.query.indexOf("aggregate('found').by('id')"));
+    expect(drop.query).not.toContain('.count()');
+  });
 
-    const issued = stub.calls[stub.calls.length - 1]!;
-    expect(issued.query).not.toContain('.count()');
-    expect(issued.query).toContain("aggregate('found').by('id')");
+  it('deleteRelationshipsByType stops with RepositoryNotFoundError when the marker goes between batches', async () => {
+    const { provider, stub } = makeProvider();
+    let markerReads = 0;
+    stub.submit = async (query, params) => {
+      stub.calls.push({ query, params });
+      if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [markerReads++ === 0 ? 1 : 0] };
+      if (query === RELATIONSHIP_TYPE_BATCH_DROP_QUERY) return { items: [['rel-1', 'rel-2']] };
+      return { items: [] };
+    };
+
+    await expect(provider.deleteRelationshipsByType(TEST_REPO, 'KNOWS')).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    expect(stub.calls.map((c) => c.query)).toEqual([
+      REPOSITORY_MARKER_COUNT_QUERY,
+      RELATIONSHIP_TYPE_BATCH_DROP_QUERY,
+      REPOSITORY_MARKER_COUNT_QUERY,
+    ]);
   });
 
   it('deleteRelationshipsByType drops nothing when the marker is gone', async () => {
@@ -2117,7 +2575,7 @@ describe('single-round-trip delete paths', () => {
 //   2. Non-storable values stay only in the canonical JSON `properties`
 //      blob (the ladder slot) — they round-trip via the read path but are
 //      not predicate-queryable.
-//   3. Reserved-name collisions and unsafe identifiers raise ProviderError
+//   3. Reserved-name collisions and unsafe identifiers raise InvalidInputError
 //      synchronously, before any submit (same contract as `createEntity` /
 //      `createRelationship`).
 //   4. The update branch is ADD/OVERWRITE only — no drop steps emit for
@@ -2247,7 +2705,7 @@ describe('importBulk user-property scalars', () => {
     expect(params['p3']).toBe(JSON.stringify(inputProperties));
   });
 
-  it('upsertEntity throws ProviderError on a reserved-key collision before any submit', async () => {
+  it('upsertEntity records an INVALID_INPUT row error on a reserved-key collision before any submit', async () => {
     const { provider, stub } = makeProvider();
     const ENTITY_ID = '40000000-0000-4000-a000-00000000b005';
 
@@ -2270,10 +2728,11 @@ describe('importBulk user-property scalars', () => {
     expect(result.entitiesImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`entity:${ENTITY_ID}`);
-    expect(result.errors[0]!.error).toMatch(/collides/);
+    expect(result.errors[0]!.error).toMatch(/reserved for a system field/);
+    expect(result.errors[0]!.code).toBe('INVALID_INPUT');
   });
 
-  it('upsertEntity throws ProviderError on an unsafe identifier before any submit', async () => {
+  it('upsertEntity records an INVALID_INPUT row error on an unsafe identifier before any submit', async () => {
     const { provider, stub } = makeProvider();
     const ENTITY_ID = '40000000-0000-4000-a000-00000000b006';
 
@@ -2294,7 +2753,8 @@ describe('importBulk user-property scalars', () => {
     expect(result.entitiesImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`entity:${ENTITY_ID}`);
-    expect(result.errors[0]!.error).toMatch(/not a valid Gremlin identifier/);
+    expect(result.errors[0]!.error).toMatch(/not a valid identifier/);
+    expect(result.errors[0]!.code).toBe('INVALID_INPUT');
   });
 
   // Relationships ────────────────────────────────────────────────────────
@@ -2405,7 +2865,7 @@ describe('importBulk user-property scalars', () => {
     expect(params['p4']).toBe(JSON.stringify(inputProperties));
   });
 
-  it('upsertRelationship throws ProviderError on a reserved-key collision before any submit', async () => {
+  it('upsertRelationship records an INVALID_INPUT row error on a reserved-key collision before any submit', async () => {
     const { provider, stub } = makeProvider();
     const REL_ID = '40000000-0000-4000-a000-00000000b105';
 
@@ -2426,10 +2886,11 @@ describe('importBulk user-property scalars', () => {
     expect(result.relationshipsImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
-    expect(result.errors[0]!.error).toMatch(/collides/);
+    expect(result.errors[0]!.error).toMatch(/reserved for a system field/);
+    expect(result.errors[0]!.code).toBe('INVALID_INPUT');
   });
 
-  it("upsertRelationship throws ProviderError on the Gremlin 'label' token collision (edge-label slot)", async () => {
+  it("upsertRelationship records an INVALID_INPUT row error on the Gremlin 'label' token collision (edge-label slot)", async () => {
     const { provider, stub } = makeProvider();
     const REL_ID = '40000000-0000-4000-a000-00000000b106';
 
@@ -2450,10 +2911,11 @@ describe('importBulk user-property scalars', () => {
     expect(result.relationshipsImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
-    expect(result.errors[0]!.error).toMatch(/collides/);
+    expect(result.errors[0]!.error).toMatch(/reserved for a system field/);
+    expect(result.errors[0]!.code).toBe('INVALID_INPUT');
   });
 
-  it('upsertRelationship throws ProviderError on an unsafe identifier before any submit', async () => {
+  it('upsertRelationship records an INVALID_INPUT row error on an unsafe identifier before any submit', async () => {
     const { provider, stub } = makeProvider();
     const REL_ID = '40000000-0000-4000-a000-00000000b107';
 
@@ -2474,7 +2936,8 @@ describe('importBulk user-property scalars', () => {
     expect(result.relationshipsImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
-    expect(result.errors[0]!.error).toMatch(/not a valid Gremlin identifier/);
+    expect(result.errors[0]!.error).toMatch(/not a valid identifier/);
+    expect(result.errors[0]!.code).toBe('INVALID_INPUT');
   });
 });
 
@@ -2611,7 +3074,7 @@ describe('importBulk(skipExistenceCheck) user-property scalars', () => {
     expect(result.entitiesImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`entity:${ENTITY_ID}`);
-    expect(result.errors[0]!.error).toMatch(/collides/);
+    expect(result.errors[0]!.error).toMatch(/reserved for a system field/);
   });
 
   it('insertEntity drops non-storable values from the suffix; the blob ladder slot still carries them via JSON', async () => {
@@ -2739,7 +3202,7 @@ describe('importBulk(skipExistenceCheck) user-property scalars', () => {
     expect(result.relationshipsImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
-    expect(result.errors[0]!.error).toMatch(/collides/);
+    expect(result.errors[0]!.error).toMatch(/reserved for a system field/);
   });
 
   it("insertRelationship throws ProviderError on the Gremlin 'label' token collision (edge-label slot)", async () => {
@@ -2761,7 +3224,7 @@ describe('importBulk(skipExistenceCheck) user-property scalars', () => {
     expect(result.relationshipsImported).toBe(0);
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]!.item).toBe(`relationship:${REL_ID}`);
-    expect(result.errors[0]!.error).toMatch(/collides/);
+    expect(result.errors[0]!.error).toMatch(/reserved for a system field/);
   });
 
   it('insertRelationship drops non-storable values from the suffix; the blob ladder slot still carries them via JSON', async () => {
@@ -3126,7 +3589,7 @@ describe('findEntities SQL shape', () => {
         limit: 10,
         offset: 0,
       }),
-    ).rejects.toThrow(/schema-managed field/);
+    ).rejects.toThrow(/reserved for a system field/);
   });
 
   it('pages with ORDER BY c.id + OFFSET + LIMIT for deterministic pagination', async () => {
@@ -3302,7 +3765,7 @@ describe('system-vertex queries scope by partition before hasId', () => {
     expect(last.params).toEqual({ rid: TEST_REPO, mid: `repo:${TEST_REPO}`, vid: `vocab:${TEST_REPO}` });
   });
 
-  it('saveVocabulary is one compare-and-set query, partition-scoped, filtered on the expected version', async () => {
+  it('saveVocabulary is one compare-and-set query, partition-scoped, gated on the marker, filtered on the expected version', async () => {
     const { provider, stub } = makeProvider();
     const next = makeVocabulary('1.1.0');
 
@@ -3311,13 +3774,17 @@ describe('system-vertex queries scope by partition before hasId', () => {
     expect(stub.calls).toHaveLength(1);
     const write = stub.calls[0]!;
     expect(write.query).toBe(VOCABULARY_SAVE_QUERY);
-    expect(partitionPredicateBeforeHasId(write.query)).toBe(true);
-    // The version filter precedes the writes, so a stale version writes nothing.
-    expect(write.query.indexOf("has('version', expectedVersion)")).toBeLessThan(
-      write.query.indexOf('.property('),
-    );
+    // The marker and the vocabulary vertex come from the first, partition-scoped step.
+    expect(write.query.startsWith("g.V().has('repositoryId', rid).hasId(within(mid, vid))")).toBe(true);
+    // The marker filter and the version filter precede the writes, so a
+    // missing repository or a stale version writes nothing.
+    const firstWrite = write.query.indexOf('.property(');
+    expect(write.query.indexOf(".hasLabel('_repository').hasNot('entityType')")).toBeLessThan(firstWrite);
+    expect(write.query.indexOf("has('version', expectedVersion)")).toBeLessThan(firstWrite);
+    expect(write.query).not.toContain('addV(');
     expect(write.params).toEqual({
       rid: TEST_REPO,
+      mid: `repo:${TEST_REPO}`,
       vid: `vocab:${TEST_REPO}`,
       expectedVersion: '1.0.0',
       newVersion: '1.1.0',
@@ -3339,8 +3806,145 @@ describe('system-vertex queries scope by partition before hasId', () => {
     expect(stub.calls.some((c) => c.query.includes('addV('))).toBe(false);
   });
 
+  describe('saveVocabulary with a change record', () => {
+    const record: VocabularyChangeRecord = {
+      changeId: 'change-1',
+      changeType: 'entity_type_added',
+      typeName: 'Person',
+      previousVersion: '1.0.0',
+      newVersion: '1.1.0',
+      proposedBy: 'agent-a',
+      proposedAt: '2026-10-04T00:00:00.000Z',
+      approvedBy: 'agent-b',
+      approvedAt: '2026-10-04T00:00:01.000Z',
+      reason: 'Adds Person',
+    };
+
+    it('adds the record vertex in the compare-and-set traversal, after the vocabulary writes', async () => {
+      const { provider, stub } = makeProvider();
+      const next = makeVocabulary('1.1.0');
+
+      await provider.saveVocabulary(TEST_REPO, next, '1.0.0', record);
+
+      expect(stub.calls).toHaveLength(1);
+      const write = stub.calls[0]!;
+      expect(write.query).toBe(VOCABULARY_SAVE_WITH_CHANGE_QUERY);
+      // The same gated compare-and-set as without a record, then the record.
+      expect(write.query.startsWith(VOCABULARY_SAVE_QUERY.replace(/\.count\(\)$/, ''))).toBe(true);
+      expect(write.query.indexOf(".property('vocabulary', vocabJson)")).toBeLessThan(
+        write.query.indexOf("addV('_vocabularyChangeLog')"),
+      );
+      expect(write.query).toContain("addV('_vocabularyChangeLog').property('id', lid).property('repositoryId', rid)");
+      expect(write.params).toEqual({
+        rid: TEST_REPO,
+        mid: `repo:${TEST_REPO}`,
+        vid: `vocab:${TEST_REPO}`,
+        expectedVersion: '1.0.0',
+        newVersion: '1.1.0',
+        vocabJson: JSON.stringify(next),
+        lid: 'vocablog:change-1',
+        c0: 'change-1',
+        c1: 'entity_type_added',
+        c2: 'Person',
+        c3: '1.1.0',
+        c4: 'agent-a',
+        c5: '2026-10-04T00:00:00.000Z',
+        c6: 'Adds Person',
+        c7: '1.0.0',
+        c8: 'agent-b',
+        c9: '2026-10-04T00:00:01.000Z',
+        absentSentinel: '',
+      });
+    });
+
+    it('binds absent optional fields to the sentinel, so they are not written', async () => {
+      const { provider, stub } = makeProvider();
+      const { previousVersion: _p, approvedBy: _b, approvedAt: _a, ...required } = record;
+
+      await provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0', required);
+
+      expect(stub.calls[0]!.params).toMatchObject({ c7: '', c8: '', c9: '', absentSentinel: '' });
+      expect(stub.calls[0]!.query).toContain(
+        ".choose(__.constant(c7).is(neq(absentSentinel)), __.property('previousVersion', c7), __.identity())",
+      );
+    });
+
+    it('a version conflict issues no further write', async () => {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === VOCABULARY_SAVE_WITH_CHANGE_QUERY) return { items: [0] };
+        if (query === VOCABULARY_STATE_QUERY) {
+          return { items: stateRows(params, { version: '1.4.0', json: JSON.stringify(makeVocabulary('1.4.0')) }) };
+        }
+        return { items: [] };
+      };
+
+      await expect(
+        provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0', record),
+      ).rejects.toBeInstanceOf(VocabularyVersionConflictError);
+      expect(stub.calls.map((c) => c.query)).toEqual([VOCABULARY_SAVE_WITH_CHANGE_QUERY, VOCABULARY_STATE_QUERY]);
+    });
+
+    it('a retry that finds its own vocabulary stored adds the record unless it is there, and writes its properties either way', async () => {
+      const next = makeVocabulary('1.1.0');
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === VOCABULARY_SAVE_WITH_CHANGE_QUERY) return { items: [0] };
+        if (query === VOCABULARY_STATE_QUERY) {
+          return { items: stateRows(params, { version: '1.1.0', json: JSON.stringify(next) }) };
+        }
+        if (query === CHANGE_RECORD_ENSURE_QUERY) return { items: [1] };
+        return { items: [] };
+      };
+
+      await expect(provider.saveVocabulary(TEST_REPO, next, '1.0.0', record)).resolves.toBeUndefined();
+      expect(stub.calls.map((c) => c.query)).toEqual([
+        VOCABULARY_SAVE_WITH_CHANGE_QUERY,
+        VOCABULARY_STATE_QUERY,
+        CHANGE_RECORD_ENSURE_QUERY,
+      ]);
+      const ensure = stub.calls[2]!;
+      // Gated on the marker, fetched with the record by id; keeps an existing record.
+      expect(ensure.query.startsWith("g.V().has('repositoryId', rid).hasId(within(mid, lid))")).toBe(true);
+      expect(ensure.query).toContain(
+        "coalesce(__.unfold().hasId(lid).hasLabel('_vocabularyChangeLog').hasNot('entityType'), " +
+          "__.addV('_vocabularyChangeLog').property('id', lid).property('repositoryId', rid))",
+      );
+      // The property ladder follows the coalesce, so a found record that an
+      // earlier attempt left part-written is completed; the id and the
+      // partition key stay inside the add branch.
+      const ladderAt = ensure.query.indexOf(".property('changeId', c0)");
+      expect(ladderAt).toBeGreaterThan(ensure.query.indexOf("property('repositoryId', rid))"));
+      expect(ensure.query.slice(ladderAt)).not.toContain("property('id'");
+      expect(ensure.query.slice(ladderAt)).not.toContain("property('repositoryId'");
+      expect(ensure.query.endsWith(".choose(__.constant(c9).is(neq(absentSentinel)), __.property('approvedAt', c9), __.identity()).count()")).toBe(true);
+      expect(ensure.params).toMatchObject({ rid: TEST_REPO, mid: `repo:${TEST_REPO}`, lid: 'vocablog:change-1', c0: 'change-1' });
+    });
+
+    it('a retry whose record write finds the marker gone throws RepositoryNotFoundError', async () => {
+      const next = makeVocabulary('1.1.0');
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === VOCABULARY_STATE_QUERY) {
+          return { items: stateRows(params, { version: '1.1.0', json: JSON.stringify(next) }) };
+        }
+        return { items: [0] };
+      };
+
+      await expect(provider.saveVocabulary(TEST_REPO, next, '1.0.0', record)).rejects.toBeInstanceOf(
+        RepositoryNotFoundError,
+      );
+    });
+  });
+
   describe('saveVocabulary miss classification', () => {
-    function stubMiss(state: { version: string; json: string } | null): {
+    function stubMiss(
+      state: { version: string; json: string } | null,
+      marker = true,
+    ): {
       provider: CosmosDbProvider;
       stub: SubmitStub;
     } {
@@ -3348,7 +3952,7 @@ describe('system-vertex queries scope by partition before hasId', () => {
       stub.submit = async (query, params) => {
         stub.calls.push({ query, params });
         if (query === VOCABULARY_SAVE_QUERY) return { items: [0] };
-        if (query === VOCABULARY_STATE_QUERY) return { items: state === null ? [] : [state] };
+        if (query === VOCABULARY_STATE_QUERY) return { items: stateRows(params, state, marker) };
         return { items: [] };
       };
       return { provider, stub };
@@ -3356,6 +3960,14 @@ describe('system-vertex queries scope by partition before hasId', () => {
 
     it('no vertex → RepositoryNotFoundError', async () => {
       const { provider } = stubMiss(null);
+      await expect(
+        provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0'),
+      ).rejects.toBeInstanceOf(RepositoryNotFoundError);
+    });
+
+    it('no marker, even with the vocabulary vertex still at the expected version → RepositoryNotFoundError', async () => {
+      // A delete drops the marker first and the vocabulary vertex last.
+      const { provider } = stubMiss({ version: '1.0.0', json: JSON.stringify(makeVocabulary('1.0.0')) }, false);
       await expect(
         provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0'),
       ).rejects.toBeInstanceOf(RepositoryNotFoundError);
@@ -3374,13 +3986,33 @@ describe('system-vertex queries scope by partition before hasId', () => {
         actualVersion: '1.4.0',
       });
 
-      // The follow-up reads version and blob together, partition-scoped.
+      // The follow-up reads the marker, and the version and blob together, partition-scoped.
       expect(stub.calls).toHaveLength(2);
       const followUp = stub.calls[1]!;
       expect(followUp.query).toBe(VOCABULARY_STATE_QUERY);
       expect(followUp.query).toContain("coalesce(values('version'), constant(''))");
-      expect(partitionPredicateBeforeHasId(followUp.query)).toBe(true);
-      expect(followUp.params).toEqual({ rid: TEST_REPO, vid: `vocab:${TEST_REPO}` });
+      expect(followUp.query.startsWith("g.V().has('repositoryId', rid).hasId(within(mid, vid))")).toBe(true);
+      expect(followUp.query).toContain(".hasLabel('_repository', '_vocabulary').hasNot('entityType')");
+      expect(followUp.params).toEqual({ rid: TEST_REPO, mid: `repo:${TEST_REPO}`, vid: `vocab:${TEST_REPO}` });
+    });
+
+    it('reads follow-up rows handed back as Maps', async () => {
+      const { provider, stub } = makeProvider();
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === VOCABULARY_SAVE_QUERY) return { items: [0] };
+        if (query === VOCABULARY_STATE_QUERY) {
+          return {
+            items: stateRows(params, { version: '1.4.0', json: JSON.stringify(makeVocabulary('1.4.0')) }).map(
+              (row) => new Map(Object.entries(row)),
+            ),
+          };
+        }
+        return { items: [] };
+      };
+      await expect(
+        provider.saveVocabulary(TEST_REPO, makeVocabulary('1.1.0'), '1.0.0'),
+      ).rejects.toMatchObject({ actualVersion: '1.4.0' });
     });
 
     function stubThrowingWrite(
@@ -3398,7 +4030,7 @@ describe('system-vertex queries scope by partition before hasId', () => {
             { statusCode: 500, statusAttributes: { 'x-ms-status-code': status } },
           );
         }
-        if (query === VOCABULARY_STATE_QUERY) return { items: state === null ? [] : [state] };
+        if (query === VOCABULARY_STATE_QUERY) return { items: stateRows(params, state, state !== null) };
         return { items: [] };
       };
       return { provider, stub };
@@ -3464,6 +4096,67 @@ describe('system-vertex queries scope by partition before hasId', () => {
       const save = provider.saveVocabulary(TEST_REPO, makeVocabulary('1.3.0'), '1.2.0');
       await expect(save).rejects.toBeInstanceOf(ProviderError);
       await expect(save).rejects.toThrow(/run ensureSchema\(\)/);
+    });
+  });
+
+  describe('getVocabularyChangeLog', () => {
+    it('reads change-log vertices only, newest first, paged, alongside a marker point read', async () => {
+      const { provider, stub } = makeProvider();
+      const stored = {
+        id: 'vocablog:change-2',
+        label: '_vocabularyChangeLog',
+        changeId: ['change-2'],
+        changeType: ['entity_type_removed'],
+        typeName: ['Person'],
+        newVersion: ['2.0.0'],
+        proposedBy: ['agent-a'],
+        proposedAt: ['2026-10-04T00:00:00.000Z'],
+        reason: ['Removes Person'],
+      };
+      stub.submit = async (query, params) => {
+        stub.calls.push({ query, params });
+        if (query === REPOSITORY_MARKER_COUNT_QUERY) return { items: [1] };
+        if (query === CHANGE_LOG_COUNT_QUERY) return { items: [3] };
+        if (query === CHANGE_LOG_PAGE_QUERY) return { items: [stored] };
+        return { items: [] };
+      };
+
+      const page = await provider.getVocabularyChangeLog(TEST_REPO, { limit: 1, offset: 1 });
+
+      // Optional fields the record left out stay absent.
+      expect(page).toEqual({
+        items: [
+          {
+            changeId: 'change-2',
+            changeType: 'entity_type_removed',
+            typeName: 'Person',
+            newVersion: '2.0.0',
+            proposedBy: 'agent-a',
+            proposedAt: '2026-10-04T00:00:00.000Z',
+            reason: 'Removes Person',
+          },
+        ],
+        total: 3,
+        hasMore: true,
+        limit: 1,
+        offset: 1,
+      });
+      expect(Object.keys(page.items[0]!)).not.toContain('previousVersion');
+      const issued = stub.calls.map((c) => c.query);
+      expect(issued).toHaveLength(3);
+      expect(issued).toEqual(
+        expect.arrayContaining([REPOSITORY_MARKER_COUNT_QUERY, CHANGE_LOG_COUNT_QUERY, CHANGE_LOG_PAGE_QUERY]),
+      );
+      // An entity typed `_vocabularyChangeLog` carries the label; `hasNot('entityType')` keeps it out.
+      for (const query of [CHANGE_LOG_COUNT_QUERY, CHANGE_LOG_PAGE_QUERY]) {
+        expect(query.startsWith("g.V().has('repositoryId', rid).hasLabel('_vocabularyChangeLog').hasNot('entityType')")).toBe(
+          true,
+        );
+      }
+      // Ties on proposedAt fall back to changeId, so pages are deterministic.
+      expect(CHANGE_LOG_PAGE_QUERY).toContain(".order().by('proposedAt', decr).by('changeId', decr).range(rangeStart, rangeEnd)");
+      const pageCall = stub.calls.find((c) => c.query === CHANGE_LOG_PAGE_QUERY)!;
+      expect(pageCall.params).toEqual({ rid: TEST_REPO, rangeStart: 1, rangeEnd: 2 });
     });
   });
 

@@ -1,4 +1,4 @@
-// Cross-repository isolation — D3b layer 4.
+// Cross-repository isolation, checked end to end through the public API.
 //
 // Two repositories `A` and `B` sit on the same Neo4j database with deliberately
 // overlapping entity ids and relationship ids. Each repository holds a distinct
@@ -60,7 +60,7 @@ function makeEntity(
     entityType,
     label,
     summary: `${repoTag} fixture summary for ${id}`,
-    // tagOwner is a per-scalar property; D22 / O1 lay it down as a native
+    // tagOwner is a user property, which the provider writes as a native
     // Neo4j property alongside the JSON blob, so it is server-side queryable.
     // Distinct values per repo make leakage detectable through findEntities.
     properties: { tagOwner: repoTag },

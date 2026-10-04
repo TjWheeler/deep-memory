@@ -1,14 +1,15 @@
 // Mapping — Neo4j driver records → StoredEntity / StoredRelationship.
 //
 // The mapper is the boundary that:
-//   - Coerces `BigInt` integer values to safe `number` (per D6b — useBigInt is
-//     enabled on the driver to avoid silent precision loss).
+//   - Coerces `BigInt` integer values to safe `number` (useBigInt is enabled
+//     on the driver to avoid silent precision loss).
 //   - Reads from either form of result row:
 //       a) `RETURN n` — the alias resolves to a `Node` with a `.properties` map.
 //       b) explicit projection (`RETURN n.id AS id, ...`) — the record carries
 //          one entry per projected field.
 //   - Treats the JSON-stringified `properties` blob as the source of truth for
-//     `StoredEntity.properties` per the O1 resolution. Per-scalar properties
+//     `StoredEntity.properties`: the blob preserves shapes Neo4j cannot store
+//     natively (nested objects, `null`, mixed arrays). Per-scalar properties
 //     exist for query-time predicates only.
 //
 // This file deliberately does NOT import `neo4j-driver` — the driver chokepoint
@@ -16,7 +17,14 @@
 // here are structurally compatible with `neo4j-driver`'s public types without
 // pulling them in.
 
-import { ProviderError } from '@utaba/deep-memory';
+import {
+  InvalidInputError,
+  ProviderError,
+  SAFE_IDENTIFIER_PATTERN,
+  assertWritablePropertyKeys,
+  isSafeIdentifier,
+  propertyNameRefusal,
+} from '@utaba/deep-memory';
 import type { StoredEntity } from '@utaba/deep-memory/types';
 import type { StoredRelationship } from '@utaba/deep-memory/types';
 import type { Provenance } from '@utaba/deep-memory/types';
@@ -53,10 +61,10 @@ export interface DriverRecord {
  * public-API seam where a count, total, or server-time figure exits the
  * provider.
  *
- * The probe P2 results (local-tests/baseline/neo4j-phase3-probes-results.md)
- * confirm that `count(n)` aggregations and `summary.resultConsumedAfter` are
- * the only fields the boundary needs to coerce — scalar string / array
- * properties round-trip without `BigInt` wrapping.
+ * Against a live server, `count(n)` aggregations and
+ * `summary.resultConsumedAfter` are the only fields the boundary needs to
+ * coerce — scalar string / array properties round-trip without `BigInt`
+ * wrapping.
  */
 export function bigintToSafeNumber(value: unknown): number {
   if (typeof value === 'number') return value;
@@ -238,6 +246,29 @@ export function changeRecordFromProperties(
 }
 
 /**
+ * The node properties a `VocabularyChangeRecord` is stored as — the inverse
+ * of `changeRecordFromProperties`. Only the record's own fields are copied,
+ * and an optional field that is absent stays absent (Cypher would otherwise
+ * drop a `null` on write anyway), so the record reads back exactly as given.
+ * `repositoryId` is not part of the record; the write statement sets it.
+ */
+export function changeRecordToProperties(record: VocabularyChangeRecord): Record<string, string> {
+  const props: Record<string, string> = {
+    changeId: record.changeId,
+    changeType: record.changeType,
+    typeName: record.typeName,
+    newVersion: record.newVersion,
+    proposedBy: record.proposedBy,
+    proposedAt: record.proposedAt,
+    reason: record.reason,
+  };
+  if (record.previousVersion !== undefined) props['previousVersion'] = record.previousVersion;
+  if (record.approvedBy !== undefined) props['approvedBy'] = record.approvedBy;
+  if (record.approvedAt !== undefined) props['approvedAt'] = record.approvedAt;
+  return props;
+}
+
+/**
  * Field list projected by entity read paths — `getEntity`, `getEntityBySlug`,
  * `getEntities`, `findEntities`, `updateEntity` (projection-on-write).
  *
@@ -307,37 +338,6 @@ export function buildEntityProjection(options?: {
 export const WRITE_ATTEMPT_PROPERTY = '_attempt';
 
 /**
- * Schema-managed property names on `:_Entity` nodes. User-supplied
- * `entity.properties` keys cannot collide with these — colliding would clobber
- * a schema-managed scalar via `SET n += $userProperties` and break round-trip.
- *
- * Kept as a frozen `Set` for O(1) membership checks on the write hot path.
- */
-export const RESERVED_ENTITY_PROPERTY_KEYS: ReadonlySet<string> = new Set([
-  'id',
-  'repositoryId',
-  'entityType',
-  'label',
-  'slug',
-  'summary',
-  'properties',
-  'data',
-  'dataFormat',
-  'embedding',
-  'createdBy',
-  'createdByType',
-  'createdAt',
-  'createdInConversation',
-  'createdFromMessage',
-  'modifiedBy',
-  'modifiedByType',
-  'modifiedAt',
-  'modifiedInConversation',
-  'modifiedFromMessage',
-  WRITE_ATTEMPT_PROPERTY,
-]);
-
-/**
  * Properties the provider writes for its own bookkeeping, on entity nodes,
  * relationship edges and repository markers. They are not part of any public
  * record: read paths never project them, and a traversal may not name them
@@ -348,34 +348,25 @@ export const INTERNAL_RECORD_PROPERTY_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * User-supplied property keys are interpolated into the Cypher string at
- * REMOVE-time (Cypher 25 cannot REMOVE a property whose key is bound at
- * run-time) and used in the predicate slot of `findEntities`. Restrict them
- * to the bare Cypher identifier shape so the interpolation cannot widen the
- * injection surface — same guard `assertSafeRelationshipType` applies to the
- * relationship-type slot.
- */
-const USER_PROPERTY_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/**
- * Validate a user-supplied entity property key. Throws `ProviderError` when
- * the key is not a bare Cypher identifier or collides with a schema-managed
- * field name. Both checks run on every write and every predicate emission —
- * the cost is one regex test plus one set lookup per key per call.
+ * Validate a user-supplied entity property key against the property-name
+ * rules core applies on every provider: a bare identifier that is not
+ * reserved for a system field. Throws `InvalidInputError` (field
+ * `properties.<key>`) otherwise — the caller chose the key, so the refusal is
+ * an input error the caller can correct rather than a store failure.
+ *
+ * Both rules matter here: user keys are interpolated into the Cypher string
+ * at REMOVE time (Cypher 25 cannot REMOVE a property whose key is bound at
+ * run-time) and into the predicate slot of `findEntities`, and they share
+ * the node with schema-managed fields that `SET n += $userProperties` would
+ * otherwise clobber.
  */
 export function assertSafeUserPropertyKey(key: string): string {
-  if (!USER_PROPERTY_KEY_PATTERN.test(key)) {
-    throw new ProviderError(
-      `Entity property key "${key}" is not a valid Cypher identifier — must match ` +
-        `${USER_PROPERTY_KEY_PATTERN.source}. User-property keys are interpolated into ` +
-        `Cypher REMOVE / predicate slots (the key slot cannot be parameterised), so an ` +
-        `unsafe value would widen the injection surface.`,
-    );
-  }
-  if (RESERVED_ENTITY_PROPERTY_KEYS.has(key)) {
-    throw new ProviderError(
-      `Entity property key "${key}" collides with a schema-managed field. ` +
-        `Reserved names: ${Array.from(RESERVED_ENTITY_PROPERTY_KEYS).join(', ')}.`,
+  const refusal = propertyNameRefusal(key, 'entity');
+  if (refusal !== undefined) {
+    throw new InvalidInputError(
+      `properties.${key}`,
+      refusal,
+      `Rename the property to a name matching ${SAFE_IDENTIFIER_PATTERN.source} that is not a reserved system field.`,
     );
   }
   return key;
@@ -415,8 +406,7 @@ export function isNativeStorableValue(value: unknown): boolean {
 /**
  * Build the parameter map for the schema-managed slots of the fixed-shape
  * entity `CREATE` template. Every schema field gets a binding on every call so
- * the planner reuses one cached plan across all entity creates (D15 — plan
- * cache friendliness).
+ * the planner reuses one cached plan across all entity creates.
  *
  * User-supplied `entity.properties` are NOT in this bag — they bind through
  * the separate `entityUserPropertyParams` helper and feed the
@@ -489,6 +479,46 @@ export function entityUserPropertyParams(
 }
 
 /**
+ * The update form of `entityUserPropertyParams`: project an update's merged
+ * property map to the native-scalar map fed to `SET n += $userProperties`,
+ * given the user properties the entity holds now (its JSON blob).
+ *
+ * Key rules govern the names the update writes: a key that is new, or whose
+ * value changes, must pass them (`InvalidInputError`, field
+ * `properties.<key>`). A key the rules refuse that is carried over unchanged
+ * (stored before the rules existed) is not refused, so the entity stays
+ * updatable, but it is left out of the native map: its name is never written
+ * into query text, and a reserved name never overwrites the system field it
+ * shares the node with. It lives on only in the JSON blob, which is what
+ * `entity.properties` reads back from. A key the update drops is removed from
+ * the blob by the blob being rewritten; no check applies to it.
+ */
+export function entityUpdatePropertyParams(
+  properties: Record<string, unknown>,
+  stored: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(properties)) {
+    if (propertyNameRefusal(key, 'entity') !== undefined) {
+      if (value === null || isUnchangedProperty(stored, key, value)) continue;
+      assertSafeUserPropertyKey(key);
+    }
+    if (isNativeStorableValue(value)) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether `stored` holds `value` under `key`. Values compare by their JSON
+ * form, which is how the blob stores them.
+ */
+function isUnchangedProperty(stored: Readonly<Record<string, unknown>>, key: string, value: unknown): boolean {
+  return Object.hasOwn(stored, key) && JSON.stringify(stored[key]) === JSON.stringify(value);
+}
+
+/**
  * Field list projected by relationship read paths. Mirror of
  * `STORED_ENTITY_FIELDS` for `StoredRelationship` — `repositoryId` is the
  * scope discriminator, not a public field, so it is intentionally excluded
@@ -533,7 +563,7 @@ export function buildRelationshipProjection(options?: { alias?: string }): strin
 /**
  * Build the parameter map for the fixed-shape relationship `CREATE` template.
  * Every field gets a binding on every call so the planner reuses one cached
- * plan per relationship type (D15) — the type slot is interpolated into the
+ * plan per relationship type — the type slot is interpolated into the
  * Cypher string at compile time (the type slot cannot be parameterised in
  * Cypher 25), so the plan cache holds one entry per distinct vocabulary type.
  *
@@ -542,10 +572,15 @@ export function buildRelationshipProjection(options?: { alias?: string }): strin
  *
  * `properties` is JSON-stringified into a single Neo4j property — relationship
  * properties are not indexed and are not predicate-queried server-side
- * (per O1/D6: indexed scalars live on entities only), so the blob round-trip
+ * (indexed scalars live on entities only), so the blob round-trip
  * is sufficient.
+ *
+ * The keys still pass the property-name rules every provider applies
+ * (`InvalidInputError`, field `properties.<key>`), so a relationship this
+ * store accepts can move to any other provider unchanged.
  */
 export function relationshipToParams(rel: StoredRelationship): Record<string, unknown> {
+  assertWritablePropertyKeys(rel.properties, 'relationship');
   const p = rel.provenance;
   return {
     id: rel.id,
@@ -572,22 +607,19 @@ export function relationshipToParams(rel: StoredRelationship): Record<string, un
  * identifier, not a value), so the type slug is concatenated directly into
  * the query string at compile time. This guard pins the value to the bare
  * identifier shape Cypher accepts unquoted, which is also the shape vocabulary
- * slugs already emit (UPPER_SNAKE_CASE per D5).
+ * slugs already emit (UPPER_SNAKE_CASE).
  *
- * Anything failing the guard is a programming error in the caller — either a
- * vocabulary value that bypassed slug normalisation, or a value handed in
- * directly without going through the relationship-create surface. Surfacing
- * it as `ProviderError` catches injection-shaped values at the chokepoint.
+ * A value failing the guard is refused as `InvalidInputError` (field
+ * `relationshipType`): the type name came from the caller (directly, or
+ * through a vocabulary entry), so it is an input the caller can correct, and
+ * the refusal happens before any query text is built.
  */
-const RELATIONSHIP_TYPE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
 export function assertSafeRelationshipType(value: string): string {
-  if (!RELATIONSHIP_TYPE_PATTERN.test(value)) {
-    throw new ProviderError(
-      `Relationship type "${value}" is not a valid Cypher identifier — must match ` +
-        `${RELATIONSHIP_TYPE_PATTERN.source}. Cypher 25 does not allow parameterising ` +
-        `the relationship-type slot, so the value is interpolated directly into the ` +
-        `query string and an unsafe value would otherwise widen the injection surface.`,
+  if (!isSafeIdentifier(value)) {
+    throw new InvalidInputError(
+      'relationshipType',
+      `Relationship type "${value}" is not a valid identifier — must match ${SAFE_IDENTIFIER_PATTERN.source}.`,
+      'Use a relationship type made of letters, digits and underscores that does not start with a digit.',
     );
   }
   return value;
@@ -739,7 +771,11 @@ function optionalString(props: Record<string, unknown>, key: string): string | u
   return value;
 }
 
-function parsePropertiesBlob(props: Record<string, unknown>): Record<string, unknown> {
+/**
+ * The user properties held in a node's JSON `properties` blob; `{}` when the
+ * node has none. Throws `ProviderError` for a blob that is not a JSON object.
+ */
+export function parsePropertiesBlob(props: Record<string, unknown>): Record<string, unknown> {
   const raw = props['properties'];
   if (raw === undefined || raw === null || raw === '') return {};
   if (typeof raw !== 'string') {

@@ -40,8 +40,8 @@ export interface UsageScope {
    * `propertiesSet`, `labelsAdded`, `labelsRemoved`, `indexesAdded`,
    * `indexesRemoved`, `constraintsAdded`, `constraintsRemoved`.
    *
-   * Probe P1 confirmed counters arrive as plain `number` under `useBigInt`,
-   * so straight addition is safe.
+   * The driver delivers counters as plain `number` even under `useBigInt`
+   * (verified against a live server), so straight addition is safe.
    */
   counters: Record<string, number>;
 }
@@ -101,8 +101,9 @@ export function getCurrentUsageScope(): UsageScope | undefined {
  * is the legacy class; at runtime with `useBigInt: true` they are `BigInt`s.
  * `bigintToSafeNumber` performs the narrowing.
  *
- * Kept local so this file does not import `neo4j-driver` directly, preserving
- * the chokepoint enforcement (D3b layer 2).
+ * Kept local so this file does not import `neo4j-driver` directly:
+ * `Neo4jConnection` is the only module allowed to touch the driver, which is
+ * what lets it enforce repository scoping on every statement.
  */
 export interface RoundTripSummary {
   resultAvailableAfter?: unknown;

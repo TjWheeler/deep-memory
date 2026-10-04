@@ -102,7 +102,8 @@ export interface Neo4jTraversalExecutorConfig {
   /**
    * When `true`, every compiled traversal query is prepended with `PROFILE`
    * and `summary.profile` is harvested into `RawTraversalResult.profile`. Off
-   * by default (probe P17 measured ~129 % wall-clock overhead vs plain).
+   * by default: `PROFILE` measured at ~129 % wall-clock overhead over a plain
+   * run on short traversals.
    */
   profileTraversals: boolean;
 }
@@ -183,7 +184,7 @@ export class Neo4jTraversalExecutor {
       if (err instanceof DeepMemoryError) throw err;
       throw new ProviderError(
         `Neo4j traversal failed: ${err instanceof Error ? err.message : String(err)}`,
-        'Inspect the compiled Cypher in queryMetadata.compiledQuery and confirm the spec passed validation.',
+        'Check that the traversal spec uses entity types, relationship types and properties from the repository vocabulary. If it does, the failure is in the store: check Neo4j connectivity and the server log.',
         { cause: err },
       );
     }
@@ -270,8 +271,8 @@ export class Neo4jTraversalExecutor {
    *
    * The compiler always emits `(n0)` as the first match part (it never adds a
    * label or property map there) — we rewrite that single occurrence. The
-   * provider's defence-in-depth (D3b layer 3) prevents cross-repository edges
-   * from existing in the first place, so scoping just the start node is
+   * provider's create statements match both endpoints within the repository,
+   * so cross-repository edges cannot exist, and scoping just the start node is
    * sufficient — once the planner anchors on a node in this repo, every
    * reachable node is also in this repo.
    */

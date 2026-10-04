@@ -326,29 +326,54 @@ export async function deleteRelationship(
 }
 
 
+/** Edges dropped per batch of a by-type delete. */
+export const RELATIONSHIP_TYPE_DELETE_BATCH_SIZE = 500;
+
 /**
- * Type-delete via the aggregate-side-effect pattern: the bucket records the
- * edge ids that were actually dropped, giving an exact
- * `deletedRelationships` count without a separate count query.
+ * One batch of a relationship-type delete: up to `batchSize` edges of the
+ * type, dropped in one request that reports their ids (the bucket records the
+ * ids before the drop).
+ */
+export const RELATIONSHIP_TYPE_BATCH_DROP_QUERY =
+  "g.E().has('repositoryId', rid).hasLabel(rtype).limit(batchSize)" +
+  ".aggregate('found').by('id').drop().cap('found')";
+
+/**
+ * Drop every edge of a type in batches, until a batch drops nothing, and
+ * report how many were dropped: the sum of the batches' buckets, each the ids
+ * its request found and dropped. The sum is never more than were removed, and
+ * may be fewer: when a transient error (429 / 503) makes the connection
+ * re-send a batch that had already partly applied, the re-sent request
+ * reports only the edges still there. A single request over the whole type grows
+ * with the type's population and can outlast the request timeout; a bounded
+ * batch costs the same whatever the type's size, and a delete stopped
+ * part-way is finished by calling it again.
  *
  * An edge traversal cannot fetch the repository marker in its first step, so
- * a marker point read runs first. Cosmos Gremlin has no transaction across
- * requests: a `deleteRepository` that drops the marker between the two
- * requests lets the drop go ahead on edges its drain would have removed, and
- * the call reports them instead of `RepositoryNotFoundError`.
+ * a marker point read runs before each batch. Cosmos Gremlin has no
+ * transaction across requests: a `deleteRepository` that drops the marker
+ * between the read and the drop lets that batch go ahead on edges its drain
+ * would have removed, and the call reports them instead of
+ * `RepositoryNotFoundError`. The next batch's read then finds the marker gone.
  *
- * @throws RepositoryNotFoundError when the marker is absent; nothing is dropped.
+ * @throws RepositoryNotFoundError when the marker is absent; the batch whose
+ *   read finds it absent drops nothing.
  */
 export async function deleteRelationshipsByType(
   conn: CosmosDbConnection,
   repositoryId: string,
   relationshipType: string,
 ): Promise<{ deletedRelationships: number }> {
-  await assertRepositoryMarker(conn, repositoryId);
-  const result = await conn.submit(
-    "g.E().has('repositoryId', rid).hasLabel(rtype)" +
-      ".aggregate('found').by('id').drop().cap('found')",
-    { rid: repositoryId, rtype: relationshipType },
-  );
-  return { deletedRelationships: bucketIds(result.items, 'relationship type delete').length };
+  let deletedRelationships = 0;
+  while (true) {
+    await assertRepositoryMarker(conn, repositoryId);
+    const result = await conn.submit(RELATIONSHIP_TYPE_BATCH_DROP_QUERY, {
+      rid: repositoryId,
+      rtype: relationshipType,
+      batchSize: RELATIONSHIP_TYPE_DELETE_BATCH_SIZE,
+    });
+    const dropped = bucketIds(result.items, 'relationship type delete').length;
+    if (dropped === 0) return { deletedRelationships };
+    deletedRelationships += dropped;
+  }
 }

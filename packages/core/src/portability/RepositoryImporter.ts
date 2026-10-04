@@ -19,6 +19,7 @@ import {
   InvalidInputError,
   OperationAbortedError,
   RepositoryNotFoundError,
+  toError,
   type DeepMemoryErrorCode,
 } from '../core/errors.js';
 import {
@@ -169,7 +170,11 @@ export class RepositoryImporter {
     }
   }
 
-  /** Streaming create mode — fast bulk inserts with no existence checks */
+  /**
+   * Streaming create mode — bulk writes with no per-item conflict handling.
+   * Into a new repository rows are inserted without existence checks; into
+   * an existing one they are upserted.
+   */
   private async importStreamCreate(
     header: ImportStreamHeader,
     chunks: AsyncIterable<ImportChunk>,
@@ -215,7 +220,10 @@ export class RepositoryImporter {
       );
     }
 
-    // Process chunks incrementally — skip existence checks since the repo is freshly created
+    // Process chunks incrementally. A freshly created repository holds
+    // nothing, so rows are inserted without existence checks. An existing
+    // repository may already hold the archive's rows (the same archive
+    // imported again), so rows are upserted there instead.
     const totalEntities = header.manifest?.statistics?.entityCount ?? 0;
     const totalRelationships = header.manifest?.statistics?.relationshipCount ?? 0;
     const totalChunks = estimateChunkCount(totalEntities, totalRelationships);
@@ -237,7 +245,7 @@ export class RepositoryImporter {
       this.throwIfAborted();
       const bulkResult = await this.storage.importBulk(target.repositoryId, [chunk], {
         ...options.bulk,
-        skipExistenceCheck: true,
+        skipExistenceCheck: existing === null,
         adaptiveConcurrencyHandle,
       });
       entitiesImported += bulkResult.entitiesImported;
@@ -349,60 +357,78 @@ export class RepositoryImporter {
             existing = await this.storage.getEntityBySlug(repositoryId, entity.slug);
           }
 
-          if (existing) {
-            const existingId = existing.id;
-            switch (entityConflict) {
-              case 'skip':
-                entitiesSkipped++;
-                warnings.push({
-                  code: 'entity_skipped',
-                  message: `Entity "${entity.slug}" already exists — skipped`,
-                  id: existingId,
-                });
-                continue;
+          // A store refuses an entity it cannot hold as invalid input (a
+          // property name the key rules reject, for one). That entity is
+          // skipped and reported like any other per-item failure, so one bad
+          // row does not abandon the rest of the import.
+          try {
+            if (existing) {
+              const existingId = existing.id;
+              switch (entityConflict) {
+                case 'skip':
+                  entitiesSkipped++;
+                  warnings.push({
+                    code: 'entity_skipped',
+                    message: `Entity "${entity.slug}" already exists — skipped`,
+                    id: existingId,
+                  });
+                  continue;
 
-              case 'overwrite':
-                await this.storage.updateEntity(repositoryId, existingId, {
-                  label: entity.label,
-                  slug: entity.slug,
-                  summary: entity.summary,
-                  properties: entity.properties,
-                  data: entity.data,
-                  dataFormat: entity.dataFormat,
-                  provenance: entity.provenance,
-                  embedding: entity.embedding,
-                });
-                entitiesImported++;
-                warnings.push({
-                  code: 'entity_overwritten',
-                  message: `Entity "${entity.slug}" overwritten`,
-                  id: existingId,
-                });
-                continue;
+                case 'overwrite':
+                  await this.storage.updateEntity(repositoryId, existingId, {
+                    label: entity.label,
+                    slug: entity.slug,
+                    summary: entity.summary,
+                    properties: entity.properties,
+                    data: entity.data,
+                    dataFormat: entity.dataFormat,
+                    provenance: entity.provenance,
+                    embedding: entity.embedding,
+                  });
+                  entitiesImported++;
+                  warnings.push({
+                    code: 'entity_overwritten',
+                    message: `Entity "${entity.slug}" overwritten`,
+                    id: existingId,
+                  });
+                  continue;
 
-              case 'rename': {
-                // Create a new entity with a new GUID and a free slug derived
-                // from the imported one. Slugs are unique per repository, so a
-                // fixed suffix would collide on the second rename of the same
-                // entity.
-                const renamedSlug = await generateUniqueSlugFrom(
-                  `${entity.slug}-imported`,
-                  async (candidate) => (await this.storage.getEntityBySlug(repositoryId, candidate)) !== null,
-                );
-                const renamedEntity = { ...entity, id: generateId(), slug: renamedSlug };
-                await this.storage.createEntity(repositoryId, renamedEntity);
-                entitiesImported++;
-                warnings.push({
-                  code: 'entity_renamed',
-                  message: `Entity "${entity.slug}" slug renamed to "${renamedEntity.slug}"`,
-                  id: entity.id,
-                });
-                continue;
+                case 'rename': {
+                  // Create a new entity with a new GUID and a free slug derived
+                  // from the imported one. Slugs are unique per repository, so a
+                  // fixed suffix would collide on the second rename of the same
+                  // entity.
+                  const renamedSlug = await generateUniqueSlugFrom(
+                    `${entity.slug}-imported`,
+                    async (candidate) => (await this.storage.getEntityBySlug(repositoryId, candidate)) !== null,
+                  );
+                  const renamedEntity = { ...entity, id: generateId(), slug: renamedSlug };
+                  await this.storage.createEntity(repositoryId, renamedEntity);
+                  entitiesImported++;
+                  warnings.push({
+                    code: 'entity_renamed',
+                    message: `Entity "${entity.slug}" slug renamed to "${renamedEntity.slug}"`,
+                    id: entity.id,
+                  });
+                  continue;
+                }
               }
+            } else {
+              await this.storage.createEntity(repositoryId, entity);
+              entitiesImported++;
             }
-          } else {
-            await this.storage.createEntity(repositoryId, entity);
-            entitiesImported++;
+          } catch (err) {
+            // Matched by code: the store may throw from its own copy of this package.
+            if (!hasErrorCode(err, 'INVALID_INPUT')) throw err;
+            const error = toError(err).message;
+            entitiesSkipped++;
+            warnings.push({
+              code: 'import_error',
+              message: `Failed to import entity "${entity.slug}": ${error}`,
+              id: entity.id,
+              errorCode: 'INVALID_INPUT',
+            });
+            await this.onItemFailed?.({ itemId: entity.id, itemType: 'entity', error, code: 'INVALID_INPUT' });
           }
         }
       }

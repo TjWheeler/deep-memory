@@ -41,6 +41,7 @@ await dm.ensureSchema();
 |--------|------|---------|-------------|
 | `connection` | `sql.config \| sql.ConnectionPool` | *required* | Either an `mssql` config object, a connection-string config, or an existing `ConnectionPool` instance. |
 | `schema` | `string` | `'dbo'` | SQL Server schema name. Must already exist in the database. |
+| `vocabularyCacheTtlMs` | `number` | `60000` | Lifetime in milliseconds of an entry in the per-process vocabulary cache. A vocabulary change made by another process reaches this one's reads, and so the validation of its writes, within this window. `0` disables the cache. Must be a non-negative finite number; anything else throws `InvalidInputError` at construction. See [Vocabulary cache](#vocabulary-cache). |
 
 ### Connection options
 
@@ -176,11 +177,30 @@ Largest PK: `(repository_id, entity_id)` = 856 bytes (under 900 limit).
 
 Deleting a repository cascades to vocabularies, vocabulary change log, entities, and relationships. Entity deletion explicitly removes related relationships before removing the entity.
 
-`deleteEntitiesByType` and `deleteRelationshipsByType` each run as one batch in one transaction that first locks the repository row, so a missing repository deletes nothing and throws `RepositoryNotFoundError`. The whole delete must finish within the connection's `requestTimeout` (`mssql` defaults to 15 seconds); raise it in the `connection` config for very large types. Two by-type deletes running at the same time on the same repository can deadlock; SQL Server rolls the victim back and it surfaces as a `ProviderError`. The delete is all-or-nothing, so retrying it is safe.
+`deleteEntitiesByType` and `deleteRelationshipsByType` each run as one batch in one transaction that first locks the repository row, so a missing repository deletes nothing and throws `RepositoryNotFoundError`. The type name matches exactly: the type columns use the database's case-insensitive default collation, so the predicate adds a binary-collation comparison and a byte-length check, and `Project` or `project ` never deletes `project`. The plain comparison stays in front, so the delete still seeks the `(repository_id, type)` index. The whole delete must finish within the connection's `requestTimeout` (`mssql` defaults to 15 seconds); raise it in the `connection` config for very large types. Two by-type deletes running at the same time on the same repository can deadlock; SQL Server rolls the victim back and it surfaces as a `ProviderError`. The delete is all-or-nothing, so retrying it is safe.
 
 ### Vocabulary writes
 
-`createRepository` inserts the repository's `dm_vocabularies` row, seeded from `config.vocabulary` or an empty vocabulary. `saveVocabulary(id, vocabulary, expectedVersion)` only updates that row, and is compare-and-set. It is a single `UPDATE` whose `WHERE` clause compares `JSON_VALUE([vocabulary], '$.version')` with `expectedVersion` using a binary collation. A stale version throws `VocabularyVersionConflictError`, and a missing row throws `RepositoryNotFoundError`. The version is read from the JSON document, so this needs no schema change and no upgrade step. The provider has no vocabulary cache, so `getVocabulary`'s `{ fresh: true }` option has no effect.
+`createRepository` inserts the repository's `dm_vocabularies` row, seeded from `config.vocabulary` or an empty vocabulary. `saveVocabulary(id, vocabulary, expectedVersion, changeRecord?)` is compare-and-set, and runs as one batch in one transaction:
+
+1. It locks the repository row first (`HOLDLOCK`), in the same order as `deleteRepository` and the by-type deletes, so it cannot deadlock with a concurrent repository delete. With no repository row nothing is written.
+2. One `UPDATE` writes the vocabulary row, with a `WHERE` clause that compares `JSON_VALUE([vocabulary], '$.version')` with `expectedVersion` using a binary collation, and their byte lengths with `DATALENGTH`: `=` ignores trailing spaces under every collation, so the length check keeps `"1.0.0 "` from matching `"1.0.0"`.
+3. When the `UPDATE` matched and a `changeRecord` was given, it inserts the record into `dm_vocabulary_change_log`. `XACT_ABORT` is on, so a failed insert rolls the vocabulary write back too: the change and its record commit together or not at all.
+4. When the `UPDATE` matched nothing, the same batch reads the stored version. A stale version throws `VocabularyVersionConflictError`; a missing repository or vocabulary row throws `RepositoryNotFoundError`. Neither writes a change record.
+
+The version is read from the JSON document, so this needs no schema change and no upgrade step.
+
+### Vocabulary cache
+
+The engine validates every write against the vocabulary, so `getVocabulary` reads through a per-process cache rather than paying a round trip each time. An entry lives for `vocabularyCacheTtlMs` (default 60 s; `0` disables the cache) from the read that stored it.
+
+- `getVocabulary(id, { fresh: true })` skips the cache, reads the stored vocabulary, and replaces the entry with what it read. Use it before a vocabulary change, so the `expectedVersion` passed to `saveVocabulary` is the stored one.
+- `saveVocabulary` drops the entry whatever the outcome: on success, so this process sees the new vocabulary at once, and on any failure, because a conflict proves the cached copy stale and any other error leaves the stored state unknown.
+- `createRepository`, `deleteRepository` and any call that throws `RepositoryNotFoundError` drop the entry too.
+- A read that an invalidation overtook is not cached, so a write in this process is never hidden for a TTL by a read that started before it.
+- `getRepositoryStats` reads the stored vocabulary, so a missing repository still throws `RepositoryNotFoundError`.
+
+A cache hit is not checked against the database, so within the TTL it can return the vocabulary of a repository another process has deleted, or one another process has since changed. Pass `{ fresh: true }` when the answer must reflect the stored state.
 
 ## Schema Management
 
@@ -265,9 +285,18 @@ for await (const chunk of provider.exportAll(repositoryId)) {
 
 ### Import
 
-`importBulk()` uses SQL Server `MERGE` statements for upsert semantics — existing records are updated, new records are inserted. Returns a count of imported entities/relationships and any errors.
+`importBulk()` uses SQL Server `MERGE` statements for upsert semantics — existing records are updated, new records are inserted. It returns the counts of imported entities and relationships.
+
+The import is all-or-nothing, unlike the providers that import row by row: it never reports row errors, and `result.errors` is always empty. Any row that fails rolls the whole import back, and the call rejects with an `ImportError` naming the row, whose `cause` is the typed error (for example `DuplicateEntityError`, `SlugConflictError` or `DuplicateRelationshipError`). A row whose property keys break the [property-name rules](#property-names) is refused before any SQL runs, with an `ImportError` whose `cause` is an `InvalidInputError`; a missing repository is reported first, with `RepositoryNotFoundError`.
 
 The import runs in one transaction that first reads the repository row and holds a shared lock on it until the import commits or rolls back. A concurrent `deleteRepository` or `updateRepository` on that repository waits for the import to finish. A missing repository writes nothing and throws `RepositoryNotFoundError`.
+
+A relationship id is never moved onto another edge:
+
+- **Upsert** (the default): a stored id is updated in place only when the row names the same edge, the same relationship type (compared exactly, including case and trailing spaces) and the same endpoints. The update leaves the stored type and endpoints unchanged. A stored id with a different type or endpoints is refused.
+- **Insert** (`skipExistenceCheck: true`): each relationship is a plain `INSERT` that does not look for the id first; the primary key refuses an id that is already stored or repeated within the call.
+
+A refused row rolls the whole import back, like any other failing row: the call rejects with an `ImportError` naming the row, whose `cause` is a `DuplicateRelationshipError` (`RELATIONSHIP_ALREADY_EXISTS`). Providers that import row by row report the same refusal as a row in `result.errors` instead.
 
 ## Error Handling
 
@@ -276,12 +305,23 @@ All errors are typed using the `@utaba/deep-memory` error hierarchy:
 | Error | When |
 |-------|------|
 | `ProviderError` | Connection failure, schema issues, SQL errors |
-| `RepositoryNotFoundError` | Repository ID doesn't exist |
+| `RepositoryNotFoundError` | Repository ID doesn't exist (see below) |
 | `DuplicateRepositoryError` | Repository ID already exists |
-| `EntityNotFoundError` | Entity ID doesn't exist in repository |
+| `EntityNotFoundError` | Entity ID doesn't exist in repository, including a relationship's missing source or target |
 | `DuplicateEntityError` | Entity ID already exists in repository |
+| `SlugConflictError` | Another entity in the repository holds the slug (the unique index `ix_dm_entities_slug`) |
 | `RelationshipNotFoundError` | Relationship ID doesn't exist |
 | `DuplicateRelationshipError` | Relationship ID already exists |
+| `InvalidInputError` | A property key breaks the [property-name rules](#property-names) |
+| `ImportError` | An `importBulk` row failed; the whole import rolled back, and `cause` is the row's typed error |
+
+Unique-key violations are mapped by the index that fired (with an error-number fallback for localised messages), and keep the driver error as `cause`. Slug uniqueness is enforced atomically by the unique index; the engine answers `SlugConflictError` by retrying with the next slug suffix.
+
+Every call that takes a repository id checks the repository, in the same batch as its work wherever it can, and throws `RepositoryNotFoundError` when it is missing, ahead of any not-found, empty or per-id answer: reads, writes, type deletes, timeline, change log, traversals, export and import. The one exception is a `getVocabulary` served from the [vocabulary cache](#vocabulary-cache) within its TTL.
+
+### Property names
+
+Entity and relationship property keys must match `^[A-Za-z_][A-Za-z0-9_]*$` and must not be a reserved system-field name (`RESERVED_ENTITY_PROPERTY_KEYS` / `RESERVED_RELATIONSHIP_PROPERTY_KEYS` from `@utaba/deep-memory`). SQL Server could store other names in its JSON column, but the rule is the same on every provider, so a repository can move between providers unchanged. `createEntity`, `updateEntity` and `createRelationship` check the keys before writing; an `updateEntity` checks only the keys it sets (new, or with a changed value), so a key stored before the rules and carried over unchanged is kept and can be removed.
 
 ## Testing
 

@@ -24,9 +24,13 @@ import {
   OperationCancelledError,
   OperationAbortedError,
   EmbeddingProviderRequiredError,
+  BatchPartialFailureError,
   isSlugConflict,
+  toError,
 } from '../core/errors.js';
+import type { MemoryVocabulary } from '../types/vocabulary.js';
 import { getEntityTypeDef } from '../vocabulary/VocabularyValidator.js';
+import { assertWritablePropertyKeys } from '../validation/propertyNames.js';
 
 /**
  * How many times a create or update re-picks a slug after the store refuses one as
@@ -56,13 +60,26 @@ export class EntityManager {
     this.embedding = embedding;
   }
 
-  /** Create one or more entities with vocabulary validation, ID generation, provenance, and events */
+  /**
+   * Create one or more entities with vocabulary validation, ID generation,
+   * provenance, and events.
+   *
+   * Every member is validated against a single read of the vocabulary before
+   * any member is written, so a vocabulary refusal of any member writes
+   * nothing and throws `VocabularyValidationError` for the first refused
+   * member. Members are then written in input order, each in its own store
+   * transaction. A failure while writing (a hook cancellation, a store error)
+   * once at least one member is stored throws `BatchPartialFailureError`,
+   * which carries the stored members; a failure that leaves nothing stored
+   * throws the original error.
+   */
   public async create(inputs: CreateEntityInput[]): Promise<Entity[]> {
-    const results: Entity[] = [];
+    if (inputs.length === 0) return [];
+    for (const input of inputs) assertWritablePropertyKeys(input.properties, 'entity');
 
+    const vocabulary = await this.vocabularyEngine.getVocabulary();
     for (const input of inputs) {
-      // Validate against vocabulary
-      const validation = await this.vocabularyEngine.validateEntity(input);
+      const validation = await this.vocabularyEngine.validateEntity(input, vocabulary);
       if (!validation.valid) {
         const errorMsg = validation.errors.map((e) => e.message).join('; ');
         const suggestions = validation.errors
@@ -77,58 +94,75 @@ export class EntityManager {
 
         throw new VocabularyValidationError(validation.errors);
       }
+    }
 
-      // Pre-mutation hook
-      const hookResult = await this.eventBus.emitHook('entity:creating', { input });
-      if (hookResult.cancelled) {
-        throw new OperationCancelledError('Entity creation', hookResult.reason ?? 'cancelled by hook');
+    const results: Entity[] = [];
+    for (const [index, input] of inputs.entries()) {
+      try {
+        const entity = await this.writeOne(input, vocabulary);
+        // Recorded before the event so `created` on a later failure includes
+        // this member even when an `entity:created` handler is what failed.
+        results.push(entity);
+        await this.eventBus.emit('entity:created', { entity });
+      } catch (err) {
+        if (results.length === 0) throw err;
+        throw new BatchPartialFailureError(results, index, inputs.length, toError(err));
       }
-
-      // Generate GUID (or use provided)
-      const id = input.id ?? generateEntityId();
-
-      // Generate unique slug
-      const pickSlug = this.createSlugPicker(input.entityType, input.label);
-      const slug = await pickSlug();
-
-      // Stamp provenance
-      const provenance = this.provenanceTracker.stampCreate();
-
-      // Generate embedding if provider available
-      const entityEmbedding = await this.generateEmbedding(input.label, input.summary, input.properties ?? {}, input.entityType);
-
-      // Build stored entity
-      const storedEntity: StoredEntity = {
-        id,
-        slug,
-        entityType: input.entityType,
-        label: input.label,
-        summary: input.summary,
-        properties: input.properties ?? {},
-        data: input.data,
-        dataFormat: input.dataFormat,
-        provenance,
-        embedding: entityEmbedding,
-      };
-
-      // Persist, re-picking the slug if a concurrent writer claimed it first.
-      const created = await this.writeWithSlugRetry(
-        slug,
-        (candidateSlug) =>
-          this.storage.createEntity(this.repositoryId, { ...storedEntity, slug: candidateSlug }),
-        pickSlug,
-      );
-
-      // Map to public type
-      const entity = storedToEntity(created);
-
-      // Emit created event
-      await this.eventBus.emit('entity:created', { entity });
-
-      results.push(entity);
     }
 
     return results;
+  }
+
+  /** Run the pre-mutation hook for one validated create input and store it */
+  private async writeOne(input: CreateEntityInput, vocabulary: MemoryVocabulary): Promise<Entity> {
+    // Pre-mutation hook
+    const hookResult = await this.eventBus.emitHook('entity:creating', { input });
+    if (hookResult.cancelled) {
+      throw new OperationCancelledError('Entity creation', hookResult.reason ?? 'cancelled by hook');
+    }
+
+    // Generate GUID (or use provided)
+    const id = input.id ?? generateEntityId();
+
+    // Generate unique slug
+    const pickSlug = this.createSlugPicker(input.entityType, input.label);
+    const slug = await pickSlug();
+
+    // Stamp provenance
+    const provenance = this.provenanceTracker.stampCreate();
+
+    // Generate embedding if provider available
+    const entityEmbedding = await this.generateEmbedding(
+      input.label,
+      input.summary,
+      input.properties ?? {},
+      input.entityType,
+      vocabulary,
+    );
+
+    // Build stored entity
+    const storedEntity: StoredEntity = {
+      id,
+      slug,
+      entityType: input.entityType,
+      label: input.label,
+      summary: input.summary,
+      properties: input.properties ?? {},
+      data: input.data,
+      dataFormat: input.dataFormat,
+      provenance,
+      embedding: entityEmbedding,
+    };
+
+    // Persist, re-picking the slug if a concurrent writer claimed it first.
+    const created = await this.writeWithSlugRetry(
+      slug,
+      (candidateSlug) =>
+        this.storage.createEntity(this.repositoryId, { ...storedEntity, slug: candidateSlug }),
+      pickSlug,
+    );
+
+    return storedToEntity(created);
   }
 
   /**
@@ -181,6 +215,16 @@ export class EntityManager {
 
   /** Update an existing entity */
   public async update(entityId: string, updates: UpdateEntityInput): Promise<Entity> {
+    // Key rules govern the names being written. A null asks for a key's
+    // removal and is allowed for any name, so a key stored before the rules
+    // existed can still be cleared.
+    if (updates.properties) {
+      assertWritablePropertyKeys(
+        Object.fromEntries(Object.entries(updates.properties).filter(([, value]) => value !== null)),
+        'entity',
+      );
+    }
+
     // Get existing entity to determine its type for validation. Storage
     // answers a deleted repository with RepositoryNotFoundError before any
     // miss, so a null here is a missing entity.
@@ -587,10 +631,20 @@ export class EntityManager {
     };
   }
 
-  /** Generate an embedding vector from label + summary + embeddable string properties if a provider is available */
-  private async generateEmbedding(label: string, summary: string | undefined, properties: Record<string, unknown>, entityType: string): Promise<number[] | undefined> {
+  /**
+   * Generate an embedding vector from label + summary + embeddable string
+   * properties if a provider is available. `vocabulary` is the one the write
+   * was validated against, when the caller has it; otherwise it is read.
+   */
+  private async generateEmbedding(
+    label: string,
+    summary: string | undefined,
+    properties: Record<string, unknown>,
+    entityType: string,
+    vocabulary?: MemoryVocabulary,
+  ): Promise<number[] | undefined> {
     if (!this.embedding) return undefined;
-    const vocab = await this.vocabularyEngine.getVocabulary();
+    const vocab = vocabulary ?? (await this.vocabularyEngine.getVocabulary());
     const typeDef = getEntityTypeDef(entityType, vocab);
     const embeddableValues = typeDef
       ? typeDef.properties

@@ -284,6 +284,22 @@ describe('TraversalValidator', () => {
       expect(result).toEqual({ valid: true, errors: [] });
     });
 
+    it('rejects projecting a name reserved for an entity system field, with or without provenance', () => {
+      for (const includeProvenance of [false, true]) {
+        const result = validateTraversalSpec({
+          start: { entityId: 'a' },
+          returnMode: 'terminal',
+          includeProvenance,
+          projection: { properties: ['startDate', 'createdInConversation', 'label', '_attempt'] },
+        });
+        expect(result.errors).toEqual([
+          expect.stringMatching(/^projection\.properties\[1\] "createdInConversation" is reserved/),
+          expect.stringMatching(/^projection\.properties\[2\] "label" is reserved/),
+          expect.stringMatching(/^projection\.properties\[3\] "_attempt" is reserved/),
+        ]);
+      }
+    });
+
     it.each([
       ['a fractional depth', 1.5],
       ['a numeric string', asNumber('3')],

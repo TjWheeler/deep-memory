@@ -287,7 +287,7 @@ export async function* exportAll(
  * row.userProperties` clause — the row payload carries the user-property
  * map under a single binding so the Cypher string stays fixed regardless of
  * which keys are populated. The JSON-stringified `properties` blob remains
- * authoritative for `entity.properties` round-trip (per O1); the user-property
+ * authoritative for `entity.properties` round-trip; the user-property
  * scalars exist for `findEntities` predicate queries only.
  *
  * Every node carries the statement's write token (`$writeAttempt`), so a
@@ -1070,8 +1070,20 @@ async function importRelationshipChunk(
   }
 
   // `repositoryId` is bound globally via the chokepoint's `$rid`; rows carry
-  // only per-edge fields.
-  const prepared = group.rows.map((rel) => ({ item: rel, params: relationshipToParams(rel) }));
+  // only per-edge fields. Each row's params are built on its own so a row the
+  // mapping refuses (an unsafe or reserved property key) is recorded against
+  // that row and the rest of the group still lands.
+  const refused: BulkImportItemError[] = [];
+  const prepared: Array<PreparedRow<StoredRelationship>> = [];
+  for (const rel of group.rows) {
+    try {
+      prepared.push({ item: rel, params: relationshipToParams(rel) });
+    } catch (err) {
+      if (!(err instanceof DeepMemoryError)) throw err;
+      refused.push(refusedRow(`relationship:${rel.id}`, err));
+    }
+  }
+  if (prepared.length === 0) return { imported: 0, errors: refused };
 
   // The upsert statement's id check sees the store as it was before the
   // statement, so an upsert chunk that repeats an id is written in waves of
@@ -1089,7 +1101,7 @@ async function importRelationshipChunk(
   // its own edge.
   const writeAttempt = skipCheck ? randomUUID() : undefined;
   let imported = 0;
-  const errors: BulkImportItemError[] = [];
+  const errors: BulkImportItemError[] = [...refused];
   for (const wave of waves) {
     if (run.stopped) break;
     let result: QueryResult;

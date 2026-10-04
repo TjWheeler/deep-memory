@@ -11,6 +11,7 @@ import {
   entityFromDocument,
   entityFromGremlin,
   entityToLadderBindings,
+  entityUpdatePropertyParams,
   entityUserPropertyParams,
   existingEntityScalarUserKeys,
   isNativeStorableValue,
@@ -34,7 +35,7 @@ import {
   markerCheckedRead,
   rowsPastMarker,
 } from './marker.js';
-import { deleteEntitiesByIds } from './deleteByIds.js';
+import { deleteEntitiesByIds, deleteTypedEntitiesByIds } from './deleteByIds.js';
 
 // Sentinels the create query returns in place of the new vertex; the caller
 // translates them into typed errors — single round-trip either way:
@@ -121,7 +122,7 @@ export async function createEntity(
   // (round-trip authoritative); native-storable scalars also project to per-
   // key vertex properties so server-side predicates and aggregations can
   // reach them. Validation runs before any round-trip — reserved-key
-  // collisions and unsafe identifiers raise ProviderError synchronously.
+  // collisions and unsafe identifiers raise InvalidInputError synchronously.
   const userProps = entityUserPropertyParams(entity.properties ?? {});
   let query: string;
   if (userProps.length === 0) {
@@ -242,8 +243,8 @@ export async function getEntities(
 // slot (set / drop / leave) with two-level choose-and-sideEffect-drop branches
 // — significant Gremlin complexity for a per-call plan-cache win that matters
 // far less here than on the bulk-import create path. The plan-cache concern is
-// framed around the "every create is a unique query" case (issue #20 in
-// plans/performance-issues.md), not partial-update calls. If the reembed loop
+// the case where every create would otherwise be a unique query string, not
+// partial-update calls. If the reembed loop
 // ever profiles as plan-parse-bound, revisit by introducing a two-sentinel
 // ladder shape — until then variable is fine.
 //
@@ -302,14 +303,6 @@ export async function updateEntity(
   entityId: string,
   updates: StoredEntityUpdate,
 ): Promise<StoredEntity> {
-  // Validate the new user-property shape BEFORE any round-trip — a reserved-
-  // name collision or unsafe identifier raises ProviderError synchronously,
-  // so we never burn a pre-read on a payload we cannot persist.
-  const userProps =
-    updates.properties !== undefined
-      ? entityUserPropertyParams(updates.properties)
-      : null;
-
   // Slugs are unique per repository. Only an update that sets a slug pays
   // for this lookup; like the create-time check it is not transactional, so
   // two updates in flight onto the same slug can both pass it. An entity that
@@ -342,6 +335,13 @@ export async function updateEntity(
     }
   }
 
+  // The new user-property shape is validated and projected once the pre-read
+  // has returned the stored blob: key rules apply only to keys the update
+  // writes (new, or with a changed value), so a key stored before the rules
+  // existed and carried over unchanged does not block the update. See
+  // `entityUpdatePropertyParams`. The drop set never names such a key either
+  // (`existingEntityScalarUserKeys` skips it).
+  let userProps: Array<{ key: string; value: unknown }> | null = null;
   let droppedUserKeys: string[] = [];
   if (updates.properties !== undefined) {
     const existing = await readExistingEntityPropertiesBlob(conn, repositoryId, entityId);
@@ -351,8 +351,10 @@ export async function updateEntity(
       await assertRepositoryMarker(conn, repositoryId);
       throw new EntityNotFoundError(entityId);
     }
+    const projected = entityUpdatePropertyParams(updates.properties, existing.blob);
+    userProps = projected;
     const existingKeys = existingEntityScalarUserKeys(existing.blob);
-    const newKeySet = new Set(userProps!.map((p) => p.key));
+    const newKeySet = new Set(projected.map((p) => p.key));
     droppedUserKeys = existingKeys.filter((k) => !newKeySet.has(k));
   }
 
@@ -451,53 +453,99 @@ export async function deleteEntity(
   if (notFound.length > 0) throw new EntityNotFoundError(entityId);
 }
 
-/** The marker-guarded by-type entity drop; see `deleteEntitiesByType`. */
-export const DELETE_ENTITIES_BY_TYPE_QUERY =
-  "g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('entityType', etype))" +
-  ".fold().as('vs').unfold().hasLabel('_repository').hasNot('entityType').aggregate('found').by('id')" +
-  ".select('vs').unfold().has('entityType', etype).aggregate('found').by('id').drop()" +
-  ".cap('found')";
+/** Entities read, and then dropped, per batch of a by-type delete. */
+export const ENTITY_TYPE_DELETE_BATCH_SIZE = 500;
 
 /**
- * Drop every entity of a type, with its edges, only while the repository
- * marker exists, and report the ids dropped, in one partition-scoped request:
+ * Consecutive by-type batches that read ids but drop none before the delete
+ * stops: one can follow a re-sent drop or a concurrent delete, two in a row
+ * mean the loop is not making progress.
+ */
+export const ENTITY_TYPE_DELETE_MAX_EMPTY_BATCHES = 2;
+
+/**
+ * The ids of up to `batchSize` entities of a type. The bound sits on the
+ * first, index-backed step, so a batch's cost does not grow with the type's
+ * population.
+ */
+export const ENTITY_TYPE_BATCH_IDS_QUERY =
+  "g.V().has('repositoryId', rid).has('entityType', etype).limit(batchSize).id()";
+
+/**
+ * Drop every entity of a type, with its edges, in batches, and report how
+ * many entities were dropped. Each batch reads up to
+ * `ENTITY_TYPE_DELETE_BATCH_SIZE` ids of the type, then drops them through the
+ * guarded delete (`deleteTypedEntitiesByIds`), which fetches the marker with
+ * the ids in its first step and drops only while the marker exists. The loop
+ * ends when a read finds no entity of the type; when the first read finds
+ * none, a marker point read decides between `RepositoryNotFoundError` and
+ * nothing to delete.
  *
- *   g.V().has('repositoryId', rid).or(__.hasId(mid), __.has('entityType', etype))  // marker and the type, one indexed lookup
- *     .fold().as('vs').unfold()
- *     .hasLabel('_repository').hasNot('entityType').aggregate('found').by('id')  // continues only past the marker
- *     .select('vs').unfold().has('entityType', etype)
- *     .aggregate('found').by('id').drop()
- *     .cap('found')
+ * A single request over the whole type would read the type into one list
+ * before the drop, so its cost and duration grow with the type's population
+ * and a large type can outlast the request timeout. A bounded batch costs the
+ * same whatever the type's size, and a delete stopped part-way is finished
+ * by calling it again. A mid-traversal `V()` after the marker step cannot
+ * bound the batch: it reads the type's whole population before `limit`.
  *
- * `cap` emits the bucket even when no traverser reaches it, so a bucket
- * without the marker id means the repository is missing and nothing was
- * dropped. Fetching the marker in the first step costs the same as the
- * unguarded drop at any repository size; a mid-traversal `V()` would not.
+ * `deletedEntities` is the sum of each batch's guarded drop: the ids that
+ * request found still of the type and dropped. It is never more than were
+ * removed, and may be fewer: when a transient error (429 / 503) makes the
+ * connection re-send a drop that had already partly applied, the re-sent
+ * request reports only the entities still there. Counting the read ids
+ * confirmed gone afterwards would not be exact either: an entity a concurrent
+ * delete removed would be counted by both. Batches are not one transaction: a
+ * delete that fails or finds the marker gone part-way leaves the batches
+ * before it dropped.
+ *
+ * A batch whose read returned ids but whose drops removed none can follow a
+ * re-sent drop or a concurrent delete; the next read moves on. Two such
+ * batches in a row mean the reads keep returning ids the guarded drop does
+ * not remove, and the loop stops with a `ProviderError` rather than spin.
+ * What was dropped stays dropped, so the call can be repeated.
  *
  * The cascaded edge count is intentionally skipped — computing it required a
- * `bothE().dedup().count()` that walked every incident edge, and the value is
- * currently discarded by the only caller (VocabularyEngine.cascadeDeleteData).
- * Returns `deletedRelationships: undefined` to signal the field is genuinely
- * unknown for this provider. SQL Server and in-memory providers continue to
- * return the exact number (rowsAffected / iteration).
+ * `bothE().dedup().count()` that walked every incident edge, and the
+ * vocabulary cascade does not read it. Returns `deletedRelationships:
+ * undefined` to signal the field is genuinely unknown for this provider.
  *
- * @throws RepositoryNotFoundError when the marker is absent; nothing is dropped.
+ * @throws RepositoryNotFoundError when the marker is absent; the request
+ *   that finds it absent drops nothing.
+ * @throws ProviderError when two batches in a row drop nothing although
+ *   their reads returned ids.
  */
 export async function deleteEntitiesByType(
   conn: CosmosDbConnection,
   repositoryId: string,
   entityType: string,
 ): Promise<{ deletedEntities: number; deletedRelationships: number | undefined }> {
-  const markerId = repoVertexId(repositoryId);
-  const result = await conn.submit(DELETE_ENTITIES_BY_TYPE_QUERY, { rid: repositoryId, mid: markerId, etype: entityType });
-  // `cap('found')` always emits the bucket as a list, so no row, or a row
-  // that is not a list, is a malformed response, not a missing repository.
-  if (result.items.length === 0) throw new ProviderError('Cosmos guarded type delete returned no row.');
-  const bucket = result.items[0];
-  if (!Array.isArray(bucket)) throw new ProviderError('Cosmos guarded type delete returned a row that is not an id list.');
-  const found = bucket.filter((id): id is string => typeof id === 'string');
-  if (!found.includes(markerId)) throw new RepositoryNotFoundError(repositoryId);
-  return { deletedEntities: found.filter((id) => id !== markerId).length, deletedRelationships: undefined };
+  let deletedEntities = 0;
+  let emptyBatches = 0;
+  for (let batch = 0; ; batch++) {
+    const read = await conn.submit(ENTITY_TYPE_BATCH_IDS_QUERY, {
+      rid: repositoryId,
+      etype: entityType,
+      batchSize: ENTITY_TYPE_DELETE_BATCH_SIZE,
+    });
+    const ids = read.items.filter((id): id is string => typeof id === 'string');
+    if (ids.length !== read.items.length) {
+      throw new ProviderError('Cosmos type id read returned a row that is not an id.');
+    }
+    if (ids.length === 0) {
+      if (batch === 0) await assertRepositoryMarker(conn, repositoryId);
+      return { deletedEntities, deletedRelationships: undefined };
+    }
+    const dropped = await deleteTypedEntitiesByIds(conn, repositoryId, entityType, ids);
+    deletedEntities += dropped;
+    emptyBatches = dropped === 0 ? emptyBatches + 1 : 0;
+    if (emptyBatches >= ENTITY_TYPE_DELETE_MAX_EMPTY_BATCHES) {
+      throw new ProviderError(
+        `Deleting entities of type "${entityType}" in repository "${repositoryId}" made no progress: ` +
+          `${emptyBatches} batches in a row read entities of the type but dropped none (${deletedEntities} dropped before that).`,
+        'Retry the delete: what was dropped stays dropped, and the delete resumes from what is left.',
+      );
+    }
+  }
 }
 
 /**
@@ -505,7 +553,7 @@ export async function deleteEntitiesByType(
  * Every user property on a Gremlin vertex is stored as `[{_value, id}]` when
  * read through the Document endpoint — so a top-level scalar reference like
  * `c.entityType` silently returns no rows. Always go through `[0]._value`.
- * See local-tests/baseline/phase-cosmos-sql-shape-probe-results.md.
+ * See "Path conventions" in docs/cosmosdb-gremlin-compatibility.md.
  */
 function sqlPath(key: string): string {
   return `c.${key}[0]._value`;

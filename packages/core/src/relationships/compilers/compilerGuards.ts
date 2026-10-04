@@ -14,6 +14,7 @@ import {
   isPositiveSafeInteger,
   isSafeIdentifier,
 } from '../../validation/identifier.js';
+import { isReservedPropertyName } from '../../validation/propertyNames.js';
 
 /**
  * Throw `TraversalValidationError` unless `value` is a safe identifier.
@@ -24,6 +25,22 @@ export function assertSafeIdentifier(value: string, role: string): void {
   if (!isSafeIdentifier(value)) {
     throw new TraversalValidationError([
       `Unsafe ${role}: ${describeRejectedValue(value)}. Identifiers must match ${SAFE_IDENTIFIER_PATTERN.source}.`,
+    ]);
+  }
+}
+
+/**
+ * Throw `TraversalValidationError` unless `value` can be projected: a safe
+ * identifier that is not reserved for an entity system field. The compilers
+ * read a projected name straight off the node, where system fields
+ * (provenance, slug, embedding, write tokens) sit beside user properties, so
+ * a reserved name would expose a system field instead of a user property.
+ */
+export function assertProjectableProperty(value: string): void {
+  assertSafeIdentifier(value, 'projection property name');
+  if (isReservedPropertyName(value, 'entity')) {
+    throw new TraversalValidationError([
+      `Projection property name "${value}" is reserved for an entity system field and cannot be projected; projection reads user properties only.`,
     ]);
   }
 }
